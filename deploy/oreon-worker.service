@@ -1,0 +1,18 @@
+[Unit]
+Description=Oreon Build Worker
+After=network.target
+
+[Service]
+Type=simple
+User=oreon-build
+Group=oreon-build
+WorkingDirectory=/opt/oreon-build-service
+EnvironmentFile=/opt/oreon-build-service/.env
+Environment=OREON_WORKER_NAME=worker-1
+Environment=OREON_WORKER_TOKEN=<set-in-env-file>
+ExecStart=/opt/oreon-build-service/venv/bin/oreon-worker
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
