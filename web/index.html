@@ -1,0 +1,190 @@
+<!--
+Oreon Build Service
+Copyright (C) 2026 Oreon HQ
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Oreon Build Service</title>
+  <link rel="stylesheet" href="/static/style.css?v=2">
+</head>
+<body>
+  <header class="header">
+    <a href="/" class="header-logo-link"><img src="/static/obslogo.png" alt="Oreon Build Service" class="header-logo" /></a>
+    <nav>
+      <a href="/">Dashboard</a>
+      <a href="/builds.html">Builds</a>
+      <a href="/packages.html">Packages</a>
+      <a href="/releases.html">Releases</a>
+      <a href="/workers.html">Workers</a>
+      <a href="/mock-environments.html">Mock Environments</a>
+      <a href="/repos.html">Repositories</a>
+      <a href="/promotions.html">Promotions</a>
+      <a href="/admin.html">Administration</a>
+      <form class="navbar-search" action="/search.html" method="get" style="display:inline-flex; margin-left:0.5rem;">
+        <input type="search" name="q" placeholder="Search…" style="padding:0.25rem 0.5rem; width:10rem;">
+        <button type="submit" class="btn" style="margin-left:0.25rem;">Go</button>
+      </form>
+      <span id="auth-section">
+        <span id="user-info"></span>
+        <button id="btn-login" type="button">Login</button>
+        <button id="btn-logout" type="button" style="display:none">Logout</button>
+      </span>
+    </nav>
+  </header>
+  <main class="main">
+    <section class="card">
+      <h2>Dashboard</h2>
+      <p id="dashboard-hint">Oreon build system. View-only for guests; login to trigger builds, create releases/packages, enroll workers, and manage mock environments.</p>
+      <div class="stats">
+        <div class="stat"><span id="stat-builds">-</span> Builds</div>
+        <div class="stat"><span id="stat-packages">-</span> Packages</div>
+        <div class="stat"><span id="stat-releases">-</span> Releases</div>
+        <div class="stat"><span id="stat-workers">-</span> Workers</div>
+      </div>
+    </section>
+    <section class="card" id="dashboard-builds-card">
+      <h2>Recent builds</h2>
+      <p style="color:var(--text-muted); font-size:0.9rem; margin-top:0.25rem;">Latest jobs across all releases and packages.</p>
+      <div id="dashboard-builds"></div>
+    </section>
+    <section class="card" id="dashboard-releases-card">
+      <h2>Releases & workers</h2>
+      <p style="color:var(--text-muted); font-size:0.9rem; margin-top:0.25rem;">Active releases with enrolled workers by architecture.</p>
+      <div id="dashboard-releases"></div>
+    </section>
+  </main>
+  <footer class="footer">Oreon Build Service</footer>
+  <script src="/static/app.js?v=2"></script>
+  <script>
+    (function() {
+      const api = window.oreonApi || {};
+      function updateHint() {
+        var el = document.getElementById('dashboard-hint');
+        if (el && api.token) el.textContent = 'Oreon build system. You can trigger builds, create releases/packages, enroll workers, and manage mock environments from the pages above.';
+        else if (el) el.textContent = 'Oreon build system. View-only for guests; login to trigger builds, create releases/packages, enroll workers, and manage mock environments.';
+      }
+      updateHint();
+      window.addEventListener('auth-change', updateHint);
+      function count(data) {
+        if (Array.isArray(data)) return data.length;
+        if (data && Array.isArray(data.items)) return data.items.length;
+        return 0;
+      }
+      async function loadStats() {
+        try {
+          const [buildsResp, packagesResp, releasesResp, workersResp] = await Promise.all([
+            api.get('/builds?limit=20'),
+            api.get('/packages?limit=500'),
+            api.get('/releases?limit=500'),
+            api.get('/workers?limit=500')
+          ]);
+          const builds = (buildsResp && buildsResp.items) ? buildsResp.items : [];
+          const packages = (packagesResp && packagesResp.items) ? packagesResp.items : [];
+          const releases = (releasesResp && releasesResp.items) ? releasesResp.items : [];
+          const workers = (workersResp && workersResp.items) ? workersResp.items : [];
+          document.getElementById('stat-builds').textContent = (buildsResp && typeof buildsResp.total === 'number') ? buildsResp.total : builds.length;
+          document.getElementById('stat-packages').textContent = (packagesResp && typeof packagesResp.total === 'number') ? packagesResp.total : packages.length;
+          document.getElementById('stat-releases').textContent = (releasesResp && typeof releasesResp.total === 'number') ? releasesResp.total : releases.length;
+          document.getElementById('stat-workers').textContent = (workersResp && typeof workersResp.total === 'number') ? workersResp.total : workers.length;
+
+          // Recent builds table
+          var buildsHost = document.getElementById('dashboard-builds');
+          function statusBadge(s) {
+            if (s === 'success') return '<span class="badge success">success</span>';
+            if (s === 'failed' || s === 'cancelled') return '<span class="badge failed">' + s + '</span>';
+            if (s === 'running' || s === 'queued') return '<span class="badge running">' + s + '</span>';
+            return '<span class="badge pending">' + (s || 'pending') + '</span>';
+          }
+          if (buildsHost) {
+            if (!builds.length) {
+              buildsHost.innerHTML = '<p style="color:var(--text-muted); font-size:0.9rem;">No builds yet.</p>';
+            } else {
+              var rows = builds.slice(0, 10).map(function(b) {
+                var pkg = packages.find(function(p) { return p.id === b.package_id; });
+                var rel = releases.find(function(r) { return r.id === b.release_id; });
+                var pkgLabel = pkg && (pkg.name || '').trim() ? (pkg.name + ' (' + b.package_id + ')') : ('#' + b.package_id);
+                var relLabel = rel && (rel.releasename || '').trim() ? (rel.releasename + ' (' + b.release_id + ')') : ('#' + b.release_id);
+                var arch = b.architecture || '—';
+                var created = (b.created_at || '').slice(0, 19);
+                return '<tr>'
+                  + '<td><a href="/build.html?job_id=' + b.id + '">#' + b.id + '</a></td>'
+                  + '<td>' + pkgLabel + '</td>'
+                  + '<td>' + relLabel + '</td>'
+                  + '<td>' + arch + '</td>'
+                  + '<td>' + statusBadge(b.status) + '</td>'
+                  + '<td>' + created + '</td>'
+                  + '</tr>';
+              }).join('');
+              buildsHost.innerHTML = '<table class="table-compact"><thead><tr>'
+                + '<th>ID</th><th>Package</th><th>Release</th><th>Arch</th><th>Status</th><th>Created</th>'
+                + '</tr></thead><tbody>' + rows + '</tbody></table>';
+            }
+          }
+
+          // Releases + worker summary
+          var relHost = document.getElementById('dashboard-releases');
+          if (relHost) {
+            if (!releases.length) {
+              relHost.innerHTML = '<p style="color:var(--text-muted); font-size:0.9rem;">No releases defined.</p>';
+            } else {
+              var byRelease = {};
+              workers.forEach(function(w) {
+                var arch = (w.architecture || 'x86_64');
+                // Workers are global; just count by architecture
+                byRelease['_all'] = byRelease['_all'] || {};
+                byRelease['_all'][arch] = (byRelease['_all'][arch] || 0) + 1;
+              });
+              var rows = releases.map(function(r) {
+                var arches = (r.architectures || '').split(',').map(function(a) { return a.trim(); }).filter(Boolean);
+                var workerSummary = '';
+                var archCounts = byRelease['_all'] || {};
+                if (arches.length) {
+                  workerSummary = arches.map(function(a) {
+                    var cnt = archCounts[a] || 0;
+                    return a + ': ' + cnt;
+                  }).join(', ');
+                } else {
+                  var parts = Object.keys(archCounts).map(function(a) { return a + ': ' + archCounts[a]; });
+                  workerSummary = parts.join(', ') || '—';
+                }
+                return '<tr>'
+                  + '<td>' + r.id + '</td>'
+                  + '<td>' + (r.releasename || '') + '</td>'
+                  + '<td>' + (r.default_channel || 'dev') + '</td>'
+                  + '<td>' + (r.architectures || '') + '</td>'
+                  + '<td>' + (r.is_active ? 'Yes' : 'No') + '</td>'
+                  + '<td>' + workerSummary + '</td>'
+                  + '</tr>';
+              }).join('');
+              relHost.innerHTML = '<table class="table-compact"><thead><tr>'
+                + '<th>ID</th><th>Release</th><th>Default channel</th><th>Architectures</th><th>Active</th><th>Workers / arch</th>'
+                + '</tr></thead><tbody>' + rows + '</tbody></table>';
+            }
+          }
+        } catch (e) {
+          var el = document.getElementById('stat-builds');
+          if (el) el.textContent = '?';
+        }
+      }
+      loadStats();
+    })();
+  </script>
+</body>
+</html>
