@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Packages - Oreon Build Service</title>
+  <link rel="stylesheet" href="/static/style.css?v=2">
+</head>
+<body>
+  <header class="header">
+    <a href="/" class="header-logo-link"><img src="/static/obslogo.png" alt="Oreon Build Service" class="header-logo" /></a>
+    <nav>
+      <a href="/">Dashboard</a>
+      <a href="/builds.html">Builds</a>
+      <a href="/packages.html">Packages</a>
+      <a href="/releases.html">Releases</a>
+      <a href="/workers.html">Workers</a>
+      <a href="/mock-environments.html">Mock Environments</a>
+      <a href="/repos.html">Repositories</a>
+      <a href="/promotions.html">Promotions</a>
+      <form class="navbar-search" action="/search.html" method="get" style="display:inline-flex; margin-left:0.5rem;">
+        <input type="search" name="q" placeholder="Search…" style="padding:0.25rem 0.5rem; width:10rem;">
+        <button type="submit" class="btn" style="margin-left:0.25rem;">Go</button>
+      </form>
+      <span id="auth-section"><span id="user-info"></span><button id="btn-login" type="button">Login</button><button id="btn-logout" type="button" style="display:none">Logout</button></span>
+    </nav>
+  </header>
+  <main class="main">
+    <section class="card">
+      <h2>Packages</h2>
+      <p id="packages-hint">Package list. Create packages from the <a href="/builds.html">Builds</a> page (New package + build). Login to edit or delete.</p>
+      <div class="form-group" style="margin-bottom:1rem;">
+        <label>Filter</label>
+        <input type="text" id="packages-filter" placeholder="Filter by name or ID…" style="padding:0.4rem; width:100%; max-width:20rem;">
+      </div>
+      <div class="list-toolbar">
+        <div class="select-all-wrap"><label for="packages-select-all">Select all</label></div>
+        <div class="pagination" id="packages-pagination">
+          <button type="button" class="btn" id="packages-prev" disabled>Prev</button>
+          <span class="page-info" id="packages-page-info">Page 1 of 1</span>
+          <button type="button" class="btn" id="packages-next" disabled>Next</button>
+          <select class="page-size" id="packages-page-size"><option value="25" selected>25</option><option value="50">50</option><option value="100">100</option></select>
+        </div>
+      </div>
+      <table class="table-list">
+        <thead>
+          <tr><th class="col-checkbox"><input type="checkbox" id="packages-select-all" title="Select all on this page"></th><th>ID</th><th>Name</th><th>Description</th><th>GitLab</th><th>Actions</th></tr>
+        </thead>
+        <tbody id="packages-tbody"></tbody>
+      </table>
+    </section>
+    <div id="edit-package-modal" class="modal">
+      <div class="modal-content">
+        <h3>Edit package</h3>
+        <input type="hidden" id="edit-package-id">
+        <div class="form-group">
+          <label>Description (optional)</label>
+          <input type="text" id="edit-package-desc" placeholder="Optional description">
+        </div>
+        <div class="form-group">
+          <label>Mock environment (optional)</label>
+          <select id="edit-package-mock-env" class="form-control">
+            <option value="">Use release default</option>
+          </select>
+          <p style="color:var(--text-muted); font-size:0.85rem; margin-top:0.25rem;">Used for rebuilds when building this package.</p>
+        </div>
+        <div class="form-group">
+          <label>GitLab web URL (optional)</label>
+          <input type="text" id="edit-package-gitlab" placeholder="https://gitlab.com/...">
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn" id="edit-package-cancel">Cancel</button>
+          <button type="button" class="btn primary" id="edit-package-save">Save</button>
+        </div>
+      </div>
+    </div>
+  </main>
+  <script src="/static/app.js?v=2"></script>
+  <script>
+    (function() {
+      const api = window.oreonApi;
+      function updateUI() {
+        var hint = document.getElementById('packages-hint');
+        if (api.token && hint) hint.innerHTML = 'Package list. Create packages from the <a href="/builds.html">Builds</a> page (New package + build). You can edit or delete packages.';
+        else if (hint) hint.innerHTML = 'Package list. Create packages from the <a href="/builds.html">Builds</a> page. Login to edit or delete.';
+      }
+      var packagesPage = 0, packagesPageSize = 25, packagesTotal = 0;
+      function load() {
+        var offset = packagesPage * packagesPageSize;
+        api.get('/packages?limit=' + packagesPageSize + '&offset=' + offset).then(function(data) {
+          var tbody = document.getElementById('packages-tbody');
+          if (!tbody) return;
+          var list = (data && data.items) ? data.items : [];
+          packagesTotal = (data && typeof data.total === 'number') ? data.total : 0;
+          var canAct = !!api.token;
+          tbody.innerHTML = list.map(function(p) {
+            var actions = canAct ? '<button type="button" class="btn edit-pkg" data-id="' + p.id + '" data-desc="' + escapeAttr(p.description || '') + '" data-gitlab="' + escapeAttr(p.gitlab_web_url || '') + '" data-mock-id="' + (p.preferred_mock_environment_id || '') + '">Edit</button> <button type="button" class="btn delete-pkg" data-id="' + p.id + '" data-name="' + escapeAttr(p.name || '') + '">Delete</button>' : '-';
+            return '<tr data-filter="' + escapeAttr((p.name || '') + ' ' + p.id) + '"><td class="col-checkbox"><input type="checkbox" class="pkg-row-cb" data-id="' + p.id + '"></td><td>' + p.id + '</td><td>' + escapeHtml(p.name || '') + '</td><td>' + escapeHtml(p.description || '-') + '</td><td>' + (p.gitlab_web_url ? '<a href="' + escapeAttr(p.gitlab_web_url) + '" target="_blank">Link</a>' : '-') + '</td><td>' + actions + '</td></tr>';
+          }).join('') || '<tr><td colspan="6">No packages</td></tr>';
+          var filterEl = document.getElementById('packages-filter');
+          if (filterEl) {
+            filterEl.oninput = function() {
+              var v = (filterEl.value || '').toLowerCase();
+              tbody.querySelectorAll('tr[data-filter]').forEach(function(tr) {
+                tr.style.display = (!v || (tr.getAttribute('data-filter') || '').toLowerCase().indexOf(v) !== -1) ? '' : 'none';
+              });
+            };
+          }
+          var selectAllEl = document.getElementById('packages-select-all');
+          if (selectAllEl) { selectAllEl.checked = false; selectAllEl.onclick = function() { tbody.querySelectorAll('.pkg-row-cb').forEach(function(cb) { cb.checked = selectAllEl.checked; }); }; }
+          tbody.querySelectorAll('.pkg-row-cb').forEach(function(cb) {
+            cb.addEventListener('change', function() {
+              var rowCbs = tbody.querySelectorAll('.pkg-row-cb');
+              var checked = tbody.querySelectorAll('.pkg-row-cb:checked').length;
+              if (selectAllEl) selectAllEl.checked = checked === rowCbs.length && rowCbs.length > 0;
+            });
+          });
+          tbody.querySelectorAll('.edit-pkg').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+              document.getElementById('edit-package-id').value = btn.dataset.id;
+              document.getElementById('edit-package-desc').value = btn.dataset.desc || '';
+              document.getElementById('edit-package-gitlab').value = btn.dataset.gitlab || '';
+              document.getElementById('edit-package-mock-env').value = btn.dataset.mockId || '';
+              document.getElementById('edit-package-modal').classList.add('open');
+            });
+          });
+          tbody.querySelectorAll('.delete-pkg').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+              window.oreonUI.confirm('Delete package "' + (btn.dataset.name || '') + '"? This cannot be undone.', 'Delete package')
+                .then(function(ok) {
+                  if (!ok) return;
+                  api.delete('/packages/' + btn.dataset.id).then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+                });
+            });
+          });
+          var numPages = packagesTotal ? Math.ceil(packagesTotal / packagesPageSize) : 1;
+          document.getElementById('packages-page-info').textContent = 'Page ' + (packagesPage + 1) + ' of ' + numPages;
+          document.getElementById('packages-prev').disabled = packagesPage <= 0;
+          document.getElementById('packages-next').disabled = packagesPage >= numPages - 1;
+        }).catch(function() {
+          var tbody = document.getElementById('packages-tbody');
+          if (tbody) tbody.innerHTML = '<tr><td colspan="6">Failed to load</td></tr>';
+        });
+      }
+      (function initPackagesPagination() {
+        document.getElementById('packages-prev').addEventListener('click', function() { if (packagesPage > 0) { packagesPage--; load(); } });
+        document.getElementById('packages-next').addEventListener('click', function() { var n = packagesTotal ? Math.ceil(packagesTotal / packagesPageSize) : 1; if (packagesPage < n - 1) { packagesPage++; load(); } });
+        document.getElementById('packages-page-size').addEventListener('change', function() { packagesPageSize = parseInt(this.value, 10) || 25; packagesPage = 0; load(); });
+      })();
+      function escapeHtml(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+      function escapeAttr(s) { return escapeHtml(s).replace(/"/g, '&quot;'); }
+      function fillMockEnvsForEdit() {
+        api.get('/mock-environments?limit=200').then(function(res) {
+          var sel = document.getElementById('edit-package-mock-env');
+          if (!sel) return;
+          var arr = (res && res.items) ? res.items : [];
+          sel.innerHTML = '<option value="">Use release default</option>';
+          arr.forEach(function(m) {
+            sel.appendChild(new Option(m.name + ' (' + (m.config_name || '') + ') [release ' + m.release_id + ']', m.id));
+          });
+        }).catch(function() {});
+      }
+      updateUI();
+      window.addEventListener('auth-change', function() { updateUI(); load(); });
+      fillMockEnvsForEdit();
+      document.getElementById('edit-package-cancel').addEventListener('click', function() { document.getElementById('edit-package-modal').classList.remove('open'); });
+      document.getElementById('edit-package-save').addEventListener('click', function() {
+        var id = document.getElementById('edit-package-id').value;
+        var desc = document.getElementById('edit-package-desc').value.trim();
+        var gitlab = document.getElementById('edit-package-gitlab').value.trim();
+        var mockIdVal = (document.getElementById('edit-package-mock-env') && document.getElementById('edit-package-mock-env').value || '').trim();
+        var payload = { description: desc || null, gitlab_web_url: gitlab || null };
+        if (mockIdVal) payload.preferred_mock_environment_id = parseInt(mockIdVal, 10);
+        else payload.preferred_mock_environment_id = null;
+        api.patch('/packages/' + id, payload)
+          .then(function() { document.getElementById('edit-package-modal').classList.remove('open'); load(); })
+          .catch(function(e) { alert('Failed: ' + e.message); });
+      });
+      load();
+    })();
+  </script>
+</body>
+</html>

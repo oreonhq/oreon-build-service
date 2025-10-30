@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Workers - Oreon Build Service</title>
+  <link rel="stylesheet" href="/static/style.css?v=2">
+</head>
+<body>
+  <header class="header">
+    <a href="/" class="header-logo-link"><img src="/static/obslogo.png" alt="Oreon Build Service" class="header-logo" /></a>
+    <nav>
+      <a href="/">Dashboard</a>
+      <a href="/builds.html">Builds</a>
+      <a href="/packages.html">Packages</a>
+      <a href="/releases.html">Releases</a>
+      <a href="/workers.html">Workers</a>
+      <a href="/mock-environments.html">Mock Environments</a>
+      <a href="/repos.html">Repositories</a>
+      <a href="/promotions.html">Promotions</a>
+      <form class="navbar-search" action="/search.html" method="get" style="display:inline-flex; margin-left:0.5rem;">
+        <input type="search" name="q" placeholder="Search…" style="padding:0.25rem 0.5rem; width:10rem;">
+        <button type="submit" class="btn" style="margin-left:0.25rem;">Go</button>
+      </form>
+      <span id="auth-section"><span id="user-info"></span><button id="btn-login" type="button">Login</button><button id="btn-logout" type="button" style="display:none">Logout</button></span>
+    </nav>
+  </header>
+  <main class="main">
+    <section class="card">
+      <h2>Workers</h2>
+      <p id="workers-hint">Build workers. Enroll new workers via form below (admin) or CLI.</p>
+      <div id="enroll-worker-section" class="card" style="display:none; margin-bottom:1rem;">
+        <h3 style="margin-top:0;">Enroll worker</h3>
+        <p style="color:var(--text-muted); font-size:0.9rem;">Use the enrollment secret from .env (WORKER_ENROLLMENT_SECRET). After enrolling, the response includes a one-time token for the worker.</p>
+        <div class="form-group">
+          <label>Worker name</label>
+          <input type="text" id="enroll-worker-name" placeholder="e.g. worker-1" maxlength="128">
+        </div>
+        <div class="form-group">
+          <label>Enrollment token</label>
+          <input type="password" id="enroll-token" placeholder="WORKER_ENROLLMENT_SECRET from .env">
+        </div>
+        <div class="form-group">
+          <label>Architecture (optional)</label>
+          <input type="text" id="enroll-arch" placeholder="e.g. x86_64">
+        </div>
+        <button type="button" class="btn primary" id="btn-enroll-worker">Enroll worker</button>
+      </div>
+      <div class="list-toolbar">
+        <div class="select-all-wrap"><label for="workers-select-all">Select all</label></div>
+        <div class="pagination">
+          <button type="button" class="btn" id="workers-prev" disabled>Prev</button>
+          <span class="page-info" id="workers-page-info">Page 1 of 1</span>
+          <button type="button" class="btn" id="workers-next" disabled>Next</button>
+          <select class="page-size" id="workers-page-size"><option value="25" selected>25</option><option value="50">50</option><option value="100">100</option></select>
+        </div>
+      </div>
+      <table class="table-list">
+        <thead>
+          <tr><th class="col-checkbox"><input type="checkbox" id="workers-select-all" title="Select all on this page"></th><th>ID</th><th>Name</th><th>State</th><th>Architecture</th><th>Last seen</th><th>Actions</th></tr>
+        </thead>
+        <tbody id="workers-tbody"></tbody>
+      </table>
+    </section>
+  </main>
+  <script src="/static/app.js?v=2"></script>
+  <script>
+    (function() {
+      const api = window.oreonApi;
+      function updateUI() {
+        var hint = document.getElementById('workers-hint');
+        var section = document.getElementById('enroll-worker-section');
+        if (api.token && hint) hint.textContent = 'Build workers. You can enroll new workers (admin).';
+        else if (hint) hint.textContent = 'Build workers. Login as admin to enroll workers.';
+        if (section) section.style.display = api.token ? 'block' : 'none';
+      }
+      function escapeHtml(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+      function escapeAttr(s) { return escapeHtml(s || '').replace(/"/g, '&quot;'); }
+      var workersPage = 0, workersPageSize = 25, workersTotal = 0;
+      function load() {
+        var offset = workersPage * workersPageSize;
+        api.get('/workers?limit=' + workersPageSize + '&offset=' + offset).then(function(data) {
+          var tbody = document.getElementById('workers-tbody');
+          if (!tbody) return;
+          var list = (data && data.items) ? data.items : [];
+          workersTotal = (data && typeof data.total === 'number') ? data.total : 0;
+          var canAct = !!api.token;
+          tbody.innerHTML = list.map(function(w) {
+            var actions = canAct ? '<button type="button" class="btn delete-worker" data-id="' + w.id + '" data-name="' + escapeAttr(w.name) + '">Delete</button>' : '-';
+            return '<tr><td class="col-checkbox"><input type="checkbox" class="worker-row-cb" data-id="' + w.id + '"></td><td>' + w.id + '</td><td>' + escapeHtml(w.name || '') + '</td><td>' + (w.state || '') + '</td><td>' + (w.architecture || '-') + '</td><td>' + (w.last_seen_at ? w.last_seen_at.slice(0,19) : '-') + '</td><td>' + actions + '</td></tr>';
+          }).join('') || '<tr><td colspan="7">No workers</td></tr>';
+          var selectAllEl = document.getElementById('workers-select-all');
+          if (selectAllEl) { selectAllEl.checked = false; selectAllEl.onclick = function() { tbody.querySelectorAll('.worker-row-cb').forEach(function(cb) { cb.checked = selectAllEl.checked; }); }; }
+          tbody.querySelectorAll('.worker-row-cb').forEach(function(cb) {
+            cb.addEventListener('change', function() {
+              var rowCbs = tbody.querySelectorAll('.worker-row-cb');
+              var checked = tbody.querySelectorAll('.worker-row-cb:checked').length;
+              if (selectAllEl) selectAllEl.checked = checked === rowCbs.length && rowCbs.length > 0;
+            });
+          });
+          tbody.querySelectorAll('.delete-worker').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+              if (!confirm('Delete worker "' + (btn.dataset.name || '') + '"? The worker will need to re-enroll.')) return;
+              api.delete('/workers/' + btn.dataset.id).then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+            });
+          });
+          var numPages = workersTotal ? Math.ceil(workersTotal / workersPageSize) : 1;
+          document.getElementById('workers-page-info').textContent = 'Page ' + (workersPage + 1) + ' of ' + numPages;
+          document.getElementById('workers-prev').disabled = workersPage <= 0;
+          document.getElementById('workers-next').disabled = workersPage >= numPages - 1;
+        }).catch(function() {
+          var tbody = document.getElementById('workers-tbody');
+          if (tbody) tbody.innerHTML = '<tr><td colspan="7">Failed to load</td></tr>';
+        });
+      }
+      (function initWorkersPagination() {
+        document.getElementById('workers-prev').addEventListener('click', function() { if (workersPage > 0) { workersPage--; load(); } });
+        document.getElementById('workers-next').addEventListener('click', function() { var n = workersTotal ? Math.ceil(workersTotal / workersPageSize) : 1; if (workersPage < n - 1) { workersPage++; load(); } });
+        document.getElementById('workers-page-size').addEventListener('change', function() { workersPageSize = parseInt(this.value, 10) || 25; workersPage = 0; load(); });
+      })();
+      updateUI();
+      window.addEventListener('auth-change', function() { updateUI(); load(); });
+      document.getElementById('btn-enroll-worker').addEventListener('click', function() {
+        var name = document.getElementById('enroll-worker-name').value.trim();
+        var token = document.getElementById('enroll-token').value;
+        if (!name || !token) { alert('Worker name and enrollment token are required.'); return; }
+        api.post('/workers/enroll', { name: name, enrollment_token: token, architecture: document.getElementById('enroll-arch').value.trim() || null })
+          .then(function(data) {
+            load();
+            if (data.token) alert('Worker enrolled. One-time token (save it): ' + data.token);
+            else alert('Worker enrolled.');
+          })
+          .catch(function(e) { alert('Failed: ' + e.message); });
+      });
+      load();
+    })();
+  </script>
+</body>
+</html>
