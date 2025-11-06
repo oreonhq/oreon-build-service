@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Releases - Oreon Build Service</title>
+  <link rel="stylesheet" href="/static/style.css?v=2">
+</head>
+<body>
+  <header class="header">
+    <a href="/" class="header-logo-link"><img src="/static/obslogo.png" alt="Oreon Build Service" class="header-logo" /></a>
+    <nav>
+      <a href="/">Dashboard</a>
+      <a href="/builds.html">Builds</a>
+      <a href="/packages.html">Packages</a>
+      <a href="/releases.html">Releases</a>
+      <a href="/workers.html">Workers</a>
+      <a href="/mock-environments.html">Mock Environments</a>
+      <a href="/repos.html">Repositories</a>
+      <a href="/promotions.html">Promotions</a>
+      <form class="navbar-search" action="/search.html" method="get" style="display:inline-flex; margin-left:0.5rem;">
+        <input type="search" name="q" placeholder="Search…" style="padding:0.25rem 0.5rem; width:10rem;">
+        <button type="submit" class="btn" style="margin-left:0.25rem;">Go</button>
+      </form>
+      <span id="auth-section"><span id="user-info"></span><button id="btn-login" type="button">Login</button><button id="btn-logout" type="button" style="display:none">Logout</button></span>
+    </nav>
+  </header>
+  <main class="main">
+    <section class="card">
+      <h2>Releases</h2>
+      <p id="releases-hint">Oreon releases. Login as admin to create or edit releases.</p>
+      <div id="create-release-section" class="card" style="display:none; margin-bottom:1rem;">
+        <h3 style="margin-top:0;">Create release</h3>
+        <div class="form-group">
+          <label>Release name</label>
+          <input type="text" id="create-releasename" placeholder="e.g. oreon11" maxlength="128">
+        </div>
+        <div class="form-group">
+          <label>Architectures (comma-separated)</label>
+          <input type="text" id="create-architectures" placeholder="e.g. x86_64,aarch64" value="x86_64">
+        </div>
+        <div class="form-group">
+          <label>Default channel</label>
+          <select id="create-default-channel">
+            <option value="dev">dev</option>
+            <option value="testing">testing</option>
+            <option value="stable">stable</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Description (optional)</label>
+          <input type="text" id="create-description" placeholder="Optional description">
+        </div>
+        <button type="button" class="btn primary" id="btn-create-release">Create release</button>
+      </div>
+      <div class="list-toolbar">
+        <div class="select-all-wrap"><label for="releases-select-all">Select all</label></div>
+        <div class="pagination">
+          <button type="button" class="btn" id="releases-prev" disabled>Prev</button>
+          <span class="page-info" id="releases-page-info">Page 1 of 1</span>
+          <button type="button" class="btn" id="releases-next" disabled>Next</button>
+          <select class="page-size" id="releases-page-size"><option value="25" selected>25</option><option value="50">50</option><option value="100">100</option></select>
+        </div>
+      </div>
+      <table class="table-list">
+        <thead>
+          <tr><th class="col-checkbox"><input type="checkbox" id="releases-select-all" title="Select all on this page"></th><th>ID</th><th>Release name</th><th>Architectures</th><th>Default channel</th><th>Active</th><th>Actions</th></tr>
+        </thead>
+        <tbody id="releases-tbody"></tbody>
+      </table>
+    </section>
+    <div id="edit-release-modal" class="modal">
+      <div class="modal-content">
+        <h3>Edit release</h3>
+        <input type="hidden" id="edit-release-id">
+        <div class="form-group">
+          <label>Description (optional)</label>
+          <input type="text" id="edit-release-desc" placeholder="Optional description">
+        </div>
+        <div class="form-group">
+          <label>Architectures (comma-separated)</label>
+          <input type="text" id="edit-release-arch" placeholder="e.g. x86_64,aarch64">
+        </div>
+        <div class="form-group">
+          <label>Default channel</label>
+          <select id="edit-release-channel">
+            <option value="dev">dev</option>
+            <option value="testing">testing</option>
+            <option value="stable">stable</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label><input type="checkbox" id="edit-release-active"> Active</label>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn" id="edit-release-cancel">Cancel</button>
+          <button type="button" class="btn primary" id="edit-release-save">Save</button>
+        </div>
+      </div>
+    </div>
+  </main>
+  <script src="/static/app.js?v=2"></script>
+  <script>
+    (function() {
+      const api = window.oreonApi;
+      function updateUI() {
+        var hint = document.getElementById('releases-hint');
+        var section = document.getElementById('create-release-section');
+        if (api.token && hint) hint.textContent = 'Oreon releases. You can create, edit, or delete releases (admin).';
+        else if (hint) hint.textContent = 'Oreon releases. Login as admin to create or edit releases.';
+        if (section) section.style.display = api.token ? 'block' : 'none';
+      }
+      function escapeHtml(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+      function escapeAttr(s) { return escapeHtml(s || '').replace(/"/g, '&quot;'); }
+      var releasesPage = 0, releasesPageSize = 25, releasesTotal = 0;
+      function load() {
+        var offset = releasesPage * releasesPageSize;
+        api.get('/releases?limit=' + releasesPageSize + '&offset=' + offset).then(function(data) {
+          var tbody = document.getElementById('releases-tbody');
+          if (!tbody) return;
+          var list = (data && data.items) ? data.items : [];
+          releasesTotal = (data && typeof data.total === 'number') ? data.total : 0;
+          var canAct = !!api.token;
+          tbody.innerHTML = list.map(function(r) {
+            var actions = canAct ? '<button type="button" class="btn edit-rel" data-id="' + r.id + '" data-desc="' + escapeAttr(r.description) + '" data-arch="' + escapeAttr(r.architectures) + '" data-channel="' + (r.default_channel || 'dev') + '" data-active="' + (r.is_active ? '1' : '0') + '">Edit</button> <button type="button" class="btn delete-rel" data-id="' + r.id + '" data-name="' + escapeAttr(r.releasename) + '">Delete</button>' : '-';
+            return '<tr><td class="col-checkbox"><input type="checkbox" class="rel-row-cb" data-id="' + r.id + '"></td><td>' + r.id + '</td><td>' + escapeHtml(r.releasename || '') + '</td><td>' + escapeHtml(r.architectures || '') + '</td><td>' + (r.default_channel || '') + '</td><td>' + (r.is_active ? 'Yes' : 'No') + '</td><td>' + actions + '</td></tr>';
+          }).join('') || '<tr><td colspan="7">No releases</td></tr>';
+          var selectAllEl = document.getElementById('releases-select-all');
+          if (selectAllEl) { selectAllEl.checked = false; selectAllEl.onclick = function() { tbody.querySelectorAll('.rel-row-cb').forEach(function(cb) { cb.checked = selectAllEl.checked; }); }; }
+          tbody.querySelectorAll('.rel-row-cb').forEach(function(cb) {
+            cb.addEventListener('change', function() {
+              var rowCbs = tbody.querySelectorAll('.rel-row-cb');
+              var checked = tbody.querySelectorAll('.rel-row-cb:checked').length;
+              if (selectAllEl) selectAllEl.checked = checked === rowCbs.length && rowCbs.length > 0;
+            });
+          });
+          tbody.querySelectorAll('.edit-rel').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+              document.getElementById('edit-release-id').value = btn.dataset.id;
+              document.getElementById('edit-release-desc').value = btn.dataset.desc || '';
+              document.getElementById('edit-release-arch').value = btn.dataset.arch || '';
+              document.getElementById('edit-release-channel').value = btn.dataset.channel || 'dev';
+              document.getElementById('edit-release-active').checked = btn.dataset.active === '1';
+              document.getElementById('edit-release-modal').classList.add('open');
+            });
+          });
+          tbody.querySelectorAll('.delete-rel').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+              if (!confirm('Delete release "' + (btn.dataset.name || '') + '"? This cannot be undone.')) return;
+              api.delete('/releases/' + btn.dataset.id).then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+            });
+          });
+          var numPages = releasesTotal ? Math.ceil(releasesTotal / releasesPageSize) : 1;
+          document.getElementById('releases-page-info').textContent = 'Page ' + (releasesPage + 1) + ' of ' + numPages;
+          document.getElementById('releases-prev').disabled = releasesPage <= 0;
+          document.getElementById('releases-next').disabled = releasesPage >= numPages - 1;
+        }).catch(function() {
+          var tbody = document.getElementById('releases-tbody');
+          if (tbody) tbody.innerHTML = '<tr><td colspan="7">Failed to load</td></tr>';
+        });
+      }
+      (function initReleasesPagination() {
+        document.getElementById('releases-prev').addEventListener('click', function() { if (releasesPage > 0) { releasesPage--; load(); } });
+        document.getElementById('releases-next').addEventListener('click', function() { var n = releasesTotal ? Math.ceil(releasesTotal / releasesPageSize) : 1; if (releasesPage < n - 1) { releasesPage++; load(); } });
+        document.getElementById('releases-page-size').addEventListener('change', function() { releasesPageSize = parseInt(this.value, 10) || 25; releasesPage = 0; load(); });
+      })();
+      updateUI();
+      window.addEventListener('auth-change', function() { updateUI(); load(); });
+      document.getElementById('edit-release-cancel').addEventListener('click', function() { document.getElementById('edit-release-modal').classList.remove('open'); });
+      document.getElementById('edit-release-save').addEventListener('click', function() {
+        var id = document.getElementById('edit-release-id').value;
+        api.patch('/releases/' + id, {
+          description: document.getElementById('edit-release-desc').value.trim() || null,
+          architectures: document.getElementById('edit-release-arch').value.trim() || null,
+          default_channel: document.getElementById('edit-release-channel').value,
+          is_active: document.getElementById('edit-release-active').checked
+        }).then(function() { document.getElementById('edit-release-modal').classList.remove('open'); load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+      });
+      document.getElementById('btn-create-release').addEventListener('click', function() {
+        var name = document.getElementById('create-releasename').value.trim();
+        var arch = document.getElementById('create-architectures').value.trim();
+        if (!name || !arch) { alert('Release name and architectures are required.'); return; }
+        api.post('/releases', { releasename: name, architectures: arch, default_channel: document.getElementById('create-default-channel').value, description: document.getElementById('create-description').value.trim() || null, base_repos: [] })
+          .then(function() { load(); document.getElementById('create-releasename').value = ''; document.getElementById('create-description').value = ''; alert('Release created.'); })
+          .catch(function(e) { alert('Failed: ' + e.message); });
+      });
+      load();
+    })();
+  </script>
+</body>
+</html>
