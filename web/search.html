@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Search - Oreon Build Service</title>
+  <link rel="stylesheet" href="/static/style.css?v=2">
+</head>
+<body>
+  <header class="header">
+    <a href="/" class="header-logo-link"><img src="/static/obslogo.png" alt="Oreon Build Service" class="header-logo" /></a>
+    <nav>
+      <a href="/">Dashboard</a>
+      <a href="/builds.html">Builds</a>
+      <a href="/packages.html">Packages</a>
+      <a href="/releases.html">Releases</a>
+      <a href="/workers.html">Workers</a>
+      <a href="/mock-environments.html">Mock Environments</a>
+      <a href="/repos.html">Repositories</a>
+      <a href="/promotions.html">Promotions</a>
+      <form class="navbar-search" action="/search.html" method="get" style="display:inline-flex; margin-left:0.5rem;">
+        <input type="search" name="q" placeholder="Search…" value="" id="nav-search-q" style="padding:0.25rem 0.5rem; width:10rem;">
+        <button type="submit" class="btn" style="margin-left:0.25rem;">Go</button>
+      </form>
+      <span id="auth-section"><span id="user-info"></span><button id="btn-login" type="button">Login</button><button id="btn-logout" type="button" style="display:none">Logout</button></span>
+    </nav>
+  </header>
+  <main class="main">
+    <section class="card">
+      <h2>Search</h2>
+      <form class="form-group" action="/search.html" method="get" style="margin-bottom:1rem;">
+        <input type="search" name="q" id="search-query" placeholder="Packages, builds, releases…" style="padding:0.5rem; width:100%; max-width:24rem;">
+        <button type="submit" class="btn primary" style="margin-top:0.5rem;">Search</button>
+      </form>
+      <div id="search-results"></div>
+    </section>
+  </main>
+  <script src="/static/app.js?v=2"></script>
+  <script>
+    (function() {
+      const api = window.oreonApi;
+      const params = new URLSearchParams(window.location.search);
+      const q = params.get('q') || '';
+      document.getElementById('search-query').value = q;
+      document.getElementById('nav-search-q').value = q;
+      if (!q.trim()) {
+        document.getElementById('search-results').innerHTML = '<p style="color:var(--text-muted);">Enter a query and press Search, or use the search box in the navbar.</p>';
+        return;
+      }
+      api.get('/search?q=' + encodeURIComponent(q) + '&limit=25').then(function(data) {
+        var html = '';
+        if (data.packages && data.packages.length) {
+          html += '<h3>Packages</h3><ul>';
+          data.packages.forEach(function(p) {
+            html += '<li><a href="/packages.html">' + escapeHtml(p.name || '') + '</a> (ID ' + p.id + ')</li>';
+          });
+          html += '</ul>';
+        }
+        if (data.builds && data.builds.length) {
+          html += '<h3>Builds</h3><ul>';
+          data.builds.forEach(function(b) {
+            html += '<li><a href="/build.html?id=' + b.id + '">Build #' + b.id + '</a>' + (b.package_id ? ' (package ' + b.package_id + ')' : '') + '</li>';
+          });
+          html += '</ul>';
+        }
+        if (data.releases && data.releases.length) {
+          html += '<h3>Releases</h3><ul>';
+          data.releases.forEach(function(r) {
+            html += '<li><a href="/releases.html">' + escapeHtml(r.name || '') + '</a> (ID ' + r.id + ')</li>';
+          });
+          html += '</ul>';
+        }
+        if (!html) html = '<p style="color:var(--text-muted);">No results found.</p>';
+        document.getElementById('search-results').innerHTML = html;
+      }).catch(function() {
+        document.getElementById('search-results').innerHTML = '<p style="color:var(--danger,#c00);">Search failed.</p>';
+      });
+      function escapeHtml(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; }
+    })();
+  </script>
+</body>
+</html>
