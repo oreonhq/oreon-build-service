@@ -1,0 +1,33 @@
+[Unit]
+# Oreon Build Service
+# Copyright (C) 2026 Oreon HQ
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+Description=Oreon Watchdog (Security Advisory Dashboard)
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=oreon-build
+Group=oreon-build
+WorkingDirectory=/opt/oreon-build-service
+EnvironmentFile=/opt/oreon-build-service/.env
+ExecStart=/bin/sh -c 'port="${WATCHDOG_URL##*:}"; [ -z "$port" ] && port="8001"; /opt/oreon-build-service/venv/bin/python -m uvicorn oreon_build.watchdog.main:app --host 0.0.0.0 --port "$port"'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
