@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Repositories - Oreon Build Service</title>
+  <link rel="stylesheet" href="/static/style.css?v=2">
+</head>
+<body>
+  <header class="header">
+    <a href="/" class="header-logo-link"><img src="/static/obslogo.png" alt="Oreon Build Service" class="header-logo" /></a>
+    <nav>
+      <a href="/">Dashboard</a>
+      <a href="/builds.html">Builds</a>
+      <a href="/packages.html">Packages</a>
+      <a href="/releases.html">Releases</a>
+      <a href="/workers.html">Workers</a>
+      <a href="/mock-environments.html">Mock Environments</a>
+      <a href="/repos.html">Repositories</a>
+      <a href="/promotions.html">Promotions</a>
+      <form class="navbar-search" action="/search.html" method="get" style="display:inline-flex; margin-left:0.5rem;">
+        <input type="search" name="q" placeholder="Search…" style="padding:0.25rem 0.5rem; width:10rem;">
+        <button type="submit" class="btn" style="margin-left:0.25rem;">Go</button>
+      </form>
+      <span id="auth-section"><span id="user-info"></span><button id="btn-login" type="button">Login</button><button id="btn-logout" type="button" style="display:none">Logout</button></span>
+    </nav>
+  </header>
+  <main class="main">
+    <section class="card">
+      <h2>Repository Status</h2>
+      <p>Repository layout is on R2: &lt;bucket&gt;/&lt;releasename&gt;/&lt;channel&gt;/&lt;basearch&gt;/ (RPMS, repodata).</p>
+      <pre id="repo-status">Loading...</pre>
+    </section>
+  </main>
+  <script src="/static/app.js?v=2"></script>
+  <script>
+    (function() {
+      window.oreonApi.get('/repos/status').then(function(data) {
+        document.getElementById('repo-status').textContent = JSON.stringify(data, null, 2);
+      }).catch(function() { document.getElementById('repo-status').textContent = 'Failed to load'; });
+    })();
+  </script>
+</body>
+</html>

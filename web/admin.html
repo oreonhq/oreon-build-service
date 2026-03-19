@@ -1,0 +1,362 @@
+<!--
+Oreon Build Service
+Copyright (C) 2026 Oreon HQ
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Administration - Oreon Build Service</title>
+  <link rel="stylesheet" href="/static/style.css?v=2">
+</head>
+<body>
+  <header class="header">
+    <a href="/" class="header-logo-link"><img src="/static/obslogo.png" alt="Oreon Build Service" class="header-logo" /></a>
+    <nav>
+      <a href="/">Dashboard</a>
+      <a href="/builds.html">Builds</a>
+      <a href="/packages.html">Packages</a>
+      <a href="/releases.html">Releases</a>
+      <a href="/workers.html">Workers</a>
+      <a href="/mock-environments.html">Mock Environments</a>
+      <a href="/repos.html">Repositories</a>
+      <a href="/promotions.html">Promotions</a>
+      <a href="/admin.html">Administration</a>
+      <form class="navbar-search" action="/search.html" method="get" style="display:inline-flex; margin-left:0.5rem;">
+        <input type="search" name="q" placeholder="Search…" style="padding:0.25rem 0.5rem; width:10rem;">
+        <button type="submit" class="btn" style="margin-left:0.25rem;">Go</button>
+      </form>
+      <span id="auth-section">
+        <span id="user-info"></span>
+        <button id="btn-login" type="button">Login</button>
+        <button id="btn-logout" type="button" style="display:none">Logout</button>
+      </span>
+    </nav>
+  </header>
+
+  <main class="main">
+    <section class="card">
+      <h2>Administration</h2>
+      <p id="admin-hint" style="color:var(--text-muted); font-size:0.9rem; margin-top:0.25rem;">
+        Admins can create and manage admin/maintainer login accounts.
+      </p>
+    </section>
+
+    <section class="card" id="admin-panel" style="display:none;">
+      <h2 style="margin-top:0;">Accounts</h2>
+
+      <div style="display:flex; gap:1.5rem; flex-wrap:wrap;">
+        <div style="flex: 1; min-width: 280px;">
+          <h3 style="margin:0 0 0.75rem;">Create new account</h3>
+          <div class="form-group">
+            <label>Username</label>
+            <input id="create-username" type="text" class="form-control" maxlength="64" placeholder="e.g. maintainer1">
+          </div>
+          <div class="form-group">
+            <label>Password</label>
+            <input id="create-password" type="password" class="form-control" placeholder="min 8 chars">
+          </div>
+          <div class="form-group">
+            <label>Role</label>
+            <select id="create-role" class="form-control">
+              <option value="maintainer" selected>maintainer</option>
+              <option value="admin">admin</option>
+            </select>
+          </div>
+          <button type="button" class="btn primary" id="btn-create-account">Create account</button>
+        </div>
+
+        <div style="flex: 1; min-width: 280px;">
+          <h3 style="margin:0 0 0.75rem;">Edit account</h3>
+          <div class="form-group">
+            <label>Selected account ID</label>
+            <input id="edit-account-id" type="text" class="form-control" readonly placeholder="-">
+          </div>
+          <div class="form-group">
+            <label>New password (optional)</label>
+            <input id="edit-password" type="password" class="form-control" placeholder="leave empty to keep current">
+          </div>
+          <div class="form-group">
+            <label>Role</label>
+            <select id="edit-role" class="form-control">
+              <option value="maintainer" selected>maintainer</option>
+              <option value="admin">admin</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>
+              <input id="edit-is-active" type="checkbox"> Active
+            </label>
+          </div>
+          <div style="display:flex; gap:0.75rem; flex-wrap:wrap; margin-top:0.5rem;">
+            <button type="button" class="btn primary" id="btn-save-account">Save</button>
+            <button type="button" class="btn" id="btn-delete-account">Delete</button>
+          </div>
+          <div id="admin-edit-status" style="color:var(--text-muted); font-size:0.9rem; margin-top:0.5rem;"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card" id="accounts-table-card" style="display:none;">
+      <h2 style="margin-top:0;">Login accounts</h2>
+      <div id="accounts-status" style="color:var(--text-muted); font-size:0.9rem; margin-bottom:0.75rem;">Loading…</div>
+      <table class="table-list">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Username</th>
+            <th>Role</th>
+            <th>Active</th>
+            <th>Created</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="accounts-tbody"></tbody>
+      </table>
+    </section>
+  </main>
+
+  <script src="/static/app.js?v=2"></script>
+  <script>
+    (function() {
+      const api = window.oreonApi;
+
+      function esc(s) {
+        var d = document.createElement('div');
+        d.textContent = s == null ? '' : s;
+        return d.innerHTML;
+      }
+
+      function decodeJwt(token) {
+        try {
+          var payload = token.split('.')[1];
+          payload = payload.replace(/-/g, '+').replace(/_/g, '/');
+          // Base64url may omit padding; add it back for atob().
+          while (payload.length % 4) payload += '=';
+          var json = atob(payload);
+          return JSON.parse(json);
+        } catch (e) {
+          return null;
+        }
+      }
+
+      function isAdmin() {
+        if (!api.token) return false;
+        var p = decodeJwt(api.token);
+        return !!(p && p.role === 'admin');
+      }
+
+      function setAdminPanelVisible(visible) {
+        var panel = document.getElementById('admin-panel');
+        var tableCard = document.getElementById('accounts-table-card');
+        if (panel) panel.style.display = visible ? 'block' : 'none';
+        if (tableCard) tableCard.style.display = visible ? 'block' : 'none';
+      }
+
+      function setEditSelected(a) {
+        var idEl = document.getElementById('edit-account-id');
+        var passEl = document.getElementById('edit-password');
+        var roleEl = document.getElementById('edit-role');
+        var activeEl = document.getElementById('edit-is-active');
+        if (!a || !idEl) return;
+        idEl.value = a.id;
+        passEl.value = '';
+        roleEl.value = a.role;
+        activeEl.checked = !!a.is_active;
+        document.getElementById('admin-edit-status').textContent = '';
+      }
+
+      function setEditStatus(msg) {
+        var el = document.getElementById('admin-edit-status');
+        if (el) el.textContent = msg || '';
+      }
+
+      async function loadAccounts() {
+        setEditSelected(null);
+        var tbody = document.getElementById('accounts-tbody');
+        var status = document.getElementById('accounts-status');
+        if (status) status.textContent = 'Loading…';
+        try {
+          var res = await api.get('/accounts');
+          // Current backend list is not paginated; it returns a plain array.
+          if (Array.isArray(res)) {
+            renderAccounts(res);
+          } else if (res && Array.isArray(res.items)) {
+            renderAccounts(res.items);
+          } else {
+            renderAccounts([]);
+          }
+          if (status) status.textContent = 'Loaded';
+        } catch (e) {
+          if (status) status.textContent = 'Failed: ' + (e.message || e);
+          if (api.token && !isAdmin()) setAdminPanelVisible(false);
+        }
+      }
+
+      function renderAccounts(accounts) {
+        var tbody = document.getElementById('accounts-tbody');
+        if (!tbody) return;
+        if (!accounts || !accounts.length) {
+          tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);">No accounts</td></tr>';
+          return;
+        }
+        tbody.innerHTML = accounts.map(function(a) {
+          return ''
+            + '<tr>'
+            + '<td>' + esc(a.id) + '</td>'
+            + '<td>' + esc(a.username) + '</td>'
+            + '<td>' + esc(a.role) + '</td>'
+            + '<td>' + (a.is_active ? 'Yes' : 'No') + '</td>'
+            + '<td>' + esc((a.created_at || '').toString().slice(0, 19)) + '</td>'
+            + '<td>'
+            +   '<button type="button" class="btn" data-edit-id="' + esc(a.id) + '">Edit</button>'
+            +   ' <button type="button" class="btn" data-del-id="' + esc(a.id) + '">Delete</button>'
+            + '</td>'
+            + '</tr>';
+        }).join('');
+
+        tbody.querySelectorAll('button[data-edit-id]').forEach(function(btn) {
+          btn.addEventListener('click', function() {
+            var id = parseInt(btn.dataset.editId, 10);
+            var a = accounts.find(function(x) { return x.id === id; });
+            setEditSelected(a);
+          });
+        });
+
+        tbody.querySelectorAll('button[data-del-id]').forEach(function(btn) {
+          btn.addEventListener('click', function() {
+            var id = parseInt(btn.dataset.delId, 10);
+            var a = accounts.find(function(x) { return x.id === id; });
+            window.oreonUI.confirm('Delete account ' + (a && a.username ? a.username : id) + '? This cannot be undone.', 'Confirm delete')
+              .then(async function(ok) {
+                if (!ok) return;
+                await deleteAccount(id);
+                await loadAccounts();
+              });
+          });
+        });
+      }
+
+      async function createAccount() {
+        var username = (document.getElementById('create-username').value || '').trim();
+        var password = document.getElementById('create-password').value || '';
+        var role = document.getElementById('create-role').value;
+        if (!username || !password) {
+          alert('Username and password are required.');
+          return;
+        }
+        if (password.length < 8) {
+          alert('Password must be at least 8 characters.');
+          return;
+        }
+        await api.post('/accounts', { username: username, password: password, role: role });
+      }
+
+      async function saveAccount() {
+        var id = parseInt(document.getElementById('edit-account-id').value || '0', 10);
+        if (!id) {
+          alert('Select an account to edit.');
+          return;
+        }
+        var password = document.getElementById('edit-password').value || '';
+        var role = document.getElementById('edit-role').value;
+        var is_active = !!document.getElementById('edit-is-active').checked;
+
+        var body = { role: role, is_active: is_active };
+        if (password.trim()) {
+          if (password.length < 8) {
+            alert('Password must be at least 8 characters.');
+            return;
+          }
+          body.password = password;
+        }
+        await api.patch('/accounts/' + id, body);
+      }
+
+      async function deleteAccount(id) {
+        if (!id) return;
+        await api.delete('/accounts/' + id);
+      }
+
+      function wireActions() {
+        var btnCreate = document.getElementById('btn-create-account');
+        if (btnCreate) btnCreate.addEventListener('click', async function() {
+          try {
+            await createAccount();
+            await loadAccounts();
+          } catch (e) {
+            alert('Create failed: ' + (e.message || e));
+          }
+        });
+
+        var btnSave = document.getElementById('btn-save-account');
+        if (btnSave) btnSave.addEventListener('click', async function() {
+          try {
+            await saveAccount();
+            setEditStatus('Saved.');
+            await loadAccounts();
+          } catch (e) {
+            setEditStatus('Save failed: ' + (e.message || e));
+          }
+        });
+
+        var btnDelete = document.getElementById('btn-delete-account');
+        if (btnDelete) btnDelete.addEventListener('click', async function() {
+          var id = parseInt(document.getElementById('edit-account-id').value || '0', 10);
+          if (!id) {
+            alert('Select an account first.');
+            return;
+          }
+          var aMsg = 'Delete account #' + id + '? This cannot be undone.';
+          window.oreonUI.confirm(aMsg, 'Confirm delete').then(async function(ok) {
+            if (!ok) return;
+            try {
+              await deleteAccount(id);
+              setEditSelected(null);
+              await loadAccounts();
+              setEditStatus('Deleted.');
+            } catch (e) {
+              setEditStatus('Delete failed: ' + (e.message || e));
+            }
+          });
+        });
+      }
+
+      function updateUI() {
+        var authed = !!api.token;
+        var admin = isAdmin();
+        setAdminPanelVisible(authed && admin);
+        var hint = document.getElementById('admin-hint');
+        if (hint) {
+          if (!authed) hint.textContent = 'Login required. Admins can manage admin/maintainer logins.';
+          else if (!admin) hint.textContent = 'Access denied: only admins can manage accounts.';
+          else hint.textContent = 'Admins can create and manage admin/maintainer accounts.';
+        }
+        if (authed && admin) {
+          loadAccounts();
+        }
+      }
+
+      wireActions();
+      window.addEventListener('auth-change', updateUI);
+      updateUI();
+    })();
+  </script>
+</body>
+</html>
+

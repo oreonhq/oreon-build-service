@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Builds - Oreon Build Service</title>
+  <link rel="stylesheet" href="/static/style.css?v=2">
+</head>
+<body>
+  <header class="header">
+    <a href="/" class="header-logo-link"><img src="/static/obslogo.png" alt="Oreon Build Service" class="header-logo" /></a>
+    <nav>
+      <a href="/">Dashboard</a>
+      <a href="/builds.html">Builds</a>
+      <a href="/packages.html">Packages</a>
+      <a href="/releases.html">Releases</a>
+      <a href="/workers.html">Workers</a>
+      <a href="/mock-environments.html">Mock Environments</a>
+      <a href="/repos.html">Repositories</a>
+      <a href="/promotions.html">Promotions</a>
+      <form class="navbar-search" action="/search.html" method="get" style="display:inline-flex; margin-left:0.5rem;">
+        <input type="search" name="q" placeholder="Search…" style="padding:0.25rem 0.5rem; width:10rem;">
+        <button type="submit" class="btn" style="margin-left:0.25rem;">Go</button>
+      </form>
+      <span id="auth-section">
+        <span id="user-info"></span>
+        <button id="btn-login" type="button">Login</button>
+        <button id="btn-logout" type="button" style="display:none">Logout</button>
+      </span>
+    </nav>
+  </header>
+  <main class="main">
+    <section class="card">
+      <h2>Builds</h2>
+      <p id="builds-hint">View build jobs and attempts. Login to trigger or retry builds.</p>
+      <div id="trigger-build-section" class="card" style="display:none; margin-bottom:1rem;">
+        <h3 style="margin-top:0;">Trigger build</h3>
+        <div class="build-mode-tabs" style="margin-bottom:1rem;">
+          <button type="button" class="build-mode-tab active" data-mode="existing">Build existing package</button>
+          <button type="button" class="build-mode-tab" data-mode="new">New package + build</button>
+        </div>
+
+        <div id="build-existing-block">
+          <p style="color:var(--text-muted); font-size:0.9rem;">Pick a <a href="/packages.html">package</a> and <a href="/releases.html">release</a>.</p>
+          <div class="form-group">
+            <label>Package</label>
+            <div id="package-search-select" class="search-select">
+              <button type="button" class="search-select-trigger" id="package-trigger">Select package...</button>
+              <div class="search-select-panel" id="package-panel">
+                <input type="text" class="search-select-search" id="package-search" placeholder="Search packages...">
+                <div class="search-select-list" id="package-list"></div>
+              </div>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Release</label>
+            <div id="release-search-select" class="search-select">
+              <button type="button" class="search-select-trigger" id="release-trigger">Select release...</button>
+              <div class="search-select-panel" id="release-panel">
+                <input type="text" class="search-select-search" id="release-search" placeholder="Search releases...">
+                <div class="search-select-list" id="release-list"></div>
+              </div>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Architectures</label>
+            <div class="arch-checkboxes" style="display:flex; gap:1rem;">
+              <label><input type="checkbox" id="arch-x86_64-existing" checked> x86_64</label>
+              <label><input type="checkbox" id="arch-aarch64-existing" checked> aarch64</label>
+            </div>
+          </div>
+          <button type="button" class="btn primary" id="btn-trigger-build">Trigger build</button>
+        </div>
+
+        <div id="build-new-block" style="display:none;">
+          <p style="color:var(--text-muted); font-size:0.9rem;">Create a package and trigger a build in one step. Package name and description come from the specfile (Upload) or from the source.</p>
+          <div class="form-group">
+            <label>1. Select the source type</label>
+            <div class="source-type-tabs" style="display:flex; gap:0.25rem; flex-wrap:wrap; margin-bottom:0.5rem;">
+              <button type="button" class="source-type-tab active" data-type="url">From URLs</button>
+              <button type="button" class="source-type-tab" data-type="upload">Upload</button>
+              <button type="button" class="source-type-tab" data-type="scm">SCM</button>
+              <button type="button" class="source-type-tab" data-type="distgit">DistGit</button>
+            </div>
+            <div id="source-url-panel" class="source-panel">
+              <label>Source URL(s)</label>
+              <input type="text" id="source-url-input" class="form-control" placeholder="https://... (one URL or comma-separated)">
+            </div>
+            <div id="source-upload-panel" class="source-panel" style="display:none;">
+              <p style="color:var(--text-muted); margin-bottom:0.5rem;">Upload SRPM and/or .spec files. Worker will build from the SRPM (or from spec + sources when provided).</p>
+              <label>SRPM or .spec file(s)</label>
+              <input type="file" id="source-upload-files" class="form-control" accept=".src.rpm,.spec" multiple>
+            </div>
+            <div id="source-scm-panel" class="source-panel" style="display:none;">
+              <label>Repository URL</label>
+              <input type="text" id="source-scm-url" class="form-control" placeholder="https://gitlab.com/...">
+              <label style="margin-top:0.5rem;">Branch (optional)</label>
+              <input type="text" id="source-scm-branch" class="form-control" placeholder="main">
+            </div>
+            <div id="source-distgit-panel" class="source-panel" style="display:none;">
+              <label>DistGit (rpm-specfiles on GitHub)</label>
+              <p style="color:var(--text-muted); font-size:0.85rem; margin-bottom:0.5rem;">
+                Uses the <code>oreonhq/rpm-specfiles</code> repository. For each package name,
+                the specfile path will be <code>&lt;release-name&gt;/&lt;package&gt;/&lt;package&gt;.spec</code>
+                (release name comes from the selected release).
+              </p>
+              <div class="form-group">
+                <label>Package names</label>
+                <textarea id="distgit-packages" class="form-control" rows="3" placeholder="Example:&#10;389-ds-base&#10;another-package"></textarea>
+                <p style="color:var(--text-muted); font-size:0.8rem; margin-top:0.25rem;">
+                  Enter one or more package names (one per line or separated by spaces). A build will be triggered for each.
+                </p>
+              </div>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Release</label>
+            <div id="release-new-select" class="search-select">
+              <button type="button" class="search-select-trigger" id="release-new-trigger">Select release...</button>
+              <div class="search-select-panel" id="release-new-panel">
+                <input type="text" class="search-select-search" id="release-new-search" placeholder="Search releases...">
+                <div class="search-select-list" id="release-new-list"></div>
+              </div>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Mock environment (optional)</label>
+            <select id="new-package-mock-env" class="form-control">
+              <option value="">Use release default</option>
+            </select>
+            <p style="color:var(--text-muted); font-size:0.85rem; margin-top:0.25rem;">Select a release first; mock envs apply to both x86_64 and aarch64.</p>
+          </div>
+          <div class="form-group">
+            <label>Architectures</label>
+            <div class="arch-checkboxes" style="display:flex; gap:1rem;">
+              <label><input type="checkbox" id="arch-x86_64-new" checked> x86_64</label>
+              <label><input type="checkbox" id="arch-aarch64-new" checked> aarch64</label>
+            </div>
+          </div>
+          <button type="button" class="btn primary" id="btn-create-and-build">Create package and trigger build</button>
+        </div>
+      </div>
+      <div class="form-group" style="margin-bottom:1rem;">
+        <label>Filter</label>
+        <input type="text" id="builds-filter" placeholder="Filter by ID, package, release, arch, status…" style="padding:0.4rem; width:100%; max-width:20rem;">
+      </div>
+      <div class="list-toolbar">
+        <div class="select-all-wrap">
+          <label for="builds-select-all">Select all</label>
+        </div>
+        <div class="pagination" id="builds-pagination">
+          <button type="button" class="btn" id="builds-prev" disabled>Prev</button>
+          <span class="page-info" id="builds-page-info">Page 1 of 1</span>
+          <button type="button" class="btn" id="builds-next" disabled>Next</button>
+          <select class="page-size" id="builds-page-size" title="Items per page">
+            <option value="25" selected>25</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+          </select>
+        </div>
+      </div>
+      <table class="table-list">
+        <thead>
+          <tr><th class="col-checkbox"><input type="checkbox" id="builds-select-all" title="Select all on this page"></th><th>ID</th><th>Package</th><th>Release</th><th>Arch</th><th>Status</th><th>Created</th><th>Actions</th></tr>
+        </thead>
+        <tbody id="builds-tbody"></tbody>
+      </table>
+    </section>
+  </main>
+  <script src="/static/app.js?v=2"></script>
+  <script>
+    (function() {
+      const api = window.oreonApi;
+      var packages = [], releases = [];
+      var selectedPackageId = null, selectedReleaseId = null, selectedReleaseIdNew = null;
+      var currentSourceType = 'url';
+
+      function updateLoggedInUI() {
+        const hint = document.getElementById('builds-hint');
+        const section = document.getElementById('trigger-build-section');
+        if (api.token && hint) hint.textContent = 'View build jobs and attempts. You can trigger or retry builds.';
+        else if (hint) hint.textContent = 'View build jobs and attempts. Login to trigger or retry builds.';
+        if (section) section.style.display = api.token ? 'block' : 'none';
+        if (api.token) loadOptions();
+      }
+      function loadOptions() {
+        api.get('/packages?limit=500').then(function(r) { packages = (r && r.items) ? r.items : []; renderPackageList(); }).catch(function() { packages = []; });
+        api.get('/releases?limit=500').then(function(r) { releases = (r && r.items) ? r.items : []; renderReleaseList(); renderReleaseListNew(); }).catch(function() { releases = []; });
+      }
+      // (helper makeSearchableSelect was removed; selects are wired manually below)
+      function escapeHtml(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; }
+      function escapeAttr(s) { return escapeHtml(s).replace(/"/g, '&quot;'); }
+      function renderPackageList() {
+        var trigger = document.getElementById('package-trigger');
+        if (trigger) trigger.textContent = selectedPackageId ? (packages.find(function(p) { return p.id === selectedPackageId; }) || {}).name || 'Package #' + selectedPackageId : 'Select package...';
+      }
+      function renderReleaseList() {
+        var trigger = document.getElementById('release-trigger');
+        if (trigger) trigger.textContent = selectedReleaseId ? (releases.find(function(r) { return r.id === selectedReleaseId; }) || {}).releasename || 'Release #' + selectedReleaseId : 'Select release...';
+      }
+
+      (function initPackageSelect() {
+        var listEl = document.getElementById('package-list');
+        var container = document.getElementById('package-search-select');
+        var search = document.getElementById('package-search');
+        var trigger = document.getElementById('package-trigger');
+        function renderList(filter) {
+          var q = (filter || '').toLowerCase();
+          listEl.innerHTML = packages.filter(function(p) { return !q || (p.name || '').toLowerCase().indexOf(q) >= 0; })
+            .map(function(p) { return '<div class="search-select-option" data-id="' + p.id + '">' + escapeHtml(p.name || '') + ' <span style="color:var(--text-muted)">(#' + p.id + ')</span></div>'; }).join('') || '<div class="search-select-option" style="cursor:default;color:var(--text-muted)">No matches</div>';
+          listEl.querySelectorAll('.search-select-option[data-id]').forEach(function(opt) {
+            opt.addEventListener('click', function() { selectedPackageId = parseInt(opt.dataset.id, 10); renderPackageList(); container.classList.remove('open'); search.value = ''; });
+          });
+        }
+        trigger.addEventListener('click', function(e) { e.stopPropagation(); container.classList.toggle('open'); if (container.classList.contains('open')) { renderList(search.value); search.focus(); } });
+        search.addEventListener('input', function() { renderList(search.value); });
+        search.addEventListener('click', function(e) { e.stopPropagation(); });
+        document.addEventListener('click', function() { container.classList.remove('open'); });
+        document.getElementById('package-panel').addEventListener('click', function(e) { e.stopPropagation(); });
+        window.renderPackageOptions = renderList;
+      })();
+      (function initReleaseSelect() {
+        var listEl = document.getElementById('release-list');
+        var container = document.getElementById('release-search-select');
+        var search = document.getElementById('release-search');
+        var trigger = document.getElementById('release-trigger');
+        function renderList(filter) {
+          var q = (filter || '').toLowerCase();
+          listEl.innerHTML = releases.filter(function(r) { return !q || (r.releasename || '').toLowerCase().indexOf(q) >= 0; })
+            .map(function(r) { return '<div class="search-select-option" data-id="' + r.id + '">' + escapeHtml(r.releasename || '') + ' <span style="color:var(--text-muted)">(#' + r.id + ')</span></div>'; }).join('') || '<div class="search-select-option" style="cursor:default;color:var(--text-muted)">No matches</div>';
+          listEl.querySelectorAll('.search-select-option[data-id]').forEach(function(opt) {
+            opt.addEventListener('click', function() { selectedReleaseId = parseInt(opt.dataset.id, 10); renderReleaseList(); container.classList.remove('open'); search.value = ''; });
+          });
+        }
+        trigger.addEventListener('click', function(e) { e.stopPropagation(); container.classList.toggle('open'); if (container.classList.contains('open')) { renderList(search.value); search.focus(); } });
+        search.addEventListener('input', function() { renderList(search.value); });
+        search.addEventListener('click', function(e) { e.stopPropagation(); });
+        document.addEventListener('click', function() { container.classList.remove('open'); });
+        document.getElementById('release-panel').addEventListener('click', function(e) { e.stopPropagation(); });
+        window.renderReleaseOptions = renderList;
+      })();
+      function renderReleaseListNew() {
+        var trigger = document.getElementById('release-new-trigger');
+        if (trigger) trigger.textContent = selectedReleaseIdNew ? (releases.find(function(r) { return r.id === selectedReleaseIdNew; }) || {}).releasename || 'Release #' + selectedReleaseIdNew : 'Select release...';
+      }
+      function fillMockEnvsForRelease(releaseId) {
+        var sel = document.getElementById('new-package-mock-env');
+        if (!sel) return;
+        sel.innerHTML = '<option value="">Use release default</option>';
+        if (!releaseId) return;
+        api.get('/mock-environments?release_id=' + releaseId + '&limit=500').then(function(res) {
+          var arr = (res && res.items) ? res.items : [];
+          arr.forEach(function(m) {
+            sel.appendChild(new Option(m.name + ' (' + (m.config_name || '') + ')', m.id));
+          });
+        }).catch(function() {});
+      }
+
+      (function initBuildModeTabs() {
+        document.querySelectorAll('.build-mode-tab').forEach(function(tab) {
+          tab.addEventListener('click', function() {
+            document.querySelectorAll('.build-mode-tab').forEach(function(t) { t.classList.remove('active'); });
+            tab.classList.add('active');
+            var mode = tab.dataset.mode;
+            document.getElementById('build-existing-block').style.display = mode === 'existing' ? 'block' : 'none';
+            document.getElementById('build-new-block').style.display = mode === 'new' ? 'block' : 'none';
+          });
+        });
+      })();
+      (function initSourceTypeTabs() {
+        document.querySelectorAll('.source-type-tab').forEach(function(tab) {
+          tab.addEventListener('click', function() {
+            document.querySelectorAll('.source-type-tab').forEach(function(t) { t.classList.remove('active'); });
+            tab.classList.add('active');
+            currentSourceType = tab.dataset.type;
+            document.querySelectorAll('.source-panel').forEach(function(p) { p.style.display = 'none'; });
+            var panel = document.getElementById('source-' + currentSourceType + '-panel');
+            if (panel) panel.style.display = 'block';
+          });
+        });
+      })();
+      (function initReleaseNewSelect() {
+        var listEl = document.getElementById('release-new-list');
+        if (!listEl) return;
+        var container = document.getElementById('release-new-select');
+        var search = document.getElementById('release-new-search');
+        var trigger = document.getElementById('release-new-trigger');
+        function renderList(filter) {
+          var q = (filter || '').toLowerCase();
+          listEl.innerHTML = releases.filter(function(r) { return !q || (r.releasename || '').toLowerCase().indexOf(q) >= 0; })
+            .map(function(r) { return '<div class="search-select-option" data-id="' + r.id + '">' + escapeHtml(r.releasename || '') + ' <span style="color:var(--text-muted)">(#' + r.id + ')</span></div>'; }).join('') || '<div class="search-select-option" style="cursor:default;color:var(--text-muted)">No matches</div>';
+          listEl.querySelectorAll('.search-select-option[data-id]').forEach(function(opt) {
+            opt.addEventListener('click', function() { selectedReleaseIdNew = parseInt(opt.dataset.id, 10); renderReleaseListNew(); fillMockEnvsForRelease(selectedReleaseIdNew); container.classList.remove('open'); if (search) search.value = ''; });
+          });
+        }
+        if (trigger) trigger.addEventListener('click', function(e) { e.stopPropagation(); container.classList.toggle('open'); if (container.classList.contains('open')) { renderList(search ? search.value : ''); if (search) search.focus(); } });
+        if (search) search.addEventListener('input', function() { renderList(search.value); });
+        if (search) search.addEventListener('click', function(e) { e.stopPropagation(); });
+        document.addEventListener('click', function() { if (container) container.classList.remove('open'); });
+        var pnl = listEl.closest('.search-select-panel'); if (pnl) pnl.addEventListener('click', function(e) { e.stopPropagation(); });
+      })();
+
+      function statusClass(s) {
+        if (s === 'success') return 'badge success';
+        if (s === 'failed' || s === 'cancelled') return 'badge failed';
+        if (s === 'running' || s === 'queued') return 'badge running';
+        return 'badge pending';
+      }
+      var buildsPage = 0;
+      var buildsPageSize = 25;
+      var buildsTotal = 0;
+      function render() {
+        var offset = buildsPage * buildsPageSize;
+        Promise.all([
+          api.get('/builds?limit=' + buildsPageSize + '&offset=' + offset),
+          api.get('/packages?limit=500').catch(function() { return { items: [] }; }),
+          api.get('/releases?limit=500').catch(function() { return { items: [] }; })
+        ]).then(function(results) {
+          var data = results[0];
+          var packagesList = (results[1] && results[1].items) ? results[1].items : [];
+          var releasesList = (results[2] && results[2].items) ? results[2].items : [];
+          const tbody = document.getElementById('builds-tbody');
+          if (!tbody) return;
+          var jobs = (data && data.items) ? data.items : [];
+          buildsTotal = (data && typeof data.total === 'number') ? data.total : 0;
+          function packageLabel(j) {
+            var pkg = packagesList.find(function(p) { return p.id === j.package_id; });
+            var name = pkg ? (pkg.name || '').trim() : '';
+            return name ? escapeHtml(name) + ' (' + j.package_id + ')' : ('#' + j.package_id);
+          }
+          function releaseLabel(j) {
+            var rel = releasesList.find(function(r) { return r.id === j.release_id; });
+            var name = rel ? (rel.releasename || '').trim() : '';
+            return name ? escapeHtml(name) + ' (' + j.release_id + ')' : ('#' + j.release_id);
+          }
+          var filterText = function(j) {
+            var pkg = packagesList.find(function(p) { return p.id === j.package_id; });
+            var rel = releasesList.find(function(r) { return r.id === j.release_id; });
+            return (j.id + ' ' + (pkg ? pkg.name : '') + ' ' + (rel ? rel.releasename : '') + ' ' + (j.architecture || '') + ' ' + (j.status || '')).toLowerCase();
+          };
+          tbody.innerHTML = jobs.map(function(j) {
+            const canAct = api.token;
+            var cancelBtn = (canAct && (j.status === 'pending' || j.status === 'queued' || j.status === 'running')) ? ' <button class="btn cancel-build" data-id="' + j.id + '">Cancel</button>' : '';
+            var retryBtn = (canAct && j.status !== 'pending' && j.status !== 'queued' && j.status !== 'running') ? ' <button class="btn retry" data-id="' + j.id + '">Retry</button>' : '';
+            var arch = (j.architecture != null && j.architecture !== '') ? j.architecture : '—';
+            return '<tr data-filter="' + escapeAttr(filterText(j)) + '" data-id="' + j.id + '"><td class="col-checkbox"><input type="checkbox" class="build-row-cb" data-id="' + j.id + '"></td><td>' + j.id + '</td><td>' + packageLabel(j) + '</td><td>' + releaseLabel(j) + '</td><td>' + arch + '</td><td><span class="' + statusClass(j.status) + '">' + j.status + '</span></td><td>' + (j.created_at || '').slice(0,19) + '</td><td><a href="/build.html?job_id=' + j.id + '">View</a>' + retryBtn + cancelBtn + '</td></tr>';
+          }).join('') || '<tr><td colspan="8">No builds</td></tr>';
+          var filterEl = document.getElementById('builds-filter');
+          if (filterEl) {
+            filterEl.oninput = function() {
+              var v = (filterEl.value || '').toLowerCase();
+              tbody.querySelectorAll('tr[data-filter]').forEach(function(tr) {
+                tr.style.display = (!v || (tr.getAttribute('data-filter') || '').indexOf(v) !== -1) ? '' : 'none';
+              });
+            };
+          }
+          var selectAllEl = document.getElementById('builds-select-all');
+          if (selectAllEl) {
+            selectAllEl.checked = false;
+            selectAllEl.onclick = function() {
+              tbody.querySelectorAll('.build-row-cb').forEach(function(cb) { cb.checked = selectAllEl.checked; });
+            };
+          }
+          tbody.querySelectorAll('.build-row-cb').forEach(function(cb) {
+            cb.addEventListener('change', function() {
+              var rowCbs = tbody.querySelectorAll('.build-row-cb');
+              var checked = tbody.querySelectorAll('.build-row-cb:checked').length;
+              if (selectAllEl) { selectAllEl.checked = checked === rowCbs.length && rowCbs.length > 0; }
+            });
+          });
+          tbody.querySelectorAll('.retry').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+              api.post('/builds/jobs/' + btn.dataset.id + '/retry').then(render).catch(function(e) { alert(e.message); });
+            });
+          });
+          tbody.querySelectorAll('.cancel-build').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+              api.post('/builds/jobs/' + btn.dataset.id + '/cancel').then(render).catch(function(e) { alert(e.message); });
+            });
+          });
+          var numPages = buildsTotal ? Math.ceil(buildsTotal / buildsPageSize) : 1;
+          document.getElementById('builds-page-info').textContent = 'Page ' + (buildsPage + 1) + ' of ' + numPages;
+          document.getElementById('builds-prev').disabled = buildsPage <= 0;
+          document.getElementById('builds-next').disabled = buildsPage >= numPages - 1;
+        }).catch(function() {
+          const tbody = document.getElementById('builds-tbody');
+          if (tbody) tbody.innerHTML = '<tr><td colspan="8">Failed to load</td></tr>';
+        });
+      }
+      (function initBuildsPagination() {
+        document.getElementById('builds-prev').addEventListener('click', function() {
+          if (buildsPage > 0) { buildsPage--; render(); }
+        });
+        document.getElementById('builds-next').addEventListener('click', function() {
+          var numPages = buildsTotal ? Math.ceil(buildsTotal / buildsPageSize) : 1;
+          if (buildsPage < numPages - 1) { buildsPage++; render(); }
+        });
+        document.getElementById('builds-page-size').addEventListener('change', function() {
+          buildsPageSize = parseInt(this.value, 10) || 25;
+          buildsPage = 0;
+          render();
+        });
+      })();
+      updateLoggedInUI();
+      window.addEventListener('auth-change', updateLoggedInUI);
+      function getSelectedArchitecturesExisting() {
+        var arch = [];
+        if (document.getElementById('arch-x86_64-existing') && document.getElementById('arch-x86_64-existing').checked) arch.push('x86_64');
+        if (document.getElementById('arch-aarch64-existing') && document.getElementById('arch-aarch64-existing').checked) arch.push('aarch64');
+        return arch.length ? arch : ['x86_64', 'aarch64'];
+      }
+      function getSelectedArchitecturesNew() {
+        var arch = [];
+        if (document.getElementById('arch-x86_64-new') && document.getElementById('arch-x86_64-new').checked) arch.push('x86_64');
+        if (document.getElementById('arch-aarch64-new') && document.getElementById('arch-aarch64-new').checked) arch.push('aarch64');
+        return arch.length ? arch : ['x86_64', 'aarch64'];
+      }
+      document.getElementById('btn-trigger-build').addEventListener('click', function() {
+        if (!selectedPackageId || !selectedReleaseId) { alert('Select a package and a release.'); return; }
+        var architectures = getSelectedArchitecturesExisting();
+        api.post('/builds/trigger', { package_id: selectedPackageId, release_id: selectedReleaseId, architectures: architectures })
+          .then(function(data) {
+            render();
+            var jobs = Array.isArray(data) ? data : (data ? [data] : []);
+            if (jobs.length) alert('Builds triggered for ' + jobs.length + ' architecture(s).');
+            else alert('Build triggered.');
+          })
+          .catch(function(e) { alert('Failed: ' + e.message); });
+      });
+      document.getElementById('btn-create-and-build').addEventListener('click', function() {
+        if (!selectedReleaseIdNew) { alert('Select a release.'); return; }
+        var mockIdVal = (document.getElementById('new-package-mock-env') && document.getElementById('new-package-mock-env').value || '').trim();
+        var arches = getSelectedArchitecturesNew();
+        if (currentSourceType === 'url') {
+          var newPackage = {
+            name: '',
+            description: null,
+            preferred_mock_environment_id: mockIdVal ? parseInt(mockIdVal, 10) : null,
+            source_type: currentSourceType
+          };
+          var urlVal = (document.getElementById('source-url-input') && document.getElementById('source-url-input').value || '').trim();
+          if (urlVal) {
+            var urls = urlVal.split(/[,\s]+/).map(function(s) { return s.trim(); }).filter(Boolean);
+            if (urls.length === 1) newPackage.source_url = urls[0];
+            else if (urls.length > 1) { newPackage.source_url = urls[0]; newPackage.source_urls = urls; }
+          }
+          api.post('/builds/trigger', { new_package: newPackage, release_id: selectedReleaseIdNew, architectures: arches })
+            .then(function() { render(); alert('Build triggered.'); })
+            .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
+        } else if (currentSourceType === 'upload') {
+          var files = document.getElementById('source-upload-files') && document.getElementById('source-upload-files').files;
+          if (!files || !files.length) { alert('Select at least one .src.rpm or .spec file.'); return; }
+          var formData = new FormData();
+          formData.append('release_id', selectedReleaseIdNew);
+          if (mockIdVal) formData.append('preferred_mock_environment_id', mockIdVal);
+          formData.append('architectures', arches.join(','));
+          for (var i = 0; i < files.length; i++) formData.append('files', files[i]);
+          fetch(api.base + '/builds/upload', {
+            method: 'POST',
+            headers: api.token ? { 'Authorization': 'Bearer ' + api.token } : {},
+            body: formData
+          }).then(function(r) {
+            if (r.status === 401) { api.setToken(null); window.dispatchEvent(new Event('auth-change')); throw new Error('Unauthorized'); }
+            if (!r.ok) {
+              return r.text().then(function(t) {
+                var err = null;
+                try { err = t ? JSON.parse(t) : {}; } catch (_) {}
+                throw new Error((err && err.detail) || r.statusText);
+              });
+            }
+            return r.text().then(function(t) {
+              if (!t || !t.trim()) return null;
+              try { return JSON.parse(t); } catch (_) { return null; }
+            });
+          }).then(function() { render(); alert('Package created and build triggered.'); document.getElementById('source-upload-files').value = ''; })
+            .catch(function(e) { alert('Failed: ' + (e.message || e)); });
+          return;
+        } else if (currentSourceType === 'scm') {
+          var newPackage = {
+            name: '',
+            description: null,
+            preferred_mock_environment_id: mockIdVal ? parseInt(mockIdVal, 10) : null,
+            source_type: currentSourceType
+          };
+          var u = (document.getElementById('source-scm-url') && document.getElementById('source-scm-url').value || '').trim();
+          if (u) newPackage.source_url = u;
+          var b = (document.getElementById('source-scm-branch') && document.getElementById('source-scm-branch').value || '').trim();
+          if (b) newPackage.source_branch = b;
+          api.post('/builds/trigger', { new_package: newPackage, release_id: selectedReleaseIdNew, architectures: arches })
+            .then(function() { render(); alert('Package created and build triggered.'); })
+            .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
+        } else if (currentSourceType === 'distgit') {
+          var pkgsRaw = (document.getElementById('distgit-packages') && document.getElementById('distgit-packages').value) || '';
+          var pkgNames = pkgsRaw
+            .split(/[\s,]+/)
+            .map(function(s) { return s.trim(); })
+            .filter(function(s) { return !!s; });
+          if (!pkgNames.length) { alert('Enter at least one package name.'); return; }
+          var rel = releases.find(function(r) { return r.id === selectedReleaseIdNew; });
+          var releasename = rel && rel.releasename ? rel.releasename.trim() : '';
+          if (!releasename) { alert('Selected release is missing a releasename.'); return; }
+          var tasks = pkgNames.map(function(pkgName) {
+            var specPath = releasename + '/' + pkgName + '/' + pkgName + '.spec';
+            var repoUrl = 'https://github.com/oreonhq/rpm-specfiles.git';
+            var branch = 'main';
+            var combinedUrl = repoUrl + '#' + branch + ':' + specPath;
+            var np = {
+              name: pkgName,
+              description: null,
+              preferred_mock_environment_id: mockIdVal ? parseInt(mockIdVal, 10) : null,
+              source_type: 'distgit',
+              source_url: combinedUrl,
+              source_branch: branch,
+              source_path: specPath
+            };
+            return api.post('/builds/trigger', { new_package: np, release_id: selectedReleaseIdNew, architectures: arches })
+              .catch(function(e) { console.error('DistGit trigger failed for package', pkgName, e); });
+          });
+          Promise.all(tasks).then(function() {
+            render();
+            alert('Trigger requested for ' + pkgNames.length + ' DistGit package(s).');
+          });
+          return;
+        }
+      });
+      render();
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+[Unit]
+Description=Oreon Build Scheduler
+After=network.target
+
+[Service]
+Type=simple
+User=oreon-build
+Group=oreon-build
+WorkingDirectory=/opt/oreon-build-service
+EnvironmentFile=/opt/oreon-build-service/.env
+ExecStart=/opt/oreon-build-service/venv/bin/oreon-scheduler
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,147 @@
+<!--
+Oreon Build Service
+Copyright (C) 2026 Oreon HQ
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CVE Advisory - Oreon Watchdog</title>
+  <link rel="stylesheet" href="/static/style.css?v=2">
+</head>
+<body>
+  <header class="header">
+    <a href="/" class="header-logo-link"><img src="/static/owdlogo.png" alt="Oreon Watchdog" class="header-logo" style="height:32px; max-height:32px;"></a>
+    <nav>
+      <a href="/">Dashboard</a>
+      <span id="auth-section">
+        <span id="user-info"></span>
+        <button id="btn-login" type="button">Login</button>
+        <button id="btn-logout" type="button" style="display:none">Logout</button>
+      </span>
+    </nav>
+  </header>
+
+  <main class="main">
+    <section class="card">
+      <div style="display:flex; gap:0.75rem; align-items:center; flex-wrap:wrap;">
+        <h2 style="margin:0;">CVE Advisory</h2>
+        <span id="advisory-status-badge" class="badge pending" style="display:none;"></span>
+      </div>
+      <div id="advisory-title" style="margin-top:0.5rem; color:var(--text-muted); font-size:0.95rem;"></div>
+      <div id="advisory-content" style="margin-top:1rem;"></div>
+      <div id="advisory-actions" style="margin-top:1rem; display:flex; gap:0.75rem; flex-wrap:wrap;"></div>
+    </section>
+  </main>
+
+  <script src="/static/app.js?v=2"></script>
+  <script>
+    (function() {
+      const api = window.oreonApi;
+      const statusBadge = document.getElementById('advisory-status-badge');
+      const contentEl = document.getElementById('advisory-content');
+      const titleEl = document.getElementById('advisory-title');
+      const actionsEl = document.getElementById('advisory-actions');
+
+      function esc(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; }
+      function decodeJwt(token) {
+        try {
+          var payload = token.split('.')[1];
+          payload = payload.replace(/-/g, '+').replace(/_/g, '/');
+          while (payload.length % 4) payload += '=';
+          var json = atob(payload);
+          return JSON.parse(json);
+        } catch (e) { return null; }
+      }
+      function isAdmin() {
+        if (!api.token) return false;
+        var p = decodeJwt(api.token);
+        return !!(p && p.role === 'admin');
+      }
+      function isAuthed() {
+        return !!(api.token && api.token.length > 0);
+      }
+
+      function renderDetail(ad) {
+        actionsEl.innerHTML = '';
+        contentEl.innerHTML = '';
+        titleEl.textContent = 'CVE: ' + (ad.cve_id || '-') + ' (ID ' + ad.id + ')';
+
+        var handled = !!ad.is_handled;
+        statusBadge.style.display = 'inline-block';
+        statusBadge.className = 'badge ' + (handled ? 'success' : 'pending');
+        statusBadge.textContent = handled ? 'Resolved' : 'Unresolved';
+
+        var releases = (ad.affected_releases || []).map(function(r) {
+          return r.releasename || ('#' + r.release_id);
+        }).join(', ');
+
+        var upstream = ad.upstream_url ? '<a href="' + esc(ad.upstream_url) + '" target="_blank" rel="noreferrer">Upstream</a>' : '-';
+        var fix = esc(ad.recommended_fix || '-');
+        var summary = ad.summary ? esc(ad.summary) : '-';
+
+        contentEl.innerHTML =
+          '<div class="form-group" style="margin-bottom:0.75rem;">' +
+            '<div><b>Package</b>: ' + esc(ad.package_name || '-') + '</div>' +
+            '<div><b>Version</b>: ' + esc(ad.package_version || '-') + '</div>' +
+            '<div><b>Severity</b>: ' + esc(ad.severity || '-') + '</div>' +
+          '</div>' +
+          '<div><b>Summary</b><div style="color:var(--text-muted); white-space:pre-wrap; margin-top:0.25rem;">' + summary + '</div></div>' +
+          '<div style="margin-top:0.75rem;"><b>Upstream</b>: ' + upstream + '</div>' +
+          '<div style="margin-top:0.75rem;"><b>Recommended fix</b>: ' + fix + '</div>' +
+          '<div style="margin-top:0.75rem;"><b>Affected Oreon releases</b>: ' + esc(releases || '-') + '</div>';
+
+        if (!handled && isAdmin()) {
+          var btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'btn primary';
+          btn.textContent = 'Resolve';
+          btn.addEventListener('click', function() {
+            actionsEl.innerHTML = '<span style="color:var(--text-muted);">Resolving…</span>';
+            api.post('/security/advisories/cve/' + ad.id + '/resolve', {}).then(function() {
+              load();
+            }).catch(function(e) {
+              actionsEl.innerHTML = '<span style="color:var(--text-muted);">Resolve failed: ' + esc(e.message || e) + '</span>';
+            });
+          });
+          actionsEl.appendChild(btn);
+        }
+      }
+
+      async function load() {
+        var parts = window.location.pathname.split('/');
+        var idStr = parts[parts.length - 1];
+        var id = parseInt(idStr, 10);
+        if (!id) return;
+        titleEl.textContent = 'Loading…';
+
+        try {
+          var ad = await api.get('/security/advisories/cve/' + id);
+          renderDetail(ad);
+        } catch (e) {
+          titleEl.textContent = 'Failed: ' + (e.message || e);
+        }
+      }
+
+      window.addEventListener('auth-change', load);
+      load();
+    })();
+  </script>
+</body>
+</html>
+

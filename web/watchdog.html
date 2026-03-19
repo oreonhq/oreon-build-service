@@ -1,0 +1,357 @@
+<!--
+Oreon Build Service
+Copyright (C) 2026 Oreon HQ
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Oreon Watchdog - Security Advisories</title>
+  <link rel="stylesheet" href="/static/style.css?v=2">
+</head>
+<body>
+  <header class="header">
+    <a href="/" class="header-logo-link">
+      <img src="/static/owdlogo.png" alt="Oreon Watchdog" class="header-logo" style="height:32px; max-height:32px;">
+    </a>
+    <nav>
+      <span id="auth-section">
+        <span id="user-info"></span>
+        <button id="btn-login" type="button">Login</button>
+        <button id="btn-logout" type="button" style="display:none">Logout</button>
+      </span>
+      <span id="watchdog-auth">
+        <span style="color:var(--text-muted); font-size:0.9rem;">Security advisories (CVE)</span>
+      </span>
+    </nav>
+  </header>
+  <main class="main">
+    <section class="card">
+      <h2>Security Advisory Dashboard</h2>
+      <p style="color:var(--text-muted); font-size:0.9rem; margin-bottom:1rem;">
+        Tracks only CVEs affecting RPM versions present in the Oreon repositories.
+      </p>
+
+      <div class="form-group">
+        <label>Filter by Oreon release (optional)</label>
+        <select id="advisories-release-id" class="form-control">
+          <option value="">All releases</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Filter by RPM package name (optional)</label>
+        <input type="text" id="advisories-package-name" class="form-control" placeholder="e.g. openssl">
+      </div>
+
+      <div class="modal-actions" style="margin-top:0.75rem;" id="watchdog-authed-actions">
+        <button type="button" class="btn primary" id="btn-scan-now" style="display:none;">Scan now</button>
+      </div>
+
+      <div id="custom-advisory-create-wrap" style="display:none; margin-top:1rem;">
+        <h3 style="margin:0 0 0.75rem;">Create custom advisory</h3>
+
+        <div class="form-group">
+          <label>Title</label>
+          <input type="text" id="custom-title" class="form-control" placeholder="e.g. Pre-discovery issue in foo">
+        </div>
+        <div class="form-group">
+          <label>CVE ID (optional)</label>
+          <input type="text" id="custom-cve-id" class="form-control" placeholder="e.g. CVE-YYYY-NNNN">
+        </div>
+
+        <div style="display:flex; gap:1rem; flex-wrap:wrap;">
+          <div class="form-group" style="flex:1; min-width:240px;">
+            <label>Package name</label>
+            <input type="text" id="custom-package-name" class="form-control" placeholder="e.g. openssl">
+          </div>
+          <div class="form-group" style="flex:1; min-width:240px;">
+            <label>Package version</label>
+            <input type="text" id="custom-package-version" class="form-control" placeholder="e.g. 1.1.1w-1">
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>Severity (optional)</label>
+          <input type="text" id="custom-severity" class="form-control" placeholder="e.g. critical / high / medium">
+        </div>
+        <div class="form-group">
+          <label>Upstream URL (optional)</label>
+          <input type="text" id="custom-upstream-url" class="form-control" placeholder="https://...">
+        </div>
+
+        <div class="form-group">
+          <label>Summary (optional)</label>
+          <textarea id="custom-summary" class="form-control" rows="3" placeholder="Short description"></textarea>
+        </div>
+        <div class="form-group">
+          <label>Recommended fix steps (required)</label>
+          <textarea id="custom-recommended-fix" class="form-control" rows="3" placeholder="Option 1: backport/patch; Option 2: bump version"></textarea>
+        </div>
+
+        <div class="form-group">
+          <label>Affected Oreon releases</label>
+          <select id="custom-advisory-releases" class="form-control" multiple size="6"></select>
+        </div>
+
+        <div style="display:flex; gap:0.75rem; flex-wrap:wrap; align-items:center;">
+          <button type="button" class="btn primary" id="btn-create-custom-advisory">Create advisory</button>
+          <div id="custom-create-status" style="color:var(--text-muted); font-size:0.9rem;"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Matches</h2>
+      <div id="advisories-status" style="color:var(--text-muted); font-size:0.9rem; margin-bottom:0.75rem;">Loading…</div>
+      <table class="table-list">
+        <thead>
+          <tr>
+            <th>Type</th>
+            <th>ID</th>
+            <th>CVE / Title</th>
+            <th>Package</th>
+            <th>Version</th>
+            <th>Severity</th>
+            <th>Upstream</th>
+            <th>Fix</th>
+            <th>Affected Oreon releases</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="advisories-tbody"></tbody>
+      </table>
+    </section>
+  </main>
+
+  <script src="/static/app.js?v=2"></script>
+  <script>
+    (function() {
+      const api = window.oreonApi || {};
+      const statusEl = document.getElementById('advisories-status');
+      const tbody = document.getElementById('advisories-tbody');
+
+      function esc(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; }
+      function urlEncode(v) { return encodeURIComponent((v || '').toString()); }
+
+      function setLocked(locked) {
+        var actions = document.getElementById('watchdog-authed-actions');
+        if (actions) actions.style.display = locked ? 'none' : 'flex';
+        var createWrap = document.getElementById('custom-advisory-create-wrap');
+        if (createWrap) createWrap.style.display = locked ? 'none' : 'block';
+      }
+
+      function isAuthed() {
+        return !!(api.token && api.token.length > 0);
+      }
+
+      function decodeJwt(token) {
+        try {
+          var payload = token.split('.')[1];
+          payload = payload.replace(/-/g, '+').replace(/_/g, '/');
+          while (payload.length % 4) payload += '=';
+          var json = atob(payload);
+          return JSON.parse(json);
+        } catch (e) {
+          return null;
+        }
+      }
+
+      function isAdmin() {
+        if (!api.token) return false;
+        var p = decodeJwt(api.token);
+        return !!(p && p.role === 'admin');
+      }
+
+      function loadReleases() {
+        api.get('/security/releases').then(function(res) {
+          var sel = document.getElementById('advisories-release-id');
+          if (!sel) return;
+          var items = (res && res.items) ? res.items : [];
+          items.forEach(function(r) {
+            sel.appendChild(new Option(r.releasename, r.id));
+          });
+
+          var multi = document.getElementById('custom-advisory-releases');
+          if (multi) {
+            multi.innerHTML = '';
+            items.forEach(function(r) {
+              multi.appendChild(new Option(r.releasename, r.id));
+            });
+          }
+        }).catch(function(e) {});
+      }
+
+      function loadAdvisories() {
+        var adminNow = isAdmin();
+        var releaseId = document.getElementById('advisories-release-id').value || '';
+        var pkg = document.getElementById('advisories-package-name').value || '';
+        var path = '/security/advisories?limit=50&offset=0';
+        if (releaseId) path += '&release_id=' + urlEncode(releaseId);
+        if (pkg) path += '&package_name=' + urlEncode(pkg);
+        statusEl.textContent = 'Loading…';
+        api.get(path).then(function(res) {
+          var items = (res && res.items) ? res.items : [];
+          if (!items.length) {
+            tbody.innerHTML = '<tr><td colspan="10" style="color:var(--text-muted);">No advisories.</td></tr>';
+            statusEl.textContent = '0 advisories';
+            return;
+          }
+          tbody.innerHTML = items.map(function(a) {
+            var releases = (a.affected_releases || []).map(function(r) { return r.releasename || r.release_id; }).join(', ');
+            var upstream = a.upstream_url ? '<a href="' + (a.upstream_url || '') + '" target="_blank" rel="noreferrer">Upstream</a>' : '-';
+            var fix = esc(a.recommended_fix || '-');
+            var type = a.kind === 'custom' ? 'Custom' : 'CVE';
+            var cveOrTitle = (a.kind === 'custom') ? (a.title || '-') : (a.cve_id || '-');
+            var detailsUrl = a.kind === 'custom' ? ('/advisories/custom/' + a.id) : ('/advisories/cve/' + a.id);
+            var statusBadge = a.is_handled ? '<span class="badge success">Resolved</span>' : '<span class="badge pending">Unresolved</span>';
+            var resolveBtn = '';
+            if (!a.is_handled && adminNow) {
+              resolveBtn = ' <button type="button" class="btn primary" data-resolve-kind="' + esc(a.kind) + '" data-resolve-id="' + esc(a.id) + '">Resolve</button>';
+            }
+            return ''
+              + '<tr>'
+              + '<td>' + esc(type) + '</td>'
+              + '<td>' + esc(a.id) + '</td>'
+              + '<td>' + esc(cveOrTitle) + '</td>'
+              + '<td>' + esc(a.package_name || '-') + '</td>'
+              + '<td>' + esc(a.package_version || '-') + '</td>'
+              + '<td>' + esc(a.severity || '-') + '</td>'
+              + '<td>' + upstream + '</td>'
+              + '<td>' + fix + '</td>'
+              + '<td>' + esc(releases || '-') + '</td>'
+              + '<td>' + statusBadge
+              + ' <a class="btn" href="' + esc(detailsUrl) + '" style="display:inline-block; text-decoration:none;">Details</a>'
+              + resolveBtn
+              + '</td>'
+              + '</tr>';
+          }).join('');
+          statusEl.textContent = items.length + ' shown';
+
+          tbody.querySelectorAll('button[data-resolve-id]').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+              var kind = btn.dataset.resolveKind;
+              var id = btn.dataset.resolveId;
+              btn.disabled = true;
+              btn.textContent = 'Resolving…';
+              var endpoint = '/security/advisories/' + (kind === 'custom' ? ('custom/' + id) : ('cve/' + id)) + '/resolve';
+              api.post(endpoint, {}).then(function() {
+                loadAdvisories();
+              }).catch(function(e) {
+                btn.disabled = false;
+                btn.textContent = 'Resolve';
+                statusEl.textContent = 'Resolve failed: ' + (e.message || e);
+              });
+            });
+          });
+        }).catch(function(e) {
+          statusEl.textContent = 'Failed to load: ' + (e.message || e);
+          tbody.innerHTML = '';
+        });
+      }
+
+      document.getElementById('advisories-release-id').addEventListener('change', loadAdvisories);
+      document.getElementById('advisories-package-name').addEventListener('input', function() {
+        // simple debounce
+        clearTimeout(window.__watchdogDebounce);
+        window.__watchdogDebounce = setTimeout(loadAdvisories, 250);
+      });
+
+      var btn = document.getElementById('btn-scan-now');
+      if (btn) { /* hidden by default; keep handler for debugging */ }
+
+      var btnCreate = document.getElementById('btn-create-custom-advisory');
+      if (btnCreate) {
+        btnCreate.addEventListener('click', function() {
+          if (!isAuthed() || !isAdmin()) return;
+          var title = (document.getElementById('custom-title').value || '').trim();
+          var cveId = (document.getElementById('custom-cve-id').value || '').trim();
+          var packageName = (document.getElementById('custom-package-name').value || '').trim();
+          var packageVersion = (document.getElementById('custom-package-version').value || '').trim();
+          var severity = (document.getElementById('custom-severity').value || '').trim();
+          var upstreamUrl = (document.getElementById('custom-upstream-url').value || '').trim();
+          var summary = (document.getElementById('custom-summary').value || '').trim();
+          var recommendedFix = (document.getElementById('custom-recommended-fix').value || '').trim();
+          var createStatus = document.getElementById('custom-create-status');
+
+          if (!title) { alert('Title is required.'); return; }
+          if (!packageName || !packageVersion) { alert('Package name and version are required.'); return; }
+          if (!recommendedFix) { alert('Recommended fix steps are required.'); return; }
+
+          var multi = document.getElementById('custom-advisory-releases');
+          var releaseIds = [];
+          if (multi) {
+            Array.from(multi.options).forEach(function(opt) {
+              if (opt.selected) releaseIds.push(parseInt(opt.value, 10));
+            });
+          }
+          // Defensive: filter out NaN values (pydantic will reject non-int items -> 422).
+          releaseIds = (releaseIds || []).filter(function(x) { return Number.isFinite(x); });
+          if (!releaseIds.length) { alert('Select at least one affected Oreon release.'); return; }
+
+          if (createStatus) createStatus.textContent = 'Creating…';
+          api.post('/security/advisories/custom', {
+            title: title,
+            cve_id: cveId || null,
+            package_name: packageName,
+            package_version: packageVersion,
+            severity: severity || null,
+            upstream_url: upstreamUrl || null,
+            summary: summary || null,
+            recommended_fix: recommendedFix,
+            affected_release_ids: releaseIds
+          }).then(function() {
+            if (createStatus) createStatus.textContent = 'Created.';
+            loadAdvisories();
+          }).catch(function(e) {
+            if (createStatus) createStatus.textContent = 'Create failed: ' + (e.message || e);
+          });
+        });
+      }
+
+      function refreshAdminUI() {
+        var createWrap = document.getElementById('custom-advisory-create-wrap');
+        if (!createWrap) return;
+        if (!isAuthed() || !isAdmin()) createWrap.style.display = 'none';
+        else createWrap.style.display = 'block';
+
+        var btnScan = document.getElementById('btn-scan-now');
+        if (btnScan) btnScan.style.display = isAdmin() ? 'inline-block' : 'none';
+
+        var actions = document.getElementById('watchdog-authed-actions');
+        if (actions) actions.style.display = isAdmin() ? 'flex' : 'none';
+      }
+
+      if (isAuthed()) {
+        loadReleases();
+        loadAdvisories();
+        refreshAdminUI();
+      } else {
+        loadReleases();
+        loadAdvisories();
+        refreshAdminUI();
+      }
+      window.addEventListener('auth-change', function() {
+        loadReleases();
+        loadAdvisories();
+        refreshAdminUI();
+      });
+    })();
+  </script>
+</body>
+</html>
+
