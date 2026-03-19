@@ -208,6 +208,44 @@ def _mock_rebuild_srpm(mock_config: str, srpm_path: Path, result_dir: Path) -> t
     return rc == 0, out
 
 
+def _pick_sources_dir(distgit_root: Path, spec_path: Path) -> Path:
+    """
+    mock --buildsrpm expects a directory of lookaside sources by basename.
+    Distgit layouts vary: sometimes tarballs live next to the spec, sometimes
+    in sources/SOURCES/lookaside. We only pick a candidate if it looks like
+    it actually contains lookaside-like files (tarballs/lockfiles).
+    """
+
+    def _dir_has_lookaside_files(d: Path) -> bool:
+        if not d.is_dir():
+            return False
+        # Most distgit lookaside content is tarballs; Cargo lockfiles are common too.
+        patterns = ["*.tar*", "*.tgz", "*.zip", "*.lock"]
+        for pat in patterns:
+            if any(d.glob(pat)):
+                return True
+        return False
+
+    spec_dir = spec_path.parent
+    candidates = [
+        distgit_root,
+        spec_dir,
+        spec_dir / "sources",
+        distgit_root / "sources",
+        spec_dir / "SOURCES",
+        distgit_root / "SOURCES",
+        spec_dir / "lookaside",
+        distgit_root / "lookaside",
+    ]
+
+    for c in candidates:
+        if _dir_has_lookaside_files(c):
+            return c
+
+    # Fallback: old behavior
+    return spec_dir
+
+
 def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
     try:
         attempt_id = job["build_attempt_id"]
@@ -294,7 +332,7 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                 ok, srpm_path, srpm_out = _mock_build_srpm_from_spec(
                     mock_config=mock_config,
                     spec_path=spec_path,
-                    sources_dir=spec_path.parent,
+                    sources_dir=_pick_sources_dir(distgit_root=git_dir, spec_path=spec_path),
                     result_dir=srpm_result_dir,
                 )
                 mock_log_parts = _mock_logs_from_result_dir(srpm_result_dir, max_lines=log_max_lines)
