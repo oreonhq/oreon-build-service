@@ -15,6 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """Oreon Build Service API - main application."""
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -27,7 +28,9 @@ from sqlalchemy import select
 from oreon_build.config import get_settings
 from oreon_build.db import get_db, init_db
 from oreon_build.models import Account, Role, RoleName
-from oreon_build.core.security import hash_password
+from oreon_build.core.security import hash_password, verify_password
+
+logger = logging.getLogger(__name__)
 
 from .routers import (
     auth,
@@ -66,7 +69,9 @@ async def lifespan(app: FastAPI):
             admin_role = result.scalar_one_or_none()
             if admin_role:
                 result = await db.execute(select(Account).where(Account.username == settings.admin_username))
-                if not result.scalar_one_or_none():
+                admin = result.scalar_one_or_none()
+                if not admin:
+                    # First boot: create the default admin from env.
                     admin = Account(
                         username=settings.admin_username,
                         password_hash=hash_password(settings.admin_password),
@@ -74,6 +79,15 @@ async def lifespan(app: FastAPI):
                         is_active=True,
                     )
                     db.add(admin)
+                else:
+                    # Subsequent boots: if the env password changed, update the stored
+                    # password hash (the "invalid password" symptom many users hit).
+                    try:
+                        if not verify_password(settings.admin_password, admin.password_hash):
+                            admin.password_hash = hash_password(settings.admin_password)
+                            db.add(admin)
+                    except Exception:
+                        logger.exception("Failed verifying/updating default admin password")
             await db.commit()
         except Exception:
             await db.rollback()
