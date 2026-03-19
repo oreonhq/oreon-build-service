@@ -1,3 +1,19 @@
+# Oreon Build Service
+# Copyright (C) 2026 Oreon HQ
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 """
 Oreon Build Worker: polls controller, runs mock builds, uploads artifacts to R2.
 
@@ -65,6 +81,72 @@ def _run(cmd: list[str], timeout_s: int, cwd: str | None = None) -> tuple[int, s
         return 127, f"Command not found: {cmd[0]}"
     except subprocess.TimeoutExpired:
         return 124, f"Timed out running: {' '.join(cmd)}"
+
+
+def _tail_lines(text: str, max_lines: int) -> str:
+    if max_lines <= 0:
+        return text
+    lines = text.splitlines()
+    if len(lines) <= max_lines:
+        return text
+    return "\n".join(lines[-max_lines:])
+
+
+def _read_text_file(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _mock_logs_from_result_dir(result_dir: Path, max_lines: int) -> list[str]:
+    """
+    mock usually writes the detailed build output to files like build.log/root.log.
+    We read those files (if present) instead of relying only on wrapper stdout/stderr.
+    """
+    wanted_names = ["build.log", "root.log", "state.log", "config.log"]
+    parts: list[str] = []
+    used_paths: set[str] = set()
+
+    for name in wanted_names:
+        matches = sorted(result_dir.rglob(name))
+        if not matches:
+            continue
+        # Prefer the "last" match (deeper nested setups can exist)
+        p = matches[-1]
+        p_key = str(p)
+        if p_key in used_paths:
+            continue
+        used_paths.add(p_key)
+
+        txt = _read_text_file(p)
+        if not txt.strip():
+            continue
+        rel = ""
+        try:
+            rel = str(p.relative_to(result_dir))
+        except Exception:
+            rel = p.name
+
+        txt = _tail_lines(txt, max_lines)
+        parts.append(f"== mock log: {name} ({rel}) ==\n{txt.strip()}")
+
+    # Fallback: if none of the known logs exist, grab up to a few *.log files.
+    if not parts:
+        generic = sorted(result_dir.rglob("*.log"))[:5]
+        for p in generic:
+            txt = _read_text_file(p)
+            if not txt.strip():
+                continue
+            rel = ""
+            try:
+                rel = str(p.relative_to(result_dir))
+            except Exception:
+                rel = p.name
+            txt = _tail_lines(txt, max_lines)
+            parts.append(f"== mock log: {p.name} ({rel}) ==\n{txt.strip()}")
+
+    return parts
 
 
 def _parse_distgit_url(distgit_url: str) -> tuple[str, str | None, str | None]:
@@ -156,6 +238,7 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
         with tempfile.TemporaryDirectory(prefix="oreon-worker-") as tmpdir:
             tmp = Path(tmpdir)
             build_log_parts: list[str] = []
+            log_max_lines = int(os.environ.get("OREON_WORKER_LOG_MAX_LINES", "40000"))
 
             srpm_path: Path | None = None
 
@@ -212,7 +295,12 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                     sources_dir=spec_path.parent,
                     result_dir=srpm_result_dir,
                 )
-                build_log_parts.append("== mock --buildsrpm ==\n" + srpm_out.strip())
+                mock_log_parts = _mock_logs_from_result_dir(srpm_result_dir, max_lines=log_max_lines)
+                if mock_log_parts:
+                    build_log_parts.extend(mock_log_parts)
+                else:
+                    # Fallback to wrapper output if mock didn't write log files.
+                    build_log_parts.append("== mock --buildsrpm (wrapper output) ==\n" + srpm_out.strip())
                 if not ok or not srpm_path:
                     msg = "\n\n".join(build_log_parts).strip()
                     _upload_bytes_to_r2(log_key, msg.encode("utf-8"), content_type="text/plain")
@@ -233,7 +321,11 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
             result_dir = tmp / "result"
             result_dir.mkdir()
             ok, rebuild_out = _mock_rebuild_srpm(mock_config=mock_config, srpm_path=srpm_path, result_dir=result_dir)
-            build_log_parts.append("== mock --rebuild ==\n" + rebuild_out.strip())
+            mock_log_parts = _mock_logs_from_result_dir(result_dir, max_lines=log_max_lines)
+            if mock_log_parts:
+                build_log_parts.extend(mock_log_parts)
+            else:
+                build_log_parts.append("== mock --rebuild (wrapper output) ==\n" + rebuild_out.strip())
             full_log = "\n\n".join([p for p in build_log_parts if p]).strip() + "\n"
 
             _upload_bytes_to_r2(log_key, full_log.encode("utf-8"), content_type="text/plain")
