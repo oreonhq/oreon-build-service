@@ -34,6 +34,7 @@ Set:
 - `OREON_WORKER_TOKEN` – token from step 2
 - `OREON_WORKER_NAME` – optional, default `worker-1`
 - `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, `R2_ENDPOINT_URL` – same bucket/creds as the controller so uploads land in one place
+- **Signing (optional but recommended):** `SIGNING_KEY_ID` (GPG key ID or fingerprint) and `GPG_HOME` (e.g. `/var/lib/oreon-build/gnupg`). Every worker that runs builds needs the same keyring if you want signed RPMs. Without these, builds succeed but artifacts show **Signed: No**.
 
 Restrict the file: `sudo chmod 600 /etc/oreon-build-worker/oreon-worker.env`
 
@@ -43,12 +44,29 @@ Restrict the file: `sudo chmod 600 /etc/oreon-build-worker/oreon-worker.env`
 sudo systemctl enable --now oreon-worker
 ```
 
-## Mock and spectool (for RPM builds)
+also:
 
-DistGit specs typically reference Source tarballs by URL and Patch files locally. The worker uses `spectool` (from rpmdevtools) to download URLs and copy local patches before mock runs. On the worker machine:
+- `sudo dnf install mock rpmdevtools`
+- `sudo usermod -a -G mock oreon-build`
 
-1. `sudo dnf install mock rpmdevtools`
-2. `sudo usermod -a -G mock oreon-build`
+## GPG and signing (local worker)
+
+# Create the directory
+sudo mkdir -p /var/lib/oreon-build/gnupg
+
+# Copy the keyring (use the keyring you already use for signing)
+sudo cp -r ~/.gnupg/* /var/lib/oreon-build/gnupg/
+
+# Ownership and permissions
+sudo chown -R oreon-build:oreon-build /var/lib/oreon-build/gnupg
+sudo chmod 700 /var/lib/oreon-build/gnupg
+sudo chmod 600 /var/lib/oreon-build/gnupg/private-keys-v1.d/* 2>/dev/null || true
+
+## GPG and signing (remote worker)
+
+1. on worker: sudo mkdir -p /var/lib/oreon-build/gnupg
+2. scp -r ~/.gnupg/* root@worker-host:/var/lib/oreon-build/gnupg/
+3. on worker: chown -R oreon-build:oreon-build /var/lib/oreon-build/gnupg && chmod 700 /var/lib/oreon-build/gnupg && chmod 600 /var/lib/oreon-build/gnupg/private-keys-v1.d/* 2>/dev/null || true
 
 ## Multiple workers
 
