@@ -173,6 +173,50 @@ def _clone_repo(repo: str, branch: str | None, dst: Path) -> tuple[bool, str]:
     return rc == 0, out
 
 
+def _maybe_git_lfs_pull(repo_dir: Path) -> tuple[int, str]:
+    """Fetch Git LFS objects when .gitattributes uses filter=lfs (shallow clone may miss blobs)."""
+    ga = repo_dir / ".gitattributes"
+    try:
+        if ga.is_file() and "filter=lfs" in ga.read_text(encoding="utf-8", errors="replace"):
+            return _run(["git", "-C", str(repo_dir), "lfs", "pull"], timeout_s=1200)
+    except OSError:
+        pass
+    return 0, ""
+
+
+def _prepare_mock_sources_with_spectool(spec_path: Path, staging_dir: Path) -> tuple[bool, str]:
+    """
+    Prepare sources for mock (spectool from rpmdevtools).
+
+    Koji/COPR do the same: sources are prepared before mock. Koji uses lookaside;
+    for URL-based Source lines, spectool is the standard tool (Fedora rpmdevtools).
+    Fetches Source URLs and copies local Patch files into staging_dir, then mock
+    receives that dir via --sources.
+    Returns (ok, log).
+    """
+    spec_dir = spec_path.parent
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    rc, out = _run(
+        ["spectool", "-g", "-C", str(staging_dir), str(spec_path)],
+        timeout_s=900,
+        cwd=str(spec_dir),
+    )
+
+    if rc == 0:
+        files = sorted(staging_dir.iterdir()) if staging_dir.is_dir() else []
+        names = [f.name for f in files if f.is_file()]
+        return True, f"spectool -g fetched sources and patches ({len(names)} files): {', '.join(names[:15])}{' ...' if len(names) > 15 else ''}"
+
+    err = f"spectool -g failed (rc={rc}). Install rpmdevtools (spectool). Output:\n{out}"
+    if rc == 127:
+        err = (
+            "spectool not found. Install rpmdevtools on the worker: sudo dnf install rpmdevtools. "
+            " spectool downloads Source URLs and copies local Patch files for mock --buildsrpm."
+        )
+    return False, err
+
+
 def _mock_build_srpm_from_spec(mock_config: str, spec_path: Path, sources_dir: Path, result_dir: Path) -> tuple[bool, Path | None, str]:
     """
     Build SRPM from spec/sources using mock (so dependencies are handled in chroot).
@@ -206,44 +250,6 @@ def _mock_rebuild_srpm(mock_config: str, srpm_path: Path, result_dir: Path) -> t
     cmd = ["mock", "-r", mock_config, "--rebuild", str(srpm_path), "--resultdir", str(result_dir)]
     rc, out = _run(cmd, timeout_s=7200)
     return rc == 0, out
-
-
-def _pick_sources_dir(distgit_root: Path, spec_path: Path) -> Path:
-    """
-    mock --buildsrpm expects a directory of lookaside sources by basename.
-    Distgit layouts vary: sometimes tarballs live next to the spec, sometimes
-    in sources/SOURCES/lookaside. We only pick a candidate if it looks like
-    it actually contains lookaside-like files (tarballs/lockfiles).
-    """
-
-    def _dir_has_lookaside_files(d: Path) -> bool:
-        if not d.is_dir():
-            return False
-        # Most distgit lookaside content is tarballs; Cargo lockfiles are common too.
-        patterns = ["*.tar*", "*.tgz", "*.zip", "*.lock"]
-        for pat in patterns:
-            if any(d.glob(pat)):
-                return True
-        return False
-
-    spec_dir = spec_path.parent
-    candidates = [
-        distgit_root,
-        spec_dir,
-        spec_dir / "sources",
-        distgit_root / "sources",
-        spec_dir / "SOURCES",
-        distgit_root / "SOURCES",
-        spec_dir / "lookaside",
-        distgit_root / "lookaside",
-    ]
-
-    for c in candidates:
-        if _dir_has_lookaside_files(c):
-            return c
-
-    # Fallback: old behavior
-    return spec_dir
 
 
 def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
@@ -316,9 +322,29 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                         json={"status": "failed", "log_r2_key": log_key, "error_message": msg[:2000]},
                     )
                     return
+                lfs_rc, lfs_out = _maybe_git_lfs_pull(git_dir)
+                if lfs_out.strip():
+                    build_log_parts.append(
+                        f"== git lfs pull (rc={lfs_rc}) ==\n{lfs_out.strip()}"
+                    )
                 spec_path = git_dir / spec_rel
                 if not spec_path.is_file():
                     build_log_parts.append(f"Spec not found: {spec_rel}")
+                    msg = "\n\n".join(build_log_parts).strip()
+                    _upload_bytes_to_r2(log_key, msg.encode("utf-8"), content_type="text/plain")
+                    session.post(
+                        f"{controller_url}/api/worker/result/{attempt_id}",
+                        json={"status": "failed", "log_r2_key": log_key, "error_message": msg[:2000]},
+                    )
+                    return
+
+                sources_staging = tmp / "mock_sources_staged"
+                src_ok, src_log = _prepare_mock_sources_with_spectool(
+                    spec_path=spec_path,
+                    staging_dir=sources_staging,
+                )
+                build_log_parts.append("== distgit sources for mock ==\n" + src_log)
+                if not src_ok:
                     msg = "\n\n".join(build_log_parts).strip()
                     _upload_bytes_to_r2(log_key, msg.encode("utf-8"), content_type="text/plain")
                     session.post(
@@ -332,7 +358,7 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                 ok, srpm_path, srpm_out = _mock_build_srpm_from_spec(
                     mock_config=mock_config,
                     spec_path=spec_path,
-                    sources_dir=_pick_sources_dir(distgit_root=git_dir, spec_path=spec_path),
+                    sources_dir=sources_staging,
                     result_dir=srpm_result_dir,
                 )
                 mock_log_parts = _mock_logs_from_result_dir(srpm_result_dir, max_lines=log_max_lines)

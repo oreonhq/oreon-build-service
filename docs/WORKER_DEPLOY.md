@@ -43,11 +43,11 @@ Restrict the file: `sudo chmod 600 /etc/oreon-build-worker/oreon-worker.env`
 sudo systemctl enable --now oreon-worker
 ```
 
-## Mock (for RPM builds to run in)
+## Mock and spectool (for RPM builds)
 
-Once done, do this on the worker machine:
+DistGit specs typically reference Source tarballs by URL and Patch files locally. The worker uses `spectool` (from rpmdevtools) to download URLs and copy local patches before mock runs. On the worker machine:
 
-1. `sudo dnf install mock`
+1. `sudo dnf install mock rpmdevtools`
 2. `sudo usermod -a -G mock oreon-build`
 
 ## Multiple workers
