@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -184,37 +185,117 @@ def _maybe_git_lfs_pull(repo_dir: Path) -> tuple[int, str]:
     return 0, ""
 
 
+def _copy_local_spec_sources_listed_by_spectool(spec_path: Path, staging_dir: Path) -> tuple[bool, str]:
+    """
+    Copy Source/Patch files that live next to the spec (distgit layout).
+
+    ``spectool -g`` only downloads *URL* sources. Local ``SourceN: foo`` and
+    ``PatchN: bar`` lines must be copied into the mock --sources staging dir
+    or rpmbuild fails with "Bad file: .../SOURCES/foo".
+    """
+    spec_dir = spec_path.parent
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    rc, out = _run(
+        ["spectool", "-l", str(spec_path.name)],
+        timeout_s=120,
+        cwd=str(spec_dir),
+    )
+    if rc != 0:
+        return False, f"spectool -l failed (rc={rc}): {out[:2000]}"
+
+    copied: list[str] = []
+    missing: list[str] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" not in line:
+            continue
+        _, _, rest = line.partition(":")
+        rest = rest.strip()
+        if not rest:
+            continue
+        low = rest.lower()
+        if low.startswith(("http://", "https://", "ftp://")):
+            continue
+
+        rel = rest.replace("\\", "/").lstrip("/")
+        if not rel or rel.startswith("..") or "/.." in rel:
+            continue
+
+        src = spec_dir / rel
+        if not src.is_file():
+            # Often listed as basename only; try next to spec
+            base = Path(rel).name
+            alt = spec_dir / base
+            if alt.is_file():
+                src = alt
+                rel = base
+            else:
+                missing.append(rest)
+                continue
+
+        dst = staging_dir / rel
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            copied.append(rel)
+        except OSError as e:
+            return False, f"copy failed for {rel}: {e}"
+
+    parts = [
+        f"local Source/Patch files copied ({len(copied)}): "
+        f"{', '.join(copied[:25])}{' ...' if len(copied) > 25 else ''}"
+    ]
+    if missing:
+        parts.append("missing local files: " + ", ".join(missing[:30]))
+        return False, "\n".join(parts)
+
+    return True, "\n".join(parts)
+
+
 def _prepare_mock_sources_with_spectool(spec_path: Path, staging_dir: Path) -> tuple[bool, str]:
     """
     Prepare sources for mock (spectool from rpmdevtools).
 
     Koji/COPR do the same: sources are prepared before mock. Koji uses lookaside;
     for URL-based Source lines, spectool is the standard tool (Fedora rpmdevtools).
-    Fetches Source URLs and copies local Patch files into staging_dir, then mock
-    receives that dir via --sources.
+    ``spectool -g`` fetches URL sources only; local distgit files are copied by
+    :func:`_copy_local_spec_sources_listed_by_spectool`.
     Returns (ok, log).
     """
     spec_dir = spec_path.parent
     staging_dir.mkdir(parents=True, exist_ok=True)
 
     rc, out = _run(
-        ["spectool", "-g", "-C", str(staging_dir), str(spec_path)],
+        ["spectool", "-g", "-C", str(staging_dir), str(spec_path.name)],
         timeout_s=900,
         cwd=str(spec_dir),
     )
 
-    if rc == 0:
-        files = sorted(staging_dir.iterdir()) if staging_dir.is_dir() else []
-        names = [f.name for f in files if f.is_file()]
-        return True, f"spectool -g fetched sources and patches ({len(names)} files): {', '.join(names[:15])}{' ...' if len(names) > 15 else ''}"
+    if rc != 0:
+        err = f"spectool -g failed (rc={rc}). Install rpmdevtools (spectool). Output:\n{out}"
+        if rc == 127:
+            err = (
+                "spectool not found. Install rpmdevtools on the worker: sudo dnf install rpmdevtools. "
+                " spectool downloads Source URLs and copies local Patch files for mock --buildsrpm."
+            )
+        return False, err
 
-    err = f"spectool -g failed (rc={rc}). Install rpmdevtools (spectool). Output:\n{out}"
-    if rc == 127:
-        err = (
-            "spectool not found. Install rpmdevtools on the worker: sudo dnf install rpmdevtools. "
-            " spectool downloads Source URLs and copies local Patch files for mock --buildsrpm."
-        )
-    return False, err
+    files = sorted(staging_dir.rglob("*")) if staging_dir.is_dir() else []
+    names = [f.name for f in files if f.is_file()]
+    log_parts = [
+        f"spectool -g fetched URL sources ({len(names)} files): "
+        f"{', '.join(names[:15])}{' ...' if len(names) > 15 else ''}"
+    ]
+
+    ok_local, local_log = _copy_local_spec_sources_listed_by_spectool(spec_path, staging_dir)
+    log_parts.append(local_log)
+    if not ok_local:
+        return False, "\n".join(log_parts)
+
+    return True, "\n".join(log_parts)
 
 
 def _mock_build_srpm_from_spec(mock_config: str, spec_path: Path, sources_dir: Path, result_dir: Path) -> tuple[bool, Path | None, str]:

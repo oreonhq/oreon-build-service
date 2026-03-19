@@ -21,16 +21,26 @@ def sign_rpm(rpm_path: Path, key_id: Optional[str] = None) -> bool:
     env = os.environ.copy()
     if settings.gpg_home:
         env["GNUPGHOME"] = settings.gpg_home
+    env.setdefault("LC_ALL", "C.UTF-8")
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["rpm", "--define", f"_gpg_name {kid}", "--addsign", str(rpm_path)],
-            check=True,
-            env=env,
             capture_output=True,
+            env=env,
+            text=True,
         )
+        if result.returncode != 0:
+            err = (result.stderr or "").strip() or (result.stdout or "").strip()
+            logger.error(
+                "RPM signing failed (exit %d) for %s: %s",
+                result.returncode,
+                rpm_path.name,
+                err or "(no output)",
+            )
+            return False
         return True
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        logger.exception("RPM signing failed: %s", e)
+    except FileNotFoundError as e:
+        logger.exception("rpm command not found: %s", e)
         return False
 
 
@@ -44,13 +54,21 @@ def sign_repomd(repomd_path: Path, key_id: Optional[str] = None) -> bool:
     if settings.gpg_home:
         env["GNUPGHOME"] = settings.gpg_home
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["gpg", "--detach-sign", "--armor", "-u", kid, str(repomd_path)],
-            check=True,
-            env=env,
             capture_output=True,
+            env=env,
+            text=True,
         )
+        if result.returncode != 0:
+            err = (result.stderr or "").strip() or (result.stdout or "").strip()
+            logger.error(
+                "repomd signing failed (exit %d): %s",
+                result.returncode,
+                err or "(no output)",
+            )
+            return False
         return True
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        logger.exception("repomd signing failed: %s", e)
+    except FileNotFoundError as e:
+        logger.exception("gpg command not found: %s", e)
         return False
