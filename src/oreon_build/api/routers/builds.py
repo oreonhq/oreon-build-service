@@ -488,6 +488,8 @@ async def cancel_build(
     db: DbSession,
     user: CurrentUser,
 ):
+    from datetime import datetime, timezone
+
     result = await db.execute(select(BuildJob).where(BuildJob.id == job_id))
     job = result.scalar_one_or_none()
     if not job:
@@ -495,8 +497,19 @@ async def cancel_build(
     if job.status not in (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.RUNNING):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Job not in cancellable state")
     job.status = BuildStatus.CANCELLED
-    from datetime import datetime, timezone
     job.completed_at = datetime.now(timezone.utc)
+    # Mark in-flight attempts cancelled so UI does not show "running" forever; worker will stop mock when it polls cancel-check.
+    att_result = await db.execute(
+        select(BuildAttempt).where(
+            BuildAttempt.build_job_id == job_id,
+            BuildAttempt.status == BuildStatus.RUNNING,
+        )
+    )
+    now = datetime.now(timezone.utc)
+    for att in att_result.scalars().all():
+        att.status = BuildStatus.CANCELLED
+        att.finished_at = now
+        att.error_message = "Cancelled by user"
     await log_audit(
         db,
         "build.cancel",

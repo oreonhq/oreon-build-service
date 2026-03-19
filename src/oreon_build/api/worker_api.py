@@ -214,6 +214,29 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
     }
 
 
+@router.get("/cancel-check/{attempt_id}")
+async def cancel_check(
+    attempt_id: int,
+    db: DbSession,
+    worker: Annotated[Worker, Depends(_require_worker)],
+):
+    """Worker polls this while a build runs; true when the user cancelled the job."""
+    result = await db.execute(
+        select(BuildAttempt).where(
+            BuildAttempt.id == attempt_id,
+            BuildAttempt.worker_id == worker.id,
+        )
+    )
+    attempt = result.scalar_one_or_none()
+    if not attempt:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attempt not found")
+    job_result = await db.execute(select(BuildJob).where(BuildJob.id == attempt.build_job_id))
+    job = job_result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    return {"cancel_requested": job.status == BuildStatus.CANCELLED}
+
+
 @router.post("/result/{attempt_id}")
 async def report_result(
     attempt_id: int,
@@ -230,14 +253,37 @@ async def report_result(
     attempt = result.scalar_one_or_none()
     if not attempt:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attempt not found")
+    job_result = await db.execute(select(BuildJob).where(BuildJob.id == attempt.build_job_id))
+    job = job_result.scalar_one()
+
+    # User cancelled: do not mark job success or promote artifacts when the worker finishes later.
+    if job.status == BuildStatus.CANCELLED:
+        if payload.log_r2_key:
+            attempt.log_r2_key = payload.log_r2_key
+        if payload.error_message:
+            prev = (attempt.error_message or "").strip()
+            attempt.error_message = (prev + "\n" if prev else "") + payload.error_message.strip()
+        worker.state = WorkerState.IDLE
+        worker.current_build_attempt_id = None
+        await db.flush()
+        await log_audit(
+            db,
+            action="build.result",
+            account_id=None,
+            resource_type="build_job",
+            resource_id=str(job.id),
+            details=f"status=ignored job_cancelled attempt_id={attempt_id}",
+            ip_address=None,
+            user_agent="worker",
+        )
+        return {"status": "ok", "job_cancelled": True}
+
     attempt.status = BuildStatus(payload.status)
     attempt.finished_at = datetime.now(timezone.utc)
     if payload.error_message:
         attempt.error_message = payload.error_message
     if payload.log_r2_key:
         attempt.log_r2_key = payload.log_r2_key
-    job_result = await db.execute(select(BuildJob).where(BuildJob.id == attempt.build_job_id))
-    job = job_result.scalar_one()
     job.status = BuildStatus(payload.status)
     job.completed_at = attempt.finished_at
     worker.state = WorkerState.IDLE

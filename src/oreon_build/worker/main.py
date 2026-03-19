@@ -84,6 +84,62 @@ def _run(cmd: list[str], timeout_s: int, cwd: str | None = None) -> tuple[int, s
         return 124, f"Timed out running: {' '.join(cmd)}"
 
 
+# Exit code when mock is killed because the user cancelled the build (worker convention)
+_RC_MOCK_CANCELLED = 130
+
+
+def _run_with_abort(
+    cmd: list[str],
+    timeout_s: int,
+    abort_event: threading.Event | None,
+    cwd: str | None = None,
+) -> tuple[int, str]:
+    """Like _run but kills the child process when abort_event is set (user cancelled build)."""
+    if not abort_event:
+        return _run(cmd, timeout_s, cwd)
+    env = {**os.environ, "LANG": "C.UTF-8"}
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=cwd,
+            env=env,
+        )
+    except FileNotFoundError:
+        return 127, f"Command not found: {cmd[0]}"
+    start = time.monotonic()
+    while True:
+        if abort_event.is_set():
+            proc.kill()
+            try:
+                proc.wait(timeout=60)
+            except Exception:
+                pass
+            out = ""
+            try:
+                stdout, stderr = proc.communicate(timeout=10)
+                out = (stdout or "") + (stderr or "")
+            except Exception:
+                pass
+            return _RC_MOCK_CANCELLED, out + "\n== Build cancelled by user (mock killed) =="
+
+        ret = proc.poll()
+        if ret is not None:
+            stdout, stderr = proc.communicate()
+            return ret, (stdout or "") + (stderr or "")
+
+        if time.monotonic() - start > timeout_s:
+            proc.kill()
+            try:
+                proc.wait(timeout=30)
+            except Exception:
+                pass
+            return 124, f"Timed out running: {' '.join(cmd)}"
+        time.sleep(0.5)
+
+
 def _tail_lines(text: str, max_lines: int) -> str:
     if max_lines <= 0:
         return text
@@ -298,10 +354,17 @@ def _prepare_mock_sources_with_spectool(spec_path: Path, staging_dir: Path) -> t
     return True, "\n".join(log_parts)
 
 
-def _mock_build_srpm_from_spec(mock_config: str, spec_path: Path, sources_dir: Path, result_dir: Path) -> tuple[bool, Path | None, str]:
+def _mock_build_srpm_from_spec(
+    mock_config: str,
+    spec_path: Path,
+    sources_dir: Path,
+    result_dir: Path,
+    abort_event: threading.Event | None = None,
+) -> tuple[bool, Path | None, str, bool]:
     """
     Build SRPM from spec/sources using mock (so dependencies are handled in chroot).
     Produces *.src.rpm in result_dir.
+    Returns (ok, srpm_path, output, cancelled).
     """
     cmd = [
         "mock",
@@ -315,27 +378,56 @@ def _mock_build_srpm_from_spec(mock_config: str, spec_path: Path, sources_dir: P
         "--resultdir",
         str(result_dir),
     ]
-    rc, out = _run(cmd, timeout_s=3600)
+    rc, out = _run_with_abort(cmd, timeout_s=3600, abort_event=abort_event)
+    if rc == _RC_MOCK_CANCELLED:
+        return False, None, out, True
     if rc != 0:
-        return False, None, out
+        return False, None, out, False
     srpms = sorted(result_dir.glob("*.src.rpm"))
     if not srpms:
         # mock sometimes nests outputs; fall back to recursive search
         srpms = sorted(result_dir.rglob("*.src.rpm"))
     if not srpms:
-        return False, None, out + "\nNo .src.rpm produced by mock --buildsrpm."
-    return True, srpms[0], out
+        return False, None, out + "\nNo .src.rpm produced by mock --buildsrpm.", False
+    return True, srpms[0], out, False
 
 
-def _mock_rebuild_srpm(mock_config: str, srpm_path: Path, result_dir: Path) -> tuple[bool, str]:
+def _mock_rebuild_srpm(
+    mock_config: str,
+    srpm_path: Path,
+    result_dir: Path,
+    abort_event: threading.Event | None = None,
+) -> tuple[bool, str, bool]:
+    """Returns (ok, output, cancelled)."""
     cmd = ["mock", "-r", mock_config, "--rebuild", str(srpm_path), "--resultdir", str(result_dir)]
-    rc, out = _run(cmd, timeout_s=7200)
-    return rc == 0, out
+    rc, out = _run_with_abort(cmd, timeout_s=7200, abort_event=abort_event)
+    if rc == _RC_MOCK_CANCELLED:
+        return False, out, True
+    return rc == 0, out, False
 
 
 def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
+    done_event = threading.Event()
+    abort_event = threading.Event()
     try:
         attempt_id = job["build_attempt_id"]
+
+        def poll_cancel() -> None:
+            while not done_event.is_set():
+                try:
+                    r = session.get(
+                        f"{controller_url}/api/worker/cancel-check/{attempt_id}",
+                        timeout=15.0,
+                    )
+                    if r.status_code == 200 and r.json().get("cancel_requested"):
+                        abort_event.set()
+                        return
+                except Exception:
+                    pass
+                time.sleep(5)
+
+        threading.Thread(target=poll_cancel, daemon=True, name="oreon-cancel-poller").start()
+
         releasename = job.get("releasename") or "oreon11"
         branch = job.get("branch") or "dev"
         arch = job.get("architecture") or "x86_64"
@@ -436,11 +528,12 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
 
                 srpm_result_dir = tmp / "srpm_result"
                 srpm_result_dir.mkdir()
-                ok, srpm_path, srpm_out = _mock_build_srpm_from_spec(
+                ok, srpm_path, srpm_out, srpm_cancelled = _mock_build_srpm_from_spec(
                     mock_config=mock_config,
                     spec_path=spec_path,
                     sources_dir=sources_staging,
                     result_dir=srpm_result_dir,
+                    abort_event=abort_event,
                 )
                 mock_log_parts = _mock_logs_from_result_dir(srpm_result_dir, max_lines=log_max_lines)
                 has_build_or_root = any(("== mock log: build.log" in p) or ("== mock log: root.log" in p) for p in mock_log_parts)
@@ -453,6 +546,20 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                 else:
                     # Fallback to wrapper output if mock didn't write log files.
                     build_log_parts.append("== mock --buildsrpm (wrapper output) ==\n" + srpm_out.strip())
+                if srpm_cancelled:
+                    build_log_parts.append("== mock --buildsrpm (cancelled) ==\n" + srpm_out.strip())
+                    msg = "\n\n".join(build_log_parts).strip()
+                    _upload_bytes_to_r2(log_key, msg.encode("utf-8"), content_type="text/plain")
+                    session.post(
+                        f"{controller_url}/api/worker/result/{attempt_id}",
+                        json={
+                            "status": "cancelled",
+                            "log_r2_key": log_key,
+                            "error_message": "Build cancelled by user",
+                            "artifacts": [],
+                        },
+                    )
+                    return
                 if not ok or not srpm_path:
                     msg = "\n\n".join(build_log_parts).strip()
                     _upload_bytes_to_r2(log_key, msg.encode("utf-8"), content_type="text/plain")
@@ -472,7 +579,12 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
 
             result_dir = tmp / "result"
             result_dir.mkdir()
-            ok, rebuild_out = _mock_rebuild_srpm(mock_config=mock_config, srpm_path=srpm_path, result_dir=result_dir)
+            ok, rebuild_out, rebuild_cancelled = _mock_rebuild_srpm(
+                mock_config=mock_config,
+                srpm_path=srpm_path,
+                result_dir=result_dir,
+                abort_event=abort_event,
+            )
             mock_log_parts = _mock_logs_from_result_dir(result_dir, max_lines=log_max_lines)
             has_build_or_root = any(("== mock log: build.log" in p) or ("== mock log: root.log" in p) for p in mock_log_parts)
             if mock_log_parts:
@@ -481,6 +593,20 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                     build_log_parts.append("== mock --rebuild (wrapper output on failure) ==\n" + rebuild_out.strip())
             else:
                 build_log_parts.append("== mock --rebuild (wrapper output) ==\n" + rebuild_out.strip())
+            if rebuild_cancelled:
+                build_log_parts.append("== mock --rebuild (cancelled) ==\n" + rebuild_out.strip())
+                full_log = "\n\n".join([p for p in build_log_parts if p]).strip() + "\n"
+                _upload_bytes_to_r2(log_key, full_log.encode("utf-8"), content_type="text/plain")
+                session.post(
+                    f"{controller_url}/api/worker/result/{attempt_id}",
+                    json={
+                        "status": "cancelled",
+                        "log_r2_key": log_key,
+                        "error_message": "Build cancelled by user",
+                        "artifacts": [],
+                    },
+                )
+                return
             full_log = "\n\n".join([p for p in build_log_parts if p]).strip() + "\n"
 
             _upload_bytes_to_r2(log_key, full_log.encode("utf-8"), content_type="text/plain")
@@ -511,6 +637,8 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
             )
     except Exception:
         logger.exception("Unhandled error while processing job")
+    finally:
+        done_event.set()
 
 
 def main() -> None:
