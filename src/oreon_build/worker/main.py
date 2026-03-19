@@ -104,7 +104,9 @@ def _mock_logs_from_result_dir(result_dir: Path, max_lines: int) -> list[str]:
     mock usually writes the detailed build output to files like build.log/root.log.
     We read those files (if present) instead of relying only on wrapper stdout/stderr.
     """
-    wanted_names = ["build.log", "root.log", "state.log", "config.log"]
+    # Order matters because the GUI shows only the tail of the uploaded log.
+    # We want the most failure-relevant logs (build/root) to appear last.
+    wanted_names = ["state.log", "config.log", "build.log", "root.log"]
     parts: list[str] = []
     used_paths: set[str] = set()
 
@@ -296,8 +298,13 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                     result_dir=srpm_result_dir,
                 )
                 mock_log_parts = _mock_logs_from_result_dir(srpm_result_dir, max_lines=log_max_lines)
+                has_build_or_root = any(("== mock log: build.log" in p) or ("== mock log: root.log" in p) for p in mock_log_parts)
                 if mock_log_parts:
                     build_log_parts.extend(mock_log_parts)
+                    # Some mock setups only emit state.log; if that's the case, wrapper stdout/stderr
+                    # often contains the actual rpmbuild error we need.
+                    if not ok and not has_build_or_root:
+                        build_log_parts.append("== mock --buildsrpm (wrapper output on failure) ==\n" + srpm_out.strip())
                 else:
                     # Fallback to wrapper output if mock didn't write log files.
                     build_log_parts.append("== mock --buildsrpm (wrapper output) ==\n" + srpm_out.strip())
@@ -322,8 +329,11 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
             result_dir.mkdir()
             ok, rebuild_out = _mock_rebuild_srpm(mock_config=mock_config, srpm_path=srpm_path, result_dir=result_dir)
             mock_log_parts = _mock_logs_from_result_dir(result_dir, max_lines=log_max_lines)
+            has_build_or_root = any(("== mock log: build.log" in p) or ("== mock log: root.log" in p) for p in mock_log_parts)
             if mock_log_parts:
                 build_log_parts.extend(mock_log_parts)
+                if not ok and not has_build_or_root:
+                    build_log_parts.append("== mock --rebuild (wrapper output on failure) ==\n" + rebuild_out.strip())
             else:
                 build_log_parts.append("== mock --rebuild (wrapper output) ==\n" + rebuild_out.strip())
             full_log = "\n\n".join([p for p in build_log_parts if p]).strip() + "\n"
