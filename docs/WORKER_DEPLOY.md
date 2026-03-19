@@ -47,6 +47,7 @@ sudo systemctl enable --now oreon-worker
 also:
 
 - `sudo dnf install mock rpmdevtools`
+- `sudo dnf install rpm-sign`
 - `sudo usermod -a -G mock oreon-build`
 
 ## GPG and signing (local worker)
