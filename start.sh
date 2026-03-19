@@ -71,24 +71,51 @@ done
 
 source .venv/bin/activate
 
+# Logs
+LOG_DIR="${OREON_LOG_DIR:-.oreon-logs}"
+mkdir -p "$LOG_DIR"
+
 # API
-uvicorn oreon_build.api.main:app --host 0.0.0.0 --port 8000 &
+nohup uvicorn oreon_build.api.main:app --host 0.0.0.0 --port 8000 \
+  > "$LOG_DIR/oreon-api.log" 2>&1 &
 echo $! > .oreon-api.pid
 echo "API started (PID $(cat .oreon-api.pid)), http://localhost:8000"
 
 # Scheduler
-oreon-scheduler &
+nohup oreon-scheduler \
+  > "$LOG_DIR/oreon-scheduler.log" 2>&1 &
 echo $! > .oreon-scheduler.pid
 echo "Scheduler started (PID $(cat .oreon-scheduler.pid))"
 
 # Watchdog (security advisory dashboard)
 WATCHDOG_URL_VAL="${WATCHDOG_URL:-http://localhost:8001}"
-WATCHDOG_PORT="${WATCHDOG_URL_VAL##*:}"
-if [ -z "$WATCHDOG_PORT" ]; then
+
+# Extract port from common forms:
+# - "8001"
+# - "http://localhost:8001"
+# - "localhost:8001"
+if [[ "$WATCHDOG_URL_VAL" =~ ^[0-9]+$ ]]; then
+  WATCHDOG_PORT="$WATCHDOG_URL_VAL"
+elif [[ "$WATCHDOG_URL_VAL" =~ :([0-9]+) ]]; then
+  WATCHDOG_PORT="${BASH_REMATCH[1]}"
+else
   WATCHDOG_PORT=8001
 fi
-uvicorn oreon_build.watchdog.main:app --host 0.0.0.0 --port "$WATCHDOG_PORT" &
+
+nohup uvicorn oreon_build.watchdog.main:app --host 0.0.0.0 --port "$WATCHDOG_PORT" \
+  > "$LOG_DIR/oreon-watchdog.log" 2>&1 &
 echo $! > .oreon-watchdog.pid
 echo "Oreon Watchdog started (PID $(cat .oreon-watchdog.pid)), http://localhost:${WATCHDOG_PORT}"
+
+# Show actual logs (non-blocking)
+LOG_SHOW_LINES="${OREON_LOG_SHOW_LINES:-200}"
+sleep 1
+
+echo "---- Tail: API ($LOG_SHOW_LINES lines) ----"
+tail -n "$LOG_SHOW_LINES" "$LOG_DIR/oreon-api.log" 2>/dev/null || true
+echo "---- Tail: Scheduler ($LOG_SHOW_LINES lines) ----"
+tail -n "$LOG_SHOW_LINES" "$LOG_DIR/oreon-scheduler.log" 2>/dev/null || true
+echo "---- Tail: Watchdog ($LOG_SHOW_LINES lines) ----"
+tail -n "$LOG_SHOW_LINES" "$LOG_DIR/oreon-watchdog.log" 2>/dev/null || true
 
 echo "Done. Run ./stop.sh to stop."
