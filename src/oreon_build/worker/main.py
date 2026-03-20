@@ -372,16 +372,21 @@ def _mock_build_srpm_from_spec(
     sources_dir: Path,
     result_dir: Path,
     abort_event: threading.Event | None = None,
+    mock_unique_ext: str | None = None,
 ) -> tuple[bool, Path | None, str, bool]:
     """
     Build SRPM from spec/sources using mock (so dependencies are handled in chroot).
     Produces *.src.rpm in result_dir.
     Returns (ok, srpm_path, output, cancelled).
+
+    ``mock_unique_ext`` must be set per concurrent build on this host (e.g. attempt id);
+    otherwise mock shares one chroot per ``-r`` config and parallel jobs fail with
+    "Build root is locked by another process."
     """
-    cmd = [
-        "mock",
-        "-r",
-        mock_config,
+    cmd: list[str] = ["mock", "-r", mock_config]
+    if mock_unique_ext:
+        cmd += ["--uniqueext", mock_unique_ext]
+    cmd += [
         "--buildsrpm",
         "--spec",
         str(spec_path),
@@ -409,9 +414,13 @@ def _mock_rebuild_srpm(
     srpm_path: Path,
     result_dir: Path,
     abort_event: threading.Event | None = None,
+    mock_unique_ext: str | None = None,
 ) -> tuple[bool, str, bool]:
-    """Returns (ok, output, cancelled)."""
-    cmd = ["mock", "-r", mock_config, "--rebuild", str(srpm_path), "--resultdir", str(result_dir)]
+    """Returns (ok, output, cancelled). See :func:`_mock_build_srpm_from_spec` for ``mock_unique_ext``."""
+    cmd: list[str] = ["mock", "-r", mock_config]
+    if mock_unique_ext:
+        cmd += ["--uniqueext", mock_unique_ext]
+    cmd += ["--rebuild", str(srpm_path), "--resultdir", str(result_dir)]
     rc, out = _run_with_abort(cmd, timeout_s=7200, abort_event=abort_event)
     if rc == _RC_MOCK_CANCELLED:
         return False, out, True
@@ -465,6 +474,9 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                 json={"status": "failed", "log_r2_key": log_key, "error_message": msg},
             )
             return
+
+        # One chroot lock per mock "-r" config; parallel threads need distinct roots.
+        mock_unique_ext = f"oreon-{attempt_id}"
 
         with tempfile.TemporaryDirectory(prefix="oreon-worker-") as tmpdir:
             tmp = Path(tmpdir)
@@ -546,6 +558,7 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                     sources_dir=sources_staging,
                     result_dir=srpm_result_dir,
                     abort_event=abort_event,
+                    mock_unique_ext=mock_unique_ext,
                 )
                 mock_log_parts = _mock_logs_from_result_dir(srpm_result_dir, max_lines=log_max_lines)
                 has_build_or_root = any(("== mock log: build.log" in p) or ("== mock log: root.log" in p) for p in mock_log_parts)
@@ -596,6 +609,7 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                 srpm_path=srpm_path,
                 result_dir=result_dir,
                 abort_event=abort_event,
+                mock_unique_ext=mock_unique_ext,
             )
             mock_log_parts = _mock_logs_from_result_dir(result_dir, max_lines=log_max_lines)
             has_build_or_root = any(("== mock log: build.log" in p) or ("== mock log: root.log" in p) for p in mock_log_parts)
