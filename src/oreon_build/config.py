@@ -81,10 +81,13 @@ class Settings(BaseSettings):
     cve_scan_cooldown_hours: int = Field(default=24, ge=1, le=168, description="Cooldown for re-querying OSV per RPM")
     cve_scan_max_per_run: int = Field(default=50, ge=1, le=500, description="Max tracked RPMs to query per scan run")
 
-    # Signing
+    # Signing (controller only — workers upload unsigned RPMs; controller signs then pushes to R2)
     signing_key_id: Optional[str] = Field(default=None)
     signing_key_grip: Optional[str] = Field(default=None)
     gpg_home: str = Field(default="/var/lib/oreon-build/gnupg")
+
+    # Worker → controller RPM upload (single artifact size cap, MiB)
+    max_worker_rpm_upload_mib: int = Field(default=4096, ge=16, le=65536)
 
     # Logging
     log_level: str = Field(default="INFO")

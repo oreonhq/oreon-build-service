@@ -15,11 +15,12 @@
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 """
-Oreon Build Worker: polls controller, runs mock builds, uploads artifacts to R2.
+Oreon Build Worker: polls controller, runs mock builds, uploads build logs to R2.
 
-DistGit support: accepts a Source(kind="distgit", url="<repo>.git#branch:spec_relpath") and builds via:
-  mock --buildsrpm (spec + sources tree) -> SRPM
-  mock --rebuild SRPM -> binary RPMs
+Built RPMs are POSTed to the controller (`/api/worker/upload-rpm/...`); the controller GPG-signs
+and writes them to R2. No signing key or `rpm-sign` is required on workers.
+
+DistGit: Source(kind="distgit", url="<repo>.git#branch:spec_relpath") — mock --buildsrpm then mock --rebuild.
 """
 
 from __future__ import annotations
@@ -38,8 +39,7 @@ from pathlib import Path
 import httpx
 
 from oreon_build.config import get_settings
-from oreon_build.services.r2 import get_r2_client, log_r2_key, repo_rpms_key, src_r2_key
-from oreon_build.services.signing import sign_rpm
+from oreon_build.services.r2 import get_r2_client, log_r2_key
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -54,16 +54,28 @@ def _get_arch() -> str:
     return m
 
 
-def _upload_file_to_r2(r2_key: str, path: Path, content_type: str | None = None) -> None:
-    r2 = get_r2_client()
-    with open(path, "rb") as f:
-        r2.upload_fileobj(r2_key, f, content_type=content_type)
-    logger.info("Uploaded %s -> %s", path.name, r2_key)
-
-
 def _upload_bytes_to_r2(r2_key: str, data: bytes, content_type: str | None = None) -> None:
     r2 = get_r2_client()
     r2.put_object(r2_key, data, content_type=content_type)
+
+
+def _upload_rpm_to_controller(
+    session: httpx.Client,
+    controller_url: str,
+    attempt_id: int,
+    rpm_path: Path,
+) -> dict:
+    """POST RPM bytes to controller; controller signs and stores in R2. Returns artifact metadata dict."""
+    upload_timeout = httpx.Timeout(7200.0, connect=120.0)
+    with open(rpm_path, "rb") as fp:
+        files = {"file": (rpm_path.name, fp, "application/x-rpm")}
+        r = session.post(
+            f"{controller_url}/api/worker/upload-rpm/{attempt_id}",
+            files=files,
+            timeout=upload_timeout,
+        )
+    r.raise_for_status()
+    return r.json()
 
 
 def _run(cmd: list[str], timeout_s: int, cwd: str | None = None) -> tuple[int, str]:
@@ -616,14 +628,32 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                 if not f.is_file():
                     continue
                 fname = f.name
-                signed = sign_rpm(f)
-                if fname.endswith(".src.rpm"):
-                    art_key = src_r2_key(releasename, branch, fname)
-                else:
-                    art_key = repo_rpms_key(releasename, branch, arch, fname)
-                _upload_file_to_r2(art_key, f)
+                try:
+                    meta = _upload_rpm_to_controller(session, controller_url, attempt_id, f)
+                except Exception as upload_err:
+                    err_msg = f"Failed to upload RPM to controller ({fname}): {upload_err}"
+                    logger.exception("%s", err_msg)
+                    fail_log = full_log + "\n\n== " + err_msg + "\n"
+                    _upload_bytes_to_r2(log_key, fail_log.encode("utf-8"), content_type="text/plain")
+                    session.post(
+                        f"{controller_url}/api/worker/result/{attempt_id}",
+                        json={
+                            "status": "failed",
+                            "log_r2_key": log_key,
+                            "error_message": fail_log[:2000],
+                            "artifacts": artifacts_payload,
+                        },
+                    )
+                    return
                 artifacts_payload.append(
-                    {"kind": "rpm", "filename": fname, "r2_key": art_key, "signed": signed}
+                    {
+                        "kind": "rpm",
+                        "filename": meta.get("filename") or fname,
+                        "r2_key": meta["r2_key"],
+                        "signed": bool(meta.get("signed")),
+                        "size_bytes": meta.get("size_bytes"),
+                        "checksum_sha256": meta.get("checksum_sha256"),
+                    }
                 )
 
             session.post(

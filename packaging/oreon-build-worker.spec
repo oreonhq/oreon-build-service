@@ -6,7 +6,7 @@
 
 Name:           oreon-build-worker
 Version:        1.0.0
-Release:        12%{?dist}
+Release:        13%{?dist}
 Summary:        Oreon Build Service worker daemon
 License:        GPLv3
 URL:            https://github.com/oreon/oreon-build-service
@@ -24,7 +24,6 @@ BuildRequires:  libffi-devel
 BuildRequires:  libpq-devel
 
 Requires:       python3 >= 3.11
-Requires:       rpm-sign
 Requires:       mock
 Requires:       python3-pydantic
 Requires:       rpmdevtools

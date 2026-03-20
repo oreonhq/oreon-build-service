@@ -1,10 +1,11 @@
 # Oreon Build Worker Deployment
 
-This guide explains how to run an Oreon build worker. The worker polls the controller for jobs, runs mock builds, and uploads logs and build artifacts to Cloudflare R2.
+This guide explains how to run an Oreon build worker. Workers poll the controller, run `mock` builds, **upload build logs to R2**, and **POST built RPMs to the controller** (the controller GPG-signs RPMs and pushes them to R2). Workers do **not** need a signing key or `rpm-sign`.
 
 ## Deploy with RPM (best way)
 
 The worker package is currently available in Oreon 10 repositories.
+
 ### 1. Install the worker
 
 ```bash
@@ -16,6 +17,7 @@ The package creates `/usr/bin/oreon-worker`, the `oreon-worker.service` unit, an
 ### 2. Enroll the worker (per instance)
 
 An admin enrolls the worker to get a one-time token.
+
 1. Log in as admin (e.g. http://localhost:8000).
 2. Open Workers.
 3. In "Enroll worker", set worker name (e.g. `worker-1-x86_64`), enrollment token (`WORKER_ENROLLMENT_SECRET` from controller `.env`), and architecture (e.g. `x86_64`).
@@ -33,8 +35,7 @@ Set:
 - `CONTROLLER_URL` – e.g. `http://192.168.1.10:8000` (controller API, no trailing slash)
 - `OREON_WORKER_TOKEN` – token from step 2
 - `OREON_WORKER_NAME` – optional, default `worker-1`
-- `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, `R2_ENDPOINT_URL` – same bucket/creds as the controller so uploads land in one place
-- **Signing (optional but recommended):** `SIGNING_KEY_ID` (GPG key ID or fingerprint) and `GPG_HOME` (e.g. `/var/lib/oreon-build/gnupg`). Every worker that runs builds needs the same keyring if you want signed RPMs. Without these, builds succeed but artifacts show **Signed: No**.
+- `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, `R2_ENDPOINT_URL` – same bucket/creds as the controller (used for build logs only)
 
 Restrict the file: `sudo chmod 600 /etc/oreon-build-worker/oreon-worker.env`
 
@@ -44,35 +45,22 @@ Restrict the file: `sudo chmod 600 /etc/oreon-build-worker/oreon-worker.env`
 sudo systemctl enable --now oreon-worker
 ```
 
-also:
+Also on the worker host:
 
 - `sudo dnf install mock rpmdevtools`
-- `sudo dnf install rpm-sign`
 - `sudo usermod -a -G mock oreon-build`
 
-## GPG and signing (local worker)
+**Do not** install `rpm-sign` or copy GPG keyrings to workers for RPM artifacts; signing runs on the **controller** (`SIGNING_KEY_ID`, `GPG_HOME`, and `rpm-sign` there).
 
-# Create the directory
-sudo mkdir -p /var/lib/oreon-build/gnupg
+## Cancelling builds
 
-# Copy the keyring (use the keyring you already use for signing)
-sudo cp -r ~/.gnupg/* /var/lib/oreon-build/gnupg/
-
-# Ownership and permissions
-sudo chown -R oreon-build:oreon-build /var/lib/oreon-build/gnupg
-sudo chmod 700 /var/lib/oreon-build/gnupg
-sudo chmod 600 /var/lib/oreon-build/gnupg/private-keys-v1.d/* 2>/dev/null || true
-
-## GPG and signing (remote worker)
-
-1. on worker: sudo mkdir -p /var/lib/oreon-build/gnupg
-2. scp -r ~/.gnupg/* root@worker-host:/var/lib/oreon-build/gnupg/
-3. on worker: chown -R oreon-build:oreon-build /var/lib/oreon-build/gnupg && chmod 700 /var/lib/oreon-build/gnupg && chmod 600 /var/lib/oreon-build/gnupg/private-keys-v1.d/* 2>/dev/null || true
+The controller marks the job and running attempts cancelled. Workers poll `GET /api/worker/cancel-check/{attempt_id}` and kill `mock` when a cancel is detected.
 
 ## Multiple workers
 
-Give each host a unique `OREON_WORKER_NAME` (worker-1, worker-2, ...). Enroll each worker and set its token in that host's `oreon-worker.env`. You can run multiple workers on one machine (separate units and env files) or one worker per machine. Also, note that by default, the controller can run 3 (or so) builds at a time on one worker to keep the amount of workers needed low, which is great for limited or cost-sensitive infra. You of course can lower this limit in the worker env.
+Give each host a unique `OREON_WORKER_NAME` (worker-1, worker-2, …). Enroll each worker and set its token in that host's `oreon-worker.env`.
 
 ## Troubleshooting
 
-Feel free to open an issue if you face any issues.
+- **Controller signing:** Configure `SIGNING_KEY_ID` and `GPG_HOME` on the **controller** `.env` and install `rpm-sign` on the controller host.
+- Open an issue if something else breaks.
