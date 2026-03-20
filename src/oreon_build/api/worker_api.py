@@ -1,10 +1,16 @@
-"""Worker-facing API: poll job, heartbeat, report result, stream log/artifacts to R2."""
+"""Worker-facing API: poll job, heartbeat, upload RPMs for signing, report result."""
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import logging
+import os
+import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile, status
 from pydantic import BaseModel
 from sqlalchemy import select, func
 
@@ -30,8 +36,10 @@ from oreon_build.models import (
 )
 from oreon_build.services.r2 import get_r2_client, repo_r2_prefix, repo_rpms_key, src_r2_key
 from oreon_build.services.publisher import update_repodata_at_prefix
+from oreon_build.services.signing import sign_rpm
 
 router = APIRouter(prefix="/worker", tags=["worker"])
+logger = logging.getLogger(__name__)
 
 
 async def get_worker(
@@ -235,6 +243,116 @@ async def cancel_check(
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
     return {"cancel_requested": job.status == BuildStatus.CANCELLED}
+
+
+def _put_rpm_bytes_to_r2(key: str, raw: bytes) -> None:
+    get_r2_client().put_object(key, raw, content_type="application/x-rpm")
+
+
+@router.post("/upload-rpm/{attempt_id}")
+async def upload_worker_rpm(
+    attempt_id: int,
+    db: DbSession,
+    worker: Annotated[Worker, Depends(_require_worker)],
+    file: UploadFile = File(...),
+):
+    """
+    Receive a built RPM from a worker, GPG-sign on the controller, push to R2, delete temp file.
+    Workers no longer need signing keys or direct R2 write access for RPM artifacts.
+    """
+    settings = get_settings()
+    max_bytes = settings.max_worker_rpm_upload_mib * 1024 * 1024
+
+    fname = (file.filename or "package.rpm").strip()
+    if not fname.lower().endswith(".rpm"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Filename must end with .rpm",
+        )
+
+    result = await db.execute(
+        select(BuildAttempt).where(
+            BuildAttempt.id == attempt_id,
+            BuildAttempt.worker_id == worker.id,
+        )
+    )
+    attempt = result.scalar_one_or_none()
+    if not attempt:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attempt not found")
+
+    job_result = await db.execute(select(BuildJob).where(BuildJob.id == attempt.build_job_id))
+    job = job_result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if job.status == BuildStatus.CANCELLED:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Job cancelled")
+
+    rel_result = await db.execute(select(Release).where(Release.id == job.release_id))
+    release = rel_result.scalar_one_or_none()
+    if not release:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Release missing")
+
+    arch = "x86_64"
+    if job.target_id:
+        t_result = await db.execute(select(BuildTarget).where(BuildTarget.id == job.target_id))
+        t = t_result.scalar_one_or_none()
+        if t and t.architecture:
+            arch = t.architecture
+    branch = getattr(job, "branch", None) or "dev"
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".rpm")
+    os.close(fd)
+    path = Path(tmp_path)
+    raw: bytes = b""
+    signed = False
+    digest = ""
+    r2_key = ""
+    try:
+        total = 0
+        with open(path, "wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail=f"RPM exceeds max {settings.max_worker_rpm_upload_mib} MiB",
+                    )
+                out.write(chunk)
+
+        signed = await asyncio.to_thread(sign_rpm, path)
+        raw = await asyncio.to_thread(path.read_bytes)
+        digest = hashlib.sha256(raw).hexdigest()
+
+        if fname.endswith(".src.rpm"):
+            r2_key = src_r2_key(release.releasename, branch, fname)
+        else:
+            r2_key = repo_rpms_key(release.releasename, branch, arch, fname)
+
+        await asyncio.to_thread(_put_rpm_bytes_to_r2, r2_key, raw)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("upload-rpm failed attempt_id=%s", attempt_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to process RPM",
+        ) from exc
+    finally:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    return {
+        "filename": fname,
+        "r2_key": r2_key,
+        "signed": signed,
+        "size_bytes": len(raw),
+        "checksum_sha256": digest,
+    }
 
 
 @router.post("/result/{attempt_id}")
