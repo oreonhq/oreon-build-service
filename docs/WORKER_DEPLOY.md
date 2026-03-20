@@ -1,7 +1,5 @@
 # Oreon Build Worker Deployment
 
-This guide explains how to run an Oreon build worker. Workers poll the controller, run `mock` builds, **upload build logs to R2**, and **POST built RPMs to the controller** (the controller GPG-signs RPMs and pushes them to R2). Workers do **not** need a signing key or `rpm-sign`.
-
 ## Deploy with RPM (best way)
 
 The worker package is currently available in Oreon 10 repositories.
@@ -62,5 +60,4 @@ Give each host a unique `OREON_WORKER_NAME` (worker-1, worker-2, …). Enroll ea
 
 ## Troubleshooting
 
-- **Controller signing:** Configure `SIGNING_KEY_ID` and `GPG_HOME` on the **controller** `.env` and install `rpm-sign` on the controller host.
 - Open an issue if something else breaks.
