@@ -6,7 +6,7 @@
 
 Name:           oreon-build-worker
 Version:        1.0.0
-Release:        16%{?dist}
+Release:        17%{?dist}
 Summary:        Oreon Build Service worker daemon
 License:        GPLv3
 URL:            https://github.com/oreon/oreon-build-service
@@ -80,6 +80,14 @@ UNIT
 %pre
 getent group oreon-build >/dev/null 2>&1 || groupadd -r oreon-build
 getent passwd oreon-build >/dev/null 2>&1 || useradd -r -g oreon-build -s /sbin/nologin -d /var/lib/oreon-build-worker oreon-build
+
+%post
+# After install: drop pip-vendored pydantic trees so the system python3-pydantic package is used.
+# (%post runs as root; same effect as the sudo rm commands below.)
+rm -rf %{_prefix}/lib/oreon-build-worker/pydantic
+rm -rf %{_prefix}/lib/oreon-build-worker/pydantic-*
+rm -rf %{_prefix}/lib/oreon-build-worker/pydantic_core
+rm -rf %{_prefix}/lib/oreon-build-worker/pydantic_core-*
 
 %files
 %{_bindir}/oreon-worker
