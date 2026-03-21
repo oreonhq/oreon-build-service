@@ -20,6 +20,9 @@ Oreon Build Worker: polls controller, runs mock builds, uploads build logs to R2
 Built RPMs are POSTed to the controller (`/api/worker/upload-rpm/...`); the controller GPG-signs
 and writes them to R2. No signing key or `rpm-sign` is required on workers.
 
+After each job, the worker runs ``mock --scrub=all`` for that job’s ``--uniqueext`` (frees ``/var/lib/mock``),
+removes its work directory, and prunes stale ``oreon-worker-*`` temp dirs (see env vars in deploy docs).
+
 DistGit: Source(kind="distgit", url="<repo>.git#branch:spec_relpath") — mock --buildsrpm then mock --rebuild.
 """
 
@@ -571,6 +574,80 @@ def _mock_rebuild_srpm(
     return rc == 0, out, False
 
 
+def _worker_temp_parent_dir() -> str | None:
+    """Optional dedicated parent for worker scratch dirs (keeps system /tmp free)."""
+    p = (os.environ.get("OREON_WORKER_TMP_PARENT") or "").strip()
+    return p or None
+
+
+def _mock_scrub_unique_chroot(mock_config: str, mock_unique_ext: str) -> None:
+    """
+    Delete mock chroot + bootstrap for this job's ``--uniqueext`` (frees space under
+    ``/var/lib/mock``). Safe to call even if the build never created a root.
+    """
+    if not mock_config or not mock_unique_ext:
+        return
+    timeout = int(os.environ.get("OREON_WORKER_MOCK_SCRUB_TIMEOUT_SEC", "3600"))
+    cmd = [
+        "mock",
+        "-r",
+        mock_config,
+        "--uniqueext",
+        mock_unique_ext,
+        "--scrub",
+        "all",
+    ]
+    rc, out = _run(cmd, timeout_s=max(120, timeout))
+    if rc != 0:
+        snippet = _tail_lines(out, 40) if out else ""
+        logger.warning(
+            "mock --scrub=all failed (rc=%s) for -r %s --uniqueext %s: %s",
+            rc,
+            mock_config,
+            mock_unique_ext,
+            snippet,
+        )
+
+
+def _prune_stale_oreon_worker_tempdirs() -> None:
+    """
+    Remove ``oreon-worker-*`` directories older than OREON_WORKER_PRUNE_TMP_AGE_SEC (default 300s).
+    Set OREON_WORKER_PRUNE_TMP_AGE_SEC=0 to disable. Covers TMPDIR and OREON_WORKER_TMP_PARENT.
+    """
+    age = int(os.environ.get("OREON_WORKER_PRUNE_TMP_AGE_SEC", "300"))
+    if age <= 0:
+        return
+    now = time.time()
+    roots: list[Path] = []
+    roots.append(Path(tempfile.gettempdir()))
+    extra = _worker_temp_parent_dir()
+    if extra:
+        roots.append(Path(extra))
+    seen: set[str] = set()
+    for root in roots:
+        try:
+            key = str(root.resolve())
+        except OSError:
+            key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not root.is_dir():
+            continue
+        try:
+            for p in root.glob("oreon-worker-*"):
+                if not p.is_dir():
+                    continue
+                try:
+                    if now - p.stat().st_mtime < age:
+                        continue
+                except OSError:
+                    continue
+                shutil.rmtree(p, ignore_errors=True)
+        except OSError:
+            pass
+
+
 def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
     done_event = threading.Event()
     abort_event = threading.Event()
@@ -621,8 +698,22 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
 
         # One chroot lock per mock "-r" config; parallel threads need distinct roots.
         mock_unique_ext = f"oreon-{attempt_id}"
+        scrub_mock_cfg = mock_config
+        scrub_mock_ext = mock_unique_ext
 
-        with tempfile.TemporaryDirectory(prefix="oreon-worker-") as tmpdir:
+        tmp_parent = _worker_temp_parent_dir()
+        if tmp_parent:
+            try:
+                Path(tmp_parent).mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                logger.warning("OREON_WORKER_TMP_PARENT=%s not usable (%s), using default temp dir", tmp_parent, e)
+                tmp_parent = None
+        tmpdir = (
+            tempfile.mkdtemp(prefix="oreon-worker-", dir=tmp_parent)
+            if tmp_parent
+            else tempfile.mkdtemp(prefix="oreon-worker-")
+        )
+        try:
             tmp = Path(tmpdir)
             build_log_parts: list[str] = []
             log_max_lines = int(os.environ.get("OREON_WORKER_LOG_MAX_LINES", "40000"))
@@ -821,6 +912,10 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                     "artifacts": artifacts_payload,
                 },
             )
+        finally:
+            _mock_scrub_unique_chroot(scrub_mock_cfg, scrub_mock_ext)
+            _prune_stale_oreon_worker_tempdirs()
+            shutil.rmtree(tmpdir, ignore_errors=True)
     except Exception:
         logger.exception("Unhandled error while processing job")
     finally:

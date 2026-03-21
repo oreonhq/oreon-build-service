@@ -48,8 +48,6 @@ Also on the worker host:
 - `sudo dnf install mock rpmdevtools`
 - `sudo usermod -a -G mock oreon-build`
 
-**Do not** install `rpm-sign` or copy GPG keyrings to workers for RPM artifacts; signing runs on the **controller** (`SIGNING_KEY_ID`, `GPG_HOME`, and `rpm-sign` there).
-
 ## Cancelling builds
 
 The controller marks the job and running attempts cancelled. Workers poll `GET /api/worker/cancel-check/{attempt_id}` and kill `mock` when a cancel is detected.
