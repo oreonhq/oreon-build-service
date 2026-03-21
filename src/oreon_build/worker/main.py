@@ -168,56 +168,71 @@ def _read_text_file(path: Path) -> str:
         return ""
 
 
-def _mock_logs_from_result_dir(result_dir: Path, max_lines: int) -> list[str]:
+def _read_mock_log_tail(result_dir: Path, log_basename: str, max_lines: int) -> str:
+    """Read the newest ``log_basename`` under result_dir (e.g. build.log) and return a tailed body."""
+    matches = sorted(result_dir.rglob(log_basename))
+    if not matches:
+        return ""
+    txt = _read_text_file(matches[-1])
+    if not txt.strip():
+        return ""
+    return _tail_lines(txt, max_lines).strip()
+
+
+def _strip_mock_cli_noise(text: str) -> str:
     """
-    mock usually writes the detailed build output to files like build.log/root.log.
-    We read those files (if present) instead of relying only on wrapper stdout/stderr.
+    Drop mock's repetitive INFO/DEBUG lines from combined stdout/stderr so UI logs stay readable.
+    Keeps ERROR/WARNING and anything else (e.g. tracebacks, rpmbuild lines if echoed).
     """
-    # Order matters because the GUI shows only the tail of the uploaded log.
-    # We want the most failure-relevant logs (build/root) to appear last.
-    wanted_names = ["state.log", "config.log", "build.log", "root.log"]
-    parts: list[str] = []
-    used_paths: set[str] = set()
-
-    for name in wanted_names:
-        matches = sorted(result_dir.rglob(name))
-        if not matches:
+    out: list[str] = []
+    for line in text.splitlines():
+        t = line.strip()
+        if t.startswith("INFO:") or t.startswith("DEBUG:"):
             continue
-        # Prefer the "last" match (deeper nested setups can exist)
-        p = matches[-1]
-        p_key = str(p)
-        if p_key in used_paths:
-            continue
-        used_paths.add(p_key)
+        out.append(line)
+    return "\n".join(out).strip()
 
-        txt = _read_text_file(p)
-        if not txt.strip():
-            continue
-        rel = ""
-        try:
-            rel = str(p.relative_to(result_dir))
-        except Exception:
-            rel = p.name
 
-        txt = _tail_lines(txt, max_lines)
-        parts.append(f"== mock log: {name} ({rel}) ==\n{txt.strip()}")
+def _mock_stage_log_sections(
+    result_dir: Path,
+    *,
+    stage_title: str,
+    mock_rc_ok: bool,
+    cancelled: bool,
+    wrapper_output: str,
+    max_build_log_lines: int,
+    chroot_tail_lines: int = 120,
+) -> list[str]:
+    """
+    Build user-facing log sections from a mock ``--resultdir``.
 
-    # Fallback: if none of the known logs exist, grab up to a few *.log files.
-    if not parts:
-        generic = sorted(result_dir.rglob("*.log"))[:5]
-        for p in generic:
-            txt = _read_text_file(p)
-            if not txt.strip():
-                continue
-            rel = ""
-            try:
-                rel = str(p.relative_to(result_dir))
-            except Exception:
-                rel = p.name
-            txt = _tail_lines(txt, max_lines)
-            parts.append(f"== mock log: {p.name} ({rel}) ==\n{txt.strip()}")
+    Primary content is **build.log** (rpmbuild output inside the chroot). We omit state.log,
+    config.log, and full root.log to avoid chroot/dnf noise. On failure before rpmbuild runs,
+    a short tail of root.log is included only when build.log is empty.
+    """
+    sections: list[str] = []
+    build_txt = _read_mock_log_tail(result_dir, "build.log", max_build_log_lines)
+    wrapper_clean = _strip_mock_cli_noise(wrapper_output)
 
-    return parts
+    if build_txt:
+        sections.append(f"## {stage_title}\n{build_txt}")
+
+    if cancelled:
+        if wrapper_clean:
+            sections.append(f"## {stage_title} — cancelled\n{wrapper_clean}")
+        return sections
+
+    if not mock_rc_ok:
+        if not build_txt and chroot_tail_lines > 0:
+            root_tail = _read_mock_log_tail(result_dir, "root.log", chroot_tail_lines)
+            if root_tail:
+                sections.append(f"## {stage_title} — setup failed before rpmbuild (root.log tail)\n{root_tail}")
+        if wrapper_clean:
+            sections.append(f"## {stage_title} — mock\n{wrapper_clean}")
+    elif not build_txt and wrapper_clean:
+        sections.append(f"## {stage_title}\n{wrapper_clean}")
+
+    return sections
 
 
 def _parse_distgit_url(distgit_url: str) -> tuple[str, str | None, str | None]:
@@ -234,7 +249,7 @@ def _parse_distgit_url(distgit_url: str) -> tuple[str, str | None, str | None]:
 
 
 def _clone_repo(repo: str, branch: str | None, dst: Path) -> tuple[bool, str]:
-    cmd = ["git", "clone", "--depth", "1"]
+    cmd = ["git", "clone", "--quiet", "--depth", "1"]
     if branch:
         cmd += ["-b", branch]
     cmd += [repo, str(dst)]
@@ -247,7 +262,7 @@ def _maybe_git_lfs_pull(repo_dir: Path) -> tuple[int, str]:
     ga = repo_dir / ".gitattributes"
     try:
         if ga.is_file() and "filter=lfs" in ga.read_text(encoding="utf-8", errors="replace"):
-            return _run(["git", "-C", str(repo_dir), "lfs", "pull"], timeout_s=1200)
+            return _run(["git", "-C", str(repo_dir), "lfs", "pull", "-q"], timeout_s=1200)
     except OSError:
         pass
     return 0, ""
@@ -312,10 +327,9 @@ def _copy_local_spec_sources_listed_by_spectool(spec_path: Path, staging_dir: Pa
         except OSError as e:
             return False, f"copy failed for {rel}: {e}"
 
-    parts = [
-        f"local Source/Patch files copied ({len(copied)}): "
-        f"{', '.join(copied[:25])}{' ...' if len(copied) > 25 else ''}"
-    ]
+    shown = copied[:8]
+    suffix = " …" if len(copied) > 8 else ""
+    parts = [f"Local Source/Patch: {len(copied)} file(s){(': ' + ', '.join(shown) + suffix) if copied else ''}"]
     if missing:
         parts.append("missing local files: " + ", ".join(missing[:30]))
         return False, "\n".join(parts)
@@ -353,10 +367,9 @@ def _prepare_mock_sources_with_spectool(spec_path: Path, staging_dir: Path) -> t
 
     files = sorted(staging_dir.rglob("*")) if staging_dir.is_dir() else []
     names = [f.name for f in files if f.is_file()]
-    log_parts = [
-        f"spectool -g fetched URL sources ({len(names)} files): "
-        f"{', '.join(names[:15])}{' ...' if len(names) > 15 else ''}"
-    ]
+    head = ", ".join(names[:6])
+    more = f" (+{len(names) - 6} more)" if len(names) > 6 else ""
+    log_parts = [f"URL sources via spectool: {len(names)} file(s){(': ' + head + more) if names else ''}"]
 
     ok_local, local_log = _copy_local_spec_sources_listed_by_spectool(spec_path, staging_dir)
     log_parts.append(local_log)
@@ -510,7 +523,8 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                     return
                 git_dir = tmp / "distgit"
                 ok, git_out = _clone_repo(repo, branch_name, git_dir)
-                build_log_parts.append("== git clone ==\n" + git_out.strip())
+                if git_out.strip():
+                    build_log_parts.append("## Git clone\n" + git_out.strip())
                 if not ok:
                     msg = "\n\n".join(build_log_parts).strip()
                     _upload_bytes_to_r2(log_key, msg.encode("utf-8"), content_type="text/plain")
@@ -521,9 +535,7 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                     return
                 lfs_rc, lfs_out = _maybe_git_lfs_pull(git_dir)
                 if lfs_out.strip():
-                    build_log_parts.append(
-                        f"== git lfs pull (rc={lfs_rc}) ==\n{lfs_out.strip()}"
-                    )
+                    build_log_parts.append(f"## Git LFS (rc={lfs_rc})\n{lfs_out.strip()}")
                 spec_path = git_dir / spec_rel
                 if not spec_path.is_file():
                     build_log_parts.append(f"Spec not found: {spec_rel}")
@@ -540,7 +552,7 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                     spec_path=spec_path,
                     staging_dir=sources_staging,
                 )
-                build_log_parts.append("== distgit sources for mock ==\n" + src_log)
+                build_log_parts.append("## Source prep\n" + src_log)
                 if not src_ok:
                     msg = "\n\n".join(build_log_parts).strip()
                     _upload_bytes_to_r2(log_key, msg.encode("utf-8"), content_type="text/plain")
@@ -560,19 +572,17 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                     abort_event=abort_event,
                     mock_unique_ext=mock_unique_ext,
                 )
-                mock_log_parts = _mock_logs_from_result_dir(srpm_result_dir, max_lines=log_max_lines)
-                has_build_or_root = any(("== mock log: build.log" in p) or ("== mock log: root.log" in p) for p in mock_log_parts)
-                if mock_log_parts:
-                    build_log_parts.extend(mock_log_parts)
-                    # Some mock setups only emit state.log; if that's the case, wrapper stdout/stderr
-                    # often contains the actual rpmbuild error we need.
-                    if not ok and not has_build_or_root:
-                        build_log_parts.append("== mock --buildsrpm (wrapper output on failure) ==\n" + srpm_out.strip())
-                else:
-                    # Fallback to wrapper output if mock didn't write log files.
-                    build_log_parts.append("== mock --buildsrpm (wrapper output) ==\n" + srpm_out.strip())
+                build_log_parts.extend(
+                    _mock_stage_log_sections(
+                        srpm_result_dir,
+                        stage_title="SRPM build (mock --buildsrpm)",
+                        mock_rc_ok=ok,
+                        cancelled=srpm_cancelled,
+                        wrapper_output=srpm_out,
+                        max_build_log_lines=log_max_lines,
+                    )
+                )
                 if srpm_cancelled:
-                    build_log_parts.append("== mock --buildsrpm (cancelled) ==\n" + srpm_out.strip())
                     msg = "\n\n".join(build_log_parts).strip()
                     _upload_bytes_to_r2(log_key, msg.encode("utf-8"), content_type="text/plain")
                     session.post(
@@ -611,16 +621,17 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                 abort_event=abort_event,
                 mock_unique_ext=mock_unique_ext,
             )
-            mock_log_parts = _mock_logs_from_result_dir(result_dir, max_lines=log_max_lines)
-            has_build_or_root = any(("== mock log: build.log" in p) or ("== mock log: root.log" in p) for p in mock_log_parts)
-            if mock_log_parts:
-                build_log_parts.extend(mock_log_parts)
-                if not ok and not has_build_or_root:
-                    build_log_parts.append("== mock --rebuild (wrapper output on failure) ==\n" + rebuild_out.strip())
-            else:
-                build_log_parts.append("== mock --rebuild (wrapper output) ==\n" + rebuild_out.strip())
+            build_log_parts.extend(
+                _mock_stage_log_sections(
+                    result_dir,
+                    stage_title="Binary RPM build (mock --rebuild)",
+                    mock_rc_ok=ok,
+                    cancelled=rebuild_cancelled,
+                    wrapper_output=rebuild_out,
+                    max_build_log_lines=log_max_lines,
+                )
+            )
             if rebuild_cancelled:
-                build_log_parts.append("== mock --rebuild (cancelled) ==\n" + rebuild_out.strip())
                 full_log = "\n\n".join([p for p in build_log_parts if p]).strip() + "\n"
                 _upload_bytes_to_r2(log_key, full_log.encode("utf-8"), content_type="text/plain")
                 session.post(
