@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import platform
 import shutil
 import subprocess
@@ -179,18 +180,140 @@ def _read_mock_log_tail(result_dir: Path, log_basename: str, max_lines: int) -> 
     return _tail_lines(txt, max_lines).strip()
 
 
-def _strip_mock_cli_noise(text: str) -> str:
+# mock's Python logging: "DEBUG util.py:461:  message" (note: space after DEBUG, not "DEBUG:")
+_RE_MOCK_PY_DEBUG = re.compile(r"^\s*DEBUG\s+(\S+\.py):(\d+):\s*(.*)$")
+_RE_MOCK_PY_INFO = re.compile(r"^\s*INFO\s+(\S+\.py):(\d+):\s*(.*)$")
+_RE_MOCK_PY_WARNING = re.compile(r"^\s*WARNING\s+(\S+\.py):(\d+):\s*(.*)$")
+
+# Substrings of mock/dnf housekeeping lines (drop whole line or DEBUG-wrapped message)
+_MOCK_INFRA_SNIPPETS = (
+    "child environment:",
+    "executing command:",
+    "child return code was:",
+    "kill orphans in chroot",
+    "removing intree",
+    "umount",
+    "unmounting",
+)
+
+# Lines in build.log that usually indicate failure (for tail-first UIs)
+_RE_BUILD_ERROR_HINT = re.compile(
+    r"(?i)(\berror:\b|\bfatal\b|\*\*\*\s|BUILD FAILED|RPM build errors|recipe failed|"
+    r"undefined reference|incorrect format|no such file|cannot find|command not found|"
+    r"make\[\d+\]: \*\*\*|error TS|error: |error \d+|traceback|\bFAILED\b)"
+)
+
+
+def _sanitize_mock_log_line(line: str) -> str | None:
     """
-    Drop mock's repetitive INFO/DEBUG lines from combined stdout/stderr so UI logs stay readable.
-    Keeps ERROR/WARNING and anything else (e.g. tracebacks, rpmbuild lines if echoed).
+    Normalize or drop a single log line. Mock emits ``DEBUG util.py:N: ...``; we keep only the
+    message after the colon when it is not pure infrastructure noise. Returns None to omit the line.
     """
+    raw = line.rstrip("\n")
+    stripped = raw.strip()
+    if not stripped:
+        return None
+
+    low = stripped.lower()
+    for snip in _MOCK_INFRA_SNIPPETS:
+        if snip in low:
+            return None
+
+    if stripped.startswith("INFO:") or stripped.startswith("DEBUG:"):
+        return None
+
+    for rx in (_RE_MOCK_PY_DEBUG, _RE_MOCK_PY_INFO, _RE_MOCK_PY_WARNING):
+        m = rx.match(raw)
+        if not m:
+            continue
+        msg = (m.group(3) or "").strip()
+        if not msg:
+            return None
+        mlow = msg.lower()
+        for snip in _MOCK_INFRA_SNIPPETS:
+            if snip in mlow:
+                return None
+        # Most INFO/WARNING from mock's util.py is noise; keep if it looks actionable
+        if rx is _RE_MOCK_PY_INFO or rx is _RE_MOCK_PY_WARNING:
+            if not _RE_BUILD_ERROR_HINT.search(msg):
+                return None
+        return msg
+
+    return stripped
+
+
+def _sanitize_mock_output(text: str) -> str:
+    """Strip mock Python DEBUG/INFO noise, dedupe consecutive identical lines."""
     out: list[str] = []
     for line in text.splitlines():
-        t = line.strip()
-        if t.startswith("INFO:") or t.startswith("DEBUG:"):
+        cleaned = _sanitize_mock_log_line(line)
+        if cleaned is None:
             continue
-        out.append(line)
-    return "\n".join(out).strip()
+        out.append(cleaned)
+    deduped: list[str] = []
+    prev: str | None = None
+    for L in out:
+        if L == prev:
+            continue
+        deduped.append(L)
+        prev = L
+    return "\n".join(deduped).strip()
+
+
+def _extract_build_error_highlights(text: str, max_lines: int = 80) -> str:
+    """Pull likely error lines from a full (sanitized) build log for tail-first web UIs."""
+    seen: set[str] = set()
+    hits: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if len(s) < 4:
+            continue
+        if not _RE_BUILD_ERROR_HINT.search(s):
+            continue
+        if s in seen:
+            continue
+        seen.add(s)
+        hits.append(s)
+        if len(hits) >= max_lines:
+            break
+    return "\n".join(hits).strip()
+
+
+def _format_build_log_display(
+    result_dir: Path,
+    *,
+    max_tail_lines: int,
+    failed_or_cancelled: bool,
+    max_read_bytes: int = 5 * 1024 * 1024,
+) -> str:
+    """
+    Prefer **build.log** (rpmbuild). On failure/cancel, scan a capped full file for error lines
+    and append ``## Detected errors`` so dashboards that only show the log *tail* still see causes.
+    """
+    matches = sorted(result_dir.rglob("build.log"))
+    if not matches:
+        return ""
+    path = matches[-1]
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return ""
+    if len(raw) > max_read_bytes:
+        raw = raw[:max_read_bytes]
+    full = raw.decode("utf-8", errors="replace")
+    if not full.strip():
+        return ""
+
+    sanitized_full = _sanitize_mock_output(full)
+    tail = _tail_lines(sanitized_full, max_tail_lines).strip()
+
+    if not failed_or_cancelled:
+        return tail
+
+    highlights = _extract_build_error_highlights(sanitized_full)
+    if highlights and highlights not in tail:
+        return f"{tail}\n\n## Detected errors (from full build.log)\n{highlights}"
+    return tail
 
 
 def _mock_stage_log_sections(
@@ -211,8 +334,13 @@ def _mock_stage_log_sections(
     a short tail of root.log is included only when build.log is empty.
     """
     sections: list[str] = []
-    build_txt = _read_mock_log_tail(result_dir, "build.log", max_build_log_lines)
-    wrapper_clean = _strip_mock_cli_noise(wrapper_output)
+    failed_or_cancelled = (not mock_rc_ok) or cancelled
+    build_txt = _format_build_log_display(
+        result_dir,
+        max_tail_lines=max_build_log_lines,
+        failed_or_cancelled=failed_or_cancelled,
+    )
+    wrapper_clean = _sanitize_mock_output(wrapper_output)
 
     if build_txt:
         sections.append(f"## {stage_title}\n{build_txt}")
@@ -224,9 +352,12 @@ def _mock_stage_log_sections(
 
     if not mock_rc_ok:
         if not build_txt and chroot_tail_lines > 0:
-            root_tail = _read_mock_log_tail(result_dir, "root.log", chroot_tail_lines)
+            root_raw = _read_mock_log_tail(result_dir, "root.log", chroot_tail_lines)
+            root_tail = _sanitize_mock_output(root_raw) if root_raw else ""
             if root_tail:
-                sections.append(f"## {stage_title} — setup failed before rpmbuild (root.log tail)\n{root_tail}")
+                sections.append(
+                    f"## {stage_title} — setup failed before rpmbuild (root.log tail)\n{root_tail}"
+                )
         if wrapper_clean:
             sections.append(f"## {stage_title} — mock\n{wrapper_clean}")
     elif not build_txt and wrapper_clean:
