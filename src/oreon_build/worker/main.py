@@ -65,6 +65,30 @@ def _upload_bytes_to_r2(r2_key: str, data: bytes, content_type: str | None = Non
     r2.put_object(r2_key, data, content_type=content_type)
 
 
+def _try_post_orphan_failure(
+    controller_url: str,
+    session: httpx.Client,
+    releasename: str,
+    attempt_id: int,
+    exc: BaseException,
+) -> None:
+    """If _process_job dies without returning, still fail the attempt so the UI does not stick on *running*."""
+    log_key = log_r2_key(releasename, attempt_id)
+    msg = f"Worker unhandled error during build: {type(exc).__name__}: {exc}"
+    try:
+        _upload_bytes_to_r2(log_key, msg.encode("utf-8"), content_type="text/plain")
+    except Exception:
+        logger.exception("Orphan failure: could not upload log for attempt %s", attempt_id)
+    try:
+        session.post(
+            f"{controller_url}/api/worker/result/{attempt_id}",
+            json={"status": "failed", "log_r2_key": log_key, "error_message": msg[:2000]},
+            timeout=120.0,
+        )
+    except Exception:
+        logger.exception("Orphan failure: could not POST result for attempt %s", attempt_id)
+
+
 def _upload_rpm_to_controller(
     session: httpx.Client,
     controller_url: str,
@@ -995,8 +1019,17 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
             )
         finally:
             _cleanup_job_disk(attempt_id, scrub_mock_cfg, scrub_mock_ext, tmpdir)
-    except Exception:
+    except Exception as exc:
         logger.exception("Unhandled error while processing job")
+        aid = job.get("build_attempt_id") if isinstance(job, dict) else None
+        if aid is not None:
+            _try_post_orphan_failure(
+                controller_url,
+                session,
+                str(job.get("releasename") or "oreon11"),
+                int(aid),
+                exc,
+            )
     finally:
         done_event.set()
 

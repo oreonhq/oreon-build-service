@@ -37,6 +37,7 @@ from oreon_build.models import (
 from oreon_build.services.r2 import get_r2_client, repo_r2_prefix, repo_rpms_key, src_r2_key
 from oreon_build.services.publisher import update_repodata_at_prefix
 from oreon_build.services.signing import sign_rpm
+from oreon_build.services.worker_state_sync import sync_worker_state_after_attempt_finished
 
 router = APIRouter(prefix="/worker", tags=["worker"])
 logger = logging.getLogger(__name__)
@@ -381,9 +382,11 @@ async def report_result(
         if payload.error_message:
             prev = (attempt.error_message or "").strip()
             attempt.error_message = (prev + "\n" if prev else "") + payload.error_message.strip()
-        worker.state = WorkerState.IDLE
-        worker.current_build_attempt_id = None
+        if attempt.status == BuildStatus.RUNNING:
+            attempt.status = BuildStatus.CANCELLED
+            attempt.finished_at = datetime.now(timezone.utc)
         await db.flush()
+        await sync_worker_state_after_attempt_finished(db, worker)
         await log_audit(
             db,
             action="build.result",
@@ -404,8 +407,8 @@ async def report_result(
         attempt.log_r2_key = payload.log_r2_key
     job.status = BuildStatus(payload.status)
     job.completed_at = attempt.finished_at
-    worker.state = WorkerState.IDLE
-    worker.current_build_attempt_id = None
+    await db.flush()
+    await sync_worker_state_after_attempt_finished(db, worker)
     for a in payload.artifacts:
         art = Artifact(
             build_attempt_id=attempt_id,

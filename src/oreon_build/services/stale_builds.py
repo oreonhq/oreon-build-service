@@ -26,7 +26,8 @@ from sqlalchemy.orm import selectinload
 
 from oreon_build.config import Settings
 from oreon_build.core.audit import log_audit
-from oreon_build.models import BuildAttempt, BuildJob, BuildStatus, Worker, WorkerState
+from oreon_build.models import BuildAttempt, BuildJob, BuildStatus, Worker
+from oreon_build.services.worker_state_sync import sync_worker_state_after_attempt_finished
 
 logger = logging.getLogger(__name__)
 
@@ -99,9 +100,9 @@ async def sweep_stale_running_builds(db: AsyncSession, settings: Settings) -> in
             job.status = BuildStatus.FAILED
             job.completed_at = now
 
-        if w is not None and w.current_build_attempt_id == att.id:
-            w.state = WorkerState.IDLE
-            w.current_build_attempt_id = None
+        await db.flush()
+        if w is not None:
+            await sync_worker_state_after_attempt_finished(db, w)
 
         updated += 1
         await log_audit(
@@ -116,7 +117,6 @@ async def sweep_stale_running_builds(db: AsyncSession, settings: Settings) -> in
         )
 
     if updated:
-        await db.flush()
         logger.warning("Marked %d stale RUNNING build attempt(s) as failed", updated)
 
     return updated
