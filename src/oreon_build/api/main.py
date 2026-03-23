@@ -15,6 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """Oreon Build Service API - main application."""
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -92,7 +93,45 @@ async def lifespan(app: FastAPI):
         except Exception:
             await db.rollback()
             raise
+
+    sweep_task: asyncio.Task[None] | None = None
+
+    async def _stale_build_sweep_loop() -> None:
+        from oreon_build.db.session import async_session_maker
+        from oreon_build.services.stale_builds import sweep_stale_running_builds
+
+        while True:
+            try:
+                s = get_settings()
+                interval = max(60, s.stale_build_sweep_interval_seconds)
+                if s.build_stale_running_minutes > 0 or s.build_stale_worker_heartbeat_minutes > 0:
+                    async with async_session_maker() as db:
+                        try:
+                            await sweep_stale_running_builds(db, s)
+                            await db.commit()
+                        except Exception:
+                            await db.rollback()
+                            raise
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Stale build sweep failed")
+                try:
+                    await asyncio.sleep(max(60, get_settings().stale_build_sweep_interval_seconds))
+                except asyncio.CancelledError:
+                    break
+
+    sweep_task = asyncio.create_task(_stale_build_sweep_loop(), name="stale-build-sweep")
+
     yield
+
+    if sweep_task is not None:
+        sweep_task.cancel()
+        try:
+            await sweep_task
+        except asyncio.CancelledError:
+            pass
     # shutdown
 
 

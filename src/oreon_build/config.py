@@ -89,6 +89,27 @@ class Settings(BaseSettings):
     # Worker → controller RPM upload (single artifact size cap, MiB)
     max_worker_rpm_upload_mib: int = Field(default=4096, ge=16, le=65536)
 
+    # Stuck builds: jobs stay RUNNING until the worker posts a result; sweep marks them failed if
+    # the attempt is too old or the worker has not heartbeated (see services/stale_builds.py).
+    build_stale_running_minutes: int = Field(
+        default=2880,
+        ge=0,
+        le=43200,
+        description="Fail RUNNING attempts older than this many minutes (0 = disable). Default 48h; raise for very long kernel builds.",
+    )
+    build_stale_worker_heartbeat_minutes: int = Field(
+        default=120,
+        ge=0,
+        le=1440,
+        description="Fail RUNNING attempts whose worker last_heartbeat is older than this (0 = disable).",
+    )
+    stale_build_sweep_interval_seconds: int = Field(
+        default=300,
+        ge=60,
+        le=86400,
+        description="How often the API runs the stale-build sweeper in the background.",
+    )
+
     # Logging
     log_level: str = Field(default="INFO")
 

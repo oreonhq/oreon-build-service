@@ -20,8 +20,10 @@ Oreon Build Worker: polls controller, runs mock builds, uploads build logs to R2
 Built RPMs are POSTed to the controller (`/api/worker/upload-rpm/...`); the controller GPG-signs
 and writes them to R2. No signing key or `rpm-sign` is required on workers.
 
-After each job, the worker runs ``mock --scrub=all`` for that job’s ``--uniqueext`` (frees ``/var/lib/mock``),
-removes its work directory, and prunes stale ``oreon-worker-*`` temp dirs (see env vars in deploy docs).
+After each job, the worker runs ``mock --scrub=all`` for that job’s ``--uniqueext``, then removes only
+that attempt’s trees under ``/var/lib/mock`` (directory names ending in ``-oreon-<attempt_id>``), then
+removes the job tempdir (prefix ``oreon-worker-<attempt_id>-``) so parallel jobs are not touched. Stale
+legacy ``oreon-worker-*`` dirs are pruned by age (see deploy docs).
 
 DistGit: Source(kind="distgit", url="<repo>.git#branch:spec_relpath") — mock --buildsrpm then mock --rebuild.
 """
@@ -609,6 +611,83 @@ def _mock_scrub_unique_chroot(mock_config: str, mock_unique_ext: str) -> None:
         )
 
 
+def _rm_rf_var_lib_mock_for_attempt(attempt_id: int) -> None:
+    """
+    Remove mock top-level roots for this attempt only (parallel-safe: names end with
+    ``-oreon-<attempt_id>``, e.g. ``fedora-rawhide-x86_64-oreon-139`` and
+    ``fedora-rawhide-x86_64-bootstrap-oreon-139``).
+    """
+    base = Path("/var/lib/mock")
+    if not base.is_dir():
+        return
+    suffix = f"-oreon-{attempt_id}"
+    removed = 0
+    try:
+        for p in list(base.iterdir()):
+            try:
+                if p.is_dir() and p.name.endswith(suffix):
+                    shutil.rmtree(p, ignore_errors=True)
+                    removed += 1
+            except OSError:
+                pass
+    except OSError:
+        pass
+    if removed:
+        logger.info("Removed %d mock root(s) under /var/lib/mock for attempt %s", removed, attempt_id)
+
+
+def _rm_rf_worker_tempdirs_for_attempt(attempt_id: int, tmp_parent: str | None) -> None:
+    """
+    Best-effort ``rm -rf`` of scratch dirs for this attempt only:
+    ``oreon-worker-<attempt_id>-…`` under TMPDIR and optional OREON_WORKER_TMP_PARENT.
+
+    Uses ``startswith("oreon-worker-{id}-")`` (not a glob) so attempt **8** never deletes **86**'s dir.
+    """
+    name_prefix = f"oreon-worker-{attempt_id}-"
+    roots: list[Path] = [Path(tempfile.gettempdir())]
+    if tmp_parent:
+        roots.append(Path(tmp_parent))
+    seen: set[str] = set()
+    removed = 0
+    for root in roots:
+        try:
+            key = str(root.resolve())
+        except OSError:
+            key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not root.is_dir():
+            continue
+        try:
+            for p in root.iterdir():
+                try:
+                    if p.is_dir() and p.name.startswith(name_prefix):
+                        shutil.rmtree(p, ignore_errors=True)
+                        removed += 1
+                except OSError:
+                    pass
+        except OSError:
+            pass
+    if removed:
+        logger.info("Removed %d worker temp dir(s) with prefix %r for attempt %s", removed, name_prefix, attempt_id)
+
+
+def _cleanup_job_disk(attempt_id: int, mock_config: str, mock_unique_ext: str, work_tmpdir: str | None) -> None:
+    """
+    After each job: mock scrub (umount), then rm -rf this attempt's trees under /var/lib/mock,
+    then this job's work tmpdir and any matching oreon-worker-<id>-* dirs, then stale prune.
+    Safe with parallel builds (everything keyed by attempt_id / known work path).
+    """
+    tmp_parent = _worker_temp_parent_dir()
+    _mock_scrub_unique_chroot(mock_config, mock_unique_ext)
+    _rm_rf_var_lib_mock_for_attempt(attempt_id)
+    if work_tmpdir:
+        shutil.rmtree(work_tmpdir, ignore_errors=True)
+    _rm_rf_worker_tempdirs_for_attempt(attempt_id, tmp_parent)
+    _prune_stale_oreon_worker_tempdirs()
+
+
 def _prune_stale_oreon_worker_tempdirs() -> None:
     """
     Remove ``oreon-worker-*`` directories older than OREON_WORKER_PRUNE_TMP_AGE_SEC (default 300s).
@@ -708,12 +787,14 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
             except OSError as e:
                 logger.warning("OREON_WORKER_TMP_PARENT=%s not usable (%s), using default temp dir", tmp_parent, e)
                 tmp_parent = None
-        tmpdir = (
-            tempfile.mkdtemp(prefix="oreon-worker-", dir=tmp_parent)
-            if tmp_parent
-            else tempfile.mkdtemp(prefix="oreon-worker-")
-        )
+        tmpdir: str | None = None
+        tmp_prefix = f"oreon-worker-{attempt_id}-"
         try:
+            tmpdir = (
+                tempfile.mkdtemp(prefix=tmp_prefix, dir=tmp_parent)
+                if tmp_parent
+                else tempfile.mkdtemp(prefix=tmp_prefix)
+            )
             tmp = Path(tmpdir)
             build_log_parts: list[str] = []
             log_max_lines = int(os.environ.get("OREON_WORKER_LOG_MAX_LINES", "40000"))
@@ -913,9 +994,7 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                 },
             )
         finally:
-            _mock_scrub_unique_chroot(scrub_mock_cfg, scrub_mock_ext)
-            _prune_stale_oreon_worker_tempdirs()
-            shutil.rmtree(tmpdir, ignore_errors=True)
+            _cleanup_job_disk(attempt_id, scrub_mock_cfg, scrub_mock_ext, tmpdir)
     except Exception:
         logger.exception("Unhandled error while processing job")
     finally:
