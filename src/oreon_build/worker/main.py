@@ -119,19 +119,22 @@ def _truthy_env(name: str) -> bool:
 
 def _make_mock_resultdir_world_readable(result_dir: Path) -> None:
     """
-    Best-effort chmod so the worker user can traverse result_dir and read ``*.rpm``.
+    Best-effort chmod so the worker user can traverse result_dir and read logs + ``*.rpm``.
 
-    mock often creates root-owned subtrees (e.g. under RPMS/) with modes that block a non-root
-    worker, causing PermissionError during rglob/open — after a long kernel build the log is
-    uploaded but artifacts stay empty.
+    mock often drops root-owned subtrees. We must run this **before** any ``result_dir.rglob()``
+    (e.g. ``_mock_stage_log_sections`` / ``build.log``), not only before artifact upload.
+
+    Non-sudo ``chmod -R`` runs every time (cheap). For root-only files, set
+    ``OREON_WORKER_CHMOD_MOCK_RESULTDIR_SUDO=1`` and sudoers (see deploy/oreon-worker.env.example).
+    Set ``OREON_WORKER_SKIP_CHMOD_MOCK_RESULTDIR=1`` to skip the non-sudo chmod (unusual).
     """
     if not result_dir.is_dir():
         return
-    if _truthy_env("OREON_WORKER_CHMOD_MOCK_RESULTDIR"):
+    if not _truthy_env("OREON_WORKER_SKIP_CHMOD_MOCK_RESULTDIR"):
         rc, out = _run(["chmod", "-R", "a+rX", str(result_dir)], timeout_s=600)
         if rc != 0 and (out or "").strip():
             logger.warning(
-                "OREON_WORKER_CHMOD_MOCK_RESULTDIR: chmod rc=%s: %s",
+                "chmod -R a+rX on mock resultdir rc=%s: %s",
                 rc,
                 _tail_lines(out, 20),
             )
@@ -192,7 +195,10 @@ def _run_with_abort(
     start = time.monotonic()
     while True:
         if abort_event.is_set():
-            proc.kill()
+            try:
+                proc.kill()
+            except OSError:
+                pass
             try:
                 proc.wait(timeout=60)
             except Exception:
@@ -211,7 +217,10 @@ def _run_with_abort(
             return ret, (stdout or "") + (stderr or "")
 
         if time.monotonic() - start > timeout_s:
-            proc.kill()
+            try:
+                proc.kill()
+            except OSError:
+                pass
             try:
                 proc.wait(timeout=30)
             except Exception:
@@ -238,7 +247,10 @@ def _read_text_file(path: Path) -> str:
 
 def _read_mock_log_tail(result_dir: Path, log_basename: str, max_lines: int) -> str:
     """Read the newest ``log_basename`` under result_dir (e.g. build.log) and return a tailed body."""
-    matches = sorted(result_dir.rglob(log_basename))
+    try:
+        matches = sorted(result_dir.rglob(log_basename))
+    except OSError:
+        return ""
     if not matches:
         return ""
     txt = _read_text_file(matches[-1])
@@ -357,7 +369,10 @@ def _format_build_log_display(
     Prefer **build.log** (rpmbuild). On failure/cancel, scan a capped full file for error lines
     and append ``## Detected errors`` so dashboards that only show the log *tail* still see causes.
     """
-    matches = sorted(result_dir.rglob("build.log"))
+    try:
+        matches = sorted(result_dir.rglob("build.log"))
+    except OSError:
+        return ""
     if not matches:
         return ""
     path = matches[-1]
@@ -937,6 +952,7 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                     abort_event=abort_event,
                     mock_unique_ext=mock_unique_ext,
                 )
+                _make_mock_resultdir_world_readable(srpm_result_dir)
                 build_log_parts.extend(
                     _mock_stage_log_sections(
                         srpm_result_dir,
@@ -986,6 +1002,7 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                 abort_event=abort_event,
                 mock_unique_ext=mock_unique_ext,
             )
+            _make_mock_resultdir_world_readable(result_dir)
             build_log_parts.extend(
                 _mock_stage_log_sections(
                     result_dir,
@@ -1013,18 +1030,16 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
 
             _upload_bytes_to_r2(log_key, full_log.encode("utf-8"), content_type="text/plain")
 
-            _make_mock_resultdir_world_readable(result_dir)
-
             perm_hint = (
-                "Permission denied while reading mock --resultdir output (common when RPMs or "
-                "parent dirs are root-owned). Enable OREON_WORKER_CHMOD_MOCK_RESULTDIR=1 and/or "
-                "OREON_WORKER_CHMOD_MOCK_RESULTDIR_SUDO=1 (see deploy/oreon-worker.env.example); "
-                "ensure the worker user is in the 'mock' group and uses a supported mock setup."
+                "Permission denied while reading mock --resultdir RPMs (tree may still be "
+                "root-owned after chmod). Set OREON_WORKER_CHMOD_MOCK_RESULTDIR_SUDO=1 and NOPASSWD "
+                "sudoers for chmod on worker temp dirs (deploy/oreon-worker.env.example). "
+                "Ensure the worker user is in the 'mock' group."
             )
             artifacts_payload: list[dict] = []
             try:
                 rpm_paths = sorted(result_dir.rglob("*.rpm"))
-            except PermissionError as pe:
+            except OSError as pe:
                 err_msg = f"{perm_hint}\n\n{type(pe).__name__}: {pe}"
                 logger.exception("%s", err_msg)
                 fail_log = full_log + "\n\n== " + err_msg + "\n"
@@ -1045,7 +1060,9 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                 fname = f.name
                 try:
                     meta = _upload_rpm_to_controller(session, controller_url, attempt_id, f)
-                except PermissionError as pe:
+                except OSError as pe:
+                    if not isinstance(pe, PermissionError):
+                        raise
                     err_msg = f"{perm_hint}\n\nWhile uploading {fname}: {type(pe).__name__}: {pe}"
                     logger.exception("%s", err_msg)
                     fail_log = full_log + "\n\n== " + err_msg + "\n"
