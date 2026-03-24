@@ -426,6 +426,78 @@ async def report_result(
         )
         return {"status": "ok", "job_cancelled": True}
 
+    # Worker default HTTP read timeout can fire after this handler already committed rows. A later
+    # orphan "failed" POST must not wipe success, and must fix failed status when artifacts exist.
+    if str(payload.status).lower() == "failed":
+        prior_art_count = await db.scalar(
+            select(func.count(Artifact.id)).where(Artifact.build_attempt_id == attempt_id)
+        )
+        if (prior_art_count or 0) > 0:
+            if attempt.status == BuildStatus.SUCCESS:
+                logger.warning(
+                    "Ignoring stale failed worker report for attempt %s (success + %d artifacts)",
+                    attempt_id,
+                    prior_art_count,
+                )
+                return {"status": "ok", "ignored_stale_failure": True}
+            if attempt.status == BuildStatus.FAILED:
+                logger.warning(
+                    "Repairing attempt %s: failed report but %d artifacts (timeout race); restoring success",
+                    attempt_id,
+                    prior_art_count,
+                )
+                attempt.status = BuildStatus.SUCCESS
+                attempt.error_message = None
+                attempt.finished_at = datetime.now(timezone.utc)
+                job.status = BuildStatus.SUCCESS
+                job.completed_at = attempt.finished_at
+                if payload.log_r2_key:
+                    attempt.log_r2_key = payload.log_r2_key
+                await db.flush()
+                await sync_worker_state_after_attempt_finished(db, worker)
+                promo_count = await db.scalar(
+                    select(func.count(Promotion.id)).where(Promotion.build_job_id == job.id)
+                )
+                if (promo_count or 0) == 0:
+                    pkg_result = await db.execute(select(Package).where(Package.id == job.package_id))
+                    pkg = pkg_result.scalar_one_or_none()
+                    db.add(
+                        Promotion(
+                            release_id=job.release_id,
+                            from_channel="dev",
+                            to_channel=None,
+                            status="pending",
+                            package_id=job.package_id,
+                            package_name=pkg.name if pkg else None,
+                            build_job_id=job.id,
+                        )
+                    )
+                    await db.flush()
+                rel_result = await db.execute(select(Release).where(Release.id == job.release_id))
+                release = rel_result.scalar_one_or_none()
+                target_result = await db.execute(select(BuildTarget).where(BuildTarget.id == job.target_id))
+                target = target_result.scalar_one_or_none()
+                arch = target.architecture if target else None
+                branch = getattr(job, "branch", "dev") or "dev"
+                if release and arch:
+                    try:
+                        prefix = repo_r2_prefix(release.releasename, branch, arch)
+                        update_repodata_at_prefix(prefix)
+                    except Exception:
+                        logger.exception("repodata refresh after repair attempt_id=%s", attempt_id)
+
+                await log_audit(
+                    db,
+                    action="build.result",
+                    account_id=None,
+                    resource_type="build_job",
+                    resource_id=str(job.id),
+                    details=f"status=repaired_success attempt_id={attempt_id}",
+                    ip_address=None,
+                    user_agent="worker",
+                )
+                return {"status": "ok", "repaired_stale_failure": True}
+
     attempt.status = BuildStatus(payload.status)
     attempt.finished_at = datetime.now(timezone.utc)
     if payload.error_message:
