@@ -1,6 +1,12 @@
+# Oreon Build Service
+# Copyright (C) 2026 Oreon HQ
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """
 oreon-buildctl - CLI for Oreon Build Service.
-Commands: create-package, trigger-build, list-builds, retry-build, logs, promote, publish, workers, repo-status, doctor.
+Commands: create-package, trigger-build, list-builds, retry-build, logs, promote, publish, workers,
+repo-status, doctor, repair-misclassified-builds.
 """
 from __future__ import annotations
 
@@ -201,3 +207,21 @@ def doctor(ctx):
     token = get_token()
     click.echo("Token: %s" % ("set" if token else "not set"))
     click.echo("OK")
+
+
+@cli.command("repair-misclassified-builds")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Only print what would change (uses DATABASE_URL / sync URL from app settings)",
+)
+def repair_misclassified_builds_cmd(dry_run):
+    """
+    Set SUCCESS on jobs whose latest attempt is FAILED but has artifacts (worker HTTP timeout race).
+
+    Uses the same database as the API (set DATABASE_URL or rely on .env). Does not use HTTP.
+    """
+    from oreon_build.services.repair_misclassified_builds import repair_misclassified_builds
+
+    for line in repair_misclassified_builds(dry_run=dry_run):
+        click.echo(line)
