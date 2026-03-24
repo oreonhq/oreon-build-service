@@ -26,7 +26,7 @@ Here’s what you deploy:
 - Worker: polls controller, runs mock builds, uploads logs to R2, sends RPMs to controller for signing and R2 upload
 - Scheduler: runs scheduled tasks (nightly builds, compose)
 - Publisher: composes repos with `createrepo_c` and uploads to R2 (no local repo storage)
-- CLI: `oreon-buildctl` (alternative to the web interface)
+- CLI: `oreon-buildctl` (alternative to the web interface), including `repair-misclassified-builds` for DB fixes after worker HTTP timeout races
 
 ## Requirements
 
