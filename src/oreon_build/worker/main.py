@@ -69,6 +69,35 @@ def _upload_bytes_to_r2(r2_key: str, data: bytes, content_type: str | None = Non
     r2.put_object(r2_key, data, content_type=content_type)
 
 
+def _worker_result_post_timeout() -> httpx.Timeout:
+    """
+    Controller ``POST /worker/result/...`` can run createrepo and R2 copies for many RPMs; the default
+    client read timeout (30s) causes ReadTimeout after the server already committed success. The worker
+    then posts a spurious *failed* and overwrites the DB. Override with OREON_WORKER_RESULT_POST_TIMEOUT_SEC.
+    """
+    raw = os.environ.get("OREON_WORKER_RESULT_POST_TIMEOUT_SEC", "900")
+    try:
+        total = float(raw)
+    except ValueError:
+        total = 900.0
+    total = max(120.0, min(total, 7200.0))
+    connect = min(120.0, total)
+    return httpx.Timeout(connect=connect, read=total, write=total, pool=total)
+
+
+def _post_worker_build_result(
+    session: httpx.Client,
+    controller_url: str,
+    attempt_id: int,
+    json_body: dict,
+) -> httpx.Response:
+    return session.post(
+        f"{controller_url}/api/worker/result/{attempt_id}",
+        json=json_body,
+        timeout=_worker_result_post_timeout(),
+    )
+
+
 def _try_post_orphan_failure(
     controller_url: str,
     session: httpx.Client,
@@ -84,10 +113,11 @@ def _try_post_orphan_failure(
     except Exception:
         logger.exception("Orphan failure: could not upload log for attempt %s", attempt_id)
     try:
-        session.post(
-            f"{controller_url}/api/worker/result/{attempt_id}",
-            json={"status": "failed", "log_r2_key": log_key, "error_message": msg[:2000]},
-            timeout=120.0,
+        _post_worker_build_result(
+            session,
+            controller_url,
+            attempt_id,
+            {"status": "failed", "log_r2_key": log_key, "error_message": msg[:2000]},
         )
     except Exception:
         logger.exception("Orphan failure: could not POST result for attempt %s", attempt_id)
@@ -846,9 +876,11 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
         if not mock_config:
             msg = "No mock config for this job (add mock environment to release)."
             _upload_bytes_to_r2(log_key, msg.encode("utf-8"), content_type="text/plain")
-            session.post(
-                f"{controller_url}/api/worker/result/{attempt_id}",
-                json={"status": "failed", "log_r2_key": log_key, "error_message": msg},
+            _post_worker_build_result(
+                session,
+                controller_url,
+                attempt_id,
+                {"status": "failed", "log_r2_key": log_key, "error_message": msg},
             )
             return
 
@@ -884,9 +916,11 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                 if not srpm_bytes:
                     msg = "SRPM not found in R2"
                     _upload_bytes_to_r2(log_key, msg.encode("utf-8"), content_type="text/plain")
-                    session.post(
-                        f"{controller_url}/api/worker/result/{attempt_id}",
-                        json={"status": "failed", "log_r2_key": log_key, "error_message": msg},
+                    _post_worker_build_result(
+                        session,
+                        controller_url,
+                        attempt_id,
+                        {"status": "failed", "log_r2_key": log_key, "error_message": msg},
                     )
                     return
                 srpm_path = tmp / "source.src.rpm"
@@ -896,9 +930,11 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                 if not spec_rel:
                     msg = "DistGit URL missing '#<branch>:<spec_relpath>' fragment"
                     _upload_bytes_to_r2(log_key, msg.encode("utf-8"), content_type="text/plain")
-                    session.post(
-                        f"{controller_url}/api/worker/result/{attempt_id}",
-                        json={"status": "failed", "log_r2_key": log_key, "error_message": msg},
+                    _post_worker_build_result(
+                        session,
+                        controller_url,
+                        attempt_id,
+                        {"status": "failed", "log_r2_key": log_key, "error_message": msg},
                     )
                     return
                 git_dir = tmp / "distgit"
@@ -908,9 +944,11 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                 if not ok:
                     msg = "\n\n".join(build_log_parts).strip()
                     _upload_bytes_to_r2(log_key, msg.encode("utf-8"), content_type="text/plain")
-                    session.post(
-                        f"{controller_url}/api/worker/result/{attempt_id}",
-                        json={"status": "failed", "log_r2_key": log_key, "error_message": msg[:2000]},
+                    _post_worker_build_result(
+                        session,
+                        controller_url,
+                        attempt_id,
+                        {"status": "failed", "log_r2_key": log_key, "error_message": msg[:2000]},
                     )
                     return
                 lfs_rc, lfs_out = _maybe_git_lfs_pull(git_dir)
@@ -921,9 +959,11 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                     build_log_parts.append(f"Spec not found: {spec_rel}")
                     msg = "\n\n".join(build_log_parts).strip()
                     _upload_bytes_to_r2(log_key, msg.encode("utf-8"), content_type="text/plain")
-                    session.post(
-                        f"{controller_url}/api/worker/result/{attempt_id}",
-                        json={"status": "failed", "log_r2_key": log_key, "error_message": msg[:2000]},
+                    _post_worker_build_result(
+                        session,
+                        controller_url,
+                        attempt_id,
+                        {"status": "failed", "log_r2_key": log_key, "error_message": msg[:2000]},
                     )
                     return
 
@@ -936,9 +976,11 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                 if not src_ok:
                     msg = "\n\n".join(build_log_parts).strip()
                     _upload_bytes_to_r2(log_key, msg.encode("utf-8"), content_type="text/plain")
-                    session.post(
-                        f"{controller_url}/api/worker/result/{attempt_id}",
-                        json={"status": "failed", "log_r2_key": log_key, "error_message": msg[:2000]},
+                    _post_worker_build_result(
+                        session,
+                        controller_url,
+                        attempt_id,
+                        {"status": "failed", "log_r2_key": log_key, "error_message": msg[:2000]},
                     )
                     return
 
@@ -966,9 +1008,11 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                 if srpm_cancelled:
                     msg = "\n\n".join(build_log_parts).strip()
                     _upload_bytes_to_r2(log_key, msg.encode("utf-8"), content_type="text/plain")
-                    session.post(
-                        f"{controller_url}/api/worker/result/{attempt_id}",
-                        json={
+                    _post_worker_build_result(
+                        session,
+                        controller_url,
+                        attempt_id,
+                        {
                             "status": "cancelled",
                             "log_r2_key": log_key,
                             "error_message": "Build cancelled by user",
@@ -979,17 +1023,21 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                 if not ok or not srpm_path:
                     msg = "\n\n".join(build_log_parts).strip()
                     _upload_bytes_to_r2(log_key, msg.encode("utf-8"), content_type="text/plain")
-                    session.post(
-                        f"{controller_url}/api/worker/result/{attempt_id}",
-                        json={"status": "failed", "log_r2_key": log_key, "error_message": msg[:2000]},
+                    _post_worker_build_result(
+                        session,
+                        controller_url,
+                        attempt_id,
+                        {"status": "failed", "log_r2_key": log_key, "error_message": msg[:2000]},
                     )
                     return
             else:
                 msg = "No SRPM or DistGit source in job (upload SRPM or configure DistGit spec path)."
                 _upload_bytes_to_r2(log_key, msg.encode("utf-8"), content_type="text/plain")
-                session.post(
-                    f"{controller_url}/api/worker/result/{attempt_id}",
-                    json={"status": "failed", "log_r2_key": log_key, "error_message": msg},
+                _post_worker_build_result(
+                    session,
+                    controller_url,
+                    attempt_id,
+                    {"status": "failed", "log_r2_key": log_key, "error_message": msg},
                 )
                 return
 
@@ -1016,9 +1064,11 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
             if rebuild_cancelled:
                 full_log = "\n\n".join([p for p in build_log_parts if p]).strip() + "\n"
                 _upload_bytes_to_r2(log_key, full_log.encode("utf-8"), content_type="text/plain")
-                session.post(
-                    f"{controller_url}/api/worker/result/{attempt_id}",
-                    json={
+                _post_worker_build_result(
+                    session,
+                    controller_url,
+                    attempt_id,
+                    {
                         "status": "cancelled",
                         "log_r2_key": log_key,
                         "error_message": "Build cancelled by user",
@@ -1044,9 +1094,11 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                 logger.exception("%s", err_msg)
                 fail_log = full_log + "\n\n== " + err_msg + "\n"
                 _upload_bytes_to_r2(log_key, fail_log.encode("utf-8"), content_type="text/plain")
-                session.post(
-                    f"{controller_url}/api/worker/result/{attempt_id}",
-                    json={
+                _post_worker_build_result(
+                    session,
+                    controller_url,
+                    attempt_id,
+                    {
                         "status": "failed",
                         "log_r2_key": log_key,
                         "error_message": fail_log[:2000],
@@ -1067,9 +1119,11 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                     logger.exception("%s", err_msg)
                     fail_log = full_log + "\n\n== " + err_msg + "\n"
                     _upload_bytes_to_r2(log_key, fail_log.encode("utf-8"), content_type="text/plain")
-                    session.post(
-                        f"{controller_url}/api/worker/result/{attempt_id}",
-                        json={
+                    _post_worker_build_result(
+                        session,
+                        controller_url,
+                        attempt_id,
+                        {
                             "status": "failed",
                             "log_r2_key": log_key,
                             "error_message": fail_log[:2000],
@@ -1082,9 +1136,11 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                     logger.exception("%s", err_msg)
                     fail_log = full_log + "\n\n== " + err_msg + "\n"
                     _upload_bytes_to_r2(log_key, fail_log.encode("utf-8"), content_type="text/plain")
-                    session.post(
-                        f"{controller_url}/api/worker/result/{attempt_id}",
-                        json={
+                    _post_worker_build_result(
+                        session,
+                        controller_url,
+                        attempt_id,
+                        {
                             "status": "failed",
                             "log_r2_key": log_key,
                             "error_message": fail_log[:2000],
@@ -1103,9 +1159,11 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                     }
                 )
 
-            session.post(
-                f"{controller_url}/api/worker/result/{attempt_id}",
-                json={
+            _post_worker_build_result(
+                session,
+                controller_url,
+                attempt_id,
+                {
                     "status": "success" if ok else "failed",
                     "log_r2_key": log_key,
                     "error_message": None if ok else full_log[:2000],
