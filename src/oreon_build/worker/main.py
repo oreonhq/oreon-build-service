@@ -20,6 +20,10 @@ Oreon Build Worker: polls controller, runs mock builds, uploads build logs to R2
 Built RPMs are POSTed to the controller (`/api/worker/upload-rpm/...`); the controller GPG-signs
 and writes them to R2. No signing key or `rpm-sign` is required on workers.
 
+If mock leaves RPMs under ``--resultdir`` owned by root with restrictive modes, the worker can hit
+``PermissionError`` when scanning or uploading artifacts. Use ``OREON_WORKER_CHMOD_MOCK_RESULTDIR``
+and/or ``OREON_WORKER_CHMOD_MOCK_RESULTDIR_SUDO`` (see ``deploy/oreon-worker.env.example``).
+
 After each job, the worker runs ``mock --scrub=all`` for that job’s ``--uniqueext``, then removes only
 that attempt’s trees under ``/var/lib/mock`` (directory names ending in ``-oreon-<attempt_id>``), then
 removes the job tempdir (prefix ``oreon-worker-<attempt_id>-``) so parallel jobs are not touched. Stale
@@ -106,6 +110,40 @@ def _upload_rpm_to_controller(
         )
     r.raise_for_status()
     return r.json()
+
+
+def _truthy_env(name: str) -> bool:
+    v = (os.environ.get(name) or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _make_mock_resultdir_world_readable(result_dir: Path) -> None:
+    """
+    Best-effort chmod so the worker user can traverse result_dir and read ``*.rpm``.
+
+    mock often creates root-owned subtrees (e.g. under RPMS/) with modes that block a non-root
+    worker, causing PermissionError during rglob/open — after a long kernel build the log is
+    uploaded but artifacts stay empty.
+    """
+    if not result_dir.is_dir():
+        return
+    if _truthy_env("OREON_WORKER_CHMOD_MOCK_RESULTDIR"):
+        rc, out = _run(["chmod", "-R", "a+rX", str(result_dir)], timeout_s=600)
+        if rc != 0 and (out or "").strip():
+            logger.warning(
+                "OREON_WORKER_CHMOD_MOCK_RESULTDIR: chmod rc=%s: %s",
+                rc,
+                _tail_lines(out, 20),
+            )
+    if _truthy_env("OREON_WORKER_CHMOD_MOCK_RESULTDIR_SUDO"):
+        rc, out = _run(["sudo", "-n", "chmod", "-R", "a+rX", str(result_dir)], timeout_s=600)
+        if rc != 0:
+            logger.warning(
+                "OREON_WORKER_CHMOD_MOCK_RESULTDIR_SUDO: sudo -n chmod failed rc=%s "
+                "(add NOPASSWD sudoers for this worker user if needed): %s",
+                rc,
+                _tail_lines(out, 25),
+            )
 
 
 def _run(cmd: list[str], timeout_s: int, cwd: str | None = None) -> tuple[int, str]:
@@ -975,13 +1013,53 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
 
             _upload_bytes_to_r2(log_key, full_log.encode("utf-8"), content_type="text/plain")
 
-            artifacts_payload = []
-            for f in sorted(result_dir.rglob("*.rpm")):
+            _make_mock_resultdir_world_readable(result_dir)
+
+            perm_hint = (
+                "Permission denied while reading mock --resultdir output (common when RPMs or "
+                "parent dirs are root-owned). Enable OREON_WORKER_CHMOD_MOCK_RESULTDIR=1 and/or "
+                "OREON_WORKER_CHMOD_MOCK_RESULTDIR_SUDO=1 (see deploy/oreon-worker.env.example); "
+                "ensure the worker user is in the 'mock' group and uses a supported mock setup."
+            )
+            artifacts_payload: list[dict] = []
+            try:
+                rpm_paths = sorted(result_dir.rglob("*.rpm"))
+            except PermissionError as pe:
+                err_msg = f"{perm_hint}\n\n{type(pe).__name__}: {pe}"
+                logger.exception("%s", err_msg)
+                fail_log = full_log + "\n\n== " + err_msg + "\n"
+                _upload_bytes_to_r2(log_key, fail_log.encode("utf-8"), content_type="text/plain")
+                session.post(
+                    f"{controller_url}/api/worker/result/{attempt_id}",
+                    json={
+                        "status": "failed",
+                        "log_r2_key": log_key,
+                        "error_message": fail_log[:2000],
+                        "artifacts": [],
+                    },
+                )
+                return
+            for f in rpm_paths:
                 if not f.is_file():
                     continue
                 fname = f.name
                 try:
                     meta = _upload_rpm_to_controller(session, controller_url, attempt_id, f)
+                except PermissionError as pe:
+                    err_msg = f"{perm_hint}\n\nWhile uploading {fname}: {type(pe).__name__}: {pe}"
+                    logger.exception("%s", err_msg)
+                    fail_log = full_log + "\n\n== " + err_msg + "\n"
+                    _upload_bytes_to_r2(log_key, fail_log.encode("utf-8"), content_type="text/plain")
+                    session.post(
+                        f"{controller_url}/api/worker/result/{attempt_id}",
+                        json={
+                            "status": "failed",
+                            "log_r2_key": log_key,
+                            "error_message": fail_log[:2000],
+                            "artifacts": artifacts_payload,
+                        },
+                    )
+                    return
                 except Exception as upload_err:
                     err_msg = f"Failed to upload RPM to controller ({fname}): {upload_err}"
                     logger.exception("%s", err_msg)
