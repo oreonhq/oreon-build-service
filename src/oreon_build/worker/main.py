@@ -200,6 +200,11 @@ def _run(cmd: list[str], timeout_s: int, cwd: str | None = None) -> tuple[int, s
 # Exit code when mock is killed because the user cancelled the build (worker convention)
 _RC_MOCK_CANCELLED = 130
 
+# Default mock wall-clock caps (override with OREON_WORKER_MOCK_*_TIMEOUT_SEC). Upper bound for env overrides.
+_MOCK_STAGE_TIMEOUT_DEFAULT_SEC = 5 * 24 * 3600  # 5 days
+_MOCK_STAGE_TIMEOUT_MAX_SEC = 30 * 24 * 3600  # 30 days
+_MOCK_STAGE_TIMEOUT_MIN_SEC = 600
+
 
 def _run_with_abort(
     cmd: list[str],
@@ -651,7 +656,9 @@ def _mock_build_srpm_from_spec(
         "--resultdir",
         str(result_dir),
     ]
-    rc, out = _run_with_abort(cmd, timeout_s=3600, abort_event=abort_event)
+    rc, out = _run_with_abort(
+        cmd, timeout_s=_mock_buildsrpm_timeout_sec(), abort_event=abort_event
+    )
     if rc == _RC_MOCK_CANCELLED:
         return False, None, out, True
     if rc != 0:
@@ -677,10 +684,34 @@ def _mock_rebuild_srpm(
     if mock_unique_ext:
         cmd += ["--uniqueext", mock_unique_ext]
     cmd += ["--rebuild", str(srpm_path), "--resultdir", str(result_dir)]
-    rc, out = _run_with_abort(cmd, timeout_s=7200, abort_event=abort_event)
+    rc, out = _run_with_abort(cmd, timeout_s=_mock_rebuild_timeout_sec(), abort_event=abort_event)
     if rc == _RC_MOCK_CANCELLED:
         return False, out, True
     return rc == 0, out, False
+
+
+def _mock_buildsrpm_timeout_sec() -> int:
+    """Seconds before killing ``mock --buildsrpm`` (default 5 days)."""
+    raw = os.environ.get(
+        "OREON_WORKER_MOCK_BUILDSRPM_TIMEOUT_SEC", str(_MOCK_STAGE_TIMEOUT_DEFAULT_SEC)
+    )
+    try:
+        v = int(raw)
+    except ValueError:
+        v = _MOCK_STAGE_TIMEOUT_DEFAULT_SEC
+    return max(_MOCK_STAGE_TIMEOUT_MIN_SEC, min(v, _MOCK_STAGE_TIMEOUT_MAX_SEC))
+
+
+def _mock_rebuild_timeout_sec() -> int:
+    """Seconds before killing ``mock --rebuild`` (default 5 days)."""
+    raw = os.environ.get(
+        "OREON_WORKER_MOCK_REBUILD_TIMEOUT_SEC", str(_MOCK_STAGE_TIMEOUT_DEFAULT_SEC)
+    )
+    try:
+        v = int(raw)
+    except ValueError:
+        v = _MOCK_STAGE_TIMEOUT_DEFAULT_SEC
+    return max(_MOCK_STAGE_TIMEOUT_MIN_SEC, min(v, _MOCK_STAGE_TIMEOUT_MAX_SEC))
 
 
 def _worker_temp_parent_dir() -> str | None:

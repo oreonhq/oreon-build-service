@@ -27,6 +27,9 @@ Requires:       python3 >= 3.11
 Requires:       mock
 Requires:       python3-pydantic
 Requires:       rpmdevtools
+Requires:       rpmrebuild
+Requires:       pesign
+Requires:       pigz
 
 %description
 Worker daemon for Oreon Build Service.
