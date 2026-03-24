@@ -86,6 +86,40 @@ class Settings(BaseSettings):
     signing_key_grip: Optional[str] = Field(default=None)
     gpg_home: str = Field(default="/var/lib/oreon-build/gnupg")
 
+    # Secure Boot / PE signing (controller): repack matching binary RPMs with rpmrebuild + pesign
+    # before GPG (--addsign). Requires pesign, rpmrebuild, file, bash on the controller host.
+    pesign_nss_dir: str = Field(
+        default="/etc/pki/pesign",
+        description="NSS database directory for pesign (-n)",
+    )
+    pesign_certificate_nickname: Optional[str] = Field(
+        default=None,
+        description=(
+            "Default NSS certificate nickname (-c) when no pesign_rules_json rule matches but "
+            "pesign_package_name_regex matches. Also enables single-cert mode if rules are empty."
+        ),
+    )
+    pesign_rules_json: Optional[str] = Field(
+        default=None,
+        description=(
+            'Optional JSON array of ordered rules: '
+            '{"name_regex": "^grub2-efi.*", "nickname": "signer", "arch_regex": "^(s390x)$"} '
+            "(arch_regex optional). First match wins; use before a global fallback nickname."
+        ),
+    )
+    pesign_token: Optional[str] = Field(
+        default=None,
+        description="Optional PKCS#11 token name for pesign (-t)",
+    )
+    pesign_package_name_regex: str = Field(
+        default=r"^(kernel.*|shim.*|fwupd.*|grub2-efi.*)$",
+        description="RPM %%{NAME} must full-match this regex (case-insensitive) for pesign",
+    )
+    pesign_strict: bool = Field(
+        default=False,
+        description="If true, upload fails when a matching RPM cannot be pesign-repacked",
+    )
+
     # Worker → controller RPM upload (single artifact size cap, MiB)
     max_worker_rpm_upload_mib: int = Field(default=4096, ge=16, le=65536)
 
