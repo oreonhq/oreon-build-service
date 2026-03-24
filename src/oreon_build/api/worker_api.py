@@ -1,3 +1,19 @@
+# Oreon Build Service
+# Copyright (C) 2026 Oreon HQ
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """Worker-facing API: poll job, heartbeat, upload RPMs for signing, report result."""
 from __future__ import annotations
 
@@ -36,7 +52,7 @@ from oreon_build.models import (
 )
 from oreon_build.services.r2 import get_r2_client, repo_r2_prefix, repo_rpms_key, src_r2_key
 from oreon_build.services.publisher import update_repodata_at_prefix
-from oreon_build.services.signing import sign_rpm
+from oreon_build.services.signing import PesignRepackError, pesign_rpm_if_configured, sign_rpm
 from oreon_build.services.worker_state_sync import sync_worker_state_after_attempt_finished
 
 router = APIRouter(prefix="/worker", tags=["worker"])
@@ -258,7 +274,8 @@ async def upload_worker_rpm(
     file: UploadFile = File(...),
 ):
     """
-    Receive a built RPM from a worker, GPG-sign on the controller, push to R2, delete temp file.
+    Receive a built RPM from a worker, optionally pesign payload (PE / .ko) then GPG-sign on the
+    controller, push to R2, delete temp file.
     Workers no longer need signing keys or direct R2 write access for RPM artifacts.
     """
     settings = get_settings()
@@ -306,6 +323,7 @@ async def upload_worker_rpm(
     path = Path(tmp_path)
     raw: bytes = b""
     signed = False
+    pesign_applied = False
     digest = ""
     r2_key = ""
     try:
@@ -322,6 +340,14 @@ async def upload_worker_rpm(
                         detail=f"RPM exceeds max {settings.max_worker_rpm_upload_mib} MiB",
                     )
                 out.write(chunk)
+
+        try:
+            pesign_applied = await asyncio.to_thread(pesign_rpm_if_configured, path)
+        except PesignRepackError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"pesign repack failed: {exc}",
+            ) from exc
 
         signed = await asyncio.to_thread(sign_rpm, path)
         raw = await asyncio.to_thread(path.read_bytes)
@@ -351,6 +377,7 @@ async def upload_worker_rpm(
         "filename": fname,
         "r2_key": r2_key,
         "signed": signed,
+        "pesign_applied": pesign_applied,
         "size_bytes": len(raw),
         "checksum_sha256": digest,
     }
