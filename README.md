@@ -14,7 +14,7 @@ We were intially going to use Koji for our build system as we are planning to go
 - Workers: Enroll with a token, poll for jobs, upload build logs to R2, POST built RPMs to the controller (controller signs and stores in R2). States: idle, busy, unhealthy, offline, draining
 - Scheduling: Cron-style jobs, dependency rebuilds, compose
 - Git: Pull sources, trigger builds
-- Signing: RPM and repodata via GPG on the controller
+- Signing: RPM and repodata via GPG on the controller; optional `pesign` (Secure Boot PE / `*.ko` in payload) for matching packages before GPG
 - Web UI: Read-only for guests, log in needed to trigger builds, create stuff, enroll workers
 - Accounts: Admin and Maintainer. Default admin comes from `.env`
 
@@ -33,7 +33,7 @@ Here’s what you deploy:
 - Python 3.11+
 - PostgreSQL
 - Cloudflare R2 for all repo/artifact storage
-- Controller host `createrepo_c`, GPG signing key + `rpm-sign` for RPM/repodata signing (see `.env.example`)
+- Controller host `createrepo_c`, GPG signing key + `rpm-sign` for RPM/repodata signing (see `.env.example`). Optional payload signing: `pesign`, `rpmrebuild`, and `file` plus NSS DB; use `PESIGN_RULES_JSON` for multiple signing certs (e.g. kernel vs GRUB vs s390) or a single `PESIGN_CERTIFICATE_NICKNAME`
 - Workers `mock`, `rpmdevtools` no GPG or `rpm-sign` on workers for artifact signing
 - Optional: `MAX_WORKER_RPM_UPLOAD_MIB` in controller `.env` if workers build very large RPMs (default 4096 MiB; HTTP 413 means increase this)
 
