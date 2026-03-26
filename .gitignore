@@ -18,6 +18,7 @@ env/
 .DS_Store
 .idea/
 .vscode/
+.cursor/
 *.swp
 *.swo
 
@@ -34,11 +35,9 @@ htmlcov/
 .env.*
 !.env.example
 
-# Cursor / IDE state
-.cursor/
-
 # Logs
 *.log
+.oreon-logs/
 
 # GPG stuff
 signing-export/
