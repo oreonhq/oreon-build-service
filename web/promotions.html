@@ -1,10 +1,15 @@
 <!DOCTYPE html>
+<!--
+  Oreon Build Service - Promotions page
+  Copyright (C) 2026 Oreon HQ
+  SPDX-License-Identifier: GPL-3.0-or-later
+-->
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Promotions - Oreon Build Service</title>
-  <link rel="stylesheet" href="/static/style.css?v=2">
+  <link rel="stylesheet" href="/static/style.css?v=3">
   <style>
     .promo-testing { background: #d4edda; color: #155724; }
     .promo-stable { background: #cce5ff; color: #004085; }
@@ -33,7 +38,7 @@
   <main class="main">
     <section class="card">
       <h2>Promotions</h2>
-      <p id="promo-hint">Completed builds appear here as promotion candidates. Login to promote to Testing or Stable, or keep in Dev.</p>
+      <p id="promo-hint">Completed builds appear here as promotion candidates. Login to promote to Testing or Stable.</p>
       <div class="form-group" style="margin-bottom:1rem; display:flex; gap:1rem; flex-wrap:wrap;">
         <label style="display:flex; align-items:center;">Filter</label>
         <input type="text" id="promo-text-filter" placeholder="Filter by package, ID…" style="padding:0.4rem; width:12rem;">
@@ -42,10 +47,13 @@
           <option value="pending" selected>Pending only</option>
           <option value="promoted_testing">Promoted to Testing</option>
           <option value="promoted_stable">Promoted to Stable</option>
-          <option value="kept_dev">Kept in Dev</option>
         </select>
       </div>
       <div class="list-toolbar">
+        <div class="bulk-selection-bar" id="promo-bulk-bar">
+          <span class="bulk-selection-count"></span>
+          <span class="bulk-selection-buttons"></span>
+        </div>
         <div class="select-all-wrap"><label for="promo-select-all">Select all</label></div>
         <div class="pagination">
           <button type="button" class="btn" id="promo-prev" disabled>Prev</button>
@@ -62,15 +70,58 @@
       </table>
     </section>
   </main>
-  <script src="/static/app.js?v=2"></script>
+  <script src="/static/app.js?v=4"></script>
   <script>
     (function() {
       const api = window.oreonApi;
       var promoPage = 0, promoPageSize = 25, promoTotal = 0;
+      var promoTableSel = window.oreonBindTableSelection(document.getElementById('promo-tbody'), {
+        rowCheckboxSelector: '.promo-row-cb',
+        selectAll: document.getElementById('promo-select-all'),
+        bulkBar: document.getElementById('promo-bulk-bar'),
+        onSelectionChange: function(ids, btns) {
+          var tbody = document.getElementById('promo-tbody');
+          var clear = document.createElement('button');
+          clear.type = 'button';
+          clear.className = 'btn';
+          clear.textContent = 'Clear selection';
+          clear.addEventListener('click', function() {
+            tbody.querySelectorAll('.promo-row-cb').forEach(function(cb) { cb.checked = false; });
+            promoTableSel.refresh();
+          });
+          btns.appendChild(clear);
+          if (!api.token) return;
+          function runPromote(pathSuffix) {
+            var chain = Promise.resolve();
+            ids.forEach(function(id) {
+              var tr = tbody.querySelector('tr[data-id="' + id + '"]');
+              var st = tr ? (tr.getAttribute('data-status') || '') : '';
+              if (st !== 'pending') return;
+              chain = chain.then(function() { return api.post('/promotions/' + id + '/' + pathSuffix); });
+            });
+            chain.then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+          }
+          var b1 = document.createElement('button');
+          b1.type = 'button';
+          b1.className = 'btn promo-testing';
+          b1.textContent = 'Promote selected to Testing';
+          b1.addEventListener('click', function() { runPromote('to-testing'); });
+          btns.appendChild(b1);
+          var b2 = document.createElement('button');
+          b2.type = 'button';
+          b2.className = 'btn promo-stable';
+          b2.textContent = 'Promote selected to Stable';
+          b2.addEventListener('click', function() { runPromote('to-stable'); });
+          btns.appendChild(b2);
+        }
+      });
       function load() {
         var statusFilter = document.getElementById('promo-status-filter').value;
         var path = '/promotions?limit=' + promoPageSize + '&offset=' + (promoPage * promoPageSize);
         if (statusFilter) path += '&status_filter=' + encodeURIComponent(statusFilter);
+        var tf = document.getElementById('promo-text-filter');
+        var pq = (tf && tf.value) ? String(tf.value).trim() : '';
+        if (pq) path += '&search=' + encodeURIComponent(pq);
         api.get(path).then(function(data) {
           var tbody = document.getElementById('promo-tbody');
           if (!tbody) return;
@@ -84,45 +135,26 @@
             var actions = '';
             if (status === 'pending' && canAct) {
               actions = '<button type="button" class="btn promo-testing" data-id="' + p.id + '" data-action="to-testing">Promote to Testing</button> ' +
-                '<button type="button" class="btn promo-stable" data-id="' + p.id + '" data-action="to-stable">Promote to Stable</button> ' +
-                '<button type="button" class="btn promo-keep" data-id="' + p.id + '" data-action="keep-dev">Keep in Dev</button>';
+                '<button type="button" class="btn promo-stable" data-id="' + p.id + '" data-action="to-stable">Promote to Stable</button>';
             } else {
               actions = p.to_channel ? (p.from_channel + ' → ' + p.to_channel) : '-';
             }
-            var filterStr = (p.id + ' ' + (p.package_name || '') + ' ' + (p.package_id || '') + ' ' + (p.release_id || '') + ' ' + (p.build_job_id || '') + ' ' + status).toLowerCase();
-            return '<tr data-filter="' + filterStr.replace(/"/g, '&quot;') + '"><td class="col-checkbox"><input type="checkbox" class="promo-row-cb" data-id="' + p.id + '"></td><td>' + p.id + '</td><td>' + esc(p.package_name || '') + ' <span style="color:var(--text-muted)">(' + (p.package_id || '') + ')</span></td><td>' + p.release_id + '</td><td>' +
+            return '<tr data-id="' + p.id + '" data-status="' + esc(status) + '"><td class="col-checkbox"><input type="checkbox" class="promo-row-cb" data-id="' + p.id + '"></td><td>' + p.id + '</td><td>' + esc(p.package_name || '') + ' <span style="color:var(--text-muted)">(' + (p.package_id || '') + ')</span></td><td>' + p.release_id + '</td><td>' +
               (p.build_job_id ? '<a href="/build.html?job_id=' + p.build_job_id + '">' + p.build_job_id + '</a>' : '-') + '</td><td><span class="' + statusClass + '">' + esc(status) + '</span></td><td>' + (p.created_at ? new Date(p.created_at).toLocaleString() : '') + '</td><td>' + actions + '</td></tr>';
           }).join('') || '<tr><td colspan="8">No promotions</td></tr>';
-          var selectAllEl = document.getElementById('promo-select-all');
-          if (selectAllEl) { selectAllEl.checked = false; selectAllEl.onclick = function() { tbody.querySelectorAll('.promo-row-cb').forEach(function(cb) { cb.checked = selectAllEl.checked; }); }; }
-          tbody.querySelectorAll('.promo-row-cb').forEach(function(cb) {
-            cb.addEventListener('change', function() {
-              var rowCbs = tbody.querySelectorAll('.promo-row-cb');
-              var checked = tbody.querySelectorAll('.promo-row-cb:checked').length;
-              if (selectAllEl) selectAllEl.checked = checked === rowCbs.length && rowCbs.length > 0;
-            });
-          });
-          var textFilter = document.getElementById('promo-text-filter');
-          if (textFilter) {
-            textFilter.oninput = function() {
-              var v = (textFilter.value || '').toLowerCase();
-              tbody.querySelectorAll('tr[data-filter]').forEach(function(tr) {
-                tr.style.display = (!v || (tr.getAttribute('data-filter') || '').indexOf(v) !== -1) ? '' : 'none';
-              });
-            };
-          }
           tbody.querySelectorAll('[data-action]').forEach(function(btn) {
             btn.addEventListener('click', function() {
               var id = btn.dataset.id;
               var action = btn.dataset.action;
-              var path = '/promotions/' + id + '/' + (action === 'to-testing' ? 'to-testing' : action === 'to-stable' ? 'to-stable' : 'keep-dev');
-              api.post(path).then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+              var postPath = '/promotions/' + id + '/' + (action === 'to-testing' ? 'to-testing' : 'to-stable');
+              api.post(postPath).then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
             });
           });
           var numPages = promoTotal ? Math.ceil(promoTotal / promoPageSize) : 1;
           document.getElementById('promo-page-info').textContent = 'Page ' + (promoPage + 1) + ' of ' + numPages;
           document.getElementById('promo-prev').disabled = promoPage <= 0;
           document.getElementById('promo-next').disabled = promoPage >= numPages - 1;
+          promoTableSel.refresh();
         }).catch(function() {
           var tbody = document.getElementById('promo-tbody');
           if (tbody) tbody.innerHTML = '<tr><td colspan="8">Failed to load</td></tr>';
@@ -133,7 +165,14 @@
         document.getElementById('promo-next').addEventListener('click', function() { var n = promoTotal ? Math.ceil(promoTotal / promoPageSize) : 1; if (promoPage < n - 1) { promoPage++; load(); } });
         document.getElementById('promo-page-size').addEventListener('change', function() { promoPageSize = parseInt(this.value, 10) || 25; promoPage = 0; load(); });
       })();
-      document.getElementById('promo-status-filter').addEventListener('change', load);
+      document.getElementById('promo-status-filter').addEventListener('change', function() { promoPage = 0; load(); });
+      var ptf = document.getElementById('promo-text-filter');
+      if (ptf && window.oreonDebounce) {
+        ptf.addEventListener('input', window.oreonDebounce(function() {
+          promoPage = 0;
+          load();
+        }, 300));
+      }
       load();
     })();
   </script>
