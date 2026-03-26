@@ -5,7 +5,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Query, Request, Upload
 from fastapi.responses import JSONResponse
 
 from oreon_build.utils.spec import name_from_srpm_filename, parse_spec_content
-from sqlalchemy import func, select
+from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.orm import selectinload
 
 from oreon_build.api.deps import CurrentUser, DbSession
@@ -17,7 +17,7 @@ from oreon_build.api.schemas import (
     PaginatedResponse,
 )
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
-from oreon_build.models import BuildAttempt, BuildJob, BuildStatus, BuildTarget, Worker
+from oreon_build.models import BuildAttempt, BuildJob, BuildStatus, BuildTarget, Package, Release, Worker
 from oreon_build.services.r2 import get_r2_client, upload_r2_key
 
 router = APIRouter(prefix="/builds", tags=["builds"])
@@ -57,24 +57,61 @@ async def _get_or_create_build_target(db: DbSession, release_id: int, architectu
     return target
 
 
+def _build_job_search_clause(search_trim: str):
+    term = search_trim.strip()
+    if not term:
+        return None
+    esc = term.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+    pat = f"%{esc}%"
+    parts = [
+        Package.name.ilike(pat, escape="\\"),
+        Release.releasename.ilike(pat, escape="\\"),
+        cast(BuildJob.status, String).ilike(pat, escape="\\"),
+        BuildTarget.architecture.ilike(pat, escape="\\"),
+    ]
+    if term.isdigit():
+        n = int(term)
+        parts.extend(
+            [
+                BuildJob.id == n,
+                BuildJob.package_id == n,
+                BuildJob.release_id == n,
+            ]
+        )
+    return or_(*parts)
+
+
 @router.get("", response_model=PaginatedResponse[BuildJobResponse])
 async def list_builds(
     db: DbSession,
     release_id: int | None = None,
     package_id: int | None = None,
     status: str | None = None,
+    search: str | None = Query(None, max_length=200, description="Filter by job id, package name, release name, arch, status"),
     limit: int = Query(25, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ):
-    """List build jobs. Query params: release_id, package_id, status, limit, offset."""
-    q = (
-        select(BuildJob)
-        .options(selectinload(BuildJob.build_target))
-        .order_by(BuildJob.created_at.desc())
-        .limit(limit)
-        .offset(offset)
-    )
+    """List build jobs. Query params: release_id, package_id, status, search, limit, offset."""
+    q = select(BuildJob).options(selectinload(BuildJob.build_target)).order_by(BuildJob.created_at.desc())
     count_q = select(func.count()).select_from(BuildJob)
+    search_trim = (search or "").strip()
+    if search_trim:
+        q = (
+            q.join(Package, BuildJob.package_id == Package.id)
+            .join(Release, BuildJob.release_id == Release.id)
+            .outerjoin(BuildTarget, BuildJob.target_id == BuildTarget.id)
+        )
+        count_q = (
+            select(func.count())
+            .select_from(BuildJob)
+            .join(Package, BuildJob.package_id == Package.id)
+            .join(Release, BuildJob.release_id == Release.id)
+            .outerjoin(BuildTarget, BuildJob.target_id == BuildTarget.id)
+        )
+        sc = _build_job_search_clause(search_trim)
+        if sc is not None:
+            q = q.where(sc)
+            count_q = count_q.where(sc)
     if release_id is not None:
         q = q.where(BuildJob.release_id == release_id)
         count_q = count_q.where(BuildJob.release_id == release_id)
@@ -85,6 +122,7 @@ async def list_builds(
         q = q.where(BuildJob.status == status)
         count_q = count_q.where(BuildJob.status == status)
     total = (await db.execute(count_q)).scalar() or 0
+    q = q.limit(limit).offset(offset)
     result = await db.execute(q)
     jobs = list(result.scalars().all())
     return PaginatedResponse(items=jobs, total=total)
