@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Builds - Oreon Build Service</title>
-  <link rel="stylesheet" href="/static/style.css?v=2">
+  <link rel="stylesheet" href="/static/style.css?v=3">
 </head>
 <body>
   <header class="header">
@@ -145,6 +145,10 @@
         <input type="text" id="builds-filter" placeholder="Filter by ID, package, release, arch, status…" style="padding:0.4rem; width:100%; max-width:20rem;">
       </div>
       <div class="list-toolbar">
+        <div class="bulk-selection-bar" id="builds-bulk-bar">
+          <span class="bulk-selection-count"></span>
+          <span class="bulk-selection-buttons"></span>
+        </div>
         <div class="select-all-wrap">
           <label for="builds-select-all">Select all</label>
         </div>
@@ -167,7 +171,7 @@
       </table>
     </section>
   </main>
-  <script src="/static/app.js?v=2"></script>
+  <script src="/static/app.js?v=4"></script>
   <script>
     (function() {
       const api = window.oreonApi;
@@ -309,10 +313,62 @@
       var buildsPage = 0;
       var buildsPageSize = 25;
       var buildsTotal = 0;
+      var buildsTableSel = window.oreonBindTableSelection(document.getElementById('builds-tbody'), {
+        rowCheckboxSelector: '.build-row-cb',
+        selectAll: document.getElementById('builds-select-all'),
+        bulkBar: document.getElementById('builds-bulk-bar'),
+        onSelectionChange: function(ids, btns) {
+          var tbody = document.getElementById('builds-tbody');
+          var clear = document.createElement('button');
+          clear.type = 'button';
+          clear.className = 'btn';
+          clear.textContent = 'Clear selection';
+          clear.addEventListener('click', function() {
+            tbody.querySelectorAll('.build-row-cb').forEach(function(cb) { cb.checked = false; });
+            buildsTableSel.refresh();
+          });
+          btns.appendChild(clear);
+          if (!api.token) return;
+          var retryBulk = document.createElement('button');
+          retryBulk.type = 'button';
+          retryBulk.className = 'btn';
+          retryBulk.textContent = 'Retry selected';
+          retryBulk.addEventListener('click', function() {
+            var chain = Promise.resolve();
+            ids.forEach(function(id) {
+              var tr = tbody.querySelector('tr[data-id="' + id + '"]');
+              var st = tr ? (tr.getAttribute('data-status') || '') : '';
+              if (st === 'pending' || st === 'queued' || st === 'running') return;
+              chain = chain.then(function() { return api.post('/builds/jobs/' + id + '/retry'); });
+            });
+            chain.then(function() { render(); }).catch(function(e) { alert(e.message); });
+          });
+          btns.appendChild(retryBulk);
+          var cancelBulk = document.createElement('button');
+          cancelBulk.type = 'button';
+          cancelBulk.className = 'btn';
+          cancelBulk.textContent = 'Cancel selected';
+          cancelBulk.addEventListener('click', function() {
+            var chain = Promise.resolve();
+            ids.forEach(function(id) {
+              var tr = tbody.querySelector('tr[data-id="' + id + '"]');
+              var st = tr ? (tr.getAttribute('data-status') || '') : '';
+              if (st !== 'pending' && st !== 'queued' && st !== 'running') return;
+              chain = chain.then(function() { return api.post('/builds/jobs/' + id + '/cancel'); });
+            });
+            chain.then(function() { render(); }).catch(function(e) { alert(e.message); });
+          });
+          btns.appendChild(cancelBulk);
+        }
+      });
       function render() {
         var offset = buildsPage * buildsPageSize;
+        var bf = document.getElementById('builds-filter');
+        var bq = (bf && bf.value) ? String(bf.value).trim() : '';
+        var buildsUrl = '/builds?limit=' + buildsPageSize + '&offset=' + offset;
+        if (bq) buildsUrl += '&search=' + encodeURIComponent(bq);
         Promise.all([
-          api.get('/builds?limit=' + buildsPageSize + '&offset=' + offset),
+          api.get(buildsUrl),
           api.get('/packages?limit=500').catch(function() { return { items: [] }; }),
           api.get('/releases?limit=500').catch(function() { return { items: [] }; })
         ]).then(function(results) {
@@ -333,41 +389,13 @@
             var name = rel ? (rel.releasename || '').trim() : '';
             return name ? escapeHtml(name) + ' (' + j.release_id + ')' : ('#' + j.release_id);
           }
-          var filterText = function(j) {
-            var pkg = packagesList.find(function(p) { return p.id === j.package_id; });
-            var rel = releasesList.find(function(r) { return r.id === j.release_id; });
-            return (j.id + ' ' + (pkg ? pkg.name : '') + ' ' + (rel ? rel.releasename : '') + ' ' + (j.architecture || '') + ' ' + (j.status || '')).toLowerCase();
-          };
           tbody.innerHTML = jobs.map(function(j) {
             const canAct = api.token;
             var cancelBtn = (canAct && (j.status === 'pending' || j.status === 'queued' || j.status === 'running')) ? ' <button class="btn cancel-build" data-id="' + j.id + '">Cancel</button>' : '';
             var retryBtn = (canAct && j.status !== 'pending' && j.status !== 'queued' && j.status !== 'running') ? ' <button class="btn retry" data-id="' + j.id + '">Retry</button>' : '';
             var arch = (j.architecture != null && j.architecture !== '') ? j.architecture : '—';
-            return '<tr data-filter="' + escapeAttr(filterText(j)) + '" data-id="' + j.id + '"><td class="col-checkbox"><input type="checkbox" class="build-row-cb" data-id="' + j.id + '"></td><td>' + j.id + '</td><td>' + packageLabel(j) + '</td><td>' + releaseLabel(j) + '</td><td>' + arch + '</td><td><span class="' + statusClass(j.status) + '">' + j.status + '</span></td><td>' + (j.created_at || '').slice(0,19) + '</td><td><a href="/build.html?job_id=' + j.id + '">View</a>' + retryBtn + cancelBtn + '</td></tr>';
+            return '<tr data-id="' + j.id + '" data-status="' + escapeAttr(j.status || '') + '"><td class="col-checkbox"><input type="checkbox" class="build-row-cb" data-id="' + j.id + '"></td><td>' + j.id + '</td><td>' + packageLabel(j) + '</td><td>' + releaseLabel(j) + '</td><td>' + arch + '</td><td><span class="' + statusClass(j.status) + '">' + j.status + '</span></td><td>' + (j.created_at || '').slice(0,19) + '</td><td><a href="/build.html?job_id=' + j.id + '">View</a>' + retryBtn + cancelBtn + '</td></tr>';
           }).join('') || '<tr><td colspan="8">No builds</td></tr>';
-          var filterEl = document.getElementById('builds-filter');
-          if (filterEl) {
-            filterEl.oninput = function() {
-              var v = (filterEl.value || '').toLowerCase();
-              tbody.querySelectorAll('tr[data-filter]').forEach(function(tr) {
-                tr.style.display = (!v || (tr.getAttribute('data-filter') || '').indexOf(v) !== -1) ? '' : 'none';
-              });
-            };
-          }
-          var selectAllEl = document.getElementById('builds-select-all');
-          if (selectAllEl) {
-            selectAllEl.checked = false;
-            selectAllEl.onclick = function() {
-              tbody.querySelectorAll('.build-row-cb').forEach(function(cb) { cb.checked = selectAllEl.checked; });
-            };
-          }
-          tbody.querySelectorAll('.build-row-cb').forEach(function(cb) {
-            cb.addEventListener('change', function() {
-              var rowCbs = tbody.querySelectorAll('.build-row-cb');
-              var checked = tbody.querySelectorAll('.build-row-cb:checked').length;
-              if (selectAllEl) { selectAllEl.checked = checked === rowCbs.length && rowCbs.length > 0; }
-            });
-          });
           tbody.querySelectorAll('.retry').forEach(function(btn) {
             btn.addEventListener('click', function() {
               api.post('/builds/jobs/' + btn.dataset.id + '/retry').then(render).catch(function(e) { alert(e.message); });
@@ -382,6 +410,7 @@
           document.getElementById('builds-page-info').textContent = 'Page ' + (buildsPage + 1) + ' of ' + numPages;
           document.getElementById('builds-prev').disabled = buildsPage <= 0;
           document.getElementById('builds-next').disabled = buildsPage >= numPages - 1;
+          buildsTableSel.refresh();
         }).catch(function() {
           const tbody = document.getElementById('builds-tbody');
           if (tbody) tbody.innerHTML = '<tr><td colspan="8">Failed to load</td></tr>';
@@ -400,6 +429,13 @@
           buildsPage = 0;
           render();
         });
+        var bff = document.getElementById('builds-filter');
+        if (bff && window.oreonDebounce) {
+          bff.addEventListener('input', window.oreonDebounce(function() {
+            buildsPage = 0;
+            render();
+          }, 300));
+        }
       })();
       updateLoggedInUI();
       window.addEventListener('auth-change', updateLoggedInUI);
