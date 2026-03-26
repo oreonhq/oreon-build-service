@@ -13,9 +13,9 @@ echo "=== Oreon Build Service deploy ==="
 if ! command -v psql &>/dev/null; then
   echo "PostgreSQL client not found. Install postgresql and postgresql-server."
   if command -v dnf &>/dev/null; then
-    echo "Run: sudo dnf install postgresql-server && sudo postgresql-setup --initdb"
+    echo "Run: sudo dnf install postgresql-server pesign rpmrebuild file && sudo postgresql-setup --initdb"
   elif command -v yum &>/dev/null; then
-    echo "Run: sudo yum install postgresql-server && sudo postgresql-setup --initdb"
+    echo "Run: sudo yum install postgresql-server pesign rpmrebuild file && sudo postgresql-setup --initdb"
   elif command -v apt-get &>/dev/null; then
     echo "Run: sudo apt-get install postgresql postgresql-contrib"
   fi
