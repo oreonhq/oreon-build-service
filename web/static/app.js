@@ -1,11 +1,81 @@
-/* Oreon Build Service - frontend helpers */
+/*
+ * Oreon Build Service - frontend helpers
+ * Copyright (C) 2026 Oreon HQ
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+function oreonParseJwtPayload(token) {
+  if (!token || typeof token !== 'string') return null;
+  var parts = token.split('.');
+  if (parts.length !== 3) return null;
+  try {
+    var raw = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    while (raw.length % 4 !== 0) raw += '=';
+    var json = atob(raw);
+    return JSON.parse(json);
+  } catch (e) {
+    return null;
+  }
+}
+
+function oreonLoadStoredAuth(api) {
+  api.token = localStorage.getItem('oreon_token') || '';
+  api.username = localStorage.getItem('oreon_username') || '';
+  api.role = localStorage.getItem('oreon_role') || '';
+  if (api.token && !api.role) {
+    var p = oreonParseJwtPayload(api.token);
+    if (p && p.role) api.role = p.role;
+  }
+}
+
 window.oreonApi = {
   base: (typeof API_BASE !== 'undefined' ? API_BASE : '') || '/api',
-  token: localStorage.getItem('oreon_token') || '',
+  token: '',
+  username: '',
+  role: '',
   setToken(t) {
     this.token = t || '';
-    if (t) localStorage.setItem('oreon_token', t);
-    else localStorage.removeItem('oreon_token');
+    if (t) {
+      localStorage.setItem('oreon_token', t);
+    } else {
+      localStorage.removeItem('oreon_token');
+      localStorage.removeItem('oreon_role');
+      localStorage.removeItem('oreon_username');
+      this.role = '';
+      this.username = '';
+    }
+  },
+  afterLogin(data) {
+    if (!data || !data.access_token) return;
+    this.token = data.access_token;
+    localStorage.setItem('oreon_token', data.access_token);
+    this.username = (data.username != null && data.username !== '') ? data.username : '';
+    this.role = (data.role != null && data.role !== '') ? data.role : '';
+    if (this.username) localStorage.setItem('oreon_username', this.username);
+    else localStorage.removeItem('oreon_username');
+    if (this.role) localStorage.setItem('oreon_role', this.role);
+    else {
+      var p = oreonParseJwtPayload(this.token);
+      if (p && p.role) {
+        this.role = p.role;
+        localStorage.setItem('oreon_role', this.role);
+      } else localStorage.removeItem('oreon_role');
+    }
+  },
+  isAdmin() {
+    return this.role === 'admin';
   },
   async request(method, path, body) {
     const opts = { method, headers: {} };
@@ -37,7 +107,78 @@ window.oreonApi = {
   delete(path) { return this.request('DELETE', path); },
 };
 
-// Lightweight UI helpers for modals / confirmations
+oreonLoadStoredAuth(window.oreonApi);
+
+/**
+ * Checkbox table: show a bulk bar and refresh counts. Call refresh() after re-rendering tbody.
+ * opts: { rowCheckboxSelector, selectAll, bulkBar, onSelectionChange(ids, buttonsEl) }
+ */
+window.oreonBindTableSelection = function(tbody, opts) {
+  if (!tbody || !opts) return { refresh: function() {}, getSelectedIds: function() { return []; } };
+  var rowSel = opts.rowCheckboxSelector || '.row-cb';
+  var selectAll = opts.selectAll;
+  var bulkBar = opts.bulkBar;
+  var onSelectionChange = opts.onSelectionChange;
+
+  function getSelectedIds() {
+    var ids = [];
+    tbody.querySelectorAll(rowSel + ':checked').forEach(function(cb) {
+      var id = cb.getAttribute('data-id');
+      if (id != null && id !== '') ids.push(id);
+    });
+    return ids;
+  }
+
+  function refresh() {
+    var ids = getSelectedIds();
+    if (selectAll) {
+      var all = tbody.querySelectorAll(rowSel);
+      var n = all.length;
+      var c = tbody.querySelectorAll(rowSel + ':checked').length;
+      selectAll.checked = n > 0 && c === n;
+    }
+    if (bulkBar) {
+      if (ids.length === 0) {
+        bulkBar.classList.remove('is-visible');
+      } else {
+        bulkBar.classList.add('is-visible');
+        var cnt = bulkBar.querySelector('.bulk-selection-count');
+        if (cnt) cnt.textContent = ids.length + ' selected';
+        var btns = bulkBar.querySelector('.bulk-selection-buttons');
+        if (btns) {
+          btns.innerHTML = '';
+          if (onSelectionChange) onSelectionChange(ids, btns);
+        }
+      }
+    }
+  }
+
+  tbody.addEventListener('change', function(e) {
+    if (e.target && e.target.matches && e.target.matches(rowSel)) refresh();
+  });
+  if (selectAll) {
+    selectAll.addEventListener('change', function() {
+      tbody.querySelectorAll(rowSel).forEach(function(cb) { cb.checked = selectAll.checked; });
+      refresh();
+    });
+  }
+
+  return { refresh: refresh, getSelectedIds: getSelectedIds };
+};
+
+/** Returns a function that runs fn after ms quiet time (use for server-backed list filters). */
+window.oreonDebounce = function(fn, ms) {
+  var t;
+  return function() {
+    var ctx = this;
+    var args = arguments;
+    clearTimeout(t);
+    t = setTimeout(function() {
+      fn.apply(ctx, args);
+    }, ms);
+  };
+};
+
 window.oreonUI = (function() {
   let confirmResolve = null;
   function ensureShell() {
@@ -67,7 +208,6 @@ window.oreonUI = (function() {
       + '</div>';
     document.body.appendChild(wrapper);
     const cm = document.getElementById('global-confirm-modal');
-    const msg = document.getElementById('confirm-message');
     const btnOk = document.getElementById('confirm-ok-btn');
     const btnCancel = document.getElementById('confirm-cancel-btn');
     function close(val) {
@@ -114,12 +254,22 @@ function updateAuthUI() {
   const userInfo = document.getElementById('user-info');
   if (btnLogin) btnLogin.style.display = token ? 'none' : 'inline-block';
   if (btnLogout) btnLogout.style.display = token ? 'inline-block' : 'none';
-  if (userInfo) userInfo.textContent = token ? '(logged in)' : '';
+  if (userInfo) {
+    if (token) {
+      var u = window.oreonApi.username || 'user';
+      var r = window.oreonApi.role || '';
+      userInfo.textContent = r ? '(' + u + ', ' + r + ')' : '(' + u + ')';
+    } else userInfo.textContent = '';
+  }
 }
 
 document.addEventListener('DOMContentLoaded', function() {
+  oreonLoadStoredAuth(window.oreonApi);
   updateAuthUI();
-  window.addEventListener('auth-change', updateAuthUI);
+  window.addEventListener('auth-change', function() {
+    oreonLoadStoredAuth(window.oreonApi);
+    updateAuthUI();
+  });
   const btnLogin = document.getElementById('btn-login');
   const btnLogout = document.getElementById('btn-logout');
   if (btnLogin) {
@@ -139,7 +289,7 @@ document.addEventListener('DOMContentLoaded', function() {
         if (!user || !pass) return;
         window.oreonApi.post('/auth/login', { username: user, password: pass })
           .then(function(data) {
-            window.oreonApi.setToken(data.access_token);
+            window.oreonApi.afterLogin(data);
             cleanup();
             window.oreonUI.closeLogin();
             updateAuthUI();
