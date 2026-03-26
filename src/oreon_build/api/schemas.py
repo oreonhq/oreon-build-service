@@ -5,7 +5,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Generic, List, Optional, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 T = TypeVar("T")
 
@@ -98,21 +98,56 @@ class ReleaseResponse(BaseModel):
 
 
 # --- Mock environment ---
+def _validate_mock_additional_repo_urls(v: object, *, allow_none: bool) -> Optional[List[str]]:
+    if v is None:
+        return None if allow_none else []
+    if not isinstance(v, list):
+        raise ValueError("additional_repo_urls must be a list of strings")
+    out: List[str] = []
+    for item in v:
+        s = str(item).strip()
+        if not s:
+            continue
+        if len(s) > 2048:
+            raise ValueError("repo URL exceeds 2048 characters")
+        if len(out) >= 32:
+            raise ValueError("at most 32 additional repo URLs")
+        if not s.startswith(("http://", "https://")):
+            raise ValueError("each additional repo URL must start with http:// or https://")
+        out.append(s)
+    return out
+
+
 class MockEnvironmentCreate(BaseModel):
     release_id: int
     name: str = Field(..., max_length=128)
     config_name: str = Field(..., max_length=128, description="Base config name; at build time worker uses <config_name>-<arch>")
     config_content: Optional[str] = None
+    additional_repo_urls: List[str] = Field(default_factory=list)
     is_available: bool = True
     priority: int = 0
+
+    @field_validator("additional_repo_urls", mode="before")
+    @classmethod
+    def _repos_create(cls, v: object) -> List[str]:
+        out = _validate_mock_additional_repo_urls(v, allow_none=False)
+        return list(out) if out is not None else []
 
 
 class MockEnvironmentUpdate(BaseModel):
     name: Optional[str] = None
     config_name: Optional[str] = None
     config_content: Optional[str] = None
+    additional_repo_urls: Optional[List[str]] = None
     is_available: Optional[bool] = None
     priority: Optional[int] = None
+
+    @field_validator("additional_repo_urls", mode="before")
+    @classmethod
+    def _repos_update(cls, v: object) -> Optional[List[str]]:
+        if v is None:
+            return None
+        return _validate_mock_additional_repo_urls(v, allow_none=False)
 
 
 class MockEnvironmentResponse(BaseModel):
@@ -121,6 +156,7 @@ class MockEnvironmentResponse(BaseModel):
     name: str
     config_name: str
     architecture: Optional[str] = None
+    additional_repo_urls: List[str] = Field(default_factory=list)
     is_available: bool
     priority: int
     created_at: datetime

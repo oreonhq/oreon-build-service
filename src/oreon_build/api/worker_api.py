@@ -163,6 +163,7 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
     releasename = None
     sources = []
     mock_config = None
+    selected_mock_env: MockEnvironment | None = None
     target = None
     rel_result = await db.execute(select(Release).where(Release.id == job.release_id))
     release = rel_result.scalar_one_or_none()
@@ -193,7 +194,8 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
         )
         target = t_result.scalar_one_or_none()
         if target and target.mock_environment:
-            mock_config = target.mock_environment.config_name
+            selected_mock_env = target.mock_environment
+            mock_config = selected_mock_env.config_name
     if not mock_config and job.package_id:
         pkg_result = await db.execute(
             select(Package).where(Package.id == job.package_id).options(
@@ -202,13 +204,15 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
         )
         pkg = pkg_result.scalar_one_or_none()
         if pkg and pkg.preferred_mock_environment and pkg.preferred_mock_environment.release_id == job.release_id:
-            mock_config = pkg.preferred_mock_environment.config_name
+            selected_mock_env = pkg.preferred_mock_environment
+            mock_config = selected_mock_env.config_name
     if not mock_config and release:
         fallback = await db.execute(
             select(MockEnvironment).where(MockEnvironment.release_id == job.release_id).limit(1)
         )
         me = fallback.scalar_one_or_none()
         if me:
+            selected_mock_env = me
             mock_config = me.config_name
 
     # At build time, worker uses <config_name>-<arch> (mock env is not arch-specific)
@@ -223,6 +227,10 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
                 break
         mock_config = base + "-" + build_arch
 
+    mock_additional_repos: list[str] = []
+    if selected_mock_env and selected_mock_env.additional_repo_urls:
+        mock_additional_repos = [str(u).strip() for u in selected_mock_env.additional_repo_urls if str(u).strip()]
+
     return {
         "job": {
             "build_job_id": job.id,
@@ -235,6 +243,7 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
             "architecture": build_arch,
             "sources": sources,
             "mock_config": mock_config,
+            "mock_additional_repos": mock_additional_repos,
         },
     }
 
