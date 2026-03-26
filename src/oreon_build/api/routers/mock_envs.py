@@ -1,3 +1,19 @@
+# Oreon Build Service
+# Copyright (C) 2026 Oreon HQ
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """Mock environments - list public; create/update/delete require admin."""
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from sqlalchemy import func, select
@@ -57,6 +73,7 @@ async def create_mock_environment(
         config_name=data.config_name,
         architecture=None,
         config_content=data.config_content,
+        additional_repo_urls=list(data.additional_repo_urls),
         is_available=data.is_available,
         priority=data.priority,
     )
@@ -97,6 +114,8 @@ async def update_mock_environment(
         env.is_available = data.is_available
     if data.priority is not None:
         env.priority = data.priority
+    if data.additional_repo_urls is not None:
+        env.additional_repo_urls = list(data.additional_repo_urls)
     await log_audit(
         db,
         "mock_env.update",
