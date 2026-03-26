@@ -6,7 +6,7 @@
 
 Name:           oreon-build-worker
 Version:        1.0.0
-Release:        23%{?dist}
+Release:        24%{?dist}
 Summary:        Oreon Build Service worker daemon
 License:        GPLv3
 URL:            https://github.com/oreon/oreon-build-service
@@ -27,8 +27,6 @@ Requires:       python3 >= 3.11
 Requires:       mock
 Requires:       python3-pydantic
 Requires:       rpmdevtools
-Requires:       rpmrebuild
-Requires:       pesign
 Requires:       pigz
 
 %description
