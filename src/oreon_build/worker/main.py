@@ -30,6 +30,9 @@ removes the job tempdir (prefix ``oreon-worker-<attempt_id>-``) so parallel jobs
 legacy ``oreon-worker-*`` dirs are pruned by age (see deploy docs).
 
 DistGit: Source(kind="distgit", url="<repo>.git#branch:spec_relpath") — mock --buildsrpm then mock --rebuild.
+
+Poll may include ``mock_additional_repos`` (base URLs) from the job mock environment. Each becomes ``mock --addrepo``.
+Optional ``OREON_WORKER_EXTRA_MOCK_ADDREPO`` appends comma-separated URLs on the worker.
 """
 
 from __future__ import annotations
@@ -145,6 +148,37 @@ def _upload_rpm_to_controller(
 def _truthy_env(name: str) -> bool:
     v = (os.environ.get(name) or "").strip().lower()
     return v in ("1", "true", "yes", "on")
+
+
+def _mock_addrepo_baseurls(job: dict) -> list[str]:
+    """URLs for ``mock --addrepo`` from poll ``mock_additional_repos`` plus optional worker env."""
+    seen: set[str] = set()
+    out: list[str] = []
+    raw = job.get("mock_additional_repos") or []
+    if isinstance(raw, list):
+        for u in raw:
+            s = str(u).strip()
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+    extra = (os.environ.get("OREON_WORKER_EXTRA_MOCK_ADDREPO") or "").strip()
+    if extra:
+        for part in extra.split(","):
+            p = part.strip()
+            if p and p not in seen:
+                seen.add(p)
+                out.append(p)
+    return out
+
+
+def _mock_cmd_base(mock_config: str, mock_unique_ext: str | None, addrepo_baseurls: list[str]) -> list[str]:
+    cmd: list[str] = ["mock", "-r", mock_config]
+    if mock_unique_ext:
+        cmd += ["--uniqueext", mock_unique_ext]
+    for url in addrepo_baseurls:
+        cmd += ["--addrepo", url]
+    return cmd
 
 
 def _make_mock_resultdir_world_readable(result_dir: Path) -> None:
@@ -634,6 +668,7 @@ def _mock_build_srpm_from_spec(
     result_dir: Path,
     abort_event: threading.Event | None = None,
     mock_unique_ext: str | None = None,
+    addrepo_baseurls: list[str] | None = None,
 ) -> tuple[bool, Path | None, str, bool]:
     """
     Build SRPM from spec/sources using mock (so dependencies are handled in chroot).
@@ -644,9 +679,7 @@ def _mock_build_srpm_from_spec(
     otherwise mock shares one chroot per ``-r`` config and parallel jobs fail with
     "Build root is locked by another process."
     """
-    cmd: list[str] = ["mock", "-r", mock_config]
-    if mock_unique_ext:
-        cmd += ["--uniqueext", mock_unique_ext]
+    cmd = _mock_cmd_base(mock_config, mock_unique_ext, addrepo_baseurls or [])
     cmd += [
         "--buildsrpm",
         "--spec",
@@ -678,11 +711,10 @@ def _mock_rebuild_srpm(
     result_dir: Path,
     abort_event: threading.Event | None = None,
     mock_unique_ext: str | None = None,
+    addrepo_baseurls: list[str] | None = None,
 ) -> tuple[bool, str, bool]:
     """Returns (ok, output, cancelled). See :func:`_mock_build_srpm_from_spec` for ``mock_unique_ext``."""
-    cmd: list[str] = ["mock", "-r", mock_config]
-    if mock_unique_ext:
-        cmd += ["--uniqueext", mock_unique_ext]
+    cmd = _mock_cmd_base(mock_config, mock_unique_ext, addrepo_baseurls or [])
     cmd += ["--rebuild", str(srpm_path), "--resultdir", str(result_dir)]
     rc, out = _run_with_abort(cmd, timeout_s=_mock_rebuild_timeout_sec(), abort_event=abort_event)
     if rc == _RC_MOCK_CANCELLED:
@@ -919,6 +951,9 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
         mock_unique_ext = f"oreon-{attempt_id}"
         scrub_mock_cfg = mock_config
         scrub_mock_ext = mock_unique_ext
+        mock_addrepos = _mock_addrepo_baseurls(job)
+        if mock_addrepos:
+            logger.info("mock --addrepo for attempt %s: %s", attempt_id, mock_addrepos)
 
         tmp_parent = _worker_temp_parent_dir()
         if tmp_parent:
@@ -1024,6 +1059,7 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                     result_dir=srpm_result_dir,
                     abort_event=abort_event,
                     mock_unique_ext=mock_unique_ext,
+                    addrepo_baseurls=mock_addrepos,
                 )
                 _make_mock_resultdir_world_readable(srpm_result_dir)
                 build_log_parts.extend(
@@ -1080,6 +1116,7 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                 result_dir=result_dir,
                 abort_event=abort_event,
                 mock_unique_ext=mock_unique_ext,
+                addrepo_baseurls=mock_addrepos,
             )
             _make_mock_resultdir_world_readable(result_dir)
             build_log_parts.extend(
