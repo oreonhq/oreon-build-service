@@ -1,10 +1,15 @@
 <!DOCTYPE html>
+<!--
+  Oreon Build Service - Workers page
+  Copyright (C) 2026 Oreon HQ
+  SPDX-License-Identifier: GPL-3.0-or-later
+-->
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Workers - Oreon Build Service</title>
-  <link rel="stylesheet" href="/static/style.css?v=2">
+  <link rel="stylesheet" href="/static/style.css?v=3">
 </head>
 <body>
   <header class="header">
@@ -47,6 +52,10 @@
         <button type="button" class="btn primary" id="btn-enroll-worker">Enroll worker</button>
       </div>
       <div class="list-toolbar">
+        <div class="bulk-selection-bar" id="workers-bulk-bar">
+          <span class="bulk-selection-count"></span>
+          <span class="bulk-selection-buttons"></span>
+        </div>
         <div class="select-all-wrap"><label for="workers-select-all">Select all</label></div>
         <div class="pagination">
           <button type="button" class="btn" id="workers-prev" disabled>Prev</button>
@@ -63,16 +72,49 @@
       </table>
     </section>
   </main>
-  <script src="/static/app.js?v=2"></script>
+  <script src="/static/app.js?v=3"></script>
   <script>
     (function() {
       const api = window.oreonApi;
+      var workersTableSel = window.oreonBindTableSelection(document.getElementById('workers-tbody'), {
+        rowCheckboxSelector: '.worker-row-cb',
+        selectAll: document.getElementById('workers-select-all'),
+        bulkBar: document.getElementById('workers-bulk-bar'),
+        onSelectionChange: function(ids, btns) {
+          var tbody = document.getElementById('workers-tbody');
+          var clear = document.createElement('button');
+          clear.type = 'button';
+          clear.className = 'btn';
+          clear.textContent = 'Clear selection';
+          clear.addEventListener('click', function() {
+            tbody.querySelectorAll('.worker-row-cb').forEach(function(cb) { cb.checked = false; });
+            workersTableSel.refresh();
+          });
+          btns.appendChild(clear);
+          if (!api.isAdmin()) return;
+          var del = document.createElement('button');
+          del.type = 'button';
+          del.className = 'btn';
+          del.style.color = 'var(--danger)';
+          del.textContent = 'Delete selected';
+          del.addEventListener('click', function() {
+            if (!confirm('Delete ' + ids.length + ' worker(s)? They will need to re-enroll.')) return;
+            var chain = Promise.resolve();
+            ids.forEach(function(id) {
+              chain = chain.then(function() { return api.delete('/workers/' + id); });
+            });
+            chain.then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+          });
+          btns.appendChild(del);
+        }
+      });
       function updateUI() {
         var hint = document.getElementById('workers-hint');
         var section = document.getElementById('enroll-worker-section');
-        if (api.token && hint) hint.textContent = 'Build workers. You can enroll new workers (admin).';
+        var isAdm = api.isAdmin();
+        if (api.token && hint) hint.textContent = isAdm ? 'Build workers. You can enroll or delete workers.' : 'Build workers. Admin role required to enroll or delete workers.';
         else if (hint) hint.textContent = 'Build workers. Login as admin to enroll workers.';
-        if (section) section.style.display = api.token ? 'block' : 'none';
+        if (section) section.style.display = isAdm ? 'block' : 'none';
       }
       function escapeHtml(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
       function escapeAttr(s) { return escapeHtml(s || '').replace(/"/g, '&quot;'); }
@@ -84,20 +126,11 @@
           if (!tbody) return;
           var list = (data && data.items) ? data.items : [];
           workersTotal = (data && typeof data.total === 'number') ? data.total : 0;
-          var canAct = !!api.token;
+          var canDel = api.isAdmin();
           tbody.innerHTML = list.map(function(w) {
-            var actions = canAct ? '<button type="button" class="btn delete-worker" data-id="' + w.id + '" data-name="' + escapeAttr(w.name) + '">Delete</button>' : '-';
+            var actions = canDel ? '<button type="button" class="btn delete-worker" data-id="' + w.id + '" data-name="' + escapeAttr(w.name) + '">Delete</button>' : '-';
             return '<tr><td class="col-checkbox"><input type="checkbox" class="worker-row-cb" data-id="' + w.id + '"></td><td>' + w.id + '</td><td>' + escapeHtml(w.name || '') + '</td><td>' + (w.state || '') + '</td><td>' + (w.architecture || '-') + '</td><td>' + (w.last_seen_at ? w.last_seen_at.slice(0,19) : '-') + '</td><td>' + actions + '</td></tr>';
           }).join('') || '<tr><td colspan="7">No workers</td></tr>';
-          var selectAllEl = document.getElementById('workers-select-all');
-          if (selectAllEl) { selectAllEl.checked = false; selectAllEl.onclick = function() { tbody.querySelectorAll('.worker-row-cb').forEach(function(cb) { cb.checked = selectAllEl.checked; }); }; }
-          tbody.querySelectorAll('.worker-row-cb').forEach(function(cb) {
-            cb.addEventListener('change', function() {
-              var rowCbs = tbody.querySelectorAll('.worker-row-cb');
-              var checked = tbody.querySelectorAll('.worker-row-cb:checked').length;
-              if (selectAllEl) selectAllEl.checked = checked === rowCbs.length && rowCbs.length > 0;
-            });
-          });
           tbody.querySelectorAll('.delete-worker').forEach(function(btn) {
             btn.addEventListener('click', function() {
               if (!confirm('Delete worker "' + (btn.dataset.name || '') + '"? The worker will need to re-enroll.')) return;
@@ -108,6 +141,7 @@
           document.getElementById('workers-page-info').textContent = 'Page ' + (workersPage + 1) + ' of ' + numPages;
           document.getElementById('workers-prev').disabled = workersPage <= 0;
           document.getElementById('workers-next').disabled = workersPage >= numPages - 1;
+          workersTableSel.refresh();
         }).catch(function() {
           var tbody = document.getElementById('workers-tbody');
           if (tbody) tbody.innerHTML = '<tr><td colspan="7">Failed to load</td></tr>';
