@@ -1,10 +1,15 @@
 <!DOCTYPE html>
+<!--
+  Oreon Build Service - Mock environments page
+  Copyright (C) 2026 Oreon HQ
+  SPDX-License-Identifier: GPL-3.0-or-later
+-->
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Mock Environments - Oreon Build Service</title>
-  <link rel="stylesheet" href="/static/style.css?v=2">
+  <link rel="stylesheet" href="/static/style.css?v=3">
 </head>
 <body>
   <header class="header">
@@ -46,9 +51,19 @@
           <input type="text" id="create-mock-config" placeholder="e.g. fedora-rawhide (worker uses this + &quot;-&lt;arch&gt;&quot;)" maxlength="128">
         </div>
         <p style="color:var(--text-muted); font-size:0.85rem;">At build time the worker uses <code>&lt;config_name&gt;-&lt;arch&gt;</code> (e.g. fedora-rawhide-x86_64).</p>
+        <div class="form-group">
+          <label>Additional repository base URLs (optional, mock <code>--addrepo</code>)</label>
+          <p style="color:var(--text-muted); font-size:0.85rem; margin:0 0 0.5rem 0;">Full base URL to repo metadata (directory that contains <code>repodata/</code>). Use <code>https://</code> or <code>http://</code>.</p>
+          <div id="create-mock-extra-repos"></div>
+          <button type="button" class="btn" id="btn-create-mock-add-repo" style="margin-top:0.35rem;">Add URL row</button>
+        </div>
         <button type="button" class="btn primary" id="btn-create-mock">Create mock environment</button>
       </div>
       <div class="list-toolbar">
+        <div class="bulk-selection-bar" id="mock-bulk-bar">
+          <span class="bulk-selection-count"></span>
+          <span class="bulk-selection-buttons"></span>
+        </div>
         <div class="select-all-wrap"><label for="mock-select-all">Select all</label></div>
         <div class="pagination">
           <button type="button" class="btn" id="mock-prev" disabled>Prev</button>
@@ -59,7 +74,7 @@
       </div>
       <table class="table-list">
         <thead>
-          <tr><th class="col-checkbox"><input type="checkbox" id="mock-select-all" title="Select all on this page"></th><th>ID</th><th>Release ID</th><th>Name</th><th>Config (base)</th><th>Available</th><th>Actions</th></tr>
+          <tr><th class="col-checkbox"><input type="checkbox" id="mock-select-all" title="Select all on this page"></th><th>ID</th><th>Release ID</th><th>Name</th><th>Config (base)</th><th>Extra repos</th><th>Available</th><th>Actions</th></tr>
         </thead>
         <tbody id="mock-tbody"></tbody>
       </table>
@@ -87,6 +102,11 @@
           <label>Priority</label>
           <input type="number" id="edit-mock-priority" value="0">
         </div>
+        <div class="form-group">
+          <label>Additional repository base URLs</label>
+          <div id="edit-mock-extra-repos"></div>
+          <button type="button" class="btn" id="btn-edit-mock-add-repo" style="margin-top:0.35rem;">Add URL row</button>
+        </div>
         <div class="modal-actions">
           <button type="button" class="btn" id="edit-mock-cancel">Cancel</button>
           <button type="button" class="btn primary" id="edit-mock-save">Save</button>
@@ -94,19 +114,76 @@
       </div>
     </div>
   </main>
-  <script src="/static/app.js?v=2"></script>
+  <script src="/static/app.js?v=3"></script>
   <script>
     (function() {
       const api = window.oreonApi;
+      var mockTableSel = window.oreonBindTableSelection(document.getElementById('mock-tbody'), {
+        rowCheckboxSelector: '.mock-row-cb',
+        selectAll: document.getElementById('mock-select-all'),
+        bulkBar: document.getElementById('mock-bulk-bar'),
+        onSelectionChange: function(ids, btns) {
+          var tbody = document.getElementById('mock-tbody');
+          var clear = document.createElement('button');
+          clear.type = 'button';
+          clear.className = 'btn';
+          clear.textContent = 'Clear selection';
+          clear.addEventListener('click', function() {
+            tbody.querySelectorAll('.mock-row-cb').forEach(function(cb) { cb.checked = false; });
+            mockTableSel.refresh();
+          });
+          btns.appendChild(clear);
+          if (!api.isAdmin()) return;
+          var del = document.createElement('button');
+          del.type = 'button';
+          del.className = 'btn';
+          del.style.color = 'var(--danger)';
+          del.textContent = 'Delete selected';
+          del.addEventListener('click', function() {
+            if (!confirm('Delete ' + ids.length + ' mock environment(s)?')) return;
+            var chain = Promise.resolve();
+            ids.forEach(function(id) {
+              chain = chain.then(function() { return api.delete('/mock-environments/' + id); });
+            });
+            chain.then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+          });
+          btns.appendChild(del);
+        }
+      });
       function updateUI() {
         var hint = document.getElementById('mock-hint');
         var section = document.getElementById('create-mock-section');
-        if (api.token && hint) hint.textContent = 'Build root configurations per release. You can create, edit, or delete (admin).';
-        else if (hint) hint.textContent = 'Build root configurations per release. Login as admin to create or edit.';
-        if (section) section.style.display = api.token ? 'block' : 'none';
+        var isAdm = api.isAdmin();
+        if (api.token && hint) hint.textContent = isAdm ? 'Build root configurations per release. You can create, edit, or delete.' : 'Build root configurations per release. Admin role required to create or edit.';
+        else if (hint) hint.textContent = 'Build root configurations per release. Login as admin to manage.';
+        if (section) section.style.display = isAdm ? 'block' : 'none';
       }
       function escapeHtml(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
       function escapeAttr(s) { return escapeHtml(s || '').replace(/"/g, '&quot;').replace(/\n/g, '&#10;'); }
+      function mockRepoRowHtml(value) {
+        value = value || '';
+        return '<div class="mock-repo-url-row" style="display:flex; gap:0.5rem; margin-bottom:0.35rem; align-items:center;"><input type="url" class="mock-repo-url-input" placeholder="https://example.com/oreon11/dev/x86_64" value="' + escapeAttr(value) + '" style="flex:1; min-width:0;"><button type="button" class="btn mock-repo-url-remove">Remove</button></div>';
+      }
+      function bindMockRepoRows(container) {
+        container.querySelectorAll('.mock-repo-url-remove').forEach(function(btn) {
+          btn.onclick = function() { var row = btn.closest('.mock-repo-url-row'); if (row) row.remove(); };
+        });
+      }
+      function collectMockRepoUrls(container) {
+        var urls = [];
+        container.querySelectorAll('.mock-repo-url-input').forEach(function(inp) {
+          var v = (inp.value || '').trim();
+          if (v) urls.push(v);
+        });
+        return urls;
+      }
+      function fillMockRepoRows(container, urls) {
+        container.innerHTML = '';
+        var list = (urls && urls.length) ? urls : [];
+        if (!list.length) list = [''];
+        list.forEach(function(u) { container.insertAdjacentHTML('beforeend', mockRepoRowHtml(u)); });
+        bindMockRepoRows(container);
+      }
       var mockPage = 0, mockPageSize = 25, mockTotal = 0;
       function load() {
         var offset = mockPage * mockPageSize;
@@ -115,29 +192,25 @@
           if (!tbody) return;
           var list = (data && data.items) ? data.items : [];
           mockTotal = (data && typeof data.total === 'number') ? data.total : 0;
-          var canAct = !!api.token;
+          var canAct = api.isAdmin();
           tbody.innerHTML = list.map(function(m) {
-            var actions = canAct ? '<button type="button" class="btn edit-mock" data-id="' + m.id + '" data-name="' + escapeAttr(m.name) + '" data-config="' + escapeAttr(m.config_name) + '" data-content="' + escapeAttr(m.config_content) + '" data-available="' + (m.is_available ? '1' : '0') + '" data-priority="' + (m.priority || 0) + '">Edit</button> <button type="button" class="btn delete-mock" data-id="' + m.id + '" data-name="' + escapeAttr(m.name) + '">Delete</button>' : '-';
-            return '<tr><td class="col-checkbox"><input type="checkbox" class="mock-row-cb" data-id="' + m.id + '"></td><td>' + m.id + '</td><td>' + m.release_id + '</td><td>' + escapeHtml(m.name || '') + '</td><td>' + escapeHtml(m.config_name || '') + '</td><td>' + (m.is_available ? 'Yes' : 'No') + '</td><td>' + actions + '</td></tr>';
-          }).join('') || '<tr><td colspan="7">No mock environments</td></tr>';
-          var selectAllEl = document.getElementById('mock-select-all');
-          if (selectAllEl) { selectAllEl.checked = false; selectAllEl.onclick = function() { tbody.querySelectorAll('.mock-row-cb').forEach(function(cb) { cb.checked = selectAllEl.checked; }); }; }
-          tbody.querySelectorAll('.mock-row-cb').forEach(function(cb) {
-            cb.addEventListener('change', function() {
-              var rowCbs = tbody.querySelectorAll('.mock-row-cb');
-              var checked = tbody.querySelectorAll('.mock-row-cb:checked').length;
-              if (selectAllEl) selectAllEl.checked = checked === rowCbs.length && rowCbs.length > 0;
-            });
-          });
+            var actions = canAct ? '<button type="button" class="btn edit-mock" data-id="' + m.id + '">Edit</button> <button type="button" class="btn delete-mock" data-id="' + m.id + '" data-name="' + escapeAttr(m.name) + '">Delete</button>' : '-';
+            var nExtra = Array.isArray(m.additional_repo_urls) ? m.additional_repo_urls.length : 0;
+            return '<tr><td class="col-checkbox"><input type="checkbox" class="mock-row-cb" data-id="' + m.id + '"></td><td>' + m.id + '</td><td>' + m.release_id + '</td><td>' + escapeHtml(m.name || '') + '</td><td>' + escapeHtml(m.config_name || '') + '</td><td>' + nExtra + '</td><td>' + (m.is_available ? 'Yes' : 'No') + '</td><td>' + actions + '</td></tr>';
+          }).join('') || '<tr><td colspan="8">No mock environments</td></tr>';
           tbody.querySelectorAll('.edit-mock').forEach(function(btn) {
             btn.addEventListener('click', function() {
-              document.getElementById('edit-mock-id').value = btn.dataset.id;
-              document.getElementById('edit-mock-name').value = btn.dataset.name || '';
-              document.getElementById('edit-mock-config').value = btn.dataset.config || '';
-              document.getElementById('edit-mock-config-content').value = (btn.dataset.content || '').replace(/&#10;/g, '\n');
-              document.getElementById('edit-mock-available').checked = btn.dataset.available === '1';
-              document.getElementById('edit-mock-priority').value = btn.dataset.priority || '0';
-              document.getElementById('edit-mock-modal').classList.add('open');
+              var id = btn.dataset.id;
+              api.get('/mock-environments/' + id).then(function(m) {
+                document.getElementById('edit-mock-id').value = m.id;
+                document.getElementById('edit-mock-name').value = m.name || '';
+                document.getElementById('edit-mock-config').value = m.config_name || '';
+                document.getElementById('edit-mock-config-content').value = m.config_content || '';
+                document.getElementById('edit-mock-available').checked = !!m.is_available;
+                document.getElementById('edit-mock-priority').value = String(m.priority != null ? m.priority : 0);
+                fillMockRepoRows(document.getElementById('edit-mock-extra-repos'), m.additional_repo_urls || []);
+                document.getElementById('edit-mock-modal').classList.add('open');
+              }).catch(function(e) { alert('Failed to load mock environment: ' + e.message); });
             });
           });
           tbody.querySelectorAll('.delete-mock').forEach(function(btn) {
@@ -150,9 +223,10 @@
           document.getElementById('mock-page-info').textContent = 'Page ' + (mockPage + 1) + ' of ' + numPages;
           document.getElementById('mock-prev').disabled = mockPage <= 0;
           document.getElementById('mock-next').disabled = mockPage >= numPages - 1;
+          mockTableSel.refresh();
         }).catch(function() {
           var tbody = document.getElementById('mock-tbody');
-          if (tbody) tbody.innerHTML = '<tr><td colspan="7">Failed to load</td></tr>';
+          if (tbody) tbody.innerHTML = '<tr><td colspan="8">Failed to load</td></tr>';
         });
       }
       (function initMockPagination() {
@@ -173,12 +247,23 @@
       window.addEventListener('auth-change', function() { updateUI(); if (api.token) fillReleases(); load(); });
       fillReleases();
       document.getElementById('edit-mock-cancel').addEventListener('click', function() { document.getElementById('edit-mock-modal').classList.remove('open'); });
+      document.getElementById('btn-create-mock-add-repo').addEventListener('click', function() {
+        var c = document.getElementById('create-mock-extra-repos');
+        c.insertAdjacentHTML('beforeend', mockRepoRowHtml(''));
+        bindMockRepoRows(c);
+      });
+      document.getElementById('btn-edit-mock-add-repo').addEventListener('click', function() {
+        var c = document.getElementById('edit-mock-extra-repos');
+        c.insertAdjacentHTML('beforeend', mockRepoRowHtml(''));
+        bindMockRepoRows(c);
+      });
       document.getElementById('edit-mock-save').addEventListener('click', function() {
         var id = document.getElementById('edit-mock-id').value;
         api.patch('/mock-environments/' + id, {
           name: document.getElementById('edit-mock-name').value.trim() || null,
           config_name: document.getElementById('edit-mock-config').value.trim() || null,
           config_content: document.getElementById('edit-mock-config-content').value.trim() || null,
+          additional_repo_urls: collectMockRepoUrls(document.getElementById('edit-mock-extra-repos')),
           is_available: document.getElementById('edit-mock-available').checked,
           priority: parseInt(document.getElementById('edit-mock-priority').value, 10) || 0
         }).then(function() { document.getElementById('edit-mock-modal').classList.remove('open'); load(); }).catch(function(e) { alert('Failed: ' + e.message); });
@@ -188,10 +273,24 @@
         var name = document.getElementById('create-mock-name').value.trim();
         var config = document.getElementById('create-mock-config').value.trim();
         if (!releaseId || !name || !config) { alert('Release, name, and config name are required.'); return; }
-        api.post('/mock-environments', { release_id: parseInt(releaseId, 10), name: name, config_name: config, is_available: true, priority: 0 })
-          .then(function() { load(); document.getElementById('create-mock-name').value = ''; document.getElementById('create-mock-config').value = ''; alert('Mock environment created.'); })
+        api.post('/mock-environments', {
+          release_id: parseInt(releaseId, 10),
+          name: name,
+          config_name: config,
+          additional_repo_urls: collectMockRepoUrls(document.getElementById('create-mock-extra-repos')),
+          is_available: true,
+          priority: 0
+        })
+          .then(function() {
+            load();
+            document.getElementById('create-mock-name').value = '';
+            document.getElementById('create-mock-config').value = '';
+            fillMockRepoRows(document.getElementById('create-mock-extra-repos'), []);
+            alert('Mock environment created.');
+          })
           .catch(function(e) { alert('Failed: ' + e.message); });
       });
+      fillMockRepoRows(document.getElementById('create-mock-extra-repos'), []);
       load();
     })();
   </script>
