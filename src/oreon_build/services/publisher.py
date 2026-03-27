@@ -84,7 +84,7 @@ def _run_createrepo(repo_dir: Path) -> None:
     )
 
 
-def update_repodata_at_prefix(r2_prefix: str, r2_client: R2Client | None = None) -> None:
+def update_repodata_at_prefix(r2_prefix: str, r2_client: R2Client | None = None) -> bool:
     """
     RPMs are already at r2_prefix/RPMS/. Download them, run createrepo_c, upload only repodata.
     Use this when the worker (or other path) has already uploaded RPMs directly to the repo.
@@ -95,17 +95,18 @@ def update_repodata_at_prefix(r2_prefix: str, r2_client: R2Client | None = None)
     rpm_keys = [o["key"] for o in objs if o.get("key")]
     if not rpm_keys:
         logger.warning("No RPMs at %s, skipping createrepo", rpms_prefix)
-        return
+        return False
     with tempfile.TemporaryDirectory(prefix="oreon-repo-") as tmp:
-        repo_dir = Path(tmp) / "repo"
-        repo_dir.mkdir()
+        repo_root = Path(tmp) / "repo"
+        rpms_dir = repo_root / "RPMS"
+        rpms_dir.mkdir(parents=True)
         for key in rpm_keys:
             data = client.get_object(key)
             if data:
                 fname = key.split("/")[-1]
-                (repo_dir / fname).write_bytes(data)
-        _run_createrepo(repo_dir)
-        repodata_dir = repo_dir / "repodata"
+                (rpms_dir / fname).write_bytes(data)
+        _run_createrepo(repo_root)
+        repodata_dir = repo_root / "repodata"
         if repodata_dir.exists():
             # Keep track of which repodata filenames we just generated so we can
             # delete older R2 objects that createrepo no longer produces.
@@ -121,7 +122,10 @@ def update_repodata_at_prefix(r2_prefix: str, r2_client: R2Client | None = None)
                 client.put_object(r2_key, f.read_bytes())
 
             _cleanup_old_repodata(client, r2_prefix, new_filenames)
-    logger.info("Updated repodata at R2 prefix %s (%s RPMs)", r2_prefix, len(rpm_keys))
+            logger.info("Updated repodata at R2 prefix %s (%s RPMs)", r2_prefix, len(rpm_keys))
+            return True
+        logger.error("createrepo_c produced no repodata under %s", repo_root)
+        return False
 
 
 def publish_rpms_to_r2(
@@ -135,15 +139,16 @@ def publish_rpms_to_r2(
     """
     client = r2_client or get_r2_client()
     with tempfile.TemporaryDirectory(prefix="oreon-repo-") as tmp:
-        repo_dir = Path(tmp) / "repo"
-        repo_dir.mkdir()
+        repo_root = Path(tmp) / "repo"
+        rpms_dir = repo_root / "RPMS"
+        rpms_dir.mkdir(parents=True)
         for key in rpm_keys:
             data = client.get_object(key)
             if data:
                 fname = key.split("/")[-1]
-                (repo_dir / fname).write_bytes(data)
-        _run_createrepo(repo_dir)
-        repodata_dir = repo_dir / "repodata"
+                (rpms_dir / fname).write_bytes(data)
+        _run_createrepo(repo_root)
+        repodata_dir = repo_root / "repodata"
         if repodata_dir.exists():
             new_filenames = {f.name for f in repodata_dir.iterdir()}
             for f in repodata_dir.iterdir():

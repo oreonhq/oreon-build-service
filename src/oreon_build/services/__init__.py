@@ -1,1 +1,1 @@
-# Services: R2, GitLab, signing, publisher, promoter
+# Services: R2, GitHub, signing, publisher, promoter
