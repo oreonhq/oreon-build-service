@@ -1,10 +1,29 @@
+# Oreon Build Service
+# Copyright (C) 2026 Oreon HQ
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """Repository status - read-only; publish/compose may be triggered (auth)."""
 from fastapi import APIRouter, HTTPException, Query, status
+from pydantic import BaseModel
 from sqlalchemy import select
 
-from oreon_build.api.deps import CurrentUser, DbSession
+from oreon_build.api.deps import CurrentAdmin, CurrentUser, DbSession
 from oreon_build.api.schemas import RepositoryResponse
 from oreon_build.models import Release, Repository
+from oreon_build.services.publisher import update_repodata_at_prefix
+from oreon_build.services.r2 import repo_r2_prefix
 
 router = APIRouter(prefix="/repos", tags=["repos"])
 
@@ -66,7 +85,6 @@ async def trigger_publish(
     release = result.scalar_one_or_none()
     if not release:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Release not found")
-    from oreon_build.services.r2 import repo_r2_prefix
     prefix = repo_r2_prefix(release.releasename, channel, architecture)
     result = await db.execute(
         select(Repository).where(
@@ -86,3 +104,42 @@ async def trigger_publish(
         db.add(repo)
         await db.flush()
     return {"status": "accepted", "r2_prefix": prefix}
+
+
+class RegenerateMetadataResult(BaseModel):
+    status: str
+    prefixes: list[str]
+    refreshed: list[str]
+    skipped_no_rpms: list[str]
+
+
+@router.post("/regenerate-metadata", response_model=RegenerateMetadataResult)
+async def regenerate_metadata_all_releases(_: CurrentAdmin, db: DbSession):
+    """
+    Re-run createrepo for every R2 prefix we know about (DB repositories plus dev/testing/stable × x86_64/aarch64
+    for each active release). Prefixes with no RPMs under RPMS/ are skipped after a quick list.
+    """
+    prefixes: set[str] = set()
+    rrepo = await db.execute(select(Repository.r2_prefix))
+    for p in rrepo.scalars().all():
+        if p:
+            prefixes.add(p)
+    rels = await db.execute(select(Release).where(Release.is_active.is_(True)))
+    for rel in rels.scalars().all():
+        for ch in ("dev", "testing", "stable"):
+            for arch in ("x86_64", "aarch64"):
+                prefixes.add(repo_r2_prefix(rel.releasename, ch, arch))
+    ordered = sorted(prefixes)
+    refreshed: list[str] = []
+    skipped: list[str] = []
+    for prefix in ordered:
+        if update_repodata_at_prefix(prefix):
+            refreshed.append(prefix)
+        else:
+            skipped.append(prefix)
+    return RegenerateMetadataResult(
+        status="ok",
+        prefixes=ordered,
+        refreshed=refreshed,
+        skipped_no_rpms=skipped,
+    )
