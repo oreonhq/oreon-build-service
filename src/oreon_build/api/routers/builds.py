@@ -161,6 +161,19 @@ def _source_url_from_new_package(np) -> str | None:
     return None
 
 
+def _infer_github_html_url_from_new_package(np) -> str | None:
+    """Best-effort https://github.com/org/repo from distgit or scm URL fragment."""
+    u = _source_url_from_new_package(np)
+    if not u or "github.com" not in u.lower():
+        return None
+    base = u.split("#", 1)[0].strip().rstrip("/")
+    if base.lower().endswith(".git"):
+        base = base[:-4]
+    if not base.lower().startswith("http"):
+        return None
+    return base
+
+
 @router.post("/trigger", response_model=list[BuildJobResponse], status_code=status.HTTP_201_CREATED)
 async def trigger_build(
     data: BuildTrigger,
@@ -192,10 +205,13 @@ async def trigger_build(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Package name already exists: {np.name}",
             )
+        gh_url = np.github_html_url or _infer_github_html_url_from_new_package(np)
         pkg = Package(
             name=np.name,
             description=np.description,
             preferred_mock_environment_id=np.preferred_mock_environment_id,
+            github_repository_id=np.github_repository_id,
+            github_html_url=gh_url,
         )
         db.add(pkg)
         await db.flush()
