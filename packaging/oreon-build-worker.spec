@@ -6,7 +6,7 @@
 
 Name:           oreon-build-worker
 Version:        1.0.0
-Release:        24%{?dist}
+Release:        25%{?dist}
 Summary:        Oreon Build Service worker daemon
 License:        GPLv3
 URL:            https://github.com/oreon/oreon-build-service
@@ -22,6 +22,8 @@ BuildRequires:  gcc-c++
 BuildRequires:  openssl-devel
 BuildRequires:  libffi-devel
 BuildRequires:  libpq-devel
+BuildRequires:  krb5-devel
+BuildRequires:  openldap-devel
 
 Requires:       python3 >= 3.11
 Requires:       mock
@@ -44,9 +46,13 @@ mkdir -p %{buildroot}%{_bindir}
 mkdir -p %{buildroot}%{_sysconfdir}/oreon-build-worker
 mkdir -p %{buildroot}%{_unitdir}
 
-# Prefer wheels for deps (hatchling/setuptools-scm etc. deadlock if everything is --no-binary :all:).
-# Pure-Python and manylinux wheels still run on EL; system python3-pydantic is used via %%post prune.
-python3 -m pip install --no-compile --ignore-installed --prefer-binary --target %{buildroot}%{_prefix}/lib/oreon-build-worker .
+# Prefer wheels so pip does not recurse building hatchling from sdist. Force sdist for packages
+# that ship manylinux wheels with bundled libcrypto/krb5/ldap (rpm autoreq then requires missing SONAMEs).
+# bcrypt stays wheel-only to avoid Rust in the build chroot.
+python3 -m pip install --no-compile --ignore-installed --prefer-binary \
+  --only-binary bcrypt \
+  --no-binary cryptography,cffi,psycopg2-binary \
+  --target %{buildroot}%{_prefix}/lib/oreon-build-worker .
 
 # Wrapper script: set PYTHONPATH and run worker (%{_prefix} expands to /usr)
 cat > %{buildroot}%{_bindir}/oreon-worker << WRAPPER
@@ -99,5 +105,8 @@ rm -rf %{_prefix}/lib/oreon-build-worker/pydantic_core-*
 %{_unitdir}/oreon-worker.service
 
 %changelog
+* Thu Mar 26 2026 Oreon HQ <packages@oreonhq.com> - 1.0.0-25
+- pip prefer-binary plus no-binary cryptography,cffi,psycopg2-binary for system SSL/LDAP/KRB linkage
+
 * Thu Mar 26 2026 Oreon HQ <packages@oreonhq.com> - 1.0.0-24
 - pip install use --prefer-binary to avoid transitive sdist build failure in Koji/mock
