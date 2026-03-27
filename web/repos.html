@@ -29,15 +29,39 @@
     <section class="card">
       <h2>Repository Status</h2>
       <p>Repository layout is on R2: &lt;bucket&gt;/&lt;releasename&gt;/&lt;channel&gt;/&lt;basearch&gt;/ (RPMS, repodata).</p>
+      <p id="repo-regen-wrap" style="display:none;"><button type="button" class="btn primary" id="btn-regen-all-repodata">Regenerate Repository Metadata for All Releases</button> <span id="repo-regen-status" style="color:var(--text-muted);"></span></p>
       <pre id="repo-status">Loading...</pre>
     </section>
   </main>
   <script src="/static/app.js?v=3"></script>
   <script>
     (function() {
-      window.oreonApi.get('/repos/status').then(function(data) {
-        document.getElementById('repo-status').textContent = JSON.stringify(data, null, 2);
-      }).catch(function() { document.getElementById('repo-status').textContent = 'Failed to load'; });
+      var api = window.oreonApi;
+      function loadStatus() {
+        api.get('/repos/status').then(function(data) {
+          document.getElementById('repo-status').textContent = JSON.stringify(data, null, 2);
+        }).catch(function() { document.getElementById('repo-status').textContent = 'Failed to load'; });
+      }
+      function updateRegenUi() {
+        var wrap = document.getElementById('repo-regen-wrap');
+        if (!wrap) return;
+        wrap.style.display = api.isAdmin() ? 'block' : 'none';
+      }
+      document.getElementById('btn-regen-all-repodata').addEventListener('click', function() {
+        if (!api.isAdmin()) return;
+        if (!confirm('Regenerate repodata on R2 for every known release prefix? Empty repos are skipped. This can take a while.')) return;
+        var st = document.getElementById('repo-regen-status');
+        st.textContent = 'Running…';
+        api.post('/repos/regenerate-metadata', {}).then(function(r) {
+          st.textContent = 'Done. Refreshed ' + (r.refreshed ? r.refreshed.length : 0) + ', skipped (no RPMs) ' + (r.skipped_no_rpms ? r.skipped_no_rpms.length : 0) + '.';
+          loadStatus();
+        }).catch(function(e) {
+          st.textContent = 'Failed: ' + e.message;
+        });
+      });
+      loadStatus();
+      updateRegenUi();
+      window.addEventListener('auth-change', function() { updateRegenUi(); });
     })();
   </script>
 </body>
