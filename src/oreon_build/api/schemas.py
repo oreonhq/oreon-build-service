@@ -178,6 +178,8 @@ class NewPackageForBuild(BaseModel):
     name: str = Field(..., max_length=256, description="Package name")
     description: Optional[str] = None
     preferred_mock_environment_id: Optional[int] = Field(None, description="Mock env to use for rebuilds (must belong to build release)")
+    github_repository_id: Optional[int] = Field(None, description="Numeric id from GitHub API (webhook matching)")
+    github_html_url: Optional[str] = Field(None, max_length=512, description="https://github.com/org/repo for webhook matching")
     source_type: SourceTypeSchema
     source_url: Optional[str] = Field(None, max_length=1024, description="Primary URL (URL/DistGit/SCM)")
     source_urls: Optional[List[str]] = Field(None, description="Multiple URLs for 'url' source type")
@@ -190,15 +192,15 @@ class PackageCreate(BaseModel):
     name: str = Field(..., max_length=256)
     description: Optional[str] = None
     preferred_mock_environment_id: Optional[int] = None
-    gitlab_project_id: Optional[int] = None
-    gitlab_web_url: Optional[str] = None
+    github_repository_id: Optional[int] = None
+    github_html_url: Optional[str] = None
 
 
 class PackageUpdate(BaseModel):
     description: Optional[str] = None
     preferred_mock_environment_id: Optional[int] = None
-    gitlab_project_id: Optional[int] = None
-    gitlab_web_url: Optional[str] = None
+    github_repository_id: Optional[int] = None
+    github_html_url: Optional[str] = None
 
 
 class PackageResponse(BaseModel):
@@ -206,8 +208,8 @@ class PackageResponse(BaseModel):
     name: str
     description: Optional[str] = None
     preferred_mock_environment_id: Optional[int] = None
-    gitlab_project_id: Optional[int] = None
-    gitlab_web_url: Optional[str] = None
+    github_repository_id: Optional[int] = None
+    github_html_url: Optional[str] = None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)

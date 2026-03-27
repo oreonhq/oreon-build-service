@@ -26,12 +26,29 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 
-from oreon_build.config import get_settings
+from oreon_build.config import Settings, get_settings
 from oreon_build.db import get_db, init_db
 from oreon_build.models import Account, Role, RoleName
 from oreon_build.core.security import hash_password, verify_password
 
 logger = logging.getLogger(__name__)
+
+_github_catchup_misconfig_logged = False
+
+
+def _configure_oreon_logging(settings: Settings) -> None:
+    """Ensure oreon_build log lines reach stderr (uvicorn often leaves app loggers quiet)."""
+    name = (settings.log_level or "INFO").upper()
+    level = getattr(logging, name, logging.INFO)
+    root = logging.getLogger("oreon_build")
+    root.setLevel(level)
+    if not root.handlers:
+        h = logging.StreamHandler()
+        h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s"))
+        root.addHandler(h)
+    root.propagate = False
+    for noisy in ("httpx", "httpcore", "hpack"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 from .routers import (
     auth,
@@ -47,7 +64,7 @@ from .routers import (
     logs,
     audit,
     search as search_router,
-    gitlab_webhook,
+    github_webhook,
 )
 from .worker_api import router as worker_router
 
@@ -56,6 +73,13 @@ from .worker_api import router as worker_router
 async def lifespan(app: FastAPI):
     await init_db()
     settings = get_settings()
+    _configure_oreon_logging(settings)
+    logger.info(
+        "API startup log_level=%s github_catchup_s=%s github_token=%s",
+        settings.log_level,
+        settings.github_catchup_interval_seconds,
+        bool(settings.github_token),
+    )
     from oreon_build.db.session import async_session_maker
     async with async_session_maker() as db:
         try:
@@ -124,14 +148,63 @@ async def lifespan(app: FastAPI):
 
     sweep_task = asyncio.create_task(_stale_build_sweep_loop(), name="stale-build-sweep")
 
+    async def _github_push_catchup_loop() -> None:
+        global _github_catchup_misconfig_logged
+        from oreon_build.db.session import async_session_maker
+        from oreon_build.services.github_push_catchup import run_github_push_catchup
+
+        first = True
+        while True:
+            try:
+                s = get_settings()
+                if s.github_catchup_interval_seconds <= 0 or not s.github_token:
+                    if not _github_catchup_misconfig_logged:
+                        _github_catchup_misconfig_logged = True
+                        reasons: list[str] = []
+                        if not s.github_token:
+                            reasons.append(
+                                "GITHUB_TOKEN is unset (use a GitHub PAT for api.github.com compare; "
+                                "GITHUB_WEBHOOK_SECRET is only for verifying inbound webhooks)"
+                            )
+                        if s.github_catchup_interval_seconds <= 0:
+                            reasons.append("GITHUB_CATCHUP_INTERVAL_SECONDS is 0")
+                        logger.warning(
+                            "GitHub push catch-up disabled: %s",
+                            " ".join(reasons),
+                        )
+                    await asyncio.sleep(3600)
+                    continue
+                if not first:
+                    await asyncio.sleep(max(60, s.github_catchup_interval_seconds))
+                first = False
+                async with async_session_maker() as db:
+                    try:
+                        result = await run_github_push_catchup(db)
+                        await db.commit()
+                        logger.info("GitHub catch-up loop result %s", result)
+                    except Exception:
+                        await db.rollback()
+                        raise
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("GitHub push catch-up failed")
+                try:
+                    await asyncio.sleep(max(60, get_settings().github_catchup_interval_seconds or 600))
+                except asyncio.CancelledError:
+                    break
+
+    catchup_task = asyncio.create_task(_github_push_catchup_loop(), name="github-push-catchup")
+
     yield
 
-    if sweep_task is not None:
-        sweep_task.cancel()
-        try:
-            await sweep_task
-        except asyncio.CancelledError:
-            pass
+    for t, label in [(sweep_task, "stale-build-sweep"), (catchup_task, "github-push-catchup")]:
+        if t is not None:
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
     # shutdown
 
 
@@ -162,7 +235,7 @@ def create_app() -> FastAPI:
     app.include_router(logs.router, prefix="/api")
     app.include_router(audit.router, prefix="/api")
     app.include_router(search_router.router, prefix="/api")
-    app.include_router(gitlab_webhook.router, prefix="/api")
+    app.include_router(github_webhook.router, prefix="/api")
     app.include_router(worker_router, prefix="/api")
     # api/main.py -> oreon_build -> src -> repo root
     web_dir = Path(__file__).resolve().parent.parent.parent.parent / "web"
