@@ -19,6 +19,7 @@ from .audit import AuditLog
 from .build import BuildAttempt, BuildJob, BuildStatus, BuildTarget
 from .artifact import Artifact
 from .package import Package, PackageVersion, Source
+from .github_push_cursor import GitHubPushCursor
 from .release import Release, ReleaseChannel, ReleaseRepo
 from .repo import Repository, RepositorySnapshot
 from .promotion import Promotion
@@ -42,6 +43,7 @@ __all__ = [
     "Package",
     "PackageVersion",
     "Source",
+    "GitHubPushCursor",
     "Release",
     "ReleaseChannel",
     "ReleaseRepo",
