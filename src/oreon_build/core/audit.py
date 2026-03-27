@@ -20,6 +20,7 @@ async def log_audit(
     details: Optional[str] = None,
     ip_address: Optional[str] = None,
     user_agent: Optional[str] = None,
+    emit_discord: bool = True,
 ) -> None:
     entry = AuditLog(
         account_id=account_id,
@@ -68,7 +69,8 @@ async def log_audit(
             if jb.build_target and jb.build_target.architecture:
                 fields.append(("Architecture", jb.build_target.architecture))
 
-    await send_discord_embed(title=title, description=description, fields=fields)
+    if emit_discord:
+        await send_discord_embed(title=title, description=description, fields=fields)
 
 
 def get_client_ip(request: Any) -> Optional[str]:
