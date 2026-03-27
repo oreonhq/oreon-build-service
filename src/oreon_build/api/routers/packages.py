@@ -85,8 +85,8 @@ async def create_package(
         name=data.name,
         description=data.description,
         preferred_mock_environment_id=data.preferred_mock_environment_id,
-        gitlab_project_id=data.gitlab_project_id,
-        gitlab_web_url=data.gitlab_web_url,
+        github_repository_id=data.github_repository_id,
+        github_html_url=data.github_html_url,
     )
     db.add(pkg)
     await db.flush()
@@ -115,14 +115,15 @@ async def update_package(
     pkg = result.scalar_one_or_none()
     if not pkg:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Package not found")
-    if data.description is not None:
+    patch_fields = data.model_dump(exclude_unset=True)
+    if "description" in patch_fields:
         pkg.description = data.description
-    if "preferred_mock_environment_id" in data.model_dump(exclude_unset=True):
+    if "preferred_mock_environment_id" in patch_fields:
         pkg.preferred_mock_environment_id = data.preferred_mock_environment_id
-    if data.gitlab_project_id is not None:
-        pkg.gitlab_project_id = data.gitlab_project_id
-    if data.gitlab_web_url is not None:
-        pkg.gitlab_web_url = data.gitlab_web_url
+    if "github_repository_id" in patch_fields:
+        pkg.github_repository_id = data.github_repository_id
+    if "github_html_url" in patch_fields:
+        pkg.github_html_url = data.github_html_url
     await log_audit(
         db,
         "package.update",
