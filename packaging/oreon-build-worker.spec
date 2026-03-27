@@ -44,8 +44,9 @@ mkdir -p %{buildroot}%{_bindir}
 mkdir -p %{buildroot}%{_sysconfdir}/oreon-build-worker
 mkdir -p %{buildroot}%{_unitdir}
 
-# Build from source so binaries link against EL10 libs; allow bcrypt wheel to avoid Rust build in chroot
-python3 -m pip install --no-compile --ignore-installed --no-binary ':all:' --only-binary bcrypt --target %{buildroot}%{_prefix}/lib/oreon-build-worker .
+# Prefer wheels for deps (hatchling/setuptools-scm etc. deadlock if everything is --no-binary :all:).
+# Pure-Python and manylinux wheels still run on EL; system python3-pydantic is used via %%post prune.
+python3 -m pip install --no-compile --ignore-installed --prefer-binary --target %{buildroot}%{_prefix}/lib/oreon-build-worker .
 
 # Wrapper script: set PYTHONPATH and run worker (%{_prefix} expands to /usr)
 cat > %{buildroot}%{_bindir}/oreon-worker << WRAPPER
@@ -96,3 +97,7 @@ rm -rf %{_prefix}/lib/oreon-build-worker/pydantic_core-*
 %{_prefix}/lib/oreon-build-worker/*
 %config(noreplace) %{_sysconfdir}/oreon-build-worker/oreon-worker.env.example
 %{_unitdir}/oreon-worker.service
+
+%changelog
+* Thu Mar 26 2026 Oreon HQ <packages@oreonhq.com> - 1.0.0-24
+- pip install use --prefer-binary to avoid transitive sdist build failure in Koji/mock
