@@ -21,6 +21,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import subprocess
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -273,6 +274,106 @@ async def cancel_check(
 
 def _put_rpm_bytes_to_r2(key: str, raw: bytes) -> None:
     get_r2_client().put_object(key, raw, content_type="application/x-rpm")
+
+
+def _rpm_name_from_bytes(data: bytes) -> str | None:
+    """Extract RPM NAME from bytes using host rpm command."""
+    if not data:
+        return None
+    path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".rpm", delete=False) as f:
+            f.write(data)
+            path = f.name
+        r = subprocess.run(
+            ["rpm", "-qp", "--qf", "%{NAME}", path],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        if r.returncode != 0:
+            return None
+        name = (r.stdout or "").strip()
+        return name or None
+    except Exception:
+        return None
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+def _prune_superseded_repo_objects(
+    *,
+    releasename: str,
+    branch: str,
+    arch: str,
+    keep_artifact_filenames: set[str],
+    payload_artifacts: list[ArtifactPayload],
+) -> None:
+    """
+    Remove older RPM/SRPM objects in the same branch when a new release is published,
+    including skipped-release upgrades (e.g. -11 -> -14).
+    """
+    r2 = get_r2_client()
+
+    # Resolve package NAMEs from newly produced payload artifacts.
+    binary_names: set[str] = set()
+    src_names: set[str] = set()
+    for a in payload_artifacts:
+        fn = (a.filename or "").strip()
+        if not fn.endswith(".rpm"):
+            continue
+        key = src_r2_key(releasename, branch, fn) if fn.endswith(".src.rpm") else repo_rpms_key(releasename, branch, arch, fn)
+        data = r2.get_object(key)
+        name = _rpm_name_from_bytes(data) if data else None
+        if not name:
+            continue
+        if fn.endswith(".src.rpm"):
+            src_names.add(name)
+        else:
+            binary_names.add(name)
+
+    # Binary RPMs (same branch/arch)
+    bin_prefix = f"{repo_r2_prefix(releasename, branch, arch)}/RPMS/"
+    for obj in r2.list_objects(bin_prefix):
+        key = obj.get("key")
+        if not key:
+            continue
+        base = key.rsplit("/", 1)[-1]
+        if not base.endswith(".rpm") or base.endswith(".src.rpm"):
+            continue
+        if base in keep_artifact_filenames:
+            continue
+        if not any(base.startswith(n + "-") for n in binary_names):
+            continue
+        data = r2.get_object(key)
+        old_name = _rpm_name_from_bytes(data) if data else None
+        if old_name and old_name in binary_names:
+            r2.delete_object(key)
+            logger.info("Pruned superseded binary RPM %s", key)
+
+    # Source RPMs (same branch/src)
+    src_prefix = f"{releasename}/{branch}/src/"
+    for obj in r2.list_objects(src_prefix):
+        key = obj.get("key")
+        if not key:
+            continue
+        base = key.rsplit("/", 1)[-1]
+        if not base.endswith(".src.rpm"):
+            continue
+        if base in keep_artifact_filenames:
+            continue
+        if not any(base.startswith(n + "-") for n in src_names):
+            continue
+        data = r2.get_object(key)
+        old_name = _rpm_name_from_bytes(data) if data else None
+        if old_name and old_name in src_names:
+            r2.delete_object(key)
+            logger.info("Pruned superseded SRPM %s", key)
 
 
 @router.post("/upload-rpm/{attempt_id}")
@@ -555,10 +656,24 @@ async def report_result(
                             else:
                                 dest = repo_rpms_key(releasename, branch, arch, a.filename)
                             r2.put_object(dest, data)
+                keep = {a.filename for a in payload.artifacts if a.filename}
+                _prune_superseded_repo_objects(
+                    releasename=releasename,
+                    branch=branch,
+                    arch=arch,
+                    keep_artifact_filenames=keep,
+                    payload_artifacts=payload.artifacts,
+                )
                 prefix = repo_r2_prefix(releasename, branch, arch)
                 update_repodata_at_prefix(prefix)
             except Exception:
-                pass  # log and continue; job is still marked success
+                logger.exception(
+                    "Post-build repo publish/cleanup failed releasename=%s branch=%s arch=%s attempt_id=%s",
+                    release.releasename if release else "?",
+                    branch,
+                    arch,
+                    attempt_id,
+                )
             # Copy package SRPM to releasename/branch/src/ (from uploads) if we have one
             if job.package_version_id:
                 src_result = await db.execute(
