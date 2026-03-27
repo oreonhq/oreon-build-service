@@ -57,10 +57,10 @@ def cli(ctx, api_url):
 @cli.command("create-package")
 @click.option("--name", required=True, help="Package name")
 @click.option("--description", default=None)
-@click.option("--gitlab-project-id", type=int, default=None)
-@click.option("--gitlab-web-url", default=None)
+@click.option("--github-repository-id", type=int, default=None)
+@click.option("--github-html-url", default=None)
 @click.pass_context
-def create_package(ctx, name, description, gitlab_project_id, gitlab_web_url):
+def create_package(ctx, name, description, github_repository_id, github_html_url):
     """Create a package."""
     token = get_token()
     if not token:
@@ -69,10 +69,10 @@ def create_package(ctx, name, description, gitlab_project_id, gitlab_web_url):
     data = {"name": name}
     if description:
         data["description"] = description
-    if gitlab_project_id is not None:
-        data["gitlab_project_id"] = gitlab_project_id
-    if gitlab_web_url:
-        data["gitlab_web_url"] = gitlab_web_url
+    if github_repository_id is not None:
+        data["github_repository_id"] = github_repository_id
+    if github_html_url:
+        data["github_html_url"] = github_html_url
     out = api_request("POST", "/packages", json=data, token=token)
     click.echo("Created package: id=%s name=%s" % (out.get("id"), out.get("name")))
 
