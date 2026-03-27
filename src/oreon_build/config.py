@@ -55,10 +55,38 @@ class Settings(BaseSettings):
     r2_endpoint_url: str = Field(default="")
     r2_public_url: Optional[str] = Field(default=None)
 
-    # GitLab
-    gitlab_url: str = Field(default="https://gitlab.com")
-    gitlab_private_token: Optional[str] = Field(default=None)
-    gitlab_group_id: Optional[str] = Field(default=None)
+    # GitHub (API + webhooks)
+    github_api_url: str = Field(default="https://api.github.com", description="GitHub REST API base URL")
+    github_token: Optional[str] = Field(default=None, description="Fine-grained or classic PAT for API calls")
+    github_org: Optional[str] = Field(default=None, description="Org login for /api/github/repos listing")
+    github_webhook_secret: Optional[str] = Field(
+        default=None,
+        description="Secret for X-Hub-Signature-256 on POST /api/github/webhook",
+    )
+    github_catchup_interval_seconds: int = Field(
+        default=600,
+        ge=0,
+        le=86400,
+        description=(
+            "Background interval to run GitHub compare vs github_push_cursors (missed webhooks). "
+            "0 disables. Needs GITHUB_TOKEN."
+        ),
+    )
+    github_catchup_bootstrap_commits: int = Field(
+        default=0,
+        ge=0,
+        le=500,
+        description=(
+            "On first cursor creation, backfill up to this many recent commits via compare. "
+            "0 keeps old baseline-only behavior."
+        ),
+    )
+    github_catchup_max_jobs_per_cycle: int = Field(
+        default=10,
+        ge=1,
+        le=5000,
+        description="Hard cap on jobs enqueued by one catch-up cycle to prevent flood/spam.",
+    )
 
     # Worker
     worker_enrollment_secret: str = Field(default="change-me-worker-secret")
@@ -68,7 +96,6 @@ class Settings(BaseSettings):
     # Webhooks / integrations
     discord_webhook_url: Optional[str] = Field(default=None)
     security_discord_webhook_url: Optional[str] = Field(default=None)
-    gitlab_webhook_secret: Optional[str] = Field(default=None)
 
     # Watchdog (security advisories dashboard)
     watchdog_url: str = Field(default="http://localhost:8001", description="Public base URL for Oreon Watchdog")
@@ -146,6 +173,14 @@ class Settings(BaseSettings):
 
     # Logging
     log_level: str = Field(default="INFO")
+
+    @field_validator("github_token", mode="before")
+    @classmethod
+    def github_token_strip_empty(cls, v: object) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s if s else None
 
     @field_validator("r2_endpoint_url", mode="before")
     @classmethod
