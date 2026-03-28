@@ -11,7 +11,7 @@ We were intially going to use Koji for our build system as we are planning to go
 - Packages and builds: Ingest sources/specs, resolve deps, schedule builds, build RPMs in mock
 - R2 for everything: Repos and artifacts go straight to Cloudflare R2. No local repo storage. Paths: `<bucket>/<releasename>/<channel>/<basearch>/` plus `<bucket>/<releasename>/src/` for source RPMs
 - Releases: Releasename, arches, base repos, channels
-- Workers: Enroll with a token, poll for jobs, upload build logs to R2, POST built RPMs to the controller (controller signs and stores in R2). States: idle, busy, unhealthy, offline, draining
+- Workers: Enroll with a token, poll for jobs, push logs and SRPM reads through the controller API, POST built RPMs for GPG signing on the controller. Optional pesign material is issued per job from the controller. States: idle, busy, unhealthy, offline, draining
 - Scheduling: Cron-style jobs, dependency rebuilds, compose
 - Git: Pull sources, trigger builds
 - Signing: RPM and repodata via GPG on the controller; optional `pesign` (Secure Boot PE / `*.ko` in payload) for matching packages before GPG
@@ -34,7 +34,7 @@ Here’s what you deploy:
 - PostgreSQL
 - Cloudflare R2 for all repo/artifact storage
 - Controller host `createrepo_c`, GPG signing key + `rpm-sign` for RPM/repodata signing (see `.env.example`). Optional payload signing: `pesign`, `rpmrebuild`, and `file` plus NSS DB; use `PESIGN_RULES_JSON` for multiple signing certs (e.g. kernel vs GRUB vs s390) or a single `PESIGN_CERTIFICATE_NICKNAME`
-- Workers `mock`, `rpmdevtools` no GPG or `rpm-sign` on workers for artifact signing
+- Workers `mock`, `rpmdevtools`. No GPG or R2 credentials on workers. Optional `pesign` + `rpmrebuild` when building PE-signed payloads; NSS stays on the controller
 - Optional: `MAX_WORKER_RPM_UPLOAD_MIB` in controller `.env` if workers build very large RPMs (default 4096 MiB; HTTP 413 means increase this)
 
 NOTE: we ship `psycopg2-binary` for Alembic (sync). The app talks to Postgres with `asyncpg` at runtime, so `DATABASE_URL` should use `postgresql+asyncpg://`.
