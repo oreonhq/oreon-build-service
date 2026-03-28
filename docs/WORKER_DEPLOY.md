@@ -30,10 +30,11 @@ sudo nano /etc/oreon-build-worker/oreon-worker.env
 
 Set:
 
-- `CONTROLLER_URL` – e.g. `http://192.168.1.10:8000` (controller API, no trailing slash)
+- `CONTROLLER_URL` – e.g. `http://192.168.1.10:8000` (controller API, HTTPS in production, no trailing slash)
 - `OREON_WORKER_TOKEN` – token from step 2
 - `OREON_WORKER_NAME` – optional, default `worker-1`
-- `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, `R2_ENDPOINT_URL` – same bucket/creds as the controller (used for build logs only)
+
+You do not put R2 or signing secrets on the worker. Build logs, SRPM downloads, and optional pesign NSS bundles go through authenticated controller APIs.
 
 Restrict the file: `sudo chmod 600 /etc/oreon-build-worker/oreon-worker.env`
 
@@ -47,6 +48,7 @@ Also on the worker host:
 
 - `sudo dnf install mock rpmdevtools`
 - `sudo usermod -a -G mock oreon-build`
+- For Secure Boot payload signing (pesign), also `sudo dnf install pesign rpmrebuild file` on workers that build matching packages. NSS keys stay on the controller. The worker streams each bundle into RAM, extracts only under `/dev/shm` when possible, and removes that tree after signing so secrets are not kept on disk.
 
 ## Cancelling builds
 
