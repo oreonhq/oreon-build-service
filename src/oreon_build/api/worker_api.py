@@ -19,16 +19,21 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
+import json
 import logging
 import os
 import subprocess
+import tarfile
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile, status
+from fastapi import APIRouter, Body, Depends, File, Header, HTTPException, Query, UploadFile, status
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 from sqlalchemy import select, func
 
 from oreon_build.api.deps import DbSession
@@ -51,13 +56,40 @@ from oreon_build.models import (
     Worker,
     WorkerState,
 )
-from oreon_build.services.r2 import get_r2_client, repo_r2_prefix, repo_rpms_key, src_r2_key
+from oreon_build.services.r2 import get_r2_client, log_r2_key, repo_r2_prefix, repo_rpms_key, src_r2_key
 from oreon_build.services.publisher import update_repodata_at_prefix
-from oreon_build.services.signing import PesignRepackError, pesign_rpm_if_configured, sign_rpm
+from oreon_build.services.signing import sign_rpm
+from oreon_build.services.worker_artifact_access import source_r2_keys_for_attempt
 from oreon_build.services.worker_state_sync import sync_worker_state_after_attempt_finished
 
 router = APIRouter(prefix="/worker", tags=["worker"])
 logger = logging.getLogger(__name__)
+
+_MAX_BUILD_LOG_BYTES = 64 * 1024 * 1024
+
+
+def _pesign_material_configured(settings) -> bool:
+    nss = Path((settings.pesign_nss_dir or "").strip()).expanduser()
+    try:
+        resolved = nss.resolve()
+    except OSError:
+        return False
+    if not resolved.is_dir():
+        return False
+    if (settings.pesign_rules_json or "").strip():
+        return True
+    if (settings.pesign_certificate_nickname or "").strip():
+        return True
+    return False
+
+
+def _build_pesign_bundle_file(dest: Path, nss_dir: Path, manifest: dict) -> None:
+    raw = json.dumps(manifest, indent=2).encode("utf-8")
+    with tarfile.open(dest, "w:gz") as tf:
+        info = tarfile.TarInfo("manifest.json")
+        info.size = len(raw)
+        tf.addfile(info, io.BytesIO(raw))
+        tf.add(str(nss_dir.resolve()), arcname="nss")
 
 
 async def get_worker(
@@ -376,6 +408,158 @@ def _prune_superseded_repo_objects(
             logger.info("Pruned superseded SRPM %s", key)
 
 
+@router.put("/build-log/{attempt_id}")
+async def worker_upload_build_log(
+    attempt_id: int,
+    db: DbSession,
+    worker: Annotated[Worker, Depends(_require_worker)],
+    content: bytes = Body(...),
+):
+    """
+    Store a build log in R2 on behalf of the authenticated worker. No R2 credentials on the worker.
+    """
+    if len(content) > _MAX_BUILD_LOG_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Log exceeds max {_MAX_BUILD_LOG_BYTES // (1024 * 1024)} MiB",
+        )
+    ar = await db.execute(
+        select(BuildAttempt).where(
+            BuildAttempt.id == attempt_id,
+            BuildAttempt.worker_id == worker.id,
+        )
+    )
+    attempt = ar.scalar_one_or_none()
+    if not attempt:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attempt not found")
+
+    job_result = await db.execute(select(BuildJob).where(BuildJob.id == attempt.build_job_id))
+    job = job_result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    rel_result = await db.execute(select(Release).where(Release.id == job.release_id))
+    release = rel_result.scalar_one_or_none()
+    if not release:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Release missing")
+
+    key = log_r2_key(release.releasename, attempt_id)
+
+    def _put() -> None:
+        get_r2_client().put_object(key, content, content_type="text/plain; charset=utf-8")
+
+    await asyncio.to_thread(_put)
+    return {"log_r2_key": key}
+
+
+@router.get("/source-blob/{attempt_id}")
+async def worker_download_source_blob(
+    attempt_id: int,
+    db: DbSession,
+    worker: Annotated[Worker, Depends(_require_worker)],
+    key: str = Query(..., min_length=1, max_length=2048),
+):
+    """Stream an object from R2 for keys attached to this job. Workers need no R2 creds."""
+    ar = await db.execute(
+        select(BuildAttempt).where(
+            BuildAttempt.id == attempt_id,
+            BuildAttempt.worker_id == worker.id,
+        )
+    )
+    if not ar.scalar_one_or_none():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attempt not found")
+    allowed = await source_r2_keys_for_attempt(db, attempt_id)
+    if key not in allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Object key not allowed for this attempt",
+        )
+
+    def _get() -> bytes | None:
+        return get_r2_client().get_object(key)
+
+    data = await asyncio.to_thread(_get)
+    if data is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Object not found")
+    return Response(content=data, media_type="application/octet-stream")
+
+
+@router.get("/pesign-bundle/{attempt_id}")
+async def worker_download_pesign_bundle(
+    attempt_id: int,
+    db: DbSession,
+    worker: Annotated[Worker, Depends(_require_worker)],
+):
+    """
+    Tar.gz of NSS DB plus manifest. Only while attempt is RUNNING; only the assigned worker; use TLS.
+    """
+    settings = get_settings()
+    ar = await db.execute(
+        select(BuildAttempt).where(
+            BuildAttempt.id == attempt_id,
+            BuildAttempt.worker_id == worker.id,
+        )
+    )
+    attempt = ar.scalar_one_or_none()
+    if not attempt:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attempt not found")
+    if attempt.status != BuildStatus.RUNNING:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Pesign bundle only while attempt is running",
+        )
+    if not _pesign_material_configured(settings):
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    nss_dir = Path(settings.pesign_nss_dir).expanduser().resolve()
+    manifest = {
+        "version": 1,
+        "pesign_rules_json": settings.pesign_rules_json,
+        "pesign_certificate_nickname": settings.pesign_certificate_nickname,
+        "pesign_package_name_regex": settings.pesign_package_name_regex,
+        "pesign_token": settings.pesign_token,
+        "pesign_strict": settings.pesign_strict,
+        "pesign_aarch64_qemu_prefix": settings.pesign_aarch64_qemu_prefix,
+        "pesign_aarch64_guest_shell": settings.pesign_aarch64_guest_shell,
+        "nss_subdir": "nss",
+    }
+    fd, tmp = tempfile.mkstemp(suffix=".tar.gz")
+    os.close(fd)
+    out_path = Path(tmp)
+
+    def _build() -> None:
+        _build_pesign_bundle_file(out_path, nss_dir, manifest)
+
+    try:
+        await asyncio.to_thread(_build)
+    except Exception:
+        out_path.unlink(missing_ok=True)
+        raise
+
+    await log_audit(
+        db,
+        action="worker.pesign_bundle_download",
+        resource_type="build_attempt",
+        resource_id=str(attempt_id),
+        details=f"worker_id={worker.id}",
+        emit_discord=False,
+    )
+
+    out_str = str(out_path)
+
+    def _cleanup() -> None:
+        try:
+            os.unlink(out_str)
+        except OSError:
+            pass
+
+    return FileResponse(
+        path=out_str,
+        filename=f"pesign-bundle-{attempt_id}.tar.gz",
+        media_type="application/gzip",
+        background=BackgroundTask(_cleanup),
+    )
+
+
 @router.post("/upload-rpm/{attempt_id}")
 async def upload_worker_rpm(
     attempt_id: int,
@@ -384,9 +568,7 @@ async def upload_worker_rpm(
     file: UploadFile = File(...),
 ):
     """
-    Receive a built RPM from a worker, optionally pesign payload (PE / .ko) then GPG-sign on the
-    controller, push to R2, delete temp file.
-    Workers no longer need signing keys or direct R2 write access for RPM artifacts.
+    Receive a built RPM. Pesign runs on the worker (bundle from GET .../pesign-bundle). GPG here.
     """
     settings = get_settings()
     max_bytes = settings.max_worker_rpm_upload_mib * 1024 * 1024
@@ -433,7 +615,6 @@ async def upload_worker_rpm(
     path = Path(tmp_path)
     raw: bytes = b""
     signed = False
-    pesign_applied = False
     digest = ""
     r2_key = ""
     try:
@@ -450,14 +631,6 @@ async def upload_worker_rpm(
                         detail=f"RPM exceeds max {settings.max_worker_rpm_upload_mib} MiB",
                     )
                 out.write(chunk)
-
-        try:
-            pesign_applied = await asyncio.to_thread(pesign_rpm_if_configured, path)
-        except PesignRepackError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"pesign repack failed: {exc}",
-            ) from exc
 
         signed = await asyncio.to_thread(sign_rpm, path)
         raw = await asyncio.to_thread(path.read_bytes)
@@ -487,7 +660,7 @@ async def upload_worker_rpm(
         "filename": fname,
         "r2_key": r2_key,
         "signed": signed,
-        "pesign_applied": pesign_applied,
+        "pesign_applied": False,
         "size_bytes": len(raw),
         "checksum_sha256": digest,
     }
