@@ -113,8 +113,9 @@ class Settings(BaseSettings):
     signing_key_grip: Optional[str] = Field(default=None)
     gpg_home: str = Field(default="/var/lib/oreon-build/gnupg")
 
-    # Secure Boot / PE signing (controller): repack matching binary RPMs with rpmrebuild + pesign
-    # before GPG (--addsign). Requires pesign, rpmrebuild, file, bash on the controller host.
+    # Secure Boot / PE signing: controller holds NSS + rules; workers fetch a short-lived bundle
+    # (GET /api/worker/pesign-bundle) and run pesign before upload. Controller only GPG-signs RPMs.
+    # Workers need pesign, rpmrebuild, file, bash on PATH.
     pesign_nss_dir: str = Field(
         default="/etc/pki/pesign",
         description="NSS database directory for pesign (-n)",
@@ -137,6 +138,22 @@ class Settings(BaseSettings):
     pesign_token: Optional[str] = Field(
         default=None,
         description="Optional PKCS#11 token name for pesign (-t)",
+    )
+    pesign_aarch64_qemu_prefix: Optional[str] = Field(
+        default=None,
+        description=(
+            "Shell prefix used to run rpmrebuild for cross-arch aarch64 payload repacks "
+            "(example: 'qemu-aarch64-static -L /path/to/aarch64-rootfs'). "
+            "Required when signing aarch64 RPMs on non-aarch64 hosts. "
+            "The -L path should be a full AArch64 root (bash or sh inside), not only /usr/aarch64-linux-gnu."
+        ),
+    )
+    pesign_aarch64_guest_shell: Optional[str] = Field(
+        default=None,
+        description=(
+            "Host path to an AArch64 ELF sh or bash used as qemu guest interpreter when -L "
+            "does not contain bin/sh (e.g. libc-only sysroot). Must match libraries implied by the same rootfs."
+        ),
     )
     pesign_package_name_regex: str = Field(
         default=r"^(kernel.*|shim.*|fwupd.*|grub2-efi.*)$",
