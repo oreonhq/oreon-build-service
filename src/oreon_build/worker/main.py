@@ -15,10 +15,12 @@
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 """
-Oreon Build Worker: polls controller, runs mock builds, uploads build logs to R2.
+Oreon Build Worker: polls controller, runs mock builds, uploads build logs via the controller API.
 
-Built RPMs are POSTed to the controller (`/api/worker/upload-rpm/...`); the controller GPG-signs
-and writes them to R2. No signing key or `rpm-sign` is required on workers.
+Built RPMs are posted to `/api/worker/upload-rpm/...`. Optional PE / `*.ko` signing streams NSS from
+``GET /api/worker/pesign-bundle/{attempt}`` into RAM, extracts only under ``/dev/shm`` (tmpfs) when
+possible, then deletes that tree as soon as signing finishes. The raw tarball is never written to disk.
+The controller GPG-signs and writes RPMs to R2.
 
 If mock leaves RPMs under ``--resultdir`` owned by root with restrictive modes, the worker can hit
 ``PermissionError`` when scanning or uploading artifacts. Use ``OREON_WORKER_CHMOD_MOCK_RESULTDIR``
@@ -37,25 +39,203 @@ Optional ``OREON_WORKER_EXTRA_MOCK_ADDREPO`` appends comma-separated URLs on the
 
 from __future__ import annotations
 
+import io
+import json
 import logging
 import os
 import re
 import platform
+import secrets
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 import httpx
 
-from oreon_build.config import get_settings
-from oreon_build.services.r2 import get_r2_client, log_r2_key
+from oreon_build.services.signing import (
+    PesignRepackError,
+    PesignRuntimeConfig,
+    pesign_rpm_if_configured,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def _controller_base_url() -> str:
+    return (
+        os.environ.get("CONTROLLER_URL")
+        or os.environ.get("OREON_CONTROLLER_URL")
+        or "http://localhost:8000"
+    ).rstrip("/")
+
+
+def _upload_build_log_via_controller(
+    session: httpx.Client,
+    controller_url: str,
+    attempt_id: int,
+    data: bytes,
+) -> str:
+    r = session.put(
+        f"{controller_url}/api/worker/build-log/{attempt_id}",
+        content=data,
+        headers={"Content-Type": "text/plain; charset=utf-8"},
+        timeout=httpx.Timeout(600.0, connect=120.0),
+    )
+    r.raise_for_status()
+    return str(r.json().get("log_r2_key") or "")
+
+
+def _download_source_via_controller(
+    session: httpx.Client,
+    controller_url: str,
+    attempt_id: int,
+    r2_key: str,
+) -> bytes:
+    r = session.get(
+        f"{controller_url}/api/worker/source-blob/{attempt_id}",
+        params={"key": r2_key},
+        timeout=httpx.Timeout(7200.0, connect=120.0),
+    )
+    r.raise_for_status()
+    return r.content
+
+
+def _pesign_bundle_max_bytes() -> int:
+    raw = (os.environ.get("OREON_WORKER_PESIGN_BUNDLE_MAX_MIB") or "256").strip()
+    try:
+        mib = int(raw)
+    except ValueError:
+        mib = 256
+    return max(16, min(mib, 1024)) * 1024 * 1024
+
+
+def _pesign_extract_parent_dir() -> Path:
+    override = (os.environ.get("OREON_WORKER_PESIGN_EXTRACT_DIR") or "").strip()
+    if override:
+        p = Path(override).expanduser()
+        if p.is_dir() and os.access(p, os.W_OK):
+            return p
+        logger.warning("OREON_WORKER_PESIGN_EXTRACT_DIR is missing or not writable, using fallback")
+    shm = Path("/dev/shm")
+    if shm.is_dir() and os.access(shm, os.W_OK):
+        return shm
+    logger.warning(
+        "/dev/shm not available for pesign extract. NSS files may touch disk-backed temp. "
+        "Use tmpfs on /dev/shm or set OREON_WORKER_PESIGN_EXTRACT_DIR to a RAM filesystem."
+    )
+    return Path(tempfile.gettempdir())
+
+
+def _wipe_pesign_tree(root: Path | None) -> None:
+    if root is None:
+        return
+    try:
+        if root.is_dir():
+            shutil.rmtree(root, ignore_errors=False)
+    except OSError:
+        shutil.rmtree(str(root), ignore_errors=True)
+
+
+@contextmanager
+def _pesign_bundle_context(
+    session: httpx.Client,
+    controller_url: str,
+    attempt_id: int,
+) -> Iterator[PesignRuntimeConfig | None]:
+    """Yield pesign config while NSS lives only under RAM-backed extract_root, then wipe it."""
+    volatile: Path | None = None
+    cfg: PesignRuntimeConfig | None = None
+    try:
+        try:
+            cfg, volatile = _fetch_pesign_bundle_volatile(session, controller_url, attempt_id)
+        except Exception as pe:
+            logger.warning("Pesign bundle not applied (%s); PE/ko signing may be skipped", pe)
+            cfg = None
+        yield cfg
+    finally:
+        _wipe_pesign_tree(volatile)
+
+
+def _fetch_pesign_bundle_volatile(
+    session: httpx.Client,
+    controller_url: str,
+    attempt_id: int,
+) -> tuple[PesignRuntimeConfig | None, Path | None]:
+    """
+    Stream bundle into RAM (no tarball file on disk). Extract under tmpfs when possible.
+    Returns (config, extract_root). Caller must _wipe_pesign_tree(extract_root) in a finally block.
+    """
+    cap = _pesign_bundle_max_bytes()
+    buf = bytearray()
+    with session.stream(
+        "GET",
+        f"{controller_url}/api/worker/pesign-bundle/{attempt_id}",
+        timeout=httpx.Timeout(600.0, connect=120.0),
+    ) as r:
+        if r.status_code == 204:
+            return None, None
+        r.raise_for_status()
+        for chunk in r.iter_bytes(chunk_size=1024 * 1024):
+            buf.extend(chunk)
+            if len(buf) > cap:
+                raise RuntimeError(
+                    f"pesign bundle larger than cap ({cap // (1024 * 1024)} MiB); "
+                    "raise OREON_WORKER_PESIGN_BUNDLE_MAX_MIB if needed"
+                )
+
+    if not buf:
+        return None, None
+
+    parent = _pesign_extract_parent_dir()
+    extract_root = parent / f"oreon-pesign-{attempt_id}-{secrets.token_hex(8)}"
+    extract_root.mkdir(mode=0o700)
+    try:
+        bio = io.BytesIO(bytes(buf))
+        del buf
+        with tarfile.open(fileobj=bio, mode="r:gz") as tf:
+            try:
+                tf.extractall(extract_root, filter="data")
+            except TypeError:
+                tf.extractall(extract_root)
+    except Exception:
+        _wipe_pesign_tree(extract_root)
+        raise
+
+    manifest_path = extract_root / "manifest.json"
+    if not manifest_path.is_file():
+        _wipe_pesign_tree(extract_root)
+        raise RuntimeError("pesign bundle missing manifest.json")
+    man = json.loads(manifest_path.read_text(encoding="utf-8"))
+    nss_rel = (man.get("nss_subdir") or "nss").strip()
+    nss_dir = (extract_root / nss_rel).resolve()
+    try:
+        nss_dir.relative_to(extract_root.resolve())
+    except ValueError:
+        _wipe_pesign_tree(extract_root)
+        raise RuntimeError("invalid nss path in bundle") from None
+    if not nss_dir.is_dir():
+        _wipe_pesign_tree(extract_root)
+        raise RuntimeError("pesign bundle missing nss directory")
+    rx = man.get("pesign_package_name_regex") or r"^(kernel.*|shim.*|fwupd.*|grub2-efi.*)$"
+    cfg = PesignRuntimeConfig(
+        pesign_nss_dir=str(nss_dir),
+        pesign_rules_json=man.get("pesign_rules_json"),
+        pesign_certificate_nickname=man.get("pesign_certificate_nickname"),
+        pesign_package_name_regex=str(rx),
+        pesign_token=man.get("pesign_token"),
+        pesign_strict=bool(man.get("pesign_strict")),
+        pesign_aarch64_qemu_prefix=man.get("pesign_aarch64_qemu_prefix"),
+        pesign_aarch64_guest_shell=man.get("pesign_aarch64_guest_shell"),
+    )
+    return cfg, extract_root
 
 
 def _get_arch() -> str:
@@ -65,11 +245,6 @@ def _get_arch() -> str:
     if m in ("aarch64", "arm64"):
         return "aarch64"
     return m
-
-
-def _upload_bytes_to_r2(r2_key: str, data: bytes, content_type: str | None = None) -> None:
-    r2 = get_r2_client()
-    r2.put_object(r2_key, data, content_type=content_type)
 
 
 def _worker_result_post_timeout() -> httpx.Timeout:
@@ -109,10 +284,12 @@ def _try_post_orphan_failure(
     exc: BaseException,
 ) -> None:
     """If _process_job dies without returning, still fail the attempt so the UI does not stick on *running*."""
-    log_key = log_r2_key(releasename, attempt_id)
     msg = f"Worker unhandled error during build: {type(exc).__name__}: {exc}"
+    log_key = ""
     try:
-        _upload_bytes_to_r2(log_key, msg.encode("utf-8"), content_type="text/plain")
+        log_key = _upload_build_log_via_controller(
+            session, controller_url, attempt_id, msg.encode("utf-8")
+        )
     except Exception:
         logger.exception("Orphan failure: could not upload log for attempt %s", attempt_id)
     try:
@@ -120,7 +297,7 @@ def _try_post_orphan_failure(
             session,
             controller_url,
             attempt_id,
-            {"status": "failed", "log_r2_key": log_key, "error_message": msg[:2000]},
+            {"status": "failed", "log_r2_key": log_key or None, "error_message": msg[:2000]},
         )
     except Exception:
         logger.exception("Orphan failure: could not POST result for attempt %s", attempt_id)
@@ -924,8 +1101,6 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
         arch = job.get("architecture") or "x86_64"
         sources = job.get("sources") or []
         mock_config = job.get("mock_config")
-        log_key = log_r2_key(releasename, attempt_id)
-
         # Locate SRPM in R2 or distgit URL
         srpm_r2_key = None
         distgit_url = None
@@ -938,7 +1113,7 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
 
         if not mock_config:
             msg = "No mock config for this job (add mock environment to release)."
-            _upload_bytes_to_r2(log_key, msg.encode("utf-8"), content_type="text/plain")
+            log_key = _upload_build_log_via_controller(session, controller_url, attempt_id, msg.encode("utf-8"))
             _post_worker_build_result(
                 session,
                 controller_url,
@@ -977,11 +1152,25 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
             srpm_path: Path | None = None
 
             if srpm_r2_key:
-                r2 = get_r2_client()
-                srpm_bytes = r2.get_object(srpm_r2_key)
+                try:
+                    srpm_bytes = _download_source_via_controller(
+                        session, controller_url, attempt_id, srpm_r2_key
+                    )
+                except Exception as dl_err:
+                    msg = f"SRPM download from controller failed: {dl_err}"
+                    log_key = _upload_build_log_via_controller(
+                        session, controller_url, attempt_id, msg.encode("utf-8")
+                    )
+                    _post_worker_build_result(
+                        session,
+                        controller_url,
+                        attempt_id,
+                        {"status": "failed", "log_r2_key": log_key, "error_message": msg[:2000]},
+                    )
+                    return
                 if not srpm_bytes:
-                    msg = "SRPM not found in R2"
-                    _upload_bytes_to_r2(log_key, msg.encode("utf-8"), content_type="text/plain")
+                    msg = "SRPM empty or not found"
+                    log_key = _upload_build_log_via_controller(session, controller_url, attempt_id, msg.encode("utf-8"))
                     _post_worker_build_result(
                         session,
                         controller_url,
@@ -995,7 +1184,7 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                 repo, branch_name, spec_rel = _parse_distgit_url(distgit_url)
                 if not spec_rel:
                     msg = "DistGit URL missing '#<branch>:<spec_relpath>' fragment"
-                    _upload_bytes_to_r2(log_key, msg.encode("utf-8"), content_type="text/plain")
+                    log_key = _upload_build_log_via_controller(session, controller_url, attempt_id, msg.encode("utf-8"))
                     _post_worker_build_result(
                         session,
                         controller_url,
@@ -1009,7 +1198,7 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                     build_log_parts.append("## Git clone\n" + git_out.strip())
                 if not ok:
                     msg = "\n\n".join(build_log_parts).strip()
-                    _upload_bytes_to_r2(log_key, msg.encode("utf-8"), content_type="text/plain")
+                    log_key = _upload_build_log_via_controller(session, controller_url, attempt_id, msg.encode("utf-8"))
                     _post_worker_build_result(
                         session,
                         controller_url,
@@ -1024,7 +1213,7 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                 if not spec_path.is_file():
                     build_log_parts.append(f"Spec not found: {spec_rel}")
                     msg = "\n\n".join(build_log_parts).strip()
-                    _upload_bytes_to_r2(log_key, msg.encode("utf-8"), content_type="text/plain")
+                    log_key = _upload_build_log_via_controller(session, controller_url, attempt_id, msg.encode("utf-8"))
                     _post_worker_build_result(
                         session,
                         controller_url,
@@ -1041,7 +1230,7 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                 build_log_parts.append("## Source prep\n" + src_log)
                 if not src_ok:
                     msg = "\n\n".join(build_log_parts).strip()
-                    _upload_bytes_to_r2(log_key, msg.encode("utf-8"), content_type="text/plain")
+                    log_key = _upload_build_log_via_controller(session, controller_url, attempt_id, msg.encode("utf-8"))
                     _post_worker_build_result(
                         session,
                         controller_url,
@@ -1074,7 +1263,7 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                 )
                 if srpm_cancelled:
                     msg = "\n\n".join(build_log_parts).strip()
-                    _upload_bytes_to_r2(log_key, msg.encode("utf-8"), content_type="text/plain")
+                    log_key = _upload_build_log_via_controller(session, controller_url, attempt_id, msg.encode("utf-8"))
                     _post_worker_build_result(
                         session,
                         controller_url,
@@ -1089,7 +1278,7 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                     return
                 if not ok or not srpm_path:
                     msg = "\n\n".join(build_log_parts).strip()
-                    _upload_bytes_to_r2(log_key, msg.encode("utf-8"), content_type="text/plain")
+                    log_key = _upload_build_log_via_controller(session, controller_url, attempt_id, msg.encode("utf-8"))
                     _post_worker_build_result(
                         session,
                         controller_url,
@@ -1099,7 +1288,7 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                     return
             else:
                 msg = "No SRPM or DistGit source in job (upload SRPM or configure DistGit spec path)."
-                _upload_bytes_to_r2(log_key, msg.encode("utf-8"), content_type="text/plain")
+                log_key = _upload_build_log_via_controller(session, controller_url, attempt_id, msg.encode("utf-8"))
                 _post_worker_build_result(
                     session,
                     controller_url,
@@ -1131,7 +1320,7 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
             )
             if rebuild_cancelled:
                 full_log = "\n\n".join([p for p in build_log_parts if p]).strip() + "\n"
-                _upload_bytes_to_r2(log_key, full_log.encode("utf-8"), content_type="text/plain")
+                log_key = _upload_build_log_via_controller(session, controller_url, attempt_id, full_log.encode("utf-8"))
                 _post_worker_build_result(
                     session,
                     controller_url,
@@ -1146,98 +1335,127 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
                 return
             full_log = "\n\n".join([p for p in build_log_parts if p]).strip() + "\n"
 
-            _upload_bytes_to_r2(log_key, full_log.encode("utf-8"), content_type="text/plain")
+            log_key = _upload_build_log_via_controller(session, controller_url, attempt_id, full_log.encode("utf-8"))
 
-            perm_hint = (
-                "Permission denied while reading mock --resultdir RPMs (tree may still be "
-                "root-owned after chmod). Set OREON_WORKER_CHMOD_MOCK_RESULTDIR_SUDO=1 and NOPASSWD "
-                "sudoers for chmod on worker temp dirs (deploy/oreon-worker.env.example). "
-                "Ensure the worker user is in the 'mock' group."
-            )
-            artifacts_payload: list[dict] = []
-            try:
-                rpm_paths = sorted(result_dir.rglob("*.rpm"))
-            except OSError as pe:
-                err_msg = f"{perm_hint}\n\n{type(pe).__name__}: {pe}"
-                logger.exception("%s", err_msg)
-                fail_log = full_log + "\n\n== " + err_msg + "\n"
-                _upload_bytes_to_r2(log_key, fail_log.encode("utf-8"), content_type="text/plain")
+            with _pesign_bundle_context(session, controller_url, attempt_id) as pesign_cfg:
+                perm_hint = (
+                    "Permission denied while reading mock --resultdir RPMs (tree may still be "
+                    "root-owned after chmod). Set OREON_WORKER_CHMOD_MOCK_RESULTDIR_SUDO=1 and NOPASSWD "
+                    "sudoers for chmod on worker temp dirs (deploy/oreon-worker.env.example). "
+                    "Ensure the worker user is in the 'mock' group."
+                )
+                artifacts_payload: list[dict] = []
+                try:
+                    rpm_paths = sorted(result_dir.rglob("*.rpm"))
+                except OSError as pe:
+                    err_msg = f"{perm_hint}\n\n{type(pe).__name__}: {pe}"
+                    logger.exception("%s", err_msg)
+                    fail_log = full_log + "\n\n== " + err_msg + "\n"
+                    log_key = _upload_build_log_via_controller(
+                        session, controller_url, attempt_id, fail_log.encode("utf-8")
+                    )
+                    _post_worker_build_result(
+                        session,
+                        controller_url,
+                        attempt_id,
+                        {
+                            "status": "failed",
+                            "log_r2_key": log_key,
+                            "error_message": fail_log[:2000],
+                            "artifacts": [],
+                        },
+                    )
+                    return
+                for f in rpm_paths:
+                    if not f.is_file():
+                        continue
+                    fname = f.name
+                    try:
+                        if pesign_cfg and not fname.endswith(".src.rpm"):
+                            pesign_rpm_if_configured(f, pesign_cfg)
+                    except PesignRepackError as pe:
+                        err_msg = f"pesign failed for {fname}: {pe}"
+                        logger.exception("%s", err_msg)
+                        fail_log = full_log + "\n\n== " + err_msg + "\n"
+                        log_key = _upload_build_log_via_controller(
+                            session, controller_url, attempt_id, fail_log.encode("utf-8")
+                        )
+                        _post_worker_build_result(
+                            session,
+                            controller_url,
+                            attempt_id,
+                            {
+                                "status": "failed",
+                                "log_r2_key": log_key,
+                                "error_message": fail_log[:2000],
+                                "artifacts": artifacts_payload,
+                            },
+                        )
+                        return
+                    try:
+                        meta = _upload_rpm_to_controller(session, controller_url, attempt_id, f)
+                    except OSError as pe:
+                        if not isinstance(pe, PermissionError):
+                            raise
+                        err_msg = f"{perm_hint}\n\nWhile uploading {fname}: {type(pe).__name__}: {pe}"
+                        logger.exception("%s", err_msg)
+                        fail_log = full_log + "\n\n== " + err_msg + "\n"
+                        log_key = _upload_build_log_via_controller(
+                            session, controller_url, attempt_id, fail_log.encode("utf-8")
+                        )
+                        _post_worker_build_result(
+                            session,
+                            controller_url,
+                            attempt_id,
+                            {
+                                "status": "failed",
+                                "log_r2_key": log_key,
+                                "error_message": fail_log[:2000],
+                                "artifacts": artifacts_payload,
+                            },
+                        )
+                        return
+                    except Exception as upload_err:
+                        err_msg = f"Failed to upload RPM to controller ({fname}): {upload_err}"
+                        logger.exception("%s", err_msg)
+                        fail_log = full_log + "\n\n== " + err_msg + "\n"
+                        log_key = _upload_build_log_via_controller(
+                            session, controller_url, attempt_id, fail_log.encode("utf-8")
+                        )
+                        _post_worker_build_result(
+                            session,
+                            controller_url,
+                            attempt_id,
+                            {
+                                "status": "failed",
+                                "log_r2_key": log_key,
+                                "error_message": fail_log[:2000],
+                                "artifacts": artifacts_payload,
+                            },
+                        )
+                        return
+                    artifacts_payload.append(
+                        {
+                            "kind": "rpm",
+                            "filename": meta.get("filename") or fname,
+                            "r2_key": meta["r2_key"],
+                            "signed": bool(meta.get("signed")),
+                            "size_bytes": meta.get("size_bytes"),
+                            "checksum_sha256": meta.get("checksum_sha256"),
+                        }
+                    )
+
                 _post_worker_build_result(
                     session,
                     controller_url,
                     attempt_id,
                     {
-                        "status": "failed",
+                        "status": "success" if ok else "failed",
                         "log_r2_key": log_key,
-                        "error_message": fail_log[:2000],
-                        "artifacts": [],
+                        "error_message": None if ok else full_log[:2000],
+                        "artifacts": artifacts_payload,
                     },
                 )
-                return
-            for f in rpm_paths:
-                if not f.is_file():
-                    continue
-                fname = f.name
-                try:
-                    meta = _upload_rpm_to_controller(session, controller_url, attempt_id, f)
-                except OSError as pe:
-                    if not isinstance(pe, PermissionError):
-                        raise
-                    err_msg = f"{perm_hint}\n\nWhile uploading {fname}: {type(pe).__name__}: {pe}"
-                    logger.exception("%s", err_msg)
-                    fail_log = full_log + "\n\n== " + err_msg + "\n"
-                    _upload_bytes_to_r2(log_key, fail_log.encode("utf-8"), content_type="text/plain")
-                    _post_worker_build_result(
-                        session,
-                        controller_url,
-                        attempt_id,
-                        {
-                            "status": "failed",
-                            "log_r2_key": log_key,
-                            "error_message": fail_log[:2000],
-                            "artifacts": artifacts_payload,
-                        },
-                    )
-                    return
-                except Exception as upload_err:
-                    err_msg = f"Failed to upload RPM to controller ({fname}): {upload_err}"
-                    logger.exception("%s", err_msg)
-                    fail_log = full_log + "\n\n== " + err_msg + "\n"
-                    _upload_bytes_to_r2(log_key, fail_log.encode("utf-8"), content_type="text/plain")
-                    _post_worker_build_result(
-                        session,
-                        controller_url,
-                        attempt_id,
-                        {
-                            "status": "failed",
-                            "log_r2_key": log_key,
-                            "error_message": fail_log[:2000],
-                            "artifacts": artifacts_payload,
-                        },
-                    )
-                    return
-                artifacts_payload.append(
-                    {
-                        "kind": "rpm",
-                        "filename": meta.get("filename") or fname,
-                        "r2_key": meta["r2_key"],
-                        "signed": bool(meta.get("signed")),
-                        "size_bytes": meta.get("size_bytes"),
-                        "checksum_sha256": meta.get("checksum_sha256"),
-                    }
-                )
-
-            _post_worker_build_result(
-                session,
-                controller_url,
-                attempt_id,
-                {
-                    "status": "success" if ok else "failed",
-                    "log_r2_key": log_key,
-                    "error_message": None if ok else full_log[:2000],
-                    "artifacts": artifacts_payload,
-                },
-            )
         finally:
             _cleanup_job_disk(attempt_id, scrub_mock_cfg, scrub_mock_ext, tmpdir)
     except Exception as exc:
@@ -1256,13 +1474,12 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
 
 
 def main() -> None:
-    settings = get_settings()
     worker_name = os.environ.get("OREON_WORKER_NAME", "worker-1")
     worker_token = os.environ.get("OREON_WORKER_TOKEN")
     if not worker_token:
         logger.error("OREON_WORKER_TOKEN not set")
         sys.exit(1)
-    controller_url = settings.controller_url.rstrip("/")
+    controller_url = _controller_base_url()
     headers = {"X-Worker-Token": worker_token}
     session = httpx.Client(timeout=30.0, headers=headers)
 
