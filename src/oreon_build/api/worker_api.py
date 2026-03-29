@@ -170,7 +170,10 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
         q = q.outerjoin(BuildTarget, BuildJob.target_id == BuildTarget.id).where(
             (BuildJob.target_id.is_(None)) | (BuildTarget.architecture == worker_arch)
         )
-    result = await db.execute(q.limit(1))
+    # One transaction must not claim the same job row twice (concurrent polls, duplicate worker
+    # processes with the same token, or LB retry). Lock the chosen row until commit.
+    q = q.limit(1).with_for_update(of=BuildJob, skip_locked=True)
+    result = await db.execute(q)
     job = result.scalar_one_or_none()
     if not job:
         return {"job": None}

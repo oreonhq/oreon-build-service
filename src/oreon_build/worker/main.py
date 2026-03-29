@@ -35,10 +35,14 @@ DistGit: Source(kind="distgit", url="<repo>.git#branch:spec_relpath") — mock -
 
 Poll may include ``mock_additional_repos`` (base URLs) from the job mock environment. Each becomes ``mock --addrepo``.
 Optional ``OREON_WORKER_EXTRA_MOCK_ADDREPO`` appends comma-separated URLs on the worker.
+
+Each build thread opens its own ``httpx.Client`` (same auth headers as poll). The poll/heartbeat loop keeps a separate client so nothing shares a sync client with mock (multi-hour jobs were seeing broken pipes from pooled stale connections and from unsafe concurrent use).
+Transient ``ReadError`` / broken pipe on controller API calls is retried (see ``OREON_WORKER_HTTP_RETRIES``).
 """
 
 from __future__ import annotations
 
+import errno
 import io
 import json
 import logging
@@ -55,7 +59,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator, TypeVar
 
 import httpx
 
@@ -67,6 +71,80 @@ from oreon_build.services.signing import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+# Ignore a second dispatch for the same build_attempt_id (duplicate poll / misbehaving client).
+_inflight_attempt_lock = threading.Lock()
+_inflight_attempt_ids: set[int] = set()
+
+T = TypeVar("T")
+
+
+def _http_retry_attempts_and_base() -> tuple[int, float]:
+    raw_n = (os.environ.get("OREON_WORKER_HTTP_RETRIES") or "5").strip()
+    raw_d = (os.environ.get("OREON_WORKER_HTTP_RETRY_BASE_SEC") or "2").strip()
+    try:
+        n = int(raw_n)
+    except ValueError:
+        n = 5
+    try:
+        base = float(raw_d)
+    except ValueError:
+        base = 2.0
+    return max(1, min(n, 12)), max(0.5, min(base, 60.0))
+
+
+def _is_transient_http_error(exc: BaseException) -> bool:
+    transient_types: tuple[type[BaseException], ...] = (
+        httpx.ReadError,
+        httpx.WriteError,
+        httpx.ConnectError,
+        httpx.RemoteProtocolError,
+        httpx.ReadTimeout,
+        httpx.WriteTimeout,
+        httpx.ConnectTimeout,
+    )
+    if hasattr(httpx, "PoolTimeout"):
+        transient_types += (getattr(httpx, "PoolTimeout"),)
+    if isinstance(exc, transient_types):
+        return True
+    if isinstance(exc, OSError) and exc.errno in (errno.EPIPE, errno.ECONNRESET, errno.ETIMEDOUT):
+        return True
+    unwrapped: BaseException | None = exc
+    for _ in range(6):
+        c = getattr(unwrapped, "__cause__", None)
+        if c is None:
+            c = getattr(unwrapped, "__context__", None)
+        if isinstance(c, OSError) and c.errno in (errno.EPIPE, errno.ECONNRESET):
+            return True
+        if not isinstance(c, BaseException):
+            break
+        unwrapped = c
+    return False
+
+
+def _with_http_retries(label: str, fn: Callable[[], T]) -> T:
+    """Retry on dead pooled connections (common after multi-hour mock) and similar transport glitches."""
+    attempts, base = _http_retry_attempts_and_base()
+    last: BaseException | None = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if i + 1 >= attempts or not _is_transient_http_error(e):
+                raise
+            delay = min(base * (2**i), 120.0)
+            logger.warning(
+                "%s: transient HTTP error %s (attempt %s/%s, sleeping %.1fs)",
+                label,
+                e,
+                i + 1,
+                attempts,
+                delay,
+            )
+            time.sleep(delay)
+    assert last is not None
+    raise last
 
 
 def _controller_base_url() -> str:
@@ -83,14 +161,17 @@ def _upload_build_log_via_controller(
     attempt_id: int,
     data: bytes,
 ) -> str:
-    r = session.put(
-        f"{controller_url}/api/worker/build-log/{attempt_id}",
-        content=data,
-        headers={"Content-Type": "text/plain; charset=utf-8"},
-        timeout=httpx.Timeout(600.0, connect=120.0),
-    )
-    r.raise_for_status()
-    return str(r.json().get("log_r2_key") or "")
+    def _do() -> str:
+        r = session.put(
+            f"{controller_url}/api/worker/build-log/{attempt_id}",
+            content=data,
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+            timeout=httpx.Timeout(600.0, connect=120.0),
+        )
+        r.raise_for_status()
+        return str(r.json().get("log_r2_key") or "")
+
+    return _with_http_retries(f"build-log upload attempt_id={attempt_id}", _do)
 
 
 def _download_source_via_controller(
@@ -99,13 +180,16 @@ def _download_source_via_controller(
     attempt_id: int,
     r2_key: str,
 ) -> bytes:
-    r = session.get(
-        f"{controller_url}/api/worker/source-blob/{attempt_id}",
-        params={"key": r2_key},
-        timeout=httpx.Timeout(7200.0, connect=120.0),
-    )
-    r.raise_for_status()
-    return r.content
+    def _do() -> bytes:
+        r = session.get(
+            f"{controller_url}/api/worker/source-blob/{attempt_id}",
+            params={"key": r2_key},
+            timeout=httpx.Timeout(7200.0, connect=120.0),
+        )
+        r.raise_for_status()
+        return r.content
+
+    return _with_http_retries(f"source-blob attempt_id={attempt_id}", _do)
 
 
 def _pesign_bundle_max_bytes() -> int:
@@ -155,7 +239,10 @@ def _pesign_bundle_context(
     cfg: PesignRuntimeConfig | None = None
     try:
         try:
-            cfg, volatile = _fetch_pesign_bundle_volatile(session, controller_url, attempt_id)
+            cfg, volatile = _with_http_retries(
+                f"pesign-bundle attempt_id={attempt_id}",
+                lambda: _fetch_pesign_bundle_volatile(session, controller_url, attempt_id),
+            )
         except Exception as pe:
             logger.warning("Pesign bundle not applied (%s); PE/ko signing may be skipped", pe)
             cfg = None
@@ -269,16 +356,19 @@ def _post_worker_build_result(
     attempt_id: int,
     json_body: dict,
 ) -> httpx.Response:
-    return session.post(
-        f"{controller_url}/api/worker/result/{attempt_id}",
-        json=json_body,
-        timeout=_worker_result_post_timeout(),
-    )
+    def _do() -> httpx.Response:
+        return session.post(
+            f"{controller_url}/api/worker/result/{attempt_id}",
+            json=json_body,
+            timeout=_worker_result_post_timeout(),
+        )
+
+    return _with_http_retries(f"worker result attempt_id={attempt_id}", _do)
 
 
 def _try_post_orphan_failure(
     controller_url: str,
-    session: httpx.Client,
+    worker_headers: dict[str, str],
     releasename: str,
     attempt_id: int,
     exc: BaseException,
@@ -286,21 +376,25 @@ def _try_post_orphan_failure(
     """If _process_job dies without returning, still fail the attempt so the UI does not stick on *running*."""
     msg = f"Worker unhandled error during build: {type(exc).__name__}: {exc}"
     log_key = ""
-    try:
-        log_key = _upload_build_log_via_controller(
-            session, controller_url, attempt_id, msg.encode("utf-8")
-        )
-    except Exception:
-        logger.exception("Orphan failure: could not upload log for attempt %s", attempt_id)
-    try:
-        _post_worker_build_result(
-            session,
-            controller_url,
-            attempt_id,
-            {"status": "failed", "log_r2_key": log_key or None, "error_message": msg[:2000]},
-        )
-    except Exception:
-        logger.exception("Orphan failure: could not POST result for attempt %s", attempt_id)
+    with httpx.Client(
+        timeout=httpx.Timeout(600.0, connect=120.0),
+        headers=worker_headers,
+    ) as oc:
+        try:
+            log_key = _upload_build_log_via_controller(
+                oc, controller_url, attempt_id, msg.encode("utf-8")
+            )
+        except Exception:
+            logger.exception("Orphan failure: could not upload log for attempt %s", attempt_id)
+        try:
+            _post_worker_build_result(
+                oc,
+                controller_url,
+                attempt_id,
+                {"status": "failed", "log_r2_key": log_key or None, "error_message": msg[:2000]},
+            )
+        except Exception:
+            logger.exception("Orphan failure: could not POST result for attempt %s", attempt_id)
 
 
 def _upload_rpm_to_controller(
@@ -311,15 +405,20 @@ def _upload_rpm_to_controller(
 ) -> dict:
     """POST RPM bytes to controller; controller signs and stores in R2. Returns artifact metadata dict."""
     upload_timeout = httpx.Timeout(7200.0, connect=120.0)
-    with open(rpm_path, "rb") as fp:
-        files = {"file": (rpm_path.name, fp, "application/x-rpm")}
-        r = session.post(
-            f"{controller_url}/api/worker/upload-rpm/{attempt_id}",
-            files=files,
-            timeout=upload_timeout,
-        )
-    r.raise_for_status()
-    return r.json()
+    fname = rpm_path.name
+
+    def _do() -> dict:
+        with open(rpm_path, "rb") as fp:
+            files = {"file": (fname, fp, "application/x-rpm")}
+            r = session.post(
+                f"{controller_url}/api/worker/upload-rpm/{attempt_id}",
+                files=files,
+                timeout=upload_timeout,
+            )
+        r.raise_for_status()
+        return r.json()
+
+    return _with_http_retries(f"rpm upload attempt_id={attempt_id} {fname}", _do)
 
 
 def _truthy_env(name: str) -> bool:
@@ -1074,25 +1173,31 @@ def _prune_stale_oreon_worker_tempdirs() -> None:
             pass
 
 
-def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
+def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict) -> None:
     done_event = threading.Event()
     abort_event = threading.Event()
+    session: httpx.Client | None = None
     try:
         attempt_id = job["build_attempt_id"]
+        session = httpx.Client(timeout=30.0, headers=worker_headers)
 
         def poll_cancel() -> None:
-            while not done_event.is_set():
-                try:
-                    r = session.get(
-                        f"{controller_url}/api/worker/cancel-check/{attempt_id}",
-                        timeout=15.0,
-                    )
-                    if r.status_code == 200 and r.json().get("cancel_requested"):
-                        abort_event.set()
-                        return
-                except Exception:
-                    pass
-                time.sleep(5)
+            cancel_client = httpx.Client(timeout=20.0, headers=worker_headers)
+            try:
+                while not done_event.is_set():
+                    try:
+                        r = cancel_client.get(
+                            f"{controller_url}/api/worker/cancel-check/{attempt_id}",
+                            timeout=15.0,
+                        )
+                        if r.status_code == 200 and r.json().get("cancel_requested"):
+                            abort_event.set()
+                            return
+                    except Exception:
+                        pass
+                    time.sleep(5)
+            finally:
+                cancel_client.close()
 
         threading.Thread(target=poll_cancel, daemon=True, name="oreon-cancel-poller").start()
 
@@ -1464,13 +1569,18 @@ def _process_job(controller_url: str, session: httpx.Client, job: dict) -> None:
         if aid is not None:
             _try_post_orphan_failure(
                 controller_url,
-                session,
+                worker_headers,
                 str(job.get("releasename") or "oreon11"),
                 int(aid),
                 exc,
             )
     finally:
         done_event.set()
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
 
 
 def main() -> None:
@@ -1530,7 +1640,31 @@ def main() -> None:
             if not job:
                 time.sleep(10)
                 continue
-            t = threading.Thread(target=_process_job, args=(controller_url, session, job), daemon=True)
+            raw_aid = job.get("build_attempt_id")
+            try:
+                aid = int(raw_aid) if raw_aid is not None else None
+            except (TypeError, ValueError):
+                aid = None
+            if aid is not None:
+                with _inflight_attempt_lock:
+                    if aid in _inflight_attempt_ids:
+                        logger.warning(
+                            "Ignoring duplicate poll job for build_attempt_id=%s (already running locally)",
+                            aid,
+                        )
+                        time.sleep(2)
+                        continue
+                    _inflight_attempt_ids.add(aid)
+
+            def _run_job() -> None:
+                try:
+                    _process_job(controller_url, headers, job)
+                finally:
+                    if aid is not None:
+                        with _inflight_attempt_lock:
+                            _inflight_attempt_ids.discard(aid)
+
+            t = threading.Thread(target=_run_job, daemon=True)
             t.start()
             active.append(t)
         except httpx.HTTPStatusError as e:
