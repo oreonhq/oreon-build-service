@@ -102,6 +102,36 @@ class R2Client:
         except ClientError:
             return False
 
+    def head_object_content_length(self, key: str) -> int | None:
+        """Return Content-Length from HEAD, or None if missing."""
+        try:
+            r = self._client.head_object(Bucket=self.bucket, Key=key)
+            return int(r["ContentLength"])
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("404", "NoSuchKey", "NotFound"):
+                return None
+            raise
+
+    def generate_presigned_put_url(
+        self,
+        key: str,
+        *,
+        content_type: str,
+        expires_in: int,
+    ) -> str:
+        """Time-limited PUT URL so workers can upload large RPMs straight to R2 (not through the API tunnel)."""
+        return self._client.generate_presigned_url(
+            "put_object",
+            Params={
+                "Bucket": self.bucket,
+                "Key": key,
+                "ContentType": content_type,
+            },
+            ExpiresIn=expires_in,
+            HttpMethod="PUT",
+        )
+
 
 # Repository layout: <releasename>/<branch>/<basearch>/RPMS/ and repodata/
 # Source layout: <releasename>/<branch>/src/*.src.rpm
