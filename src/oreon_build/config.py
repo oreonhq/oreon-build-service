@@ -164,8 +164,18 @@ class Settings(BaseSettings):
         description="If true, upload fails when a matching RPM cannot be pesign-repacked",
     )
 
-    # Worker → controller RPM upload (single artifact size cap, MiB)
-    max_worker_rpm_upload_mib: int = Field(default=4096, ge=16, le=65536)
+    # Worker → controller RPM upload (single artifact size cap, MiB). Default 51200 (= 50 GiB).
+    # Keep <= any reverse-proxy client_max_body_size on the origin. HTTP 413 with no JSON detail
+    # is often nginx or another hop before FastAPI. Cloudflare Tunnel (cloudflared) does not add the
+    # same upload cap as orange-cloud HTTP proxy, but whatever cloudflared forwards to must allow
+    # large POST bodies (e.g. nginx on loopback in front of uvicorn).
+    max_worker_rpm_upload_mib: int = Field(default=51200, ge=16, le=102400)
+    worker_rpm_presign_put_expires_seconds: int = Field(
+        default=7200,
+        ge=600,
+        le=86400,
+        description="Presigned PUT to R2 TTL for worker direct RPM uploads (bypasses small POST limits on tunnels).",
+    )
 
     # Stuck builds: jobs stay RUNNING until the worker posts a result; sweep marks them failed if
     # the attempt is too old or the worker has not heartbeated (see services/stale_builds.py).
