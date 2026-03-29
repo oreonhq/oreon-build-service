@@ -35,7 +35,7 @@ Here’s what you deploy:
 - Cloudflare R2 for all repo/artifact storage
 - Controller host `createrepo_c`, GPG signing key + `rpm-sign` for RPM/repodata signing (see `.env.example`). Optional payload signing: `pesign`, `rpmrebuild`, and `file` plus NSS DB; use `PESIGN_RULES_JSON` for multiple signing certs (e.g. kernel vs GRUB vs s390) or a single `PESIGN_CERTIFICATE_NICKNAME`
 - Workers `mock`, `rpmdevtools`. No GPG or R2 credentials on workers. Optional `pesign` + `rpmrebuild` when building PE-signed payloads; NSS stays on the controller
-- Optional: `MAX_WORKER_RPM_UPLOAD_MIB` in controller `.env` if workers build very large RPMs (default 4096 MiB; HTTP 413 means increase this)
+- Optional: `MAX_WORKER_RPM_UPLOAD_MIB` in controller `.env` (default 51200 MiB, 50 GiB per artifact). Workers upload RPMs via presigned PUT to R2 plus a small API `complete` by default (`OREON_WORKER_RPM_UPLOAD_VIA_PRESIGNED_R2`, unset means on) so big SRPMs are not POSTed through Cloudflare Tunnel. See `deploy/oreon-worker.env.example`
 
 NOTE: we ship `psycopg2-binary` for Alembic (sync). The app talks to Postgres with `asyncpg` at runtime, so `DATABASE_URL` should use `postgresql+asyncpg://`.
 
