@@ -38,11 +38,13 @@ Optional ``OREON_WORKER_EXTRA_MOCK_ADDREPO`` appends comma-separated URLs on the
 
 Each build thread opens its own ``httpx.Client`` (same auth headers as poll). The poll/heartbeat loop keeps a separate client so nothing shares a sync client with mock (multi-hour jobs were seeing broken pipes from pooled stale connections and from unsafe concurrent use).
 Transient ``ReadError`` / broken pipe on controller API calls is retried (see ``OREON_WORKER_HTTP_RETRIES``).
+RPM uploads default to presigned PUT to R2 plus a small API ``complete`` call (``OREON_WORKER_RPM_UPLOAD_VIA_PRESIGNED_R2`` defaults on) so payloads do not go through tunnel POST limits. Set that var to ``0`` to use legacy multipart POST to the controller instead.
 """
 
 from __future__ import annotations
 
 import errno
+import hashlib
 import io
 import json
 import logging
@@ -397,17 +399,81 @@ def _try_post_orphan_failure(
             logger.exception("Orphan failure: could not POST result for attempt %s", attempt_id)
 
 
+def _rpm_file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(8 * 1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _rpm_upload_presigned_r2_enabled() -> bool:
+    """Default on. Set OREON_WORKER_RPM_UPLOAD_VIA_PRESIGNED_R2=0 to use multipart POST through the controller."""
+    v = (os.environ.get("OREON_WORKER_RPM_UPLOAD_VIA_PRESIGNED_R2") or "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def _upload_rpm_via_presigned_r2(
+    session: httpx.Client,
+    controller_url: str,
+    attempt_id: int,
+    rpm_path: Path,
+) -> dict:
+    fname = rpm_path.name
+    size_bytes = rpm_path.stat().st_size
+    digest = _rpm_file_sha256(rpm_path)
+
+    def _presign() -> dict:
+        r = session.post(
+            f"{controller_url}/api/worker/upload-rpm/presign/{attempt_id}",
+            json={"filename": fname},
+            timeout=httpx.Timeout(120.0, connect=60.0),
+        )
+        r.raise_for_status()
+        return r.json()
+
+    pres = _with_http_retries(f"rpm presign attempt_id={attempt_id} {fname}", _presign)
+    put_url = str(pres["put_url"])
+    hdrs = dict(pres.get("headers") or {})
+    put_timeout = httpx.Timeout(7200.0, connect=120.0)
+
+    def _put() -> None:
+        with rpm_path.open("rb") as fp:
+            pr = session.put(put_url, headers=hdrs, content=fp, timeout=put_timeout)
+        pr.raise_for_status()
+
+    _with_http_retries(f"rpm R2 PUT attempt_id={attempt_id} {fname}", _put)
+
+    def _complete() -> dict:
+        r = session.post(
+            f"{controller_url}/api/worker/upload-rpm/complete/{attempt_id}",
+            json={
+                "filename": fname,
+                "checksum_sha256": digest,
+                "size_bytes": size_bytes,
+            },
+            timeout=httpx.Timeout(7200.0, connect=120.0),
+        )
+        r.raise_for_status()
+        return r.json()
+
+    return _with_http_retries(f"rpm presign-complete attempt_id={attempt_id} {fname}", _complete)
+
+
 def _upload_rpm_to_controller(
     session: httpx.Client,
     controller_url: str,
     attempt_id: int,
     rpm_path: Path,
 ) -> dict:
-    """POST RPM bytes to controller; controller signs and stores in R2. Returns artifact metadata dict."""
+    """Default: presigned R2 PUT + API complete. Optional: multipart POST when presign is disabled."""
     upload_timeout = httpx.Timeout(7200.0, connect=120.0)
     fname = rpm_path.name
 
-    def _do() -> dict:
+    def _multipart() -> dict:
         with open(rpm_path, "rb") as fp:
             files = {"file": (fname, fp, "application/x-rpm")}
             r = session.post(
@@ -418,7 +484,18 @@ def _upload_rpm_to_controller(
         r.raise_for_status()
         return r.json()
 
-    return _with_http_retries(f"rpm upload attempt_id={attempt_id} {fname}", _do)
+    if _rpm_upload_presigned_r2_enabled():
+        return _upload_rpm_via_presigned_r2(session, controller_url, attempt_id, rpm_path)
+    try:
+        return _with_http_retries(f"rpm upload attempt_id={attempt_id} {fname}", _multipart)
+    except httpx.HTTPStatusError as e:
+        if e.response is not None and e.response.status_code == 413:
+            logger.warning(
+                "Multipart RPM upload returned 413 for %s, retrying via presigned R2 PUT",
+                fname,
+            )
+            return _upload_rpm_via_presigned_r2(session, controller_url, attempt_id, rpm_path)
+        raise
 
 
 def _truthy_env(name: str) -> bool:
