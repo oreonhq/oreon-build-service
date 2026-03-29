@@ -311,6 +311,206 @@ def _put_rpm_bytes_to_r2(key: str, raw: bytes) -> None:
     get_r2_client().put_object(key, raw, content_type="application/x-rpm")
 
 
+_RPM_UPLOAD_CONTENT_TYPE = "application/x-rpm"
+
+
+async def _resolve_worker_rpm_upload_context(
+    db: DbSession,
+    worker: Worker,
+    attempt_id: int,
+    fname_raw: str,
+) -> tuple[BuildAttempt, BuildJob, Release, str, str, str]:
+    """
+    Validate worker/attempt/job and compute repo ``r2_key`` for ``fname``.
+    Returns ``attempt``, ``job``, ``release``, ``arch``, ``branch``, ``r2_key``.
+    """
+    fname = Path(fname_raw.strip()).name
+    if not fname or not fname.lower().endswith(".rpm"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Filename must end with .rpm",
+        )
+
+    ar = await db.execute(
+        select(BuildAttempt).where(
+            BuildAttempt.id == attempt_id,
+            BuildAttempt.worker_id == worker.id,
+        )
+    )
+    attempt = ar.scalar_one_or_none()
+    if not attempt:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attempt not found")
+
+    job_result = await db.execute(select(BuildJob).where(BuildJob.id == attempt.build_job_id))
+    job = job_result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if job.status == BuildStatus.CANCELLED:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Job cancelled")
+
+    rel_result = await db.execute(select(Release).where(Release.id == job.release_id))
+    release = rel_result.scalar_one_or_none()
+    if not release:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Release missing",
+        )
+
+    arch = "x86_64"
+    if job.target_id:
+        t_result = await db.execute(select(BuildTarget).where(BuildTarget.id == job.target_id))
+        t = t_result.scalar_one_or_none()
+        if t and t.architecture:
+            arch = t.architecture
+    branch = getattr(job, "branch", None) or "dev"
+
+    if fname.endswith(".src.rpm"):
+        r2_key = src_r2_key(release.releasename, branch, fname)
+    else:
+        r2_key = repo_rpms_key(release.releasename, branch, arch, fname)
+
+    return attempt, job, release, arch, branch, r2_key
+
+
+class WorkerRpmPresignBody(BaseModel):
+    filename: str
+
+
+class WorkerRpmCompleteBody(BaseModel):
+    filename: str
+    checksum_sha256: str
+    size_bytes: int
+
+
+@router.post("/upload-rpm/presign/{attempt_id}")
+async def upload_worker_rpm_presign(
+    attempt_id: int,
+    db: DbSession,
+    worker: Annotated[Worker, Depends(_require_worker)],
+    body: WorkerRpmPresignBody,
+):
+    """
+    Presigned PUT to R2 so workers can upload very large RPMs without POSTing through Cloudflare Tunnel
+    (which often returns 413 for very large bodies). Binary RPMs can still use multipart ``/upload-rpm/``.
+    """
+    settings = get_settings()
+    _, _, _, _, _, r2_key = await _resolve_worker_rpm_upload_context(
+        db, worker, attempt_id, body.filename
+    )
+    expires = settings.worker_rpm_presign_put_expires_seconds
+    url = get_r2_client().generate_presigned_put_url(
+        r2_key,
+        content_type=_RPM_UPLOAD_CONTENT_TYPE,
+        expires_in=expires,
+    )
+    await log_audit(
+        db,
+        action="worker.rpm_presign",
+        resource_type="build_attempt",
+        resource_id=str(attempt_id),
+        details=f"worker_id={worker.id} key={r2_key}",
+        emit_discord=False,
+    )
+    return {
+        "put_url": url,
+        "headers": {"Content-Type": _RPM_UPLOAD_CONTENT_TYPE},
+        "expires_in": expires,
+    }
+
+
+@router.post("/upload-rpm/complete/{attempt_id}")
+async def upload_worker_rpm_complete(
+    attempt_id: int,
+    db: DbSession,
+    worker: Annotated[Worker, Depends(_require_worker)],
+    body: WorkerRpmCompleteBody,
+):
+    """
+    After the worker PUTs the unsigned RPM to R2 using a presigned URL, this runs on the controller:
+    HEAD+GET from R2 into a temp file (same network path as any S3 client, not through the worker
+    tunnel), verify size and SHA-256, ``rpm --addsign`` on that file, then ``put_object`` overwrites
+    the same R2 key with the signed RPM bytes.
+    """
+    settings = get_settings()
+    max_bytes = settings.max_worker_rpm_upload_mib * 1024 * 1024
+    if body.size_bytes > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"RPM exceeds max {settings.max_worker_rpm_upload_mib} MiB",
+        )
+
+    _, _, _, _, _, r2_key = await _resolve_worker_rpm_upload_context(
+        db, worker, attempt_id, body.filename
+    )
+    want_sha = (body.checksum_sha256 or "").strip().lower()
+    if len(want_sha) != 64 or any(c not in "0123456789abcdef" for c in want_sha):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid checksum_sha256")
+    sz = int(body.size_bytes)
+
+    def _finalize() -> tuple[bytes, bool, str]:
+        fd, tmp_path = tempfile.mkstemp(suffix=".rpm")
+        os.close(fd)
+        path = Path(tmp_path)
+        try:
+            r2 = get_r2_client()
+            cl = r2.head_object_content_length(r2_key)
+            if cl is None:
+                raise FileNotFoundError("RPM not in R2 yet (complete presigned PUT first)")
+            if cl != sz:
+                raise ValueError(f"Size mismatch: R2 has {cl} bytes, worker claimed {sz}")
+            stream = r2.get_object_stream(r2_key)
+            if stream is None:
+                raise FileNotFoundError("RPM not in R2")
+            h = hashlib.sha256()
+            try:
+                with open(path, "wb") as out:
+                    while True:
+                        chunk = stream.read(8 * 1024 * 1024)
+                        if not chunk:
+                            break
+                        h.update(chunk)
+                        out.write(chunk)
+            finally:
+                stream.close()
+            if h.hexdigest() != want_sha:
+                raise ValueError("SHA256 of uploaded object does not match checksum_sha256")
+            signed = sign_rpm(path)
+            raw = path.read_bytes()
+            r2.put_object(r2_key, raw, content_type=_RPM_UPLOAD_CONTENT_TYPE)
+            return raw, signed, r2_key
+        finally:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    try:
+        raw, signed, rk = await asyncio.to_thread(_finalize)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+    digest = hashlib.sha256(raw).hexdigest()
+    fname = Path(body.filename.strip()).name
+    await log_audit(
+        db,
+        action="worker.rpm_upload_presigned_complete",
+        resource_type="build_attempt",
+        resource_id=str(attempt_id),
+        details=f"worker_id={worker.id} {fname} {rk}",
+        emit_discord=False,
+    )
+    return {
+        "filename": fname,
+        "r2_key": rk,
+        "signed": signed,
+        "pesign_applied": False,
+        "size_bytes": len(raw),
+        "checksum_sha256": digest,
+    }
+
+
 def _rpm_name_from_bytes(data: bytes) -> str | None:
     """Extract RPM NAME from bytes using host rpm command."""
     if not data:
@@ -576,42 +776,11 @@ async def upload_worker_rpm(
     settings = get_settings()
     max_bytes = settings.max_worker_rpm_upload_mib * 1024 * 1024
 
-    fname = (file.filename or "package.rpm").strip()
-    if not fname.lower().endswith(".rpm"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Filename must end with .rpm",
-        )
-
-    result = await db.execute(
-        select(BuildAttempt).where(
-            BuildAttempt.id == attempt_id,
-            BuildAttempt.worker_id == worker.id,
-        )
+    fname_raw = file.filename or "package.rpm"
+    _, _, _, _, _, r2_key = await _resolve_worker_rpm_upload_context(
+        db, worker, attempt_id, fname_raw
     )
-    attempt = result.scalar_one_or_none()
-    if not attempt:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attempt not found")
-
-    job_result = await db.execute(select(BuildJob).where(BuildJob.id == attempt.build_job_id))
-    job = job_result.scalar_one_or_none()
-    if not job:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
-    if job.status == BuildStatus.CANCELLED:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Job cancelled")
-
-    rel_result = await db.execute(select(Release).where(Release.id == job.release_id))
-    release = rel_result.scalar_one_or_none()
-    if not release:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Release missing")
-
-    arch = "x86_64"
-    if job.target_id:
-        t_result = await db.execute(select(BuildTarget).where(BuildTarget.id == job.target_id))
-        t = t_result.scalar_one_or_none()
-        if t and t.architecture:
-            arch = t.architecture
-    branch = getattr(job, "branch", None) or "dev"
+    fname = Path(fname_raw.strip()).name
 
     fd, tmp_path = tempfile.mkstemp(suffix=".rpm")
     os.close(fd)
@@ -638,11 +807,6 @@ async def upload_worker_rpm(
         signed = await asyncio.to_thread(sign_rpm, path)
         raw = await asyncio.to_thread(path.read_bytes)
         digest = hashlib.sha256(raw).hexdigest()
-
-        if fname.endswith(".src.rpm"):
-            r2_key = src_r2_key(release.releasename, branch, fname)
-        else:
-            r2_key = repo_rpms_key(release.releasename, branch, arch, fname)
 
         await asyncio.to_thread(_put_rpm_bytes_to_r2, r2_key, raw)
     except HTTPException:
