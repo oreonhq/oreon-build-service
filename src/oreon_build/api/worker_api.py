@@ -611,21 +611,14 @@ def _prune_superseded_repo_objects(
             logger.info("Pruned superseded SRPM %s", key)
 
 
-@router.put("/build-log/{attempt_id}")
-async def worker_upload_build_log(
-    attempt_id: int,
+_BUILD_LOG_PUT_CONTENT_TYPE = "text/plain; charset=utf-8"
+
+
+async def _resolve_worker_build_log_r2_key(
     db: DbSession,
-    worker: Annotated[Worker, Depends(_require_worker)],
-    content: bytes = Body(...),
-):
-    """
-    Store a build log in R2 on behalf of the authenticated worker. No R2 credentials on the worker.
-    """
-    if len(content) > _MAX_BUILD_LOG_BYTES:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"Log exceeds max {_MAX_BUILD_LOG_BYTES // (1024 * 1024)} MiB",
-        )
+    worker: Worker,
+    attempt_id: int,
+) -> str:
     ar = await db.execute(
         select(BuildAttempt).where(
             BuildAttempt.id == attempt_id,
@@ -643,12 +636,131 @@ async def worker_upload_build_log(
     rel_result = await db.execute(select(Release).where(Release.id == job.release_id))
     release = rel_result.scalar_one_or_none()
     if not release:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Release missing")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Release missing",
+        )
+    return log_r2_key(release.releasename, attempt_id)
 
-    key = log_r2_key(release.releasename, attempt_id)
+
+class WorkerBuildLogCompleteBody(BaseModel):
+    checksum_sha256: str
+    size_bytes: int
+
+
+@router.post("/build-log/presign/{attempt_id}")
+async def worker_build_log_presign(
+    attempt_id: int,
+    db: DbSession,
+    worker: Annotated[Worker, Depends(_require_worker)],
+):
+    """
+    Presigned PUT so workers can stream large logs to R2 without tunneling huge bodies through
+    Cloudflare (which often returns 524 while the origin buffers and uploads to R2).
+    """
+    settings = get_settings()
+    key = await _resolve_worker_build_log_r2_key(db, worker, attempt_id)
+    expires = settings.worker_rpm_presign_put_expires_seconds
+    url = get_r2_client().generate_presigned_put_url(
+        key,
+        content_type=_BUILD_LOG_PUT_CONTENT_TYPE,
+        expires_in=expires,
+    )
+    await log_audit(
+        db,
+        action="worker.build_log_presign",
+        resource_type="build_attempt",
+        resource_id=str(attempt_id),
+        details=f"worker_id={worker.id} key={key}",
+        emit_discord=False,
+    )
+    return {
+        "put_url": url,
+        "headers": {"Content-Type": _BUILD_LOG_PUT_CONTENT_TYPE},
+        "expires_in": expires,
+    }
+
+
+@router.post("/build-log/complete/{attempt_id}")
+async def worker_build_log_complete(
+    attempt_id: int,
+    db: DbSession,
+    worker: Annotated[Worker, Depends(_require_worker)],
+    body: WorkerBuildLogCompleteBody,
+):
+    """After presigned PUT, verify log object in R2 (size + SHA-256). No re-upload; log is not GPG-signed."""
+    if body.size_bytes > _MAX_BUILD_LOG_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Log exceeds max {_MAX_BUILD_LOG_BYTES // (1024 * 1024)} MiB",
+        )
+    key = await _resolve_worker_build_log_r2_key(db, worker, attempt_id)
+    want_sha = (body.checksum_sha256 or "").strip().lower()
+    if len(want_sha) != 64 or any(c not in "0123456789abcdef" for c in want_sha):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid checksum_sha256")
+    sz = int(body.size_bytes)
+
+    def _verify() -> str:
+        r2 = get_r2_client()
+        cl = r2.head_object_content_length(key)
+        if cl is None:
+            raise FileNotFoundError("Build log not in R2 yet (complete presigned PUT first)")
+        if cl != sz:
+            raise ValueError(f"Size mismatch: R2 has {cl} bytes, worker claimed {sz}")
+        stream = r2.get_object_stream(key)
+        if stream is None:
+            raise FileNotFoundError("Build log not in R2")
+        h = hashlib.sha256()
+        try:
+            while True:
+                chunk = stream.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+        finally:
+            stream.close()
+        if h.hexdigest() != want_sha:
+            raise ValueError("SHA256 of uploaded log does not match checksum_sha256")
+        return key
+
+    try:
+        await asyncio.to_thread(_verify)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+    await log_audit(
+        db,
+        action="worker.build_log_presign_complete",
+        resource_type="build_attempt",
+        resource_id=str(attempt_id),
+        details=f"worker_id={worker.id} {key}",
+        emit_discord=False,
+    )
+    return {"log_r2_key": key}
+
+
+@router.put("/build-log/{attempt_id}")
+async def worker_upload_build_log(
+    attempt_id: int,
+    db: DbSession,
+    worker: Annotated[Worker, Depends(_require_worker)],
+    content: bytes = Body(...),
+):
+    """
+    Store a build log in R2 on behalf of the authenticated worker. No R2 credentials on the worker.
+    Large logs should use ``/build-log/presign`` + PUT to R2 + ``/build-log/complete`` from the worker instead.
+    """
+    if len(content) > _MAX_BUILD_LOG_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Log exceeds max {_MAX_BUILD_LOG_BYTES // (1024 * 1024)} MiB",
+        )
+    key = await _resolve_worker_build_log_r2_key(db, worker, attempt_id)
 
     def _put() -> None:
-        get_r2_client().put_object(key, content, content_type="text/plain; charset=utf-8")
+        get_r2_client().put_object(key, content, content_type=_BUILD_LOG_PUT_CONTENT_TYPE)
 
     await asyncio.to_thread(_put)
     return {"log_r2_key": key}

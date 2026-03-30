@@ -35,10 +35,13 @@ DistGit: Source(kind="distgit", url="<repo>.git#branch:spec_relpath") — mock -
 
 Poll may include ``mock_additional_repos`` (base URLs) from the job mock environment. Each becomes ``mock --addrepo``.
 Optional ``OREON_WORKER_EXTRA_MOCK_ADDREPO`` appends comma-separated URLs on the worker.
+By default the worker passes ``mock --define dist .orN`` where ``N`` is the first run of digits in the job
+``releasename`` (e.g. ``oreon-11-rp1`` gives ``.or11``) so RPM names use ``orN`` instead of the chroot
+default like ``fc45``. See ``OREON_WORKER_RPM_DIST`` and ``OREON_WORKER_SKIP_RPM_DIST_OVERRIDE`` in deploy docs.
 
 Each build thread opens its own ``httpx.Client`` (same auth headers as poll). The poll/heartbeat loop keeps a separate client so nothing shares a sync client with mock (multi-hour jobs were seeing broken pipes from pooled stale connections and from unsafe concurrent use).
 Transient ``ReadError`` / broken pipe on controller API calls is retried (see ``OREON_WORKER_HTTP_RETRIES``).
-RPM uploads default to presigned PUT to R2 plus a small API ``complete`` call (``OREON_WORKER_RPM_UPLOAD_VIA_PRESIGNED_R2`` defaults on) so payloads do not go through tunnel POST limits. Set that var to ``0`` to use legacy multipart POST to the controller instead.
+RPM uploads default to presigned PUT to R2 plus a small API ``complete`` call (``OREON_WORKER_RPM_UPLOAD_VIA_PRESIGNED_R2`` defaults on). Build logs default the same way (``OREON_WORKER_BUILD_LOG_VIA_PRESIGNED_R2``) to avoid Cloudflare 524 while the origin ingests huge ``PUT`` bodies. Disable with ``=0`` to use legacy tunnel POSTs.
 """
 
 from __future__ import annotations
@@ -109,6 +112,13 @@ def _is_transient_http_error(exc: BaseException) -> bool:
         transient_types += (getattr(httpx, "PoolTimeout"),)
     if isinstance(exc, transient_types):
         return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        resp = exc.response
+        if resp is not None:
+            sc = resp.status_code
+            # Cloudflare 522/524 (origin down / timeout), plus generic gateway overload.
+            if sc in (408, 425, 429, 500, 502, 503, 504, 522, 523, 524):
+                return True
     if isinstance(exc, OSError) and exc.errno in (errno.EPIPE, errno.ECONNRESET, errno.ETIMEDOUT):
         return True
     unwrapped: BaseException | None = exc
@@ -157,18 +167,78 @@ def _controller_base_url() -> str:
     ).rstrip("/")
 
 
+def _build_log_put_timeout() -> httpx.Timeout:
+    raw = (os.environ.get("OREON_WORKER_BUILD_LOG_PUT_TIMEOUT_SEC") or "7200").strip()
+    try:
+        total = float(raw)
+    except ValueError:
+        total = 7200.0
+    total = max(120.0, min(total, 86400.0))
+    return httpx.Timeout(total, connect=120.0)
+
+
+def _build_log_presigned_r2_enabled() -> bool:
+    """Default on so huge logs do not POST through Cloudflare Tunnel (524 timeouts)."""
+    v = (os.environ.get("OREON_WORKER_BUILD_LOG_VIA_PRESIGNED_R2") or "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def _upload_build_log_via_presigned_r2(
+    session: httpx.Client,
+    controller_url: str,
+    attempt_id: int,
+    data: bytes,
+) -> str:
+    digest = hashlib.sha256(data).hexdigest()
+    size_bytes = len(data)
+    put_to = _build_log_put_timeout()
+
+    def _presign() -> dict:
+        r = session.post(
+            f"{controller_url}/api/worker/build-log/presign/{attempt_id}",
+            timeout=httpx.Timeout(120.0, connect=60.0),
+        )
+        r.raise_for_status()
+        return r.json()
+
+    pres = _with_http_retries(f"build-log presign attempt_id={attempt_id}", _presign)
+    put_url = str(pres["put_url"])
+    hdrs = dict(pres.get("headers") or {})
+
+    def _put() -> None:
+        pr = session.put(put_url, headers=hdrs, content=data, timeout=put_to)
+        pr.raise_for_status()
+
+    _with_http_retries(f"build-log R2 PUT attempt_id={attempt_id}", _put)
+
+    def _complete() -> dict:
+        r = session.post(
+            f"{controller_url}/api/worker/build-log/complete/{attempt_id}",
+            json={"checksum_sha256": digest, "size_bytes": size_bytes},
+            timeout=httpx.Timeout(600.0, connect=120.0),
+        )
+        r.raise_for_status()
+        return r.json()
+
+    out = _with_http_retries(f"build-log complete attempt_id={attempt_id}", _complete)
+    return str(out.get("log_r2_key") or "")
+
+
 def _upload_build_log_via_controller(
     session: httpx.Client,
     controller_url: str,
     attempt_id: int,
     data: bytes,
 ) -> str:
+    if _build_log_presigned_r2_enabled():
+        return _upload_build_log_via_presigned_r2(session, controller_url, attempt_id, data)
+
     def _do() -> str:
         r = session.put(
             f"{controller_url}/api/worker/build-log/{attempt_id}",
             content=data,
             headers={"Content-Type": "text/plain; charset=utf-8"},
-            timeout=httpx.Timeout(600.0, connect=120.0),
+            timeout=_build_log_put_timeout(),
         )
         r.raise_for_status()
         return str(r.json().get("log_r2_key") or "")
@@ -525,12 +595,44 @@ def _mock_addrepo_baseurls(job: dict) -> list[str]:
     return out
 
 
-def _mock_cmd_base(mock_config: str, mock_unique_ext: str | None, addrepo_baseurls: list[str]) -> list[str]:
+def _rpm_dist_macro_value(releasename: str | None) -> str | None:
+    """
+    Return the value for rpmbuild ``dist`` (e.g. ``.or11``) so ``Release`` and filenames use ``orN``
+    instead of the Fedora mock default (``fc45``). Return None to leave the chroot default.
+
+    Order: if ``OREON_WORKER_SKIP_RPM_DIST_OVERRIDE`` is set, None. Else if ``OREON_WORKER_RPM_DIST`` is
+    set, use that (add a leading dot when missing). Else derive ``.or`` + first digit run in
+    ``releasename`` (``oreon-11-rp1`` -> ``11``).
+    """
+    if _truthy_env("OREON_WORKER_SKIP_RPM_DIST_OVERRIDE"):
+        return None
+    raw = (os.environ.get("OREON_WORKER_RPM_DIST") or "").strip()
+    if raw:
+        low = raw.lower()
+        if low in ("0", "false", "no", "off", "default"):
+            return None
+        return raw if raw.startswith(".") else f".{raw}"
+    if not releasename:
+        return None
+    m = re.search(r"(\d+)", str(releasename).strip())
+    if not m:
+        return None
+    return f".or{m.group(1)}"
+
+
+def _mock_cmd_base(
+    mock_config: str,
+    mock_unique_ext: str | None,
+    addrepo_baseurls: list[str],
+    rpm_dist: str | None = None,
+) -> list[str]:
     cmd: list[str] = ["mock", "-r", mock_config]
     if mock_unique_ext:
         cmd += ["--uniqueext", mock_unique_ext]
     for url in addrepo_baseurls:
         cmd += ["--addrepo", url]
+    if rpm_dist:
+        cmd += ["--define", f"dist {rpm_dist}"]
     return cmd
 
 
@@ -1022,6 +1124,7 @@ def _mock_build_srpm_from_spec(
     abort_event: threading.Event | None = None,
     mock_unique_ext: str | None = None,
     addrepo_baseurls: list[str] | None = None,
+    rpm_dist: str | None = None,
 ) -> tuple[bool, Path | None, str, bool]:
     """
     Build SRPM from spec/sources using mock (so dependencies are handled in chroot).
@@ -1032,7 +1135,7 @@ def _mock_build_srpm_from_spec(
     otherwise mock shares one chroot per ``-r`` config and parallel jobs fail with
     "Build root is locked by another process."
     """
-    cmd = _mock_cmd_base(mock_config, mock_unique_ext, addrepo_baseurls or [])
+    cmd = _mock_cmd_base(mock_config, mock_unique_ext, addrepo_baseurls or [], rpm_dist=rpm_dist)
     cmd += [
         "--buildsrpm",
         "--spec",
@@ -1065,9 +1168,10 @@ def _mock_rebuild_srpm(
     abort_event: threading.Event | None = None,
     mock_unique_ext: str | None = None,
     addrepo_baseurls: list[str] | None = None,
+    rpm_dist: str | None = None,
 ) -> tuple[bool, str, bool]:
     """Returns (ok, output, cancelled). See :func:`_mock_build_srpm_from_spec` for ``mock_unique_ext``."""
-    cmd = _mock_cmd_base(mock_config, mock_unique_ext, addrepo_baseurls or [])
+    cmd = _mock_cmd_base(mock_config, mock_unique_ext, addrepo_baseurls or [], rpm_dist=rpm_dist)
     cmd += ["--rebuild", str(srpm_path), "--resultdir", str(result_dir)]
     rc, out = _run_with_abort(cmd, timeout_s=_mock_rebuild_timeout_sec(), abort_event=abort_event)
     if rc == _RC_MOCK_CANCELLED:
@@ -1312,6 +1416,10 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
         if mock_addrepos:
             logger.info("mock --addrepo for attempt %s: %s", attempt_id, mock_addrepos)
 
+        rpm_dist = _rpm_dist_macro_value(job.get("releasename"))
+        if rpm_dist:
+            logger.info("mock rpmbuild dist for attempt %s: %s", attempt_id, rpm_dist)
+
         tmp_parent = _worker_temp_parent_dir()
         if tmp_parent:
             try:
@@ -1431,6 +1539,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                     abort_event=abort_event,
                     mock_unique_ext=mock_unique_ext,
                     addrepo_baseurls=mock_addrepos,
+                    rpm_dist=rpm_dist,
                 )
                 _make_mock_resultdir_world_readable(srpm_result_dir)
                 build_log_parts.extend(
@@ -1488,6 +1597,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                 abort_event=abort_event,
                 mock_unique_ext=mock_unique_ext,
                 addrepo_baseurls=mock_addrepos,
+                rpm_dist=rpm_dist,
             )
             _make_mock_resultdir_world_readable(result_dir)
             build_log_parts.extend(
@@ -1517,8 +1627,8 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                 return
             full_log = "\n\n".join([p for p in build_log_parts if p]).strip() + "\n"
 
-            log_key = _upload_build_log_via_controller(session, controller_url, attempt_id, full_log.encode("utf-8"))
-
+            # Upload RPMs before the big build log so a tunnel timeout on log cannot block any binary,
+            # and so alphabetical order (e.g. huge debuginfo before kernel-modules) does not strand later RPMs.
             with _pesign_bundle_context(session, controller_url, attempt_id) as pesign_cfg:
                 perm_hint = (
                     "Permission denied while reading mock --resultdir RPMs (tree may still be "
@@ -1626,6 +1736,10 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                             "checksum_sha256": meta.get("checksum_sha256"),
                         }
                     )
+
+                log_key = _upload_build_log_via_controller(
+                    session, controller_url, attempt_id, full_log.encode("utf-8")
+                )
 
                 _post_worker_build_result(
                     session,
