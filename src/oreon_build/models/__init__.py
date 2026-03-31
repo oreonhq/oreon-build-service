@@ -18,6 +18,7 @@ from .account import Account, Role, RoleName
 from .audit import AuditLog
 from .build import BuildAttempt, BuildJob, BuildStatus, BuildTarget
 from .artifact import Artifact
+from .build_attempt_finalization import BuildAttemptFinalization
 from .package import Package, PackageVersion, Source
 from .github_push_cursor import GitHubPushCursor
 from .release import Release, ReleaseChannel, ReleaseRepo
@@ -28,6 +29,8 @@ from .mock_env import MockEnvironment
 from .signing import SigningJob
 from .schedule import Schedule
 from .cve import TrackedRpm, CveMatch, CveMatchRelease
+from .publish_task import PublishTask
+from .rpm_complete_lock import RpmCompleteLock
 from .security_advisory import SecurityAdvisory, SecurityAdvisoryRelease
 
 __all__ = [
@@ -40,6 +43,7 @@ __all__ = [
     "BuildStatus",
     "BuildTarget",
     "Artifact",
+    "BuildAttemptFinalization",
     "Package",
     "PackageVersion",
     "Source",
@@ -55,6 +59,8 @@ __all__ = [
     "MockEnvironment",
     "SigningJob",
     "Schedule",
+    "PublishTask",
+    "RpmCompleteLock",
     "TrackedRpm",
     "CveMatch",
     "CveMatchRelease",

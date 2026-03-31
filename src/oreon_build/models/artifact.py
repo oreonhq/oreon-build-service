@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Optional
 
 from sqlalchemy import DateTime, ForeignKey, String, func
+import sqlalchemy as sa
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from oreon_build.db.base import Base
@@ -14,6 +15,15 @@ if TYPE_CHECKING:
 
 class Artifact(Base):
     __tablename__ = "artifacts"
+    __table_args__ = (
+        sa.UniqueConstraint(
+            "build_attempt_id",
+            "kind",
+            "filename",
+            "r2_key",
+            name="ux_artifacts_attempt_kind_filename_r2_key",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     build_attempt_id: Mapped[int] = mapped_column(ForeignKey("build_attempts.id"), nullable=False)
