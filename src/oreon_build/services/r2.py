@@ -113,6 +113,18 @@ class R2Client:
                 return None
             raise
 
+    def head_object_metadata(self, key: str) -> dict[str, str] | None:
+        """Return user-defined metadata from HEAD, or None if object is missing."""
+        try:
+            r = self._client.head_object(Bucket=self.bucket, Key=key)
+            # boto3 returns Metadata keys already stripped from the `x-amz-meta-` prefix.
+            return r.get("Metadata") or {}
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("404", "NoSuchKey", "NotFound"):
+                return None
+            raise
+
     def generate_presigned_put_url(
         self,
         key: str,
