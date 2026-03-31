@@ -204,15 +204,6 @@ def _upload_build_log_via_presigned_r2(
     pres = _with_http_retries(f"build-log presign attempt_id={attempt_id}", _presign)
     put_url = str(pres["put_url"])
     hdrs = dict(pres.get("headers") or {})
-    # Persist integrity metadata in the R2 object so the controller can avoid re-hashing
-    # the whole log on retry.
-    hdrs.update(
-        {
-            "x-amz-meta-sha256": digest,
-            "x-amz-meta-size_bytes": str(size_bytes),
-        }
-    )
-
     def _put() -> None:
         pr = session.put(put_url, headers=hdrs, content=data, timeout=put_to)
         pr.raise_for_status()
