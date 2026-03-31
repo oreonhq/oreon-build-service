@@ -1696,6 +1696,9 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                 return
             full_log = "\n\n".join([p for p in build_log_parts if p]).strip() + "\n"
 
+            rpm_upload_stage = tmp / "rpm_upload_staging"
+            rpm_upload_stage.mkdir(exist_ok=True)
+
             # Upload RPMs before the big build log so a tunnel timeout on log cannot block any binary,
             # and so alphabetical order (e.g. huge debuginfo before kernel-modules) does not strand later RPMs.
             with _pesign_bundle_context(session, controller_url, attempt_id) as pesign_cfg:
@@ -1731,9 +1734,31 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                     if not f.is_file():
                         continue
                     fname = f.name
+                    staged = rpm_upload_stage / fname
+                    try:
+                        f.replace(staged)
+                    except OSError as stage_err:
+                        err_msg = f"Could not move RPM out of mock resultdir for upload ({fname}): {stage_err}"
+                        logger.exception("%s", err_msg)
+                        fail_log = full_log + "\n\n== " + err_msg + "\n"
+                        log_key = _upload_build_log_via_controller(
+                            session, controller_url, attempt_id, fail_log.encode("utf-8")
+                        )
+                        _post_worker_build_result(
+                            session,
+                            controller_url,
+                            attempt_id,
+                            {
+                                "status": "failed",
+                                "log_r2_key": log_key,
+                                "error_message": fail_log[:2000],
+                                "artifacts": artifacts_payload,
+                            },
+                        )
+                        return
                     try:
                         if pesign_cfg and not fname.endswith(".src.rpm"):
-                            pesign_rpm_if_configured(f, pesign_cfg)
+                            pesign_rpm_if_configured(staged, pesign_cfg)
                     except PesignRepackError as pe:
                         err_msg = f"pesign failed for {fname}: {pe}"
                         logger.exception("%s", err_msg)
@@ -1754,8 +1779,27 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                         )
                         return
                     try:
-                        meta = _upload_rpm_to_controller(session, controller_url, attempt_id, f)
+                        meta = _upload_rpm_to_controller(session, controller_url, attempt_id, staged)
                     except OSError as pe:
+                        if isinstance(pe, FileNotFoundError):
+                            err_msg = f"RPM disappeared during upload ({fname}): {pe}"
+                            logger.exception("%s", err_msg)
+                            fail_log = full_log + "\n\n== " + err_msg + "\n"
+                            log_key = _upload_build_log_via_controller(
+                                session, controller_url, attempt_id, fail_log.encode("utf-8")
+                            )
+                            _post_worker_build_result(
+                                session,
+                                controller_url,
+                                attempt_id,
+                                {
+                                    "status": "failed",
+                                    "log_r2_key": log_key,
+                                    "error_message": fail_log[:2000],
+                                    "artifacts": artifacts_payload,
+                                },
+                            )
+                            return
                         if not isinstance(pe, PermissionError):
                             raise
                         err_msg = f"{perm_hint}\n\nWhile uploading {fname}: {type(pe).__name__}: {pe}"
