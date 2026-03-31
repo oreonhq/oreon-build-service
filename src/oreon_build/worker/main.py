@@ -486,6 +486,41 @@ def _rpm_upload_presigned_r2_enabled() -> bool:
     return v not in ("0", "false", "no", "off")
 
 
+def _rpm_complete_post_timeout() -> httpx.Timeout:
+    """
+    Controller may download a multi GiB object from R2, hash it, and ``rpm --addsign`` while other
+    builds run. Default read timeout is higher than the presigned PUT timeout.
+    """
+    raw = (os.environ.get("OREON_WORKER_RPM_COMPLETE_TIMEOUT_SEC") or "32400").strip()
+    try:
+        total = float(raw)
+    except ValueError:
+        total = 32400.0
+    total = max(300.0, min(total, 86400.0))
+    return httpx.Timeout(total, connect=120.0)
+
+
+def _rpm_complete_extra_retries() -> int:
+    """Extra passes after a non-transient HTTP 400 with a retryable error detail (R2 lag, verify race)."""
+    raw = (os.environ.get("OREON_WORKER_RPM_COMPLETE_EXTRA_RETRIES") or "5").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 5
+    return max(0, min(n, 15))
+
+
+def _rpm_complete_400_retryable(detail: str) -> bool:
+    if not detail:
+        return False
+    low = detail.lower()
+    if "job cancelled" in low or "invalid checksum" in low:
+        return False
+    if "filename must end with" in low:
+        return False
+    return any(x in low for x in ("not in r2", "upload verify failed"))
+
+
 def _upload_rpm_via_presigned_r2(
     session: httpx.Client,
     controller_url: str,
@@ -517,20 +552,54 @@ def _upload_rpm_via_presigned_r2(
 
     _with_http_retries(f"rpm R2 PUT attempt_id={attempt_id} {fname}", _put)
 
-    def _complete() -> dict:
-        r = session.post(
-            f"{controller_url}/api/worker/upload-rpm/complete/{attempt_id}",
-            json={
-                "filename": fname,
-                "checksum_sha256": digest,
-                "size_bytes": size_bytes,
-            },
-            timeout=httpx.Timeout(7200.0, connect=120.0),
-        )
-        r.raise_for_status()
-        return r.json()
+    complete_timeout = _rpm_complete_post_timeout()
+    extra = _rpm_complete_extra_retries()
+    max_pass = 1 + extra
+    last_exc: BaseException | None = None
+    for ci in range(max_pass):
 
-    return _with_http_retries(f"rpm presign-complete attempt_id={attempt_id} {fname}", _complete)
+        def _complete() -> dict:
+            r = session.post(
+                f"{controller_url}/api/worker/upload-rpm/complete/{attempt_id}",
+                json={
+                    "filename": fname,
+                    "checksum_sha256": digest,
+                    "size_bytes": size_bytes,
+                },
+                timeout=complete_timeout,
+            )
+            r.raise_for_status()
+            return r.json()
+
+        try:
+            return _with_http_retries(
+                f"rpm presign-complete attempt_id={attempt_id} {fname} pass={ci + 1}/{max_pass}",
+                _complete,
+            )
+        except httpx.HTTPStatusError as e:
+            last_exc = e
+            if e.response is not None and e.response.status_code == 400 and ci + 1 < max_pass:
+                detail = ""
+                try:
+                    body = e.response.json()
+                    if isinstance(body, dict) and body.get("detail") is not None:
+                        detail = str(body["detail"])
+                except Exception:
+                    detail = (e.response.text or "")[:800]
+                if _rpm_complete_400_retryable(detail):
+                    delay = min(3.0 * (1.6**ci), 90.0)
+                    logger.warning(
+                        "rpm complete HTTP 400 retryable for %s (attempt_id=%s): %s, sleeping %.1fs",
+                        fname,
+                        attempt_id,
+                        detail[:200],
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
+            raise
+    assert last_exc is not None
+    raise last_exc
 
 
 def _upload_rpm_to_controller(

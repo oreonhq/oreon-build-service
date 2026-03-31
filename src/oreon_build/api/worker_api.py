@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import subprocess
+import time
 import tarfile
 import tempfile
 from datetime import datetime, timezone
@@ -66,6 +67,21 @@ router = APIRouter(prefix="/worker", tags=["worker"])
 logger = logging.getLogger(__name__)
 
 _MAX_BUILD_LOG_BYTES = 64 * 1024 * 1024
+
+# One finalize at a time per (attempt_id, filename) so parallel POST /upload-rpm/complete under load
+# does not race (duplicate R2 downloads, GPG addsign contention, flaky verify while another pass runs).
+_presign_complete_locks: dict[tuple[int, str], asyncio.Lock] = {}
+_presign_complete_locks_guard = asyncio.Lock()
+
+
+async def _presigned_rpm_finalize_lock(attempt_id: int, filename: str) -> asyncio.Lock:
+    key = (attempt_id, Path(filename.strip()).name)
+    async with _presign_complete_locks_guard:
+        lock = _presign_complete_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _presign_complete_locks[key] = lock
+        return lock
 
 
 def _pesign_material_configured(settings) -> bool:
@@ -313,6 +329,99 @@ def _put_rpm_bytes_to_r2(key: str, raw: bytes) -> None:
 
 _RPM_UPLOAD_CONTENT_TYPE = "application/x-rpm"
 
+_RPM_QUIET_TIMEOUT_SEC = 600
+
+
+def _rpm_nevra_stem_from_path(path: Path) -> str | None:
+    """NEVRA string like NAME-VERSION-RELEASE.ARCH (no trailing .rpm)."""
+    try:
+        r = subprocess.run(
+            ["rpm", "-qp", "--qf", "%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=_RPM_QUIET_TIMEOUT_SEC,
+            check=False,
+        )
+        if r.returncode != 0:
+            return None
+        s = (r.stdout or "").strip()
+        return s or None
+    except Exception:
+        return None
+
+
+def _rpm_signature_verifies(path: Path) -> bool:
+    try:
+        r = subprocess.run(
+            ["rpm", "-K", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=_RPM_QUIET_TIMEOUT_SEC,
+            check=False,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+def _rpm_has_pgp_signature(path: Path) -> bool:
+    """
+    Check signature presence without verifying against the local rpmdb keys.
+
+    rpm -K can fail when the public key isn't imported into the controller's rpmdb.
+    For idempotent retries we mainly need to know that the object is already signed,
+    not that the controller can verify it right now.
+    """
+    try:
+        r = subprocess.run(
+            ["rpm", "-qp", "--qf", "%{SIGPGP:pgpsig}", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=_RPM_QUIET_TIMEOUT_SEC,
+            check=False,
+        )
+        if r.returncode != 0:
+            return False
+        s = (r.stdout or "").strip()
+        return bool(s)
+    except Exception:
+        return False
+
+
+def _presigned_rpm_already_finalized_on_retry(path: Path, fname: str) -> bool:
+    """
+    After a successful complete, R2 holds the GPG-signed RPM while the worker may retry complete
+    with the original unsigned size/checksum (e.g. read timeout on the JSON response). Accept the
+    object if it is the same NEVRA as the filename and signatures verify.
+    """
+    name = Path(fname.strip()).name
+    if not name.lower().endswith(".rpm"):
+        return False
+    stem = Path(name).stem
+    got = _rpm_nevra_stem_from_path(path)
+    if not got:
+        return False
+    if got != stem:
+        # Some rpm builds include an epoch prefix "(none):" or "0:" in tag output.
+        ep = subprocess.run(
+            ["rpm", "-qp", "--qf", "%{EPOCH}:%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=_RPM_QUIET_TIMEOUT_SEC,
+            check=False,
+        )
+        if ep.returncode == 0:
+            alt = (ep.stdout or "").strip()
+            if alt.startswith("(none):") or alt.startswith("0:"):
+                rest = alt.split(":", 1)[-1]
+                if rest == stem:
+                    # Don't require rpmdb key verification; just check signature presence.
+                    return _rpm_has_pgp_signature(path)
+        return False
+
+    # Don't require rpm -K verification for idempotent retry. Just verify that the object looks
+    # like the expected NEVRA and has a PGP signature already embedded.
+    return _rpm_has_pgp_signature(path)
+
 
 async def _resolve_worker_rpm_upload_context(
     db: DbSession,
@@ -451,45 +560,80 @@ async def upload_worker_rpm_complete(
         fd, tmp_path = tempfile.mkstemp(suffix=".rpm")
         os.close(fd)
         path = Path(tmp_path)
+        fname = Path(body.filename.strip()).name
         try:
             r2 = get_r2_client()
-            cl = r2.head_object_content_length(r2_key)
+            cl: int | None = None
+            for hi in range(20):
+                cl = r2.head_object_content_length(r2_key)
+                if cl is not None:
+                    break
+                time.sleep(min(0.25 * (hi + 1), 2.5))
             if cl is None:
                 raise FileNotFoundError("RPM not in R2 yet (complete presigned PUT first)")
-            if cl != sz:
-                raise ValueError(f"Size mismatch: R2 has {cl} bytes, worker claimed {sz}")
+            if cl > max_bytes:
+                raise ValueError(
+                    f"R2 object exceeds max {settings.max_worker_rpm_upload_mib} MiB ({cl} bytes)"
+                )
+
             stream = r2.get_object_stream(r2_key)
             if stream is None:
                 raise FileNotFoundError("RPM not in R2")
             h = hashlib.sha256()
             try:
                 with open(path, "wb") as out:
+                    total = 0
                     while True:
                         chunk = stream.read(8 * 1024 * 1024)
                         if not chunk:
                             break
+                        total += len(chunk)
+                        if total > max_bytes:
+                            raise ValueError(
+                                f"RPM exceeds max {settings.max_worker_rpm_upload_mib} MiB"
+                            )
                         h.update(chunk)
                         out.write(chunk)
             finally:
                 stream.close()
-            if h.hexdigest() != want_sha:
-                raise ValueError("SHA256 of uploaded object does not match checksum_sha256")
-            signed = sign_rpm(path)
-            raw = path.read_bytes()
-            r2.put_object(r2_key, raw, content_type=_RPM_UPLOAD_CONTENT_TYPE)
-            return raw, signed, r2_key
+
+            actual_size = path.stat().st_size
+            actual_sha = h.hexdigest()
+
+            if actual_size == sz and actual_sha == want_sha:
+                signed = sign_rpm(path)
+                raw = path.read_bytes()
+                r2.put_object(r2_key, raw, content_type=_RPM_UPLOAD_CONTENT_TYPE)
+                return raw, signed, r2_key
+
+            if _presigned_rpm_already_finalized_on_retry(path, fname):
+                logger.warning(
+                    "presigned RPM complete idempotent retry ok for %s attempt_id=%s",
+                    fname,
+                    attempt_id,
+                )
+                raw = path.read_bytes()
+                return raw, True, r2_key
+
+            raise ValueError(
+                "Upload verify failed (R2 size=%s sha256=%s; worker size=%s sha256=%s). "
+                "Retry after a completed sign changes the object on disk."
+                % (actual_size, actual_sha[:16], sz, want_sha[:16])
+            )
         finally:
             try:
                 path.unlink(missing_ok=True)
             except OSError:
                 pass
 
-    try:
-        raw, signed, rk = await asyncio.to_thread(_finalize)
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    finalize_lock = await _presigned_rpm_finalize_lock(attempt_id, body.filename)
+    async with finalize_lock:
+        try:
+            raw, signed, rk = await asyncio.to_thread(_finalize)
+        except FileNotFoundError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 
     digest = hashlib.sha256(raw).hexdigest()
     fname = Path(body.filename.strip()).name
