@@ -35,7 +35,8 @@ from fastapi import APIRouter, Body, Depends, File, Header, HTTPException, Query
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
-from sqlalchemy import select, func
+from sqlalchemy import delete, select, func
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from oreon_build.api.deps import DbSession
 from oreon_build.config import get_settings
@@ -45,11 +46,14 @@ from sqlalchemy.orm import selectinload
 
 from oreon_build.models import (
     Artifact,
+    BuildAttemptFinalization,
     BuildAttempt,
     BuildJob,
     BuildStatus,
     BuildTarget,
     MockEnvironment,
+    PublishTask,
+    RpmCompleteLock,
     Package,
     Promotion,
     Release,
@@ -68,20 +72,9 @@ logger = logging.getLogger(__name__)
 
 _MAX_BUILD_LOG_BYTES = 64 * 1024 * 1024
 
-# One finalize at a time per (attempt_id, filename) so parallel POST /upload-rpm/complete under load
-# does not race (duplicate R2 downloads, GPG addsign contention, flaky verify while another pass runs).
-_presign_complete_locks: dict[tuple[int, str], asyncio.Lock] = {}
-_presign_complete_locks_guard = asyncio.Lock()
-
-
-async def _presigned_rpm_finalize_lock(attempt_id: int, filename: str) -> asyncio.Lock:
-    key = (attempt_id, Path(filename.strip()).name)
-    async with _presign_complete_locks_guard:
-        lock = _presign_complete_locks.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            _presign_complete_locks[key] = lock
-        return lock
+#
+# RPM finalize uses a DB-backed distributed lock (see `RpmCompleteLock`) so multiple controller
+# workers cannot sign/upload the same R2 key at the same time.
 
 
 def _pesign_material_configured(settings) -> bool:
@@ -556,7 +549,7 @@ async def upload_worker_rpm_complete(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid checksum_sha256")
     sz = int(body.size_bytes)
 
-    def _finalize() -> tuple[bytes, bool, str]:
+    def _finalize() -> tuple[bool, str, int, str]:
         fd, tmp_path = tempfile.mkstemp(suffix=".rpm")
         os.close(fd)
         path = Path(tmp_path)
@@ -602,9 +595,18 @@ async def upload_worker_rpm_complete(
 
             if actual_size == sz and actual_sha == want_sha:
                 signed = sign_rpm(path)
-                raw = path.read_bytes()
-                r2.put_object(r2_key, raw, content_type=_RPM_UPLOAD_CONTENT_TYPE)
-                return raw, signed, r2_key
+                signed_size = path.stat().st_size
+                h2 = hashlib.sha256()
+                with open(path, "rb") as fh:
+                    while True:
+                        chunk = fh.read(8 * 1024 * 1024)
+                        if not chunk:
+                            break
+                        h2.update(chunk)
+                signed_sha = h2.hexdigest()
+                with open(path, "rb") as fh2:
+                    r2.upload_fileobj(r2_key, fh2, content_type=_RPM_UPLOAD_CONTENT_TYPE)
+                return signed, r2_key, signed_size, signed_sha
 
             if _presigned_rpm_already_finalized_on_retry(path, fname):
                 logger.warning(
@@ -612,8 +614,7 @@ async def upload_worker_rpm_complete(
                     fname,
                     attempt_id,
                 )
-                raw = path.read_bytes()
-                return raw, True, r2_key
+                return True, r2_key, actual_size, actual_sha
 
             raise ValueError(
                 "Upload verify failed (R2 size=%s sha256=%s; worker size=%s sha256=%s). "
@@ -626,16 +627,80 @@ async def upload_worker_rpm_complete(
             except OSError:
                 pass
 
-    finalize_lock = await _presigned_rpm_finalize_lock(attempt_id, body.filename)
-    async with finalize_lock:
+    from datetime import timedelta
+    from uuid import uuid4
+
+    lock_ttl_sec = int((os.environ.get("OREON_WORKER_RPM_COMPLETE_LOCK_TTL_SEC") or "43200").strip())
+    max_wait_sec = int((os.environ.get("OREON_WORKER_RPM_COMPLETE_LOCK_MAX_WAIT_SEC") or "3600").strip())
+    owner = str(uuid4())
+
+    lock_acquired = False
+    try:
+        start = datetime.now(timezone.utc)
+        while True:
+            expires_at = datetime.now(timezone.utc) + timedelta(seconds=lock_ttl_sec)
+            stmt = (
+                pg_insert(RpmCompleteLock.__table__)
+                .values(
+                    attempt_id=attempt_id,
+                    r2_key=r2_key,
+                    owner=owner,
+                    expires_at=expires_at,
+                )
+                .on_conflict_do_nothing(index_elements=["attempt_id", "r2_key"])
+                .returning(RpmCompleteLock.owner)
+            )
+            got = await db.execute(stmt)
+            lock_owner = got.scalar_one_or_none()
+            if lock_owner is not None:
+                await db.commit()
+                lock_acquired = True
+                break
+
+            now = datetime.now(timezone.utc)
+            existing_res = await db.execute(
+                select(RpmCompleteLock).where(
+                    RpmCompleteLock.attempt_id == attempt_id, RpmCompleteLock.r2_key == r2_key
+                )
+            )
+            existing = existing_res.scalar_one_or_none()
+            if existing is not None and existing.expires_at <= now:
+                await db.execute(
+                    delete(RpmCompleteLock).where(
+                        RpmCompleteLock.attempt_id == attempt_id, RpmCompleteLock.r2_key == r2_key
+                    )
+                )
+                await db.commit()
+                continue
+
+            if (now - start).total_seconds() > max_wait_sec:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Timed out waiting for RPM finalize lock",
+                )
+            await asyncio.sleep(2)
+
         try:
-            raw, signed, rk = await asyncio.to_thread(_finalize)
+            signed, rk, signed_size, signed_sha = await asyncio.to_thread(_finalize)
         except FileNotFoundError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
         except ValueError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    finally:
+        if lock_acquired:
+            try:
+                await db.execute(
+                    delete(RpmCompleteLock).where(
+                        RpmCompleteLock.attempt_id == attempt_id,
+                        RpmCompleteLock.r2_key == r2_key,
+                        RpmCompleteLock.owner == owner,
+                    )
+                )
+                await db.commit()
+            except Exception:
+                pass
 
-    digest = hashlib.sha256(raw).hexdigest()
+    digest = signed_sha
     fname = Path(body.filename.strip()).name
     await log_audit(
         db,
@@ -650,7 +715,7 @@ async def upload_worker_rpm_complete(
         "r2_key": rk,
         "signed": signed,
         "pesign_applied": False,
-        "size_bytes": len(raw),
+        "size_bytes": signed_size,
         "checksum_sha256": digest,
     }
 
@@ -851,6 +916,17 @@ async def worker_build_log_complete(
             raise FileNotFoundError("Build log not in R2 yet (complete presigned PUT first)")
         if cl != sz:
             raise ValueError(f"Size mismatch: R2 has {cl} bytes, worker claimed {sz}")
+
+        # Fast retry path: if worker uploaded metadata in the presigned PUT, the controller can
+        # validate integrity via HEAD user-metadata without re-hashing the whole object.
+        meta = r2.head_object_metadata(key)
+        if meta:
+            meta_sha = (meta.get("sha256") or meta.get("checksum_sha256") or "").strip().lower()
+            meta_sz_raw = (meta.get("size_bytes") or meta.get("size") or "").strip()
+            meta_ok = meta_sha == want_sha and meta_sz_raw.isdigit() and int(meta_sz_raw) == sz
+            if meta_ok:
+                return key
+
         stream = r2.get_object_stream(key)
         if stream is None:
             raise FileNotFoundError("Build log not in R2")
@@ -1097,16 +1173,50 @@ async def report_result(
     worker: Annotated[Worker, Depends(_require_worker)],
 ):
     result = await db.execute(
-        select(BuildAttempt).where(
-            BuildAttempt.id == attempt_id,
-            BuildAttempt.worker_id == worker.id,
-        )
+        select(BuildAttempt)
+        .where(BuildAttempt.id == attempt_id, BuildAttempt.worker_id == worker.id)
+        .with_for_update()
     )
     attempt = result.scalar_one_or_none()
     if not attempt:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attempt not found")
     job_result = await db.execute(select(BuildJob).where(BuildJob.id == attempt.build_job_id))
     job = job_result.scalar_one()
+
+    # Idempotency: if we already finalized this attempt, do nothing (no artifacts insert,
+    # no promotion duplication, no repodata/prune/repack side effects).
+    existing_final = await db.execute(
+        select(BuildAttemptFinalization).where(BuildAttemptFinalization.attempt_id == attempt_id)
+    )
+    if existing_final.scalar_one_or_none() is not None:
+        return {"status": "ok", "already_finalized": True}
+
+    now = datetime.now(timezone.utc)
+
+    async def _insert_finalization_row(finalized_status: str) -> None:
+        stmt = (
+            pg_insert(BuildAttemptFinalization.__table__)
+            .values(
+                attempt_id=attempt_id,
+                finalized_status=finalized_status,
+                log_r2_key=payload.log_r2_key or attempt.log_r2_key,
+                error_message=(
+                    payload.error_message if payload.error_message else attempt.error_message
+                ),
+                finalized_at=now,
+            )
+            .on_conflict_do_nothing(index_elements=["attempt_id"])
+        )
+        await db.execute(stmt)
+        await db.flush()
+
+    async def _enqueue_repo_publish_task() -> None:
+        stmt = (
+            pg_insert(PublishTask.__table__)
+            .values(kind="repo_publish", attempt_id=attempt_id, build_job_id=job.id)
+            .on_conflict_do_nothing(index_elements=["attempt_id"])
+        )
+        await db.execute(stmt)
 
     # User cancelled: do not mark job success or promote artifacts when the worker finishes later.
     if job.status == BuildStatus.CANCELLED:
@@ -1130,6 +1240,7 @@ async def report_result(
             ip_address=None,
             user_agent="worker",
         )
+        await _insert_finalization_row(attempt.status.value)
         return {"status": "ok", "job_cancelled": True}
 
     # Worker default HTTP read timeout can fire after this handler already committed rows. A later
@@ -1186,11 +1297,7 @@ async def report_result(
                 arch = target.architecture if target else None
                 branch = getattr(job, "branch", "dev") or "dev"
                 if release and arch:
-                    try:
-                        prefix = repo_r2_prefix(release.releasename, branch, arch)
-                        update_repodata_at_prefix(prefix)
-                    except Exception:
-                        logger.exception("repodata refresh after repair attempt_id=%s", attempt_id)
+                    await _enqueue_repo_publish_task()
 
                 await log_audit(
                     db,
@@ -1202,6 +1309,7 @@ async def report_result(
                     ip_address=None,
                     user_agent="worker",
                 )
+                await _insert_finalization_row(attempt.status.value)
                 return {"status": "ok", "repaired_stale_failure": True}
 
     attempt.status = BuildStatus(payload.status)
@@ -1215,17 +1323,22 @@ async def report_result(
     await db.flush()
     await sync_worker_state_after_attempt_finished(db, worker)
     for a in payload.artifacts:
-        art = Artifact(
-            build_attempt_id=attempt_id,
-            kind=a.kind,
-            filename=a.filename,
-            r2_key=a.r2_key,
-            size_bytes=a.size_bytes,
-            checksum_sha256=a.checksum_sha256,
-            is_signed=bool(getattr(a, "signed", False)),
+        stmt = (
+            pg_insert(Artifact.__table__)
+            .values(
+                build_attempt_id=attempt_id,
+                kind=a.kind,
+                filename=a.filename,
+                r2_key=a.r2_key,
+                size_bytes=a.size_bytes,
+                checksum_sha256=a.checksum_sha256,
+                is_signed=bool(getattr(a, "signed", False)),
+            )
+            .on_conflict_do_nothing(
+                index_elements=["build_attempt_id", "kind", "filename", "r2_key"]
+            )
         )
-        db.add(art)
-    await db.flush()
+        await db.execute(stmt)
 
     # On success: ensure RPMs are in dev/, then update repodata, create promotion
     # Worker may upload to builds/ or dev/. If builds/: copy to dev/ FIRST, then we delete builds/ later.
@@ -1239,37 +1352,9 @@ async def report_result(
         arch = target.architecture if target else None
         branch = getattr(job, "branch", "dev") or "dev"
         if release and arch:
-            try:
-                r2 = get_r2_client()
-                releasename = release.releasename
-                # Copy any artifacts from builds/ to dev/ (worker may still use builds/)
-                for a in payload.artifacts:
-                    if a.r2_key and "/builds/" in a.r2_key:
-                        data = r2.get_object(a.r2_key)
-                        if data and a.filename:
-                            if a.filename.endswith(".src.rpm"):
-                                dest = src_r2_key(releasename, branch, a.filename)
-                            else:
-                                dest = repo_rpms_key(releasename, branch, arch, a.filename)
-                            r2.put_object(dest, data)
-                keep = {a.filename for a in payload.artifacts if a.filename}
-                _prune_superseded_repo_objects(
-                    releasename=releasename,
-                    branch=branch,
-                    arch=arch,
-                    keep_artifact_filenames=keep,
-                    payload_artifacts=payload.artifacts,
-                )
-                prefix = repo_r2_prefix(releasename, branch, arch)
-                update_repodata_at_prefix(prefix)
-            except Exception:
-                logger.exception(
-                    "Post-build repo publish/cleanup failed releasename=%s branch=%s arch=%s attempt_id=%s",
-                    release.releasename if release else "?",
-                    branch,
-                    arch,
-                    attempt_id,
-                )
+            # Queue expensive R2 copy/prune/createrepo work. This makes POST /worker/result fast and safe
+            # under HTTP timeouts.
+            await _enqueue_repo_publish_task()
             # Copy package SRPM to releasename/branch/src/ (from uploads) if we have one
             if job.package_version_id:
                 src_result = await db.execute(
@@ -1291,18 +1376,26 @@ async def report_result(
                                 r2.put_object(dest_key, data)
                     except Exception:
                         pass
-        # Create promotion candidate (pending)
-        promo = Promotion(
-            release_id=job.release_id,
-            from_channel="dev",
-            to_channel=None,
-            status="pending",
-            package_id=job.package_id,
-            package_name=pkg.name if pkg else None,
-            build_job_id=job.id,
+        # Create promotion candidate (pending), but don't duplicate it on retries.
+        promo_count = await db.scalar(
+            select(func.count(Promotion.id)).where(
+                Promotion.build_job_id == job.id,
+                Promotion.status == "pending",
+                Promotion.to_channel.is_(None),
+            )
         )
-        db.add(promo)
-        await db.flush()
+        if (promo_count or 0) == 0:
+            promo = Promotion(
+                release_id=job.release_id,
+                from_channel="dev",
+                to_channel=None,
+                status="pending",
+                package_id=job.package_id,
+                package_name=pkg.name if pkg else None,
+                build_job_id=job.id,
+            )
+            db.add(promo)
+            await db.flush()
 
     # Delete upload R2 objects after build (success or fail); uploads are not reused for retries.
     # ONLY delete keys under /uploads/ - never touch repo path (dev/arch/RPMS, dev/src).
@@ -1330,7 +1423,7 @@ async def report_result(
     # Delete ONLY keys under releasename/builds/{attempt_id}/ - never touch dev/arch or repo path.
     rel_result = await db.execute(select(Release).where(Release.id == job.release_id))
     release = rel_result.scalar_one_or_none()
-    if release:
+    if release and attempt.status != BuildStatus.SUCCESS:
         exact_builds_prefix = f"{release.releasename}/builds/{attempt_id}/"
         art_keys_result = await db.execute(
             select(Artifact.r2_key).where(
@@ -1351,6 +1444,7 @@ async def report_result(
             pass
 
     # Emit audit + Discord for build result
+    await _insert_finalization_row(attempt.status.value)
     await log_audit(
         db,
         action="build.result",
