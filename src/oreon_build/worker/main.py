@@ -204,6 +204,14 @@ def _upload_build_log_via_presigned_r2(
     pres = _with_http_retries(f"build-log presign attempt_id={attempt_id}", _presign)
     put_url = str(pres["put_url"])
     hdrs = dict(pres.get("headers") or {})
+    # Persist integrity metadata in the R2 object so the controller can avoid re-hashing
+    # the whole log on retry.
+    hdrs.update(
+        {
+            "x-amz-meta-sha256": digest,
+            "x-amz-meta-size_bytes": str(size_bytes),
+        }
+    )
 
     def _put() -> None:
         pr = session.put(put_url, headers=hdrs, content=data, timeout=put_to)
@@ -1393,6 +1401,18 @@ def _prune_stale_oreon_worker_tempdirs() -> None:
     if age <= 0:
         return
     now = time.time()
+    with _inflight_attempt_lock:
+        inflight_ids = set(_inflight_attempt_ids)
+
+    def _tempdir_attempt_id(name: str) -> int | None:
+        m = re.match(r"^oreon-worker-(\d+)-", name)
+        if not m:
+            return None
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
+
     roots: list[Path] = []
     roots.append(Path(tempfile.gettempdir()))
     extra = _worker_temp_parent_dir()
@@ -1412,6 +1432,9 @@ def _prune_stale_oreon_worker_tempdirs() -> None:
         try:
             for p in root.glob("oreon-worker-*"):
                 if not p.is_dir():
+                    continue
+                aid = _tempdir_attempt_id(p.name)
+                if aid is not None and aid in inflight_ids:
                     continue
                 try:
                     if now - p.stat().st_mtime < age:
