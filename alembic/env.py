@@ -11,8 +11,10 @@ from oreon_build.models import (
     Artifact,
     AuditLog,
     BuildAttempt,
+    BuildAttemptFinalization,
     BuildJob,
     BuildTarget,
+    PublishTask,
     MockEnvironment,
     Package,
     PackageVersion,
@@ -25,6 +27,7 @@ from oreon_build.models import (
     Schedule,
     SigningJob,
     Source,
+    RpmCompleteLock,
     Worker,
 )
 
