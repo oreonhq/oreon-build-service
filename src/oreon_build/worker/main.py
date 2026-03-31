@@ -538,73 +538,96 @@ def _upload_rpm_via_presigned_r2(
     size_bytes = rpm_path.stat().st_size
     digest = _rpm_file_sha256(rpm_path)
 
-    def _presign() -> dict:
-        r = session.post(
-            f"{controller_url}/api/worker/upload-rpm/presign/{attempt_id}",
-            json={"filename": fname},
-            timeout=httpx.Timeout(120.0, connect=60.0),
-        )
-        r.raise_for_status()
-        return r.json()
-
-    pres = _with_http_retries(f"rpm presign attempt_id={attempt_id} {fname}", _presign)
-    put_url = str(pres["put_url"])
-    hdrs = dict(pres.get("headers") or {})
     put_timeout = httpx.Timeout(7200.0, connect=120.0)
-
-    def _put() -> None:
-        with rpm_path.open("rb") as fp:
-            pr = session.put(put_url, headers=hdrs, content=fp, timeout=put_timeout)
-        pr.raise_for_status()
-
-    _with_http_retries(f"rpm R2 PUT attempt_id={attempt_id} {fname}", _put)
-
     complete_timeout = _rpm_complete_post_timeout()
     extra = _rpm_complete_extra_retries()
     max_pass = 1 + extra
+    cycles = 2  # full re-presign and re-put cycle count for stubborn 400 verify races
     last_exc: BaseException | None = None
-    for ci in range(max_pass):
-
-        def _complete() -> dict:
+    for cycle in range(cycles):
+        def _presign() -> dict:
             r = session.post(
-                f"{controller_url}/api/worker/upload-rpm/complete/{attempt_id}",
-                json={
-                    "filename": fname,
-                    "checksum_sha256": digest,
-                    "size_bytes": size_bytes,
-                },
-                timeout=complete_timeout,
+                f"{controller_url}/api/worker/upload-rpm/presign/{attempt_id}",
+                json={"filename": fname},
+                timeout=httpx.Timeout(120.0, connect=60.0),
             )
             r.raise_for_status()
             return r.json()
 
-        try:
-            return _with_http_retries(
-                f"rpm presign-complete attempt_id={attempt_id} {fname} pass={ci + 1}/{max_pass}",
-                _complete,
-            )
-        except httpx.HTTPStatusError as e:
-            last_exc = e
-            if e.response is not None and e.response.status_code == 400 and ci + 1 < max_pass:
+        pres = _with_http_retries(
+            f"rpm presign attempt_id={attempt_id} {fname} cycle={cycle + 1}/{cycles}",
+            _presign,
+        )
+        put_url = str(pres["put_url"])
+        hdrs = dict(pres.get("headers") or {})
+
+        def _put() -> None:
+            with rpm_path.open("rb") as fp:
+                pr = session.put(put_url, headers=hdrs, content=fp, timeout=put_timeout)
+            pr.raise_for_status()
+
+        _with_http_retries(
+            f"rpm R2 PUT attempt_id={attempt_id} {fname} cycle={cycle + 1}/{cycles}",
+            _put,
+        )
+
+        saw_400 = False
+        for ci in range(max_pass):
+            def _complete() -> dict:
+                r = session.post(
+                    f"{controller_url}/api/worker/upload-rpm/complete/{attempt_id}",
+                    json={
+                        "filename": fname,
+                        "checksum_sha256": digest,
+                        "size_bytes": size_bytes,
+                    },
+                    timeout=complete_timeout,
+                )
+                r.raise_for_status()
+                return r.json()
+
+            try:
+                return _with_http_retries(
+                    f"rpm presign-complete attempt_id={attempt_id} {fname} cycle={cycle + 1}/{cycles} pass={ci + 1}/{max_pass}",
+                    _complete,
+                )
+            except httpx.HTTPStatusError as e:
+                last_exc = e
                 detail = ""
-                try:
-                    body = e.response.json()
-                    if isinstance(body, dict) and body.get("detail") is not None:
-                        detail = str(body["detail"])
-                except Exception:
-                    detail = (e.response.text or "")[:800]
-                if _rpm_complete_400_retryable(detail):
-                    delay = min(3.0 * (1.6**ci), 90.0)
-                    logger.warning(
-                        "rpm complete HTTP 400 retryable for %s (attempt_id=%s): %s, sleeping %.1fs",
-                        fname,
-                        attempt_id,
-                        detail[:200],
-                        delay,
-                    )
-                    time.sleep(delay)
-                    continue
-            raise
+                if e.response is not None and e.response.status_code == 400:
+                    saw_400 = True
+                    try:
+                        body = e.response.json()
+                        if isinstance(body, dict) and body.get("detail") is not None:
+                            detail = str(body["detail"])
+                    except Exception:
+                        detail = (e.response.text or "")[:800]
+                    if ci + 1 < max_pass and _rpm_complete_400_retryable(detail):
+                        delay = min(3.0 * (1.6**ci), 90.0)
+                        logger.warning(
+                            "rpm complete HTTP 400 retryable for %s (attempt_id=%s cycle=%s/%s): %s, sleeping %.1fs",
+                            fname,
+                            attempt_id,
+                            cycle + 1,
+                            cycles,
+                            detail[:200],
+                            delay,
+                        )
+                        time.sleep(delay)
+                        continue
+                raise
+
+        if saw_400 and cycle + 1 < cycles:
+            logger.warning(
+                "rpm complete kept returning 400 for %s (attempt_id=%s), retrying with fresh presign+PUT cycle %s/%s",
+                fname,
+                attempt_id,
+                cycle + 2,
+                cycles,
+            )
+            continue
+        break
+
     assert last_exc is not None
     raise last_exc
 
