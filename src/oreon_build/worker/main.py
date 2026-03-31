@@ -517,7 +517,15 @@ def _rpm_complete_400_retryable(detail: str) -> bool:
         return False
     if "filename must end with" in low:
         return False
-    return any(x in low for x in ("not in r2", "upload verify failed"))
+    return any(
+        x in low
+        for x in (
+            "not in r2",
+            "upload verify failed",
+            "size mismatch",
+            "timed out waiting for rpm finalize lock",
+        )
+    )
 
 
 def _upload_rpm_via_presigned_r2(
@@ -1277,6 +1285,46 @@ def _worker_temp_parent_dir() -> str | None:
     return p or None
 
 
+def _inflight_marker_paths(attempt_id: int) -> list[Path]:
+    """
+    Cross-process inflight markers so stale prune cannot delete active attempt dirs when multiple
+    worker processes run on the same host.
+    """
+    roots: list[Path] = [Path(tempfile.gettempdir())]
+    extra = _worker_temp_parent_dir()
+    if extra:
+        roots.append(Path(extra))
+    out: list[Path] = []
+    seen: set[str] = set()
+    for r in roots:
+        try:
+            key = str(r.resolve())
+        except OSError:
+            key = str(r)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r / f".oreon-worker-inflight-{attempt_id}.lock")
+    return out
+
+
+def _mark_inflight_attempt_external(attempt_id: int) -> None:
+    for p in _inflight_marker_paths(attempt_id):
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(str(os.getpid()), encoding="utf-8")
+        except OSError:
+            pass
+
+
+def _clear_inflight_attempt_external(attempt_id: int) -> None:
+    for p in _inflight_marker_paths(attempt_id):
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _mock_scrub_unique_chroot(mock_config: str, mock_unique_ext: str) -> None:
     """
     Delete mock chroot + bootstrap for this job's ``--uniqueext`` (frees space under
@@ -1427,6 +1475,9 @@ def _prune_stale_oreon_worker_tempdirs() -> None:
                 aid = _tempdir_attempt_id(p.name)
                 if aid is not None and aid in inflight_ids:
                     continue
+                if aid is not None:
+                    if any(mp.exists() for mp in _inflight_marker_paths(aid)):
+                        continue
                 try:
                     if now - p.stat().st_mtime < age:
                         continue
@@ -1748,10 +1799,42 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                     if not f.is_file():
                         continue
                     fname = f.name
+                    try:
+                        rpm_upload_stage.mkdir(parents=True, exist_ok=True)
+                    except OSError:
+                        pass
                     staged = rpm_upload_stage / fname
                     try:
                         f.replace(staged)
                     except OSError as stage_err:
+                        if isinstance(stage_err, FileNotFoundError):
+                            # If tmp tree was removed unexpectedly, recreate staging once and retry.
+                            try:
+                                rpm_upload_stage.mkdir(parents=True, exist_ok=True)
+                                f.replace(staged)
+                            except OSError as stage_err2:
+                                err_msg = (
+                                    f"Could not move RPM out of mock resultdir for upload ({fname}): "
+                                    f"{stage_err2}"
+                                )
+                                logger.exception("%s", err_msg)
+                                fail_log = full_log + "\n\n== " + err_msg + "\n"
+                                log_key = _upload_build_log_via_controller(
+                                    session, controller_url, attempt_id, fail_log.encode("utf-8")
+                                )
+                                _post_worker_build_result(
+                                    session,
+                                    controller_url,
+                                    attempt_id,
+                                    {
+                                        "status": "failed",
+                                        "log_r2_key": log_key,
+                                        "error_message": fail_log[:2000],
+                                        "artifacts": artifacts_payload,
+                                    },
+                                )
+                                return
+                            continue
                         err_msg = f"Could not move RPM out of mock resultdir for upload ({fname}): {stage_err}"
                         logger.exception("%s", err_msg)
                         fail_log = full_log + "\n\n== " + err_msg + "\n"
@@ -1973,6 +2056,7 @@ def main() -> None:
                         time.sleep(2)
                         continue
                     _inflight_attempt_ids.add(aid)
+                _mark_inflight_attempt_external(aid)
 
             def _run_job() -> None:
                 try:
@@ -1981,6 +2065,7 @@ def main() -> None:
                     if aid is not None:
                         with _inflight_attempt_lock:
                             _inflight_attempt_ids.discard(aid)
+                        _clear_inflight_attempt_external(aid)
 
             t = threading.Thread(target=_run_job, daemon=True)
             t.start()
