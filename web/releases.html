@@ -53,6 +53,10 @@
           </select>
         </div>
         <div class="form-group">
+          <label>Repo path folder (R2, not Git)</label>
+          <input type="text" id="create-default-repo-branch" placeholder="e.g. dev" maxlength="32" value="dev" title="Folder under releasename/ where builds are published">
+        </div>
+        <div class="form-group">
           <label>Description (optional)</label>
           <input type="text" id="create-description" placeholder="Optional description">
         </div>
@@ -73,7 +77,7 @@
       </div>
       <table class="table-list">
         <thead>
-          <tr><th class="col-checkbox"><input type="checkbox" id="releases-select-all" title="Select all on this page"></th><th>ID</th><th>Release name</th><th>Architectures</th><th>Default channel</th><th>Active</th><th>Actions</th></tr>
+          <tr><th class="col-checkbox"><input type="checkbox" id="releases-select-all" title="Select all on this page"></th><th>ID</th><th>Release name</th><th>Architectures</th><th>Default channel</th><th>Repo folder</th><th>Active</th><th>Actions</th></tr>
         </thead>
         <tbody id="releases-tbody"></tbody>
       </table>
@@ -97,6 +101,10 @@
             <option value="testing">testing</option>
             <option value="stable">stable</option>
           </select>
+        </div>
+        <div class="form-group">
+          <label>Repo path folder (R2, not Git)</label>
+          <input type="text" id="edit-default-repo-branch" placeholder="e.g. dev" maxlength="32" title="Folder under releasename/ where builds are published">
         </div>
         <div class="form-group">
           <label><input type="checkbox" id="edit-release-active"> Active</label>
@@ -164,15 +172,17 @@
           releasesTotal = (data && typeof data.total === 'number') ? data.total : 0;
           var canAct = api.isAdmin();
           tbody.innerHTML = list.map(function(r) {
-            var actions = canAct ? '<button type="button" class="btn edit-rel" data-id="' + r.id + '" data-desc="' + escapeAttr(r.description) + '" data-arch="' + escapeAttr(r.architectures) + '" data-channel="' + (r.default_channel || 'dev') + '" data-active="' + (r.is_active ? '1' : '0') + '">Edit</button> <button type="button" class="btn delete-rel" data-id="' + r.id + '" data-name="' + escapeAttr(r.releasename) + '">Delete</button>' : '-';
-            return '<tr><td class="col-checkbox"><input type="checkbox" class="rel-row-cb" data-id="' + r.id + '"></td><td>' + r.id + '</td><td>' + escapeHtml(r.releasename || '') + '</td><td>' + escapeHtml(r.architectures || '') + '</td><td>' + (r.default_channel || '') + '</td><td>' + (r.is_active ? 'Yes' : 'No') + '</td><td>' + actions + '</td></tr>';
-          }).join('') || '<tr><td colspan="7">No releases</td></tr>';
+            var repoBr = r.default_repo_branch || 'dev';
+            var actions = canAct ? '<button type="button" class="btn edit-rel" data-id="' + r.id + '" data-desc="' + escapeAttr(r.description) + '" data-arch="' + escapeAttr(r.architectures) + '" data-channel="' + (r.default_channel || 'dev') + '" data-repo-branch="' + escapeAttr(repoBr) + '" data-active="' + (r.is_active ? '1' : '0') + '">Edit</button> <button type="button" class="btn delete-rel" data-id="' + r.id + '" data-name="' + escapeAttr(r.releasename) + '">Delete</button>' : '-';
+            return '<tr><td class="col-checkbox"><input type="checkbox" class="rel-row-cb" data-id="' + r.id + '"></td><td>' + r.id + '</td><td>' + escapeHtml(r.releasename || '') + '</td><td>' + escapeHtml(r.architectures || '') + '</td><td>' + (r.default_channel || '') + '</td><td>' + escapeHtml(repoBr) + '</td><td>' + (r.is_active ? 'Yes' : 'No') + '</td><td>' + actions + '</td></tr>';
+          }).join('') || '<tr><td colspan="8">No releases</td></tr>';
           tbody.querySelectorAll('.edit-rel').forEach(function(btn) {
             btn.addEventListener('click', function() {
               document.getElementById('edit-release-id').value = btn.dataset.id;
               document.getElementById('edit-release-desc').value = btn.dataset.desc || '';
               document.getElementById('edit-release-arch').value = btn.dataset.arch || '';
               document.getElementById('edit-release-channel').value = btn.dataset.channel || 'dev';
+              document.getElementById('edit-default-repo-branch').value = btn.dataset.repoBranch || 'dev';
               document.getElementById('edit-release-active').checked = btn.dataset.active === '1';
               document.getElementById('edit-release-modal').classList.add('open');
             });
@@ -190,7 +200,7 @@
           releasesTableSel.refresh();
         }).catch(function() {
           var tbody = document.getElementById('releases-tbody');
-          if (tbody) tbody.innerHTML = '<tr><td colspan="7">Failed to load</td></tr>';
+          if (tbody) tbody.innerHTML = '<tr><td colspan="8">Failed to load</td></tr>';
         });
       }
       (function initReleasesPagination() {
@@ -207,6 +217,7 @@
           description: document.getElementById('edit-release-desc').value.trim() || null,
           architectures: document.getElementById('edit-release-arch').value.trim() || null,
           default_channel: document.getElementById('edit-release-channel').value,
+          default_repo_branch: document.getElementById('edit-default-repo-branch').value.trim() || null,
           is_active: document.getElementById('edit-release-active').checked
         }).then(function() { document.getElementById('edit-release-modal').classList.remove('open'); load(); }).catch(function(e) { alert('Failed: ' + e.message); });
       });
@@ -214,8 +225,8 @@
         var name = document.getElementById('create-releasename').value.trim();
         var arch = document.getElementById('create-architectures').value.trim();
         if (!name || !arch) { alert('Release name and architectures are required.'); return; }
-        api.post('/releases', { releasename: name, architectures: arch, default_channel: document.getElementById('create-default-channel').value, description: document.getElementById('create-description').value.trim() || null, base_repos: [] })
-          .then(function() { load(); document.getElementById('create-releasename').value = ''; document.getElementById('create-description').value = ''; alert('Release created.'); })
+        api.post('/releases', { releasename: name, architectures: arch, default_channel: document.getElementById('create-default-channel').value, default_repo_branch: document.getElementById('create-default-repo-branch').value.trim() || 'dev', description: document.getElementById('create-description').value.trim() || null, base_repos: [] })
+          .then(function() { load(); document.getElementById('create-releasename').value = ''; document.getElementById('create-description').value = ''; document.getElementById('create-default-repo-branch').value = 'dev'; alert('Release created.'); })
           .catch(function(e) { alert('Failed: ' + e.message); });
       });
       load();
