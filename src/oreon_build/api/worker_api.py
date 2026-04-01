@@ -325,14 +325,27 @@ _RPM_UPLOAD_CONTENT_TYPE = "application/x-rpm"
 _RPM_QUIET_TIMEOUT_SEC = 600
 
 
+def _rpm_subproc_timeout_sec(path: Path) -> int:
+    """
+    Large SRPMs (e.g. linux-firmware) need a longer ``rpm -qp`` window or nevra / sig probes time out and
+    idempotent complete retries falsely fail with HTTP 400.
+    """
+    try:
+        mib = max(1, path.stat().st_size // (1024 * 1024))
+    except OSError:
+        return _RPM_QUIET_TIMEOUT_SEC
+    return min(7200, max(_RPM_QUIET_TIMEOUT_SEC, mib * 3))
+
+
 def _rpm_nevra_stem_from_path(path: Path) -> str | None:
     """NEVRA string like NAME-VERSION-RELEASE.ARCH (no trailing .rpm)."""
+    to = _rpm_subproc_timeout_sec(path)
     try:
         r = subprocess.run(
             ["rpm", "-qp", "--qf", "%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}", str(path)],
             capture_output=True,
             text=True,
-            timeout=_RPM_QUIET_TIMEOUT_SEC,
+            timeout=to,
             check=False,
         )
         if r.returncode != 0:
@@ -349,35 +362,40 @@ def _rpm_signature_verifies(path: Path) -> bool:
             ["rpm", "-K", str(path)],
             capture_output=True,
             text=True,
-            timeout=_RPM_QUIET_TIMEOUT_SEC,
+            timeout=_rpm_subproc_timeout_sec(path),
             check=False,
         )
         return r.returncode == 0
     except Exception:
         return False
 
-def _rpm_has_pgp_signature(path: Path) -> bool:
+
+def _rpm_appears_gpg_signed(path: Path) -> bool:
     """
     Check signature presence without verifying against the local rpmdb keys.
 
     rpm -K can fail when the public key isn't imported into the controller's rpmdb.
-    For idempotent retries we mainly need to know that the object is already signed,
-    not that the controller can verify it right now.
+    Some builds only populate OPENPGP/SIGGPG style slots in the header, so SIGPGP alone is not enough.
     """
-    try:
-        r = subprocess.run(
-            ["rpm", "-qp", "--qf", "%{SIGPGP:pgpsig}", str(path)],
-            capture_output=True,
-            text=True,
-            timeout=_RPM_QUIET_TIMEOUT_SEC,
-            check=False,
-        )
-        if r.returncode != 0:
-            return False
-        s = (r.stdout or "").strip()
-        return bool(s)
-    except Exception:
-        return False
+    to = _rpm_subproc_timeout_sec(path)
+    for qf in (
+        "%{SIGPGP:pgpsig}",
+        "%{SIGGPG:armor}",
+        "%{OPENPGP:armor}",
+    ):
+        try:
+            r = subprocess.run(
+                ["rpm", "-qp", "--qf", qf, str(path)],
+                capture_output=True,
+                text=True,
+                timeout=to,
+                check=False,
+            )
+            if r.returncode == 0 and (r.stdout or "").strip():
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _presigned_rpm_already_finalized_on_retry(path: Path, fname: str) -> bool:
@@ -399,7 +417,7 @@ def _presigned_rpm_already_finalized_on_retry(path: Path, fname: str) -> bool:
             ["rpm", "-qp", "--qf", "%{EPOCH}:%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}", str(path)],
             capture_output=True,
             text=True,
-            timeout=_RPM_QUIET_TIMEOUT_SEC,
+            timeout=_rpm_subproc_timeout_sec(path),
             check=False,
         )
         if ep.returncode == 0:
@@ -408,12 +426,12 @@ def _presigned_rpm_already_finalized_on_retry(path: Path, fname: str) -> bool:
                 rest = alt.split(":", 1)[-1]
                 if rest == stem:
                     # Don't require rpmdb key verification; just check signature presence.
-                    return _rpm_has_pgp_signature(path)
+                    return _rpm_appears_gpg_signed(path)
         return False
 
     # Don't require rpm -K verification for idempotent retry. Just verify that the object looks
     # like the expected NEVRA and has a PGP signature already embedded.
-    return _rpm_has_pgp_signature(path)
+    return _rpm_appears_gpg_signed(path)
 
 
 async def _resolve_worker_rpm_upload_context(
@@ -549,83 +567,128 @@ async def upload_worker_rpm_complete(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid checksum_sha256")
     sz = int(body.size_bytes)
 
+    verify_retries = int((os.environ.get("OREON_RPM_COMPLETE_VERIFY_RETRIES") or "8").strip())
+    verify_retries = max(1, min(verify_retries, 24))
+    head_polls = int((os.environ.get("OREON_RPM_COMPLETE_HEAD_POLLS") or "48").strip())
+    head_polls = max(8, min(head_polls, 160))
+
     def _finalize() -> tuple[bool, str, int, str]:
-        fd, tmp_path = tempfile.mkstemp(suffix=".rpm")
-        os.close(fd)
-        path = Path(tmp_path)
         fname = Path(body.filename.strip()).name
-        try:
-            r2 = get_r2_client()
-            cl: int | None = None
-            for hi in range(20):
-                cl = r2.head_object_content_length(r2_key)
-                if cl is not None:
-                    break
-                time.sleep(min(0.25 * (hi + 1), 2.5))
-            if cl is None:
-                raise FileNotFoundError("RPM not in R2 yet (complete presigned PUT first)")
-            if cl > max_bytes:
+
+        def _one_attempt() -> tuple[bool, str, int, str]:
+            fd, tmp_path = tempfile.mkstemp(suffix=".rpm")
+            os.close(fd)
+            path = Path(tmp_path)
+            try:
+                r2 = get_r2_client()
+                cl: int | None = None
+                for hi in range(head_polls):
+                    cl = r2.head_object_content_length(r2_key)
+                    if cl is not None:
+                        break
+                    time.sleep(min(0.25 * (hi + 1), 2.5))
+                if cl is None:
+                    raise FileNotFoundError("RPM not in R2 yet (complete presigned PUT first)")
+                if cl > max_bytes:
+                    raise ValueError(
+                        f"R2 object exceeds max {settings.max_worker_rpm_upload_mib} MiB ({cl} bytes)"
+                    )
+
+                stream = r2.get_object_stream(r2_key)
+                if stream is None:
+                    raise FileNotFoundError("RPM not in R2")
+                h = hashlib.sha256()
+                try:
+                    with open(path, "wb") as out:
+                        total = 0
+                        while True:
+                            chunk = stream.read(8 * 1024 * 1024)
+                            if not chunk:
+                                break
+                            total += len(chunk)
+                            if total > max_bytes:
+                                raise ValueError(
+                                    f"RPM exceeds max {settings.max_worker_rpm_upload_mib} MiB"
+                                )
+                            h.update(chunk)
+                            out.write(chunk)
+                finally:
+                    stream.close()
+
+                actual_size = path.stat().st_size
+                actual_sha = h.hexdigest()
+
+                if actual_size == sz and actual_sha == want_sha:
+                    signed = sign_rpm(path)
+                    signed_size = path.stat().st_size
+                    h2 = hashlib.sha256()
+                    with open(path, "rb") as fh:
+                        while True:
+                            chunk = fh.read(8 * 1024 * 1024)
+                            if not chunk:
+                                break
+                            h2.update(chunk)
+                    signed_sha = h2.hexdigest()
+                    with open(path, "rb") as fh2:
+                        r2.upload_fileobj(r2_key, fh2, content_type=_RPM_UPLOAD_CONTENT_TYPE)
+                    return signed, r2_key, signed_size, signed_sha
+
+                if _presigned_rpm_already_finalized_on_retry(path, fname):
+                    logger.warning(
+                        "presigned RPM complete idempotent retry ok for %s attempt_id=%s",
+                        fname,
+                        attempt_id,
+                    )
+                    return True, r2_key, actual_size, actual_sha
+
                 raise ValueError(
-                    f"R2 object exceeds max {settings.max_worker_rpm_upload_mib} MiB ({cl} bytes)"
+                    "Upload verify failed (R2 size=%s sha256=%s; worker size=%s sha256=%s). "
+                    "Retry after a completed sign changes the object on disk."
+                    % (actual_size, actual_sha[:16], sz, want_sha[:16])
                 )
-
-            stream = r2.get_object_stream(r2_key)
-            if stream is None:
-                raise FileNotFoundError("RPM not in R2")
-            h = hashlib.sha256()
-            try:
-                with open(path, "wb") as out:
-                    total = 0
-                    while True:
-                        chunk = stream.read(8 * 1024 * 1024)
-                        if not chunk:
-                            break
-                        total += len(chunk)
-                        if total > max_bytes:
-                            raise ValueError(
-                                f"RPM exceeds max {settings.max_worker_rpm_upload_mib} MiB"
-                            )
-                        h.update(chunk)
-                        out.write(chunk)
             finally:
-                stream.close()
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
-            actual_size = path.stat().st_size
-            actual_sha = h.hexdigest()
-
-            if actual_size == sz and actual_sha == want_sha:
-                signed = sign_rpm(path)
-                signed_size = path.stat().st_size
-                h2 = hashlib.sha256()
-                with open(path, "rb") as fh:
-                    while True:
-                        chunk = fh.read(8 * 1024 * 1024)
-                        if not chunk:
-                            break
-                        h2.update(chunk)
-                signed_sha = h2.hexdigest()
-                with open(path, "rb") as fh2:
-                    r2.upload_fileobj(r2_key, fh2, content_type=_RPM_UPLOAD_CONTENT_TYPE)
-                return signed, r2_key, signed_size, signed_sha
-
-            if _presigned_rpm_already_finalized_on_retry(path, fname):
-                logger.warning(
-                    "presigned RPM complete idempotent retry ok for %s attempt_id=%s",
-                    fname,
-                    attempt_id,
-                )
-                return True, r2_key, actual_size, actual_sha
-
-            raise ValueError(
-                "Upload verify failed (R2 size=%s sha256=%s; worker size=%s sha256=%s). "
-                "Retry after a completed sign changes the object on disk."
-                % (actual_size, actual_sha[:16], sz, want_sha[:16])
-            )
-        finally:
+        for round_i in range(verify_retries):
             try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                pass
+                return _one_attempt()
+            except FileNotFoundError as e:
+                if round_i + 1 < verify_retries:
+                    delay = min(3.0 * (1.45**round_i), 60.0)
+                    logger.warning(
+                        "rpm finalize R2 not ready key=%s attempt_id=%s round=%s/%s sleep=%.1fs: %s",
+                        r2_key,
+                        attempt_id,
+                        round_i + 1,
+                        verify_retries,
+                        delay,
+                        e,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise
+            except ValueError as e:
+                msg_low = str(e).lower()
+                if "exceeds max" in msg_low:
+                    raise
+                if round_i + 1 < verify_retries and "upload verify failed" in msg_low:
+                    delay = min(4.0 * (1.45**round_i), 90.0)
+                    logger.warning(
+                        "rpm finalize verify retry key=%s attempt_id=%s round=%s/%s sleep=%.1fs: %s",
+                        r2_key,
+                        attempt_id,
+                        round_i + 1,
+                        verify_retries,
+                        delay,
+                        e,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise
+        raise RuntimeError("rpm finalize fell through without result")
 
     from datetime import timedelta
     from uuid import uuid4

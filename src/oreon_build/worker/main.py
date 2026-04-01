@@ -542,7 +542,7 @@ def _upload_rpm_via_presigned_r2(
     complete_timeout = _rpm_complete_post_timeout()
     extra = _rpm_complete_extra_retries()
     max_pass = 1 + extra
-    cycles = 2  # full re-presign and re-put cycle count for stubborn 400 verify races
+    cycles = 4  # full re-presign and re-put cycle count for huge SRPMs and R2 eventual consistency
     last_exc: BaseException | None = None
     for cycle in range(cycles):
         def _presign() -> dict:
