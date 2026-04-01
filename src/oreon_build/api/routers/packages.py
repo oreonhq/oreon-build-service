@@ -24,7 +24,19 @@ from sqlalchemy import delete, func, or_, select
 from oreon_build.api.deps import CurrentAdmin, CurrentUser, DbSession
 from oreon_build.api.schemas import PackageCreate, PackageResponse, PackageUpdate, PaginatedResponse
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
-from oreon_build.models import Artifact, BuildAttempt, BuildJob, BuildTarget, Package, PackageVersion, Release, Source
+from oreon_build.models import (
+    Artifact,
+    BuildAttempt,
+    BuildAttemptFinalization,
+    BuildJob,
+    BuildTarget,
+    Package,
+    PackageVersion,
+    PublishTask,
+    Release,
+    RpmCompleteLock,
+    Source,
+)
 from oreon_build.services.r2 import get_r2_client, repo_rpms_key, src_r2_key
 
 logger = logging.getLogger(__name__)
@@ -151,13 +163,16 @@ async def delete_package(
     # Delete R2 objects for this package (artifacts and sources) before DB deletes
     job_ids_result = await db.execute(select(BuildJob.id).where(BuildJob.package_id == package_id))
     job_ids = [r[0] for r in job_ids_result.all()]
-    artifact_keys = []
-    repo_keys_to_delete = set()  # repo path keys (releasename/branch/arch/RPMS/ and branch/src/)
+    attempt_ids: list[int] = []
     if job_ids:
         attempt_ids_result = await db.execute(
             select(BuildAttempt.id).where(BuildAttempt.build_job_id.in_(job_ids))
         )
         attempt_ids = [r[0] for r in attempt_ids_result.all()]
+
+    artifact_keys = []
+    repo_keys_to_delete = set()  # repo path keys (releasename/branch/arch/RPMS/ and branch/src/)
+    if job_ids:
         if attempt_ids:
             art_result = await db.execute(
                 select(Artifact.r2_key).where(
@@ -209,6 +224,15 @@ async def delete_package(
             )
         except Exception as e:
             logger.exception("R2 client or delete failed during package delete (package_id=%s): %s", package_id, e)
+
+    # Rows that FK to build_jobs / build_attempts must go before attempts and jobs (see migrations 012, 014).
+    if job_ids:
+        await db.execute(delete(PublishTask).where(PublishTask.build_job_id.in_(job_ids)))
+    if attempt_ids:
+        await db.execute(
+            delete(BuildAttemptFinalization).where(BuildAttemptFinalization.attempt_id.in_(attempt_ids))
+        )
+        await db.execute(delete(RpmCompleteLock).where(RpmCompleteLock.attempt_id.in_(attempt_ids)))
 
     # Delete dependent rows explicitly to satisfy NOT NULL / FK constraints
     # 1) build_attempts -> build_jobs (artifacts are deleted via cascade or we must delete them first)
