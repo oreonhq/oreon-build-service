@@ -27,9 +27,10 @@ If mock leaves RPMs under ``--resultdir`` owned by root with restrictive modes, 
 and/or ``OREON_WORKER_CHMOD_MOCK_RESULTDIR_SUDO`` (see ``deploy/oreon-worker.env.example``).
 
 After each job, the worker runs ``mock --scrub=all`` for that job’s ``--uniqueext``, then removes only
-that attempt’s trees under ``/var/lib/mock`` (directory names ending in ``-oreon-<attempt_id>``), then
-removes the job tempdir (prefix ``oreon-worker-<attempt_id>-``) so parallel jobs are not touched. Stale
-legacy ``oreon-worker-*`` dirs are pruned by age (see deploy docs).
+that attempt’s trees under ``/var/lib/mock`` (directory names ending in ``-oreon-<attempt_id>``), the
+attempt’s mock cache under ``/var/cache/mock/oreon-<attempt_id>/`` (see ``--config-opts cache_topdir``),
+then removes the job tempdir (prefix ``oreon-worker-<attempt_id>-``) so parallel jobs are not touched.
+Stale legacy ``oreon-worker-*`` dirs are pruned by age (see deploy docs).
 
 DistGit: Source(kind="distgit", url="<repo>.git#branch:spec_relpath") — mock --buildsrpm then mock --rebuild.
 
@@ -719,15 +720,35 @@ def _rpm_dist_macro_value(releasename: str | None) -> str | None:
     return f".or{m.group(1)}"
 
 
+def _mock_shared_host_cache_enabled() -> bool:
+    """
+    If set, the worker does not pass per-attempt ``cache_topdir`` to mock.
+
+    Default off so parallel jobs do not share ``/var/cache/mock/<root>/dnf_cache`` (mock uses
+    ``shared_root_name`` without ``uniqueext`` for that path). Sharing it causes dnf5 races
+    (tmpdir / directory iterator errors) under load.
+    """
+    return _truthy_env("OREON_WORKER_MOCK_SHARED_CACHE")
+
+
+def _mock_cache_topdir_for_attempt(attempt_id: int) -> str:
+    parent = (os.environ.get("OREON_WORKER_MOCK_CACHE_PARENT") or "/var/cache/mock").rstrip("/")
+    return f"{parent}/oreon-{attempt_id}"
+
+
 def _mock_cmd_base(
     mock_config: str,
     mock_unique_ext: str | None,
     addrepo_baseurls: list[str],
     rpm_dist: str | None = None,
+    *,
+    attempt_id: int | None = None,
 ) -> list[str]:
     cmd: list[str] = ["mock", "-r", mock_config]
     if mock_unique_ext:
         cmd += ["--uniqueext", mock_unique_ext]
+    if attempt_id is not None and not _mock_shared_host_cache_enabled():
+        cmd += ["--config-opts", f"cache_topdir={_mock_cache_topdir_for_attempt(attempt_id)}"]
     for url in addrepo_baseurls:
         cmd += ["--addrepo", url]
     if rpm_dist:
@@ -1224,6 +1245,7 @@ def _mock_build_srpm_from_spec(
     mock_unique_ext: str | None = None,
     addrepo_baseurls: list[str] | None = None,
     rpm_dist: str | None = None,
+    attempt_id: int | None = None,
 ) -> tuple[bool, Path | None, str, bool]:
     """
     Build SRPM from spec/sources using mock (so dependencies are handled in chroot).
@@ -1233,8 +1255,18 @@ def _mock_build_srpm_from_spec(
     ``mock_unique_ext`` must be set per concurrent build on this host (e.g. attempt id);
     otherwise mock shares one chroot per ``-r`` config and parallel jobs fail with
     "Build root is locked by another process."
+
+    Pass ``attempt_id`` so mock gets a dedicated ``cache_topdir`` (unless
+    ``OREON_WORKER_MOCK_SHARED_CACHE`` is set). Otherwise dnf metadata and tmpdirs are shared
+    across all jobs using the same ``-r`` and dnf5 can fail when builds overlap.
     """
-    cmd = _mock_cmd_base(mock_config, mock_unique_ext, addrepo_baseurls or [], rpm_dist=rpm_dist)
+    cmd = _mock_cmd_base(
+        mock_config,
+        mock_unique_ext,
+        addrepo_baseurls or [],
+        rpm_dist=rpm_dist,
+        attempt_id=attempt_id,
+    )
     cmd += [
         "--buildsrpm",
         "--spec",
@@ -1268,9 +1300,16 @@ def _mock_rebuild_srpm(
     mock_unique_ext: str | None = None,
     addrepo_baseurls: list[str] | None = None,
     rpm_dist: str | None = None,
+    attempt_id: int | None = None,
 ) -> tuple[bool, str, bool]:
-    """Returns (ok, output, cancelled). See :func:`_mock_build_srpm_from_spec` for ``mock_unique_ext``."""
-    cmd = _mock_cmd_base(mock_config, mock_unique_ext, addrepo_baseurls or [], rpm_dist=rpm_dist)
+    """Returns (ok, output, cancelled). See :func:`_mock_build_srpm_from_spec` for isolation knobs."""
+    cmd = _mock_cmd_base(
+        mock_config,
+        mock_unique_ext,
+        addrepo_baseurls or [],
+        rpm_dist=rpm_dist,
+        attempt_id=attempt_id,
+    )
     cmd += ["--rebuild", str(srpm_path), "--resultdir", str(result_dir)]
     rc, out = _run_with_abort(cmd, timeout_s=_mock_rebuild_timeout_sec(), abort_event=abort_event)
     if rc == _RC_MOCK_CANCELLED:
@@ -1348,7 +1387,7 @@ def _clear_inflight_attempt_external(attempt_id: int) -> None:
             pass
 
 
-def _mock_scrub_unique_chroot(mock_config: str, mock_unique_ext: str) -> None:
+def _mock_scrub_unique_chroot(mock_config: str, mock_unique_ext: str, attempt_id: int | None = None) -> None:
     """
     Delete mock chroot + bootstrap for this job's ``--uniqueext`` (frees space under
     ``/var/lib/mock``). Safe to call even if the build never created a root.
@@ -1362,9 +1401,10 @@ def _mock_scrub_unique_chroot(mock_config: str, mock_unique_ext: str) -> None:
         mock_config,
         "--uniqueext",
         mock_unique_ext,
-        "--scrub",
-        "all",
     ]
+    if attempt_id is not None and not _mock_shared_host_cache_enabled():
+        cmd += ["--config-opts", f"cache_topdir={_mock_cache_topdir_for_attempt(attempt_id)}"]
+    cmd += ["--scrub", "all"]
     rc, out = _run(cmd, timeout_s=max(120, timeout))
     if rc != 0:
         snippet = _tail_lines(out, 40) if out else ""
@@ -1400,6 +1440,19 @@ def _rm_rf_var_lib_mock_for_attempt(attempt_id: int) -> None:
         pass
     if removed:
         logger.info("Removed %d mock root(s) under /var/lib/mock for attempt %s", removed, attempt_id)
+
+
+def _rm_rf_mock_cache_topdir_for_attempt(attempt_id: int) -> None:
+    """Remove per-attempt mock ``cache_topdir`` (dnf/yum host cache bind-mounted into the chroot)."""
+    if _mock_shared_host_cache_enabled():
+        return
+    p = Path(_mock_cache_topdir_for_attempt(attempt_id))
+    try:
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+            logger.info("Removed mock cache_topdir %s", p)
+    except OSError as e:
+        logger.warning("Could not remove mock cache_topdir %s: %s", p, e)
 
 
 def _rm_rf_worker_tempdirs_for_attempt(attempt_id: int, tmp_parent: str | None) -> None:
@@ -1446,8 +1499,9 @@ def _cleanup_job_disk(attempt_id: int, mock_config: str, mock_unique_ext: str, w
     Safe with parallel builds (everything keyed by attempt_id / known work path).
     """
     tmp_parent = _worker_temp_parent_dir()
-    _mock_scrub_unique_chroot(mock_config, mock_unique_ext)
+    _mock_scrub_unique_chroot(mock_config, mock_unique_ext, attempt_id)
     _rm_rf_var_lib_mock_for_attempt(attempt_id)
+    _rm_rf_mock_cache_topdir_for_attempt(attempt_id)
     if work_tmpdir:
         shutil.rmtree(work_tmpdir, ignore_errors=True)
     _rm_rf_worker_tempdirs_for_attempt(attempt_id, tmp_parent)
@@ -1697,6 +1751,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                     mock_unique_ext=mock_unique_ext,
                     addrepo_baseurls=mock_addrepos,
                     rpm_dist=rpm_dist,
+                    attempt_id=attempt_id,
                 )
                 _make_mock_resultdir_world_readable(srpm_result_dir)
                 build_log_parts.extend(
@@ -1755,6 +1810,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                 mock_unique_ext=mock_unique_ext,
                 addrepo_baseurls=mock_addrepos,
                 rpm_dist=rpm_dist,
+                attempt_id=attempt_id,
             )
             _make_mock_resultdir_world_readable(result_dir)
             build_log_parts.extend(
