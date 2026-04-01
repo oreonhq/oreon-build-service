@@ -24,6 +24,7 @@ from sqlalchemy import delete, func, or_, select
 from oreon_build.api.deps import CurrentAdmin, CurrentUser, DbSession
 from oreon_build.api.schemas import PackageCreate, PackageResponse, PackageUpdate, PaginatedResponse
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
+from oreon_build.core.repo_branch import default_repo_branch_segment
 from oreon_build.models import (
     Artifact,
     BuildAttempt,
@@ -184,7 +185,12 @@ async def delete_package(
             artifact_keys = [r[0] for r in art_result.all()]
             # Also delete from repo layout (worker uploads to releasename/branch/arch/RPMS/ and branch/src/)
             art_with_job = await db.execute(
-                select(Artifact.filename, Release.releasename, BuildJob.branch, BuildTarget.architecture)
+                select(
+                    Artifact.filename,
+                    Release.releasename,
+                    Release.default_repo_branch,
+                    BuildTarget.architecture,
+                )
                 .join(BuildAttempt, BuildAttempt.id == Artifact.build_attempt_id)
                 .join(BuildJob, BuildJob.id == BuildAttempt.build_job_id)
                 .join(Release, Release.id == BuildJob.release_id)
@@ -192,7 +198,8 @@ async def delete_package(
                 .where(BuildJob.package_id == package_id)
             )
             for row in art_with_job.all():
-                filename, releasename, branch, arch = row[0], row[1], row[2] or "dev", row[3] or "x86_64"
+                filename, releasename, drb, arch = row[0], row[1], row[2], row[3] or "x86_64"
+                branch = default_repo_branch_segment(drb)
                 if filename.endswith(".src.rpm"):
                     repo_keys_to_delete.add(src_r2_key(releasename, branch, filename))
                 else:
