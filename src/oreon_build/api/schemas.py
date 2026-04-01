@@ -63,6 +63,11 @@ class ReleaseCreate(BaseModel):
     description: Optional[str] = None
     architectures: str = Field(..., description="Comma-separated, e.g. x86_64,aarch64")
     default_channel: ReleaseChannelSchema = ReleaseChannelSchema.dev
+    default_repo_branch: str = Field(
+        default="dev",
+        max_length=32,
+        description="R2 folder under releasename/ for built RPMs (usually dev); not a Git branch name",
+    )
     base_repos: List[ReleaseRepoCreate] = []
 
 
@@ -70,6 +75,7 @@ class ReleaseUpdate(BaseModel):
     description: Optional[str] = None
     architectures: Optional[str] = None
     default_channel: Optional[ReleaseChannelSchema] = None
+    default_repo_branch: Optional[str] = Field(None, max_length=32)
     is_active: Optional[bool] = None
     base_repos: Optional[List[ReleaseRepoCreate]] = None
 
@@ -90,6 +96,7 @@ class ReleaseResponse(BaseModel):
     description: Optional[str] = None
     architectures: str
     default_channel: str
+    default_repo_branch: str
     is_active: bool
     created_at: datetime
     base_repos: List[ReleaseRepoResponse] = []

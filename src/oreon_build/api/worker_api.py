@@ -40,6 +40,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from oreon_build.api.deps import DbSession
 from oreon_build.config import get_settings
+from oreon_build.core.repo_branch import r2_publish_branch
 from oreon_build.core.security import verify_worker_token
 from oreon_build.core.audit import log_audit
 from sqlalchemy.orm import selectinload
@@ -262,7 +263,7 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
 
     # At build time, worker uses <config_name>-<arch> (mock env is not arch-specific)
     build_arch = (target.architecture if target else None) or (worker.architecture or "").strip() or "x86_64"
-    branch = getattr(job, "branch", None) or "dev"
+    branch = r2_publish_branch(release)
     if mock_config:
         base = mock_config.strip()
         # Normalize: if stored value already ends with -x86_64 or -aarch64, treat as base
@@ -482,7 +483,7 @@ async def _resolve_worker_rpm_upload_context(
         t = t_result.scalar_one_or_none()
         if t and t.architecture:
             arch = t.architecture
-    branch = getattr(job, "branch", None) or "dev"
+    branch = r2_publish_branch(release)
 
     if fname.endswith(".src.rpm"):
         r2_key = src_r2_key(release.releasename, branch, fname)
@@ -1358,7 +1359,8 @@ async def report_result(
                 target_result = await db.execute(select(BuildTarget).where(BuildTarget.id == job.target_id))
                 target = target_result.scalar_one_or_none()
                 arch = target.architecture if target else None
-                branch = getattr(job, "branch", "dev") or "dev"
+                branch = r2_publish_branch(release)
+                job.branch = branch
                 if release and arch:
                     await _enqueue_repo_publish_task()
 
@@ -1413,7 +1415,8 @@ async def report_result(
         target_result = await db.execute(select(BuildTarget).where(BuildTarget.id == job.target_id))
         target = target_result.scalar_one_or_none()
         arch = target.architecture if target else None
-        branch = getattr(job, "branch", "dev") or "dev"
+        branch = r2_publish_branch(release)
+        job.branch = branch
         if release and arch:
             # Queue expensive R2 copy/prune/createrepo work. This makes POST /worker/result fast and safe
             # under HTTP timeouts.

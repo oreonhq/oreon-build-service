@@ -200,6 +200,7 @@ async def lifespan(app: FastAPI):
     async def _publish_tasks_loop() -> None:
         from datetime import datetime, timezone
 
+        from oreon_build.core.repo_branch import r2_publish_branch
         from oreon_build.db.session import async_session_maker
         from oreon_build.models import Artifact, BuildAttempt, BuildJob, BuildTarget, PublishTask, Release
         from oreon_build.services.publisher import update_repodata_at_prefix
@@ -297,7 +298,7 @@ async def lifespan(app: FastAPI):
                             if not target or not target.architecture:
                                 raise RuntimeError(f"build target arch missing for job: {job_id}")
 
-                            branch = getattr(job, "branch", "dev") or "dev"
+                            branch = r2_publish_branch(release)
                             arch = target.architecture
 
                             art_r = await db2.execute(
