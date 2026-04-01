@@ -21,6 +21,7 @@ from sqlalchemy import select
 
 from oreon_build.api.deps import CurrentAdmin, CurrentUser, DbSession
 from oreon_build.api.schemas import RepositoryResponse
+from oreon_build.core.repo_branch import r2_publish_branch
 from oreon_build.models import Release, Repository
 from oreon_build.services.publisher import update_repodata_at_prefix
 from oreon_build.services.r2 import repo_r2_prefix
@@ -116,8 +117,8 @@ class RegenerateMetadataResult(BaseModel):
 @router.post("/regenerate-metadata", response_model=RegenerateMetadataResult)
 async def regenerate_metadata_all_releases(_: CurrentAdmin, db: DbSession):
     """
-    Re-run createrepo for every R2 prefix we know about (DB repositories plus dev/testing/stable × x86_64/aarch64
-    for each active release). Prefixes with no RPMs under RPMS/ are skipped after a quick list.
+    Re-run createrepo for every R2 prefix we know about (DB repositories plus each release's default repo branch,
+    testing, and stable, times x86_64 and aarch64). Prefixes with no RPMs under RPMS/ are skipped after a quick list.
     """
     prefixes: set[str] = set()
     rrepo = await db.execute(select(Repository.r2_prefix))
@@ -126,7 +127,8 @@ async def regenerate_metadata_all_releases(_: CurrentAdmin, db: DbSession):
             prefixes.add(p)
     rels = await db.execute(select(Release).where(Release.is_active.is_(True)))
     for rel in rels.scalars().all():
-        for ch in ("dev", "testing", "stable"):
+        dev_seg = r2_publish_branch(rel)
+        for ch in (dev_seg, "testing", "stable"):
             for arch in ("x86_64", "aarch64"):
                 prefixes.add(repo_r2_prefix(rel.releasename, ch, arch))
     ordered = sorted(prefixes)
