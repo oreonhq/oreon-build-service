@@ -88,7 +88,7 @@
       </div>
     </div>
   </main>
-  <script src="/static/app.js?v=4"></script>
+  <script src="/static/app.js?v=5"></script>
   <script>
     (function() {
       const api = window.oreonApi;
@@ -121,7 +121,7 @@
                   ids.forEach(function(id) {
                     chain = chain.then(function() { return api.delete('/packages/' + id); });
                   });
-                  chain.then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+                  chain.then(function() { load(); }).catch(function(e) { alert('Failed: ' + window.oreonErrorMessage(e)); });
                 });
             });
             btns.appendChild(del);
@@ -166,7 +166,7 @@
               window.oreonUI.confirm('Delete package "' + (btn.dataset.name || '') + '"? This cannot be undone.', 'Delete package')
                 .then(function(ok) {
                   if (!ok) return;
-                  api.delete('/packages/' + btn.dataset.id).then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+                  api.delete('/packages/' + btn.dataset.id).then(function() { load(); }).catch(function(e) { alert('Failed: ' + window.oreonErrorMessage(e)); });
                 });
             });
           });
@@ -224,7 +224,7 @@
         else payload.preferred_mock_environment_id = null;
         api.patch('/packages/' + id, payload)
           .then(function() { document.getElementById('edit-package-modal').classList.remove('open'); load(); })
-          .catch(function(e) { alert('Failed: ' + e.message); });
+          .catch(function(e) { alert('Failed: ' + window.oreonErrorMessage(e)); });
       });
       load();
     })();
