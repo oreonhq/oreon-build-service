@@ -12,6 +12,7 @@ from oreon_build.api.schemas import (
     ReleaseUpdate,
 )
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
+from oreon_build.core.repo_branch import r2_publish_branch
 from oreon_build.models import Release, ReleaseChannel, ReleaseRepo
 
 router = APIRouter(prefix="/releases", tags=["releases"])
@@ -24,6 +25,7 @@ def _release_to_response(r: Release) -> ReleaseResponse:
         description=r.description,
         architectures=r.architectures,
         default_channel=r.default_channel.value,
+        default_repo_branch=r2_publish_branch(r),
         is_active=r.is_active,
         created_at=r.created_at,
         base_repos=[
@@ -72,11 +74,13 @@ async def create_release(
     result = await db.execute(select(Release).where(Release.releasename == data.releasename))
     if result.scalar_one_or_none():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Releasename already exists")
+    drb = (data.default_repo_branch or "dev").strip()[:32] or "dev"
     release = Release(
         releasename=data.releasename,
         description=data.description,
         architectures=data.architectures,
         default_channel=ReleaseChannel(data.default_channel.value),
+        default_repo_branch=drb,
         is_active=True,
     )
     db.add(release)
@@ -128,6 +132,9 @@ async def update_release(
         release.architectures = data.architectures
     if data.default_channel is not None:
         release.default_channel = ReleaseChannel(data.default_channel.value)
+    if data.default_repo_branch is not None:
+        s = data.default_repo_branch.strip()[:32]
+        release.default_repo_branch = s or "dev"
     if data.is_active is not None:
         release.is_active = data.is_active
     if data.base_repos is not None:
