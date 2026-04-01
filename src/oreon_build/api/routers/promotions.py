@@ -25,6 +25,7 @@ from sqlalchemy.orm import selectinload
 from oreon_build.api.deps import CurrentUser, DbSession
 from oreon_build.api.schemas import PaginatedResponse, PromoteRequest, PromotionResponse
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
+from oreon_build.core.repo_branch import r2_publish_branch
 from oreon_build.models import Artifact, BuildAttempt, BuildJob, BuildStatus, BuildTarget, Package, Promotion, Release
 from oreon_build.services.r2 import get_r2_client, repo_rpms_key, src_r2_key
 from oreon_build.services.promotion_r2_cleanup import run_post_promotion_r2_maintenance
@@ -178,7 +179,7 @@ async def _promote_pending_to_channel(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Build job or release/target not found")
     releasename = job.release.releasename
     arch = job.build_target.architecture
-    branch = getattr(job, "branch", "dev") or "dev"
+    branch = r2_publish_branch(job.release)
     successful = next((a for a in job.attempts if a.status == BuildStatus.SUCCESS), None)
     if not successful or not successful.artifacts:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No successful attempt or artifacts")
