@@ -28,6 +28,7 @@ from sqlalchemy.orm import selectinload
 
 from oreon_build.api.routers.builds import _get_or_create_build_target
 from oreon_build.core.audit import log_audit
+from oreon_build.core.repo_branch import r2_publish_branch
 from oreon_build.models import BuildJob, BuildStatus, Package, PackageVersion, Release, Source
 
 logger = logging.getLogger(__name__)
@@ -299,6 +300,12 @@ async def apply_github_push(
             if max_jobs is not None and len(triggered) >= max_jobs:
                 skipped.append({"package_id": pkg.id, "reason": "max_jobs_limit_reached", "limit": max_jobs})
                 break
+            rel_row = await db.execute(select(Release).where(Release.id == release_id))
+            rel_obj = rel_row.scalar_one_or_none()
+            if not rel_obj:
+                skipped.append({"package_id": pkg.id, "release_id": release_id, "reason": "release_not_found"})
+                continue
+            publish_branch = r2_publish_branch(rel_obj)
             target = await _get_or_create_build_target(db, release_id, arch, pkg.preferred_mock_environment_id)
             job = BuildJob(
                 package_id=pkg.id,
@@ -308,6 +315,7 @@ async def apply_github_push(
                 status=BuildStatus.PENDING,
                 priority=0,
                 triggered_by_id=None,
+                branch=publish_branch,
             )
             db.add(job)
             await db.flush()
@@ -318,7 +326,7 @@ async def apply_github_push(
                 account_id=None,
                 resource_type="build_job",
                 resource_id=str(job.id),
-                details=f"package_id={pkg.id} release_id={release_id} arch={arch} repo_id={repo_id} branch={job.branch}",
+                details=f"package_id={pkg.id} release_id={release_id} arch={arch} repo_id={repo_id} branch={publish_branch}",
                 ip_address=None,
                 user_agent=user_agent,
                 emit_discord=(kind == "webhook"),

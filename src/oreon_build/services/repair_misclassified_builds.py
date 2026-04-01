@@ -24,7 +24,8 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker, selectinload
 
 from oreon_build.config import get_settings
-from oreon_build.models import BuildAttempt, BuildJob, BuildStatus, Package, Promotion
+from oreon_build.core.repo_branch import r2_publish_branch
+from oreon_build.models import BuildAttempt, BuildJob, BuildStatus, Package, Promotion, Release
 
 
 def repair_misclassified_builds(*, dry_run: bool) -> List[str]:
@@ -70,6 +71,9 @@ def repair_misclassified_builds(*, dry_run: bool) -> List[str]:
             latest.finished_at = latest.finished_at or now
             job.status = BuildStatus.SUCCESS
             job.completed_at = latest.finished_at
+            rel = session.get(Release, job.release_id)
+            if rel:
+                job.branch = r2_publish_branch(rel)
 
             promo_n = session.scalar(
                 select(func.count(Promotion.id)).where(Promotion.build_job_id == job.id)
