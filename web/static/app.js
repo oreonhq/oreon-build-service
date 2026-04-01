@@ -30,6 +30,64 @@ function oreonParseJwtPayload(token) {
   }
 }
 
+/**
+ * Turn FastAPI ``detail`` (string, list of validation errors, or object) into a single line.
+ * Avoids ``new Error([])`` which yields an empty ``message`` and blank UI alerts.
+ * HTTP/2 responses often have an empty ``statusText`` so we always fall back to the status code.
+ */
+function oreonNormalizeApiErrorDetail(detail, status, statusText) {
+  var st = (statusText && String(statusText).trim()) ? String(statusText).trim() : '';
+  var code = typeof status === 'number' && status > 0 ? status : 0;
+  var fallback = st || (code ? 'HTTP ' + code : 'Request failed');
+  if (detail == null || detail === '') return fallback;
+  if (typeof detail === 'string') {
+    var s = detail.trim();
+    return s || fallback;
+  }
+  if (Array.isArray(detail)) {
+    var parts = [];
+    for (var i = 0; i < detail.length; i++) {
+      var x = detail[i];
+      if (x == null) continue;
+      if (typeof x === 'string') parts.push(x);
+      else if (typeof x.msg === 'string') parts.push(x.msg);
+      else {
+        try {
+          parts.push(JSON.stringify(x));
+        } catch (_) {
+          parts.push(String(x));
+        }
+      }
+    }
+    var joined = parts.join('; ').trim();
+    return joined || fallback;
+  }
+  if (typeof detail === 'object') {
+    if (typeof detail.msg === 'string' && detail.msg.trim()) return detail.msg.trim();
+    if (typeof detail.message === 'string' && detail.message.trim()) return detail.message.trim();
+    try {
+      return JSON.stringify(detail);
+    } catch (_) {
+      return fallback;
+    }
+  }
+  var asStr = String(detail).trim();
+  return asStr || fallback;
+}
+
+/** Non-empty text for alerts when ``e.message`` is missing (e.g. old bugs or thrown primitives). */
+window.oreonErrorMessage = function(e) {
+  if (!e) return 'Unknown error';
+  var m = e.message;
+  if (m != null && String(m).trim() !== '') return String(m).trim();
+  if (typeof e === 'string' && e.trim()) return e.trim();
+  try {
+    return JSON.stringify(e);
+  } catch (_) {
+    return String(e) || 'Unknown error';
+  }
+};
+
 function oreonLoadStoredAuth(api) {
   api.token = localStorage.getItem('oreon_token') || '';
   api.username = localStorage.getItem('oreon_username') || '';
@@ -90,8 +148,10 @@ window.oreonApi = {
       window.dispatchEvent(new Event('auth-change'));
     }
     if (!r.ok) {
-      const err = await r.json().catch(() => ({ detail: r.statusText }));
-      throw new Error(err.detail || r.statusText);
+      const errBody = await r.json().catch(() => ({}));
+      const raw = errBody && errBody.detail !== undefined ? errBody.detail : errBody && errBody.message;
+      const msg = oreonNormalizeApiErrorDetail(raw, r.status, r.statusText);
+      throw new Error(msg);
     }
     const text = await r.text();
     if (r.status === 204 || !text || !text.trim()) return null;
