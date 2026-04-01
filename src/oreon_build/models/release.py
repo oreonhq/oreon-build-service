@@ -34,6 +34,7 @@ class Release(Base):
         default=ReleaseChannel.DEV,
         nullable=False,
     )
+    default_repo_branch: Mapped[str] = mapped_column(String(32), default="dev", nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
