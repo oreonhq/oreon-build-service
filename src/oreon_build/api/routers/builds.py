@@ -17,6 +17,7 @@ from oreon_build.api.schemas import (
     PaginatedResponse,
 )
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
+from oreon_build.core.repo_branch import r2_publish_branch
 from oreon_build.models import BuildAttempt, BuildJob, BuildStatus, BuildTarget, Package, Release, Worker
 from oreon_build.services.r2 import get_r2_client, upload_r2_key
 
@@ -254,8 +255,10 @@ async def trigger_build(
         preferred_mock_environment_id = pkg.preferred_mock_environment_id if pkg.preferred_mock_environment_id else None
 
     rr = await db.execute(select(Release).where(Release.id == data.release_id))
-    if not rr.scalar_one_or_none():
+    release_for_job = rr.scalar_one_or_none()
+    if not release_for_job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Release not found")
+    publish_branch = r2_publish_branch(release_for_job)
 
     architectures = data.architectures or DEFAULT_ARCHITECTURES
     if not architectures:
@@ -285,6 +288,7 @@ async def trigger_build(
             status=BuildStatus.PENDING,
             priority=data.priority,
             triggered_by_id=user.id,
+            branch=publish_branch,
         )
         db.add(job)
         await db.flush()
@@ -444,6 +448,7 @@ async def upload_and_trigger(
             status=BuildStatus.PENDING,
             priority=0,
             triggered_by_id=user.id,
+            branch=r2_publish_branch(release),
         )
         db.add(job)
         await db.flush()
