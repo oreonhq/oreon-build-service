@@ -1,4 +1,5 @@
 """Builds - list/view public; trigger/cancel require maintainer or admin."""
+import logging
 import uuid
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile, status
@@ -17,11 +18,14 @@ from oreon_build.api.schemas import (
     PaginatedResponse,
 )
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
+from oreon_build.core.machine_arch import normalize_machine_arch
 from oreon_build.core.repo_branch import r2_publish_branch
 from oreon_build.models import BuildAttempt, BuildJob, BuildStatus, BuildTarget, Package, Release, Worker
 from oreon_build.services.r2 import get_r2_client, upload_r2_key
 
 router = APIRouter(prefix="/builds", tags=["builds"])
+
+logger = logging.getLogger(__name__)
 
 # Default architectures for multi-arch builds
 DEFAULT_ARCHITECTURES = ["x86_64", "aarch64"]
@@ -205,50 +209,56 @@ async def trigger_build(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Mock environment not found or does not belong to the selected release.",
                 )
-        existing = await db.execute(select(Package).where(Package.name == np.name))
-        if existing.scalar_one_or_none():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Package name already exists: {np.name}",
+        existing_r = await db.execute(select(Package).where(Package.name == np.name))
+        existing_pkg = existing_r.scalar_one_or_none()
+        if existing_pkg:
+            # DistGit / UI often sends new_package even when the package already exists (e.g. second arch).
+            # Queue builds like a normal trigger instead of rejecting.
+            package_id = existing_pkg.id
+            preferred_mock_environment_id = (
+                existing_pkg.preferred_mock_environment_id
+                if existing_pkg.preferred_mock_environment_id
+                else None
             )
-        gh_url = np.github_html_url or _infer_github_html_url_from_new_package(np)
-        pkg = Package(
-            name=np.name,
-            description=np.description,
-            preferred_mock_environment_id=np.preferred_mock_environment_id,
-            github_repository_id=np.github_repository_id,
-            github_html_url=gh_url,
-        )
-        db.add(pkg)
-        await db.flush()
-        package_id = pkg.id
+        else:
+            gh_url = np.github_html_url or _infer_github_html_url_from_new_package(np)
+            pkg = Package(
+                name=np.name,
+                description=np.description,
+                preferred_mock_environment_id=np.preferred_mock_environment_id,
+                github_repository_id=np.github_repository_id,
+                github_html_url=gh_url,
+            )
+            db.add(pkg)
+            await db.flush()
+            package_id = pkg.id
 
-        pv = PackageVersion(
-            package_id=pkg.id,
-            version=np.version or "0.0.1",
-        )
-        db.add(pv)
-        await db.flush()
-        package_version_id = pv.id
+            pv = PackageVersion(
+                package_id=pkg.id,
+                version=np.version or "0.0.1",
+            )
+            db.add(pv)
+            await db.flush()
+            package_version_id = pv.id
 
-        primary_url = _source_url_from_new_package(np)
-        if primary_url:
-            db.add(Source(package_version_id=pv.id, kind=np.source_type.value, url=primary_url))
-        for u in (np.source_urls or [])[1:]:
-            db.add(Source(package_version_id=pv.id, kind="url", url=u))
-        await db.flush()
+            primary_url = _source_url_from_new_package(np)
+            if primary_url:
+                db.add(Source(package_version_id=pv.id, kind=np.source_type.value, url=primary_url))
+            for u in (np.source_urls or [])[1:]:
+                db.add(Source(package_version_id=pv.id, kind="url", url=u))
+            await db.flush()
 
-        await log_audit(
-            db,
-            "package.create",
-            account_id=user.id,
-            resource_type="package",
-            resource_id=str(pkg.id),
-            details=np.name,
-            ip_address=get_client_ip(request),
-            user_agent=get_user_agent(request),
-        )
-        preferred_mock_environment_id = np.preferred_mock_environment_id
+            await log_audit(
+                db,
+                "package.create",
+                account_id=user.id,
+                resource_type="package",
+                resource_id=str(pkg.id),
+                details=np.name,
+                ip_address=get_client_ip(request),
+                user_agent=get_user_agent(request),
+            )
+            preferred_mock_environment_id = np.preferred_mock_environment_id
     else:
         package_id = data.package_id
         rp = await db.execute(
@@ -273,18 +283,18 @@ async def trigger_build(
     workers = list(workers_result.scalars().all())
     workers_by_arch: dict[str, bool] = {}
     for w in workers:
-        arch = (w.architecture or "").strip() or "x86_64"
-        workers_by_arch[arch] = True
+        workers_by_arch[normalize_machine_arch(w.architecture)] = True
 
     jobs_created: list[BuildJob] = []
     for arch in architectures:
         arch = (arch or "").strip()
         if not arch:
             continue
-        has_worker = workers_by_arch.get(arch, False)
+        canon = normalize_machine_arch(arch)
+        has_worker = workers_by_arch.get(canon, False)
         if not has_worker:
             continue  # Skip arch with no worker; only create jobs that can run
-        target = await _get_or_create_build_target(db, data.release_id, arch, preferred_mock_environment_id)
+        target = await _get_or_create_build_target(db, data.release_id, canon, preferred_mock_environment_id)
         job = BuildJob(
             package_id=package_id,
             release_id=data.release_id,
@@ -300,10 +310,18 @@ async def trigger_build(
         jobs_created.append(job)
 
     if not jobs_created:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No worker available for any selected architecture. Enroll a worker for at least one selected arch.",
+        req_norm = sorted(
+            {normalize_machine_arch(a) for a in architectures if (a or "").strip()}
         )
+        avail_norm = sorted(workers_by_arch.keys())
+        detail = (
+            "No worker enrolled for any selected architecture. "
+            f"Requested: {', '.join(req_norm) if req_norm else '(none)'}. "
+            f"Workers cover: {', '.join(avail_norm) if avail_norm else '(no workers)'}. "
+            "Enroll a worker for at least one selected arch or fix its architecture field."
+        )
+        logger.warning("build.trigger rejected release_id=%s package_id=%s %s", data.release_id, package_id, detail)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
     for job in jobs_created:
         await log_audit(
             db,
@@ -436,15 +454,15 @@ async def upload_and_trigger(
     workers = list(workers_result.scalars().all())
     workers_by_arch = {}
     for w in workers:
-        arch = (w.architecture or "").strip() or "x86_64"
-        workers_by_arch[arch] = True
+        workers_by_arch[normalize_machine_arch(w.architecture)] = True
 
     jobs_created = []
     for arch in arch_list:
-        has_worker = workers_by_arch.get(arch, False)
+        canon = normalize_machine_arch(arch)
+        has_worker = workers_by_arch.get(canon, False)
         if not has_worker:
             continue  # Skip arch with no worker; only create jobs that can run
-        target = await _get_or_create_build_target(db, release_id, arch, mock_env_id)
+        target = await _get_or_create_build_target(db, release_id, canon, mock_env_id)
         job = BuildJob(
             package_id=pkg.id,
             release_id=release_id,
@@ -469,10 +487,16 @@ async def upload_and_trigger(
             user_agent=get_user_agent(request),
         )
     if not jobs_created:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No worker available for any selected architecture. Enroll a worker for at least one selected arch.",
+        req_norm = sorted({normalize_machine_arch(a) for a in arch_list if (a or "").strip()})
+        avail_norm = sorted(workers_by_arch.keys())
+        detail = (
+            "No worker enrolled for any selected architecture. "
+            f"Requested: {', '.join(req_norm) if req_norm else '(none)'}. "
+            f"Workers cover: {', '.join(avail_norm) if avail_norm else '(no workers)'}. "
+            "Enroll a worker for at least one selected arch or fix its architecture field."
         )
+        logger.warning("build.upload trigger rejected release_id=%s package_id=%s %s", release_id, pkg.id, detail)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
     first = jobs_created[0]
     # Get architecture without touching job.build_target (avoids async lazy-load)
     arch = None

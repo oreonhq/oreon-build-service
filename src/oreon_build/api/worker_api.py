@@ -40,6 +40,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from oreon_build.api.deps import DbSession
 from oreon_build.config import get_settings
+from oreon_build.core.machine_arch import sql_arch_match_values
 from oreon_build.core.repo_branch import r2_publish_branch
 from oreon_build.core.security import verify_worker_token
 from oreon_build.core.audit import log_audit
@@ -177,9 +178,11 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
         .order_by(BuildJob.priority.desc(), BuildJob.created_at.asc())
     )
     if worker_arch:
-        q = q.outerjoin(BuildTarget, BuildJob.target_id == BuildTarget.id).where(
-            (BuildJob.target_id.is_(None)) | (BuildTarget.architecture == worker_arch)
-        )
+        arch_vals = sql_arch_match_values(worker.architecture)
+        if arch_vals:
+            q = q.outerjoin(BuildTarget, BuildJob.target_id == BuildTarget.id).where(
+                (BuildJob.target_id.is_(None)) | (BuildTarget.architecture.in_(arch_vals))
+            )
     # One transaction must not claim the same job row twice (concurrent polls, duplicate worker
     # processes with the same token, or LB retry). Lock the chosen row until commit.
     q = q.limit(1).with_for_update(of=BuildJob, skip_locked=True)
