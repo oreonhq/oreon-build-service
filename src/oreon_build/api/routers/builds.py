@@ -18,7 +18,7 @@ from oreon_build.api.schemas import (
 )
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
 from oreon_build.core.repo_branch import r2_publish_branch
-from oreon_build.models import BuildAttempt, BuildJob, BuildStatus, BuildTarget, Package, Release, Worker
+from oreon_build.models import BuildAttempt, BuildJob, BuildStatus, BuildTarget, Package, Release
 from oreon_build.services.r2 import get_r2_client, upload_r2_key
 
 router = APIRouter(prefix="/builds", tags=["builds"])
@@ -269,21 +269,11 @@ async def trigger_build(
     if not architectures:
         architectures = DEFAULT_ARCHITECTURES
 
-    workers_result = await db.execute(select(Worker))
-    workers = list(workers_result.scalars().all())
-    workers_by_arch: dict[str, bool] = {}
-    for w in workers:
-        arch = (w.architecture or "").strip() or "x86_64"
-        workers_by_arch[arch] = True
-
     jobs_created: list[BuildJob] = []
     for arch in architectures:
         arch = (arch or "").strip()
         if not arch:
             continue
-        has_worker = workers_by_arch.get(arch, False)
-        if not has_worker:
-            continue  # Skip arch with no worker; only create jobs that can run
         target = await _get_or_create_build_target(db, data.release_id, arch, preferred_mock_environment_id)
         job = BuildJob(
             package_id=package_id,
@@ -302,7 +292,7 @@ async def trigger_build(
     if not jobs_created:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No worker available for any selected architecture. Enroll a worker for at least one selected arch.",
+            detail="No build jobs created. Provide at least one non-empty architecture name.",
         )
     for job in jobs_created:
         await log_audit(
@@ -432,18 +422,8 @@ async def upload_and_trigger(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="At least one architecture must be selected.",
         )
-    workers_result = await db.execute(select(Worker))
-    workers = list(workers_result.scalars().all())
-    workers_by_arch = {}
-    for w in workers:
-        arch = (w.architecture or "").strip() or "x86_64"
-        workers_by_arch[arch] = True
-
     jobs_created = []
     for arch in arch_list:
-        has_worker = workers_by_arch.get(arch, False)
-        if not has_worker:
-            continue  # Skip arch with no worker; only create jobs that can run
         target = await _get_or_create_build_target(db, release_id, arch, mock_env_id)
         job = BuildJob(
             package_id=pkg.id,
@@ -471,7 +451,7 @@ async def upload_and_trigger(
     if not jobs_created:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No worker available for any selected architecture. Enroll a worker for at least one selected arch.",
+            detail="No build jobs created. Provide at least one non-empty architecture name.",
         )
     first = jobs_created[0]
     # Get architecture without touching job.build_target (avoids async lazy-load)
