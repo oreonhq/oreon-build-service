@@ -251,7 +251,7 @@ class BuildTrigger(BaseModel):
     release_id: int = Field(..., description="Release to build for")
     architectures: List[str] = Field(
         default=["x86_64", "aarch64"],
-        description="One build job per listed arch; jobs stay pending until a worker for that arch polls",
+        description="Architectures to build for; job per arch; no worker for arch = that job fails",
     )
     package_version_id: Optional[int] = None
     target_id: Optional[int] = None
