@@ -361,8 +361,9 @@
                 sawAlreadyRetried = true;
                 return;
               }
-              markBuildJobRetried(sid);
-              chain = chain.then(function() { return api.post('/builds/jobs/' + sid + '/retry'); });
+              chain = chain.then(function() {
+                return api.post('/builds/jobs/' + sid + '/retry').then(function() { markBuildJobRetried(sid); });
+              });
             });
             if (sawAlreadyRetried) {
               alert(RETRY_ALREADY_MESSAGE);
@@ -438,8 +439,9 @@
                 alert(RETRY_ALREADY_MESSAGE);
                 return;
               }
-              markBuildJobRetried(jid);
-              api.post('/builds/jobs/' + jid + '/retry').then(render).catch(function(e) { alert(e.message); });
+              api.post('/builds/jobs/' + jid + '/retry')
+                .then(function() { markBuildJobRetried(jid); render(); })
+                .catch(function(e) { alert(e.message); });
             });
           });
           tbody.querySelectorAll('.cancel-build').forEach(function(btn) {
