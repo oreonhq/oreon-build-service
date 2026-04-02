@@ -30,13 +30,18 @@ DEFAULT_ARCHITECTURES = ["x86_64", "aarch64"]
 async def _get_or_create_build_target(db: DbSession, release_id: int, architecture: str, mock_environment_id: int | None) -> BuildTarget:
     """Get or create a BuildTarget for (release_id, architecture, mock_environment_id)."""
     from oreon_build.models import MockEnvironment
-    q = select(BuildTarget).where(
-        BuildTarget.release_id == release_id,
-        BuildTarget.architecture == architecture,
-        BuildTarget.mock_environment_id == mock_environment_id,
+    q = (
+        select(BuildTarget)
+        .where(
+            BuildTarget.release_id == release_id,
+            BuildTarget.architecture == architecture,
+            BuildTarget.mock_environment_id == mock_environment_id,
+        )
+        .order_by(BuildTarget.id.asc())
+        .limit(1)
     )
     result = await db.execute(q)
-    target = result.scalar_one_or_none()
+    target = result.scalars().first()
     if target:
         return target
     # Use first mock env for release if none specified
