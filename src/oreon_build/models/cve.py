@@ -68,11 +68,16 @@ class CveMatch(Base):
     summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     recommended_fix: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     severity: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    # First upstream/fixed version OSV records in ranges (hint for backport vs bump decisions).
+    osv_fixed_version: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     is_handled: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="false", index=True)
     handled_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     handled_by_account_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("accounts.id"), nullable=True, index=True
     )
+    # e.g. backport, upstream_bump, false_positive, mitigated, accepted_risk (set via resolve API).
+    handled_reason: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    handled_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     tracked_rpm: Mapped["TrackedRpm"] = relationship("TrackedRpm", back_populates="matches")
