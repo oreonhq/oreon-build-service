@@ -31,7 +31,7 @@ from oreon_build.services.github import get_github_client
 from oreon_build.services.github_push_catchup import upsert_github_push_cursor
 from oreon_build.services.github_push_trigger import (
     apply_github_push,
-    collect_paths_from_webhook_commits,
+    resolve_github_webhook_changed_paths,
 )
 
 router = APIRouter(prefix="/github", tags=["github"])
@@ -83,9 +83,13 @@ async def github_push_webhook(request: Request, db: DbSession) -> dict[str, Any]
         logger.warning("GitHub webhook ignored no_repository_id in payload")
         return {"status": "ignored", "reason": "no_repository_id"}
 
+    if body.get("deleted"):
+        logger.info("GitHub webhook ignored deleted ref")
+        return {"status": "ignored", "reason": "deleted_ref"}
+
     repo_id = int(repo_id)
     push_branch = _push_ref_branch(body)
-    changed_paths = collect_paths_from_webhook_commits(body)
+    changed_paths = await resolve_github_webhook_changed_paths(body, repository)
     result = await apply_github_push(db, repository, repo_id, push_branch, changed_paths, kind="webhook")
 
     after_sha = body.get("after")
