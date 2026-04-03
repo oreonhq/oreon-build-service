@@ -77,6 +77,16 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         return !!(api.token && api.token.length > 0);
       }
 
+      var RESOLVE_REASONS = [
+        { value: '', label: 'Reason (optional)' },
+        { value: 'backport', label: 'Backport / distro patch' },
+        { value: 'upstream_bump', label: 'Upstream version bump' },
+        { value: 'false_positive', label: 'False positive' },
+        { value: 'mitigated', label: 'Mitigated elsewhere' },
+        { value: 'accepted_risk', label: 'Accepted risk' },
+        { value: 'other', label: 'Other' }
+      ];
+
       function renderDetail(ad) {
         actionsEl.innerHTML = '';
         contentEl.innerHTML = '';
@@ -94,32 +104,93 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         var upstream = ad.upstream_url ? '<a href="' + esc(ad.upstream_url) + '" target="_blank" rel="noreferrer">Upstream</a>' : '-';
         var fix = esc(ad.recommended_fix || '-');
         var summary = ad.summary ? esc(ad.summary) : '-';
+        var osvFixed = ad.osv_fixed_version ? esc(ad.osv_fixed_version) : '—';
+        var shipped = esc(ad.package_version || '-');
+        var resolutionBlock = '';
+        if (handled) {
+          resolutionBlock =
+            '<div style="margin-top:0.75rem;" class="form-group">' +
+            '<div><span style="font-weight:600;">Handled as</span>: ' + esc(ad.handled_reason || '—') + '</div>' +
+            (ad.handled_notes ? '<div style="margin-top:0.35rem;"><span style="font-weight:600;">Notes</span><div style="color:var(--text-muted); white-space:pre-wrap;">' + esc(ad.handled_notes) + '</div></div>' : '') +
+            '</div>';
+        }
 
         contentEl.innerHTML =
           '<div class="form-group" style="margin-bottom:0.75rem;">' +
-            '<div><b>Package</b>: ' + esc(ad.package_name || '-') + '</div>' +
-            '<div><b>Version</b>: ' + esc(ad.package_version || '-') + '</div>' +
-            '<div><b>Severity</b>: ' + esc(ad.severity || '-') + '</div>' +
+            '<div><span style="font-weight:600;">Package</span> ' + esc(ad.package_name || '-') + '</div>' +
+            '<div><span style="font-weight:600;">Shipped NEVR</span> ' + shipped + '</div>' +
+            '<div><span style="font-weight:600;">Fixed version hint</span> ' + osvFixed + '</div>' +
+            '<div style="margin-top:0.35rem; color:var(--text-muted); font-size:0.88rem;">If your release is patched but the version string is below the upstream fixed version, resolve this row as backport and describe the fix in notes.</div>' +
+            '<div><span style="font-weight:600;">Severity</span> ' + esc(ad.severity || '-') + '</div>' +
           '</div>' +
-          '<div><b>Summary</b><div style="color:var(--text-muted); white-space:pre-wrap; margin-top:0.25rem;">' + summary + '</div></div>' +
-          '<div style="margin-top:0.75rem;"><b>Upstream</b>: ' + upstream + '</div>' +
-          '<div style="margin-top:0.75rem;"><b>Recommended fix</b>: ' + fix + '</div>' +
-          '<div style="margin-top:0.75rem;"><b>Affected Oreon releases</b>: ' + esc(releases || '-') + '</div>';
+          '<div><span style="font-weight:600;">Summary</span><div style="color:var(--text-muted); white-space:pre-wrap; margin-top:0.25rem;">' + summary + '</div></div>' +
+          '<div style="margin-top:0.75rem;"><span style="font-weight:600;">Upstream</span> ' + upstream + '</div>' +
+          '<div style="margin-top:0.75rem;"><span style="font-weight:600;">Recommended fix</span> ' + fix + '</div>' +
+          '<div style="margin-top:0.75rem;"><span style="font-weight:600;">Affected Oreon releases</span> ' + esc(releases || '-') + '</div>' +
+          resolutionBlock;
 
         if (!handled && isAdmin()) {
+          var wrap = document.createElement('div');
+          wrap.className = 'form-group';
+          wrap.style.marginTop = '0.75rem';
+          var sel = document.createElement('select');
+          sel.className = 'form-control';
+          sel.id = 'cve-resolve-reason';
+          RESOLVE_REASONS.forEach(function(opt) {
+            var o = document.createElement('option');
+            o.value = opt.value;
+            o.textContent = opt.label;
+            sel.appendChild(o);
+          });
+          var ta = document.createElement('textarea');
+          ta.className = 'form-control';
+          ta.id = 'cve-resolve-notes';
+          ta.rows = 3;
+          ta.placeholder = 'e.g. RHSA-… backport, commit hash, or why this is a false positive';
           var btn = document.createElement('button');
           btn.type = 'button';
           btn.className = 'btn primary';
-          btn.textContent = 'Resolve';
+          btn.textContent = 'Mark resolved';
+          var statusLine = document.createElement('div');
+          statusLine.style.color = 'var(--text-muted)';
+          statusLine.style.marginTop = '0.5rem';
           btn.addEventListener('click', function() {
-            actionsEl.innerHTML = '<span style="color:var(--text-muted);">Resolving…</span>';
-            api.post('/security/advisories/cve/' + ad.id + '/resolve', {}).then(function() {
+            var body = {};
+            var rv = (sel.value || '').trim();
+            if (rv) body.reason = rv;
+            var nv = (ta.value || '').trim();
+            if (nv) body.notes = nv;
+            btn.disabled = true;
+            sel.disabled = true;
+            ta.disabled = true;
+            statusLine.textContent = 'Saving…';
+            api.post('/security/advisories/cve/' + ad.id + '/resolve', body).then(function() {
               load();
             }).catch(function(e) {
-              actionsEl.innerHTML = '<span style="color:var(--text-muted);">Resolve failed: ' + esc(e.message || e) + '</span>';
+              btn.disabled = false;
+              sel.disabled = false;
+              ta.disabled = false;
+              statusLine.textContent = 'Resolve failed: ' + (e.message || e);
             });
           });
-          actionsEl.appendChild(btn);
+          var lbl1 = document.createElement('label');
+          lbl1.textContent = 'Resolution';
+          lbl1.style.display = 'block';
+          lbl1.style.marginBottom = '0.35rem';
+          var lbl2 = document.createElement('label');
+          lbl2.textContent = 'Notes (optional)';
+          lbl2.style.display = 'block';
+          lbl2.style.marginTop = '0.5rem';
+          lbl2.style.marginBottom = '0.35rem';
+          wrap.appendChild(lbl1);
+          wrap.appendChild(sel);
+          wrap.appendChild(lbl2);
+          wrap.appendChild(ta);
+          wrap.appendChild(document.createElement('br'));
+          wrap.appendChild(btn);
+          statusLine.style.minHeight = '1.25rem';
+          wrap.appendChild(statusLine);
+          actionsEl.appendChild(wrap);
         }
       }
 
