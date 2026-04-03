@@ -103,10 +103,12 @@ class Settings(BaseSettings):
         default=30,
         ge=1,
         le=1440,
-        description="How often Watchdog triggers a CVE scan run (OSV work is still gated by per-RPM cooldown).",
+        description="How often Watchdog refreshes the tracked RPM inventory from build artifacts (no external CVE APIs).",
     )
-    cve_scan_cooldown_hours: int = Field(default=24, ge=1, le=168, description="Cooldown for re-querying OSV per RPM")
-    cve_scan_max_per_run: int = Field(default=50, ge=1, le=500, description="Max tracked RPMs to query per scan run")
+    cve_scan_omit_subpackage_suffixes: str = Field(
+        default="debuginfo,debugsource,doc,help,static",
+        description="Comma-separated name suffixes to skip (e.g. foo-debuginfo). Empty string disables.",
+    )
 
     # Signing (controller only — workers upload unsigned RPMs; controller signs then pushes to R2)
     signing_key_id: Optional[str] = Field(default=None)
