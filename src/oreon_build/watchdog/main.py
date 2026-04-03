@@ -548,7 +548,6 @@ def create_app() -> FastAPI:
             "r2_env_configured": r2_configured,
             "advisory_source": "manual_and_legacy_db_only",
             "cve_scan_interval_minutes": int(getattr(s, "cve_scan_interval_minutes", 30) or 30),
-            "hint": "Watchdog does not call OSV, NVD, or R2 for CVEs. New advisories are custom entries you create. cve_match_row_count may be legacy rows from older runs. If tracked_rpm_row_count is 0 but you expect packages, confirm this process uses the same database as the build API.",
         }
         return JSONResponse(content=content)
 
@@ -561,7 +560,6 @@ def create_app() -> FastAPI:
     ):
         """
         RPM name plus version-release from build artifacts (refreshed on the Watchdog schedule).
-        CVE-style rows in the advisories list are only from the database (legacy or future imports), not live OSV/NVD.
         """
         from sqlalchemy import func, select
 

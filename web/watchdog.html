@@ -337,15 +337,37 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         api.get('/security/releases').then(function(res) {
           var sel = document.getElementById('advisories-release-id');
           if (!sel) return;
+          var prev = sel.value;
           var items = (res && res.items) ? res.items : [];
-          items.forEach(function(r) {
+          var seenId = {};
+          var seenName = {};
+          var deduped = [];
+          for (var i = 0; i < items.length; i++) {
+            var r = items[i];
+            var idStr = String(r.id);
+            var nameKey = ((r.releasename || '') + '').trim().toLowerCase();
+            if (!nameKey || seenId[idStr] || seenName[nameKey]) continue;
+            seenId[idStr] = true;
+            seenName[nameKey] = true;
+            deduped.push(r);
+          }
+          sel.innerHTML = '';
+          sel.appendChild(new Option('All releases', ''));
+          deduped.forEach(function(r) {
             sel.appendChild(new Option(r.releasename, r.id));
           });
+          if (prev) {
+            var ok = false;
+            for (var j = 0; j < sel.options.length; j++) {
+              if (sel.options[j].value === prev) { ok = true; break; }
+            }
+            if (ok) sel.value = prev;
+          }
 
           var multi = document.getElementById('custom-advisory-releases');
           if (multi) {
             multi.innerHTML = '';
-            items.forEach(function(r) {
+            deduped.forEach(function(r) {
               multi.appendChild(new Option(r.releasename, r.id));
             });
           }
