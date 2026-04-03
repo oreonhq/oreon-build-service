@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 
 from oreon_build.utils.spec import name_from_srpm_filename, parse_spec_content
 from sqlalchemy import String, cast, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from oreon_build.api.deps import CurrentUser, DbSession
@@ -58,12 +59,28 @@ async def _has_successful_build_for_target(
 async def _get_or_create_build_target(db: DbSession, release_id: int, architecture: str, mock_environment_id: int | None) -> BuildTarget:
     """Get or create a BuildTarget for (release_id, architecture, mock_environment_id)."""
     from oreon_build.models import MockEnvironment
+
+    # Resolve default mock *before* lookup. If we only queried mock_environment_id == None here and
+    # then fell back to mock id 1, we would miss an existing (release, arch, mock=1) row and hit
+    # uq_build_targets_release_arch_mock_nonnull on insert.
+    mock_env_id = mock_environment_id
+    if mock_env_id is None:
+        fb = await db.execute(
+            select(MockEnvironment)
+            .where(MockEnvironment.release_id == release_id)
+            .order_by(MockEnvironment.id.asc())
+            .limit(1)
+        )
+        me = fb.scalar_one_or_none()
+        if me:
+            mock_env_id = me.id
+
     q = (
         select(BuildTarget)
         .where(
             BuildTarget.release_id == release_id,
             BuildTarget.architecture == architecture,
-            BuildTarget.mock_environment_id == mock_environment_id,
+            BuildTarget.mock_environment_id == mock_env_id,
         )
         .order_by(BuildTarget.id.asc())
         .limit(1)
@@ -72,23 +89,24 @@ async def _get_or_create_build_target(db: DbSession, release_id: int, architectu
     target = result.scalars().first()
     if target:
         return target
-    # Use first mock env for release if none specified
-    mock_env_id = mock_environment_id
-    if mock_env_id is None:
-        fallback = await db.execute(
-            select(MockEnvironment).where(MockEnvironment.release_id == release_id).limit(1)
-        )
-        me = fallback.scalar_one_or_none()
-        if me:
-            mock_env_id = me.id
-    target = BuildTarget(
+
+    created = BuildTarget(
         release_id=release_id,
         architecture=architecture,
         mock_environment_id=mock_env_id,
     )
-    db.add(target)
-    await db.flush()
-    return target
+    db.add(created)
+    try:
+        async with db.begin_nested():
+            await db.flush()
+    except IntegrityError:
+        db.expunge(created)
+        again = await db.execute(q)
+        found = again.scalars().first()
+        if found:
+            return found
+        raise
+    return created
 
 
 def _build_job_search_clause(search_trim: str):

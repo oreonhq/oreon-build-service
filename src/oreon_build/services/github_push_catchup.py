@@ -316,6 +316,11 @@ async def run_github_push_catchup(db: AsyncSession) -> dict[str, Any]:
             except Exception as e:
                 logger.exception("GitHub catch-up pair failed repo_id=%s branch=%s", repository_id, branch)
                 summary["errors"].append(f"{repository_id}@{branch}: {e}")
+                # Swallowed errors can leave the async session needing a rollback before commit().
+                try:
+                    await db.rollback()
+                except Exception:
+                    logger.exception("GitHub catch-up rollback after pair failure failed")
 
         logger.info("GitHub push catch-up summary %s", summary)
         out: dict[str, Any] = {"status": "ok"}
