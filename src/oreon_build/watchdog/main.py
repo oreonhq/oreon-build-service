@@ -22,7 +22,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Body, Depends, FastAPI, Query, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -31,6 +31,7 @@ from oreon_build.db.session import init_db, async_session_maker
 from oreon_build.core.auth import require_admin, require_account
 from oreon_build.api.routers.auth import router as auth_router
 from oreon_build.models import (
+    Artifact,
     CveMatch,
     CveMatchRelease,
     Release,
@@ -38,11 +39,37 @@ from oreon_build.models import (
     SecurityAdvisoryRelease,
     TrackedRpm,
 )
+from oreon_build.config import get_settings as get_app_settings
 from oreon_build.services.discord import send_security_discord_embed
+from oreon_build.watchdog.package_names import (
+    parse_omit_subpackage_suffixes,
+    tracked_rpm_not_subpackage_predicate,
+)
 
 from .scanner import scan_cves_once
 
 logger = logging.getLogger(__name__)
+
+
+CVE_RESOLVE_REASONS = frozenset(
+    {"backport", "upstream_bump", "false_positive", "mitigated", "accepted_risk", "other"}
+)
+
+
+def _configure_watchdog_logging() -> None:
+    root = logging.getLogger("oreon_build")
+    root.setLevel(logging.INFO)
+    if not root.handlers:
+        h = logging.StreamHandler()
+        h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s"))
+        root.addHandler(h)
+    root.propagate = False
+
+
+class CveResolveBody(BaseModel):
+    """Optional metadata when marking a CVE row handled (e.g. distro backport)."""
+    reason: str | None = Field(None, max_length=32)
+    notes: str | None = Field(None, max_length=4000)
 
 
 class CustomAdvisoryCreate(BaseModel):
@@ -70,35 +97,40 @@ def _dt_to_iso(dt) -> str | None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    _configure_watchdog_logging()
 
-    # Kick off a background scan once at startup. The scan is idempotent.
     from oreon_build.config import get_settings
 
     settings = get_settings()
     interval_s = max(60, int(getattr(settings, "cve_scan_interval_minutes", 30) * 60))
-    scan_lock = asyncio.Lock()
+    app.state.scan_lock = asyncio.Lock()
 
-    async def _startup_scan() -> None:
+    async def _run_scan(reason: str) -> None:
         try:
-            await scan_cves_once()
+            async with app.state.scan_lock:
+                logger.info("Watchdog inventory sync started reason=%s", reason)
+                await scan_cves_once()
+                logger.info("Watchdog inventory sync finished reason=%s", reason)
         except Exception:
-            logger.exception("Watchdog startup scan failed")
+            logger.exception("Watchdog inventory sync failed reason=%s", reason)
 
     async def _periodic_loop() -> None:
-        # Run forever; FastAPI lifespan keeps this background task alive.
+        # Guaranteed startup scan followed by interval scans.
+        await _run_scan("startup")
         while True:
-            try:
-                async with scan_lock:
-                    await scan_cves_once()
-            except Exception:
-                logger.exception("Watchdog periodic CVE scan failed")
             await asyncio.sleep(interval_s)
+            await _run_scan("schedule")
 
-    # Startup scan first, then periodic.
-    asyncio.create_task(_startup_scan())
-    asyncio.create_task(_periodic_loop())
+    periodic_task = asyncio.create_task(_periodic_loop())
 
-    yield
+    try:
+        yield
+    finally:
+        periodic_task.cancel()
+        try:
+            await periodic_task
+        except asyncio.CancelledError:
+            pass
 
 
 def create_app() -> FastAPI:
@@ -130,13 +162,17 @@ def create_app() -> FastAPI:
     async def list_advisories(
         release_id: int | None = Query(None),
         package_name: str | None = Query(None),
-        limit: int = Query(25, ge=1, le=100),
+        omit_subpackages: bool = Query(True),
+        limit: int = Query(25, ge=1, le=500),
         offset: int = Query(0, ge=0),
     ):
         from datetime import datetime, timezone
         from sqlalchemy import and_, func, select
 
         k = offset + limit
+        st = get_app_settings()
+        sp_suf = parse_omit_subpackage_suffixes(str(st.cve_scan_omit_subpackage_suffixes or ""))
+        sp_pred = tracked_rpm_not_subpackage_predicate(sp_suf) if omit_subpackages and sp_suf else None
 
         async with async_session_maker() as db:
             # ---- totals (distinct IDs to avoid duplicates from joins)
@@ -151,6 +187,8 @@ def create_app() -> FastAPI:
                 )
             if package_name:
                 cve_count_q = cve_count_q.where(TrackedRpm.package_name == package_name)
+            if sp_pred is not None:
+                cve_count_q = cve_count_q.where(sp_pred)
 
             custom_count_q = select(func.count(func.distinct(SecurityAdvisory.id))).select_from(SecurityAdvisory)
             if release_id is not None:
@@ -175,6 +213,9 @@ def create_app() -> FastAPI:
                     CveMatch.summary,
                     CveMatch.severity,
                     CveMatch.is_handled,
+                    CveMatch.osv_fixed_version,
+                    CveMatch.handled_reason,
+                    CveMatch.handled_notes,
                     TrackedRpm.package_name,
                     TrackedRpm.rpm_version,
                     TrackedRpm.rpm_release,
@@ -187,6 +228,8 @@ def create_app() -> FastAPI:
                 )
             if package_name:
                 cve_q = cve_q.where(TrackedRpm.package_name == package_name)
+            if sp_pred is not None:
+                cve_q = cve_q.where(sp_pred)
 
             cve_q = cve_q.order_by(CveMatch.created_at.desc()).limit(k)
             cve_rows = (await db.execute(cve_q)).all()
@@ -265,6 +308,9 @@ def create_app() -> FastAPI:
                 summary,
                 severity,
                 is_handled,
+                osv_fixed_version,
+                handled_reason,
+                handled_notes,
                 pkg_name,
                 rpm_ver,
                 rpm_rel,
@@ -287,6 +333,9 @@ def create_app() -> FastAPI:
                         "severity": severity,
                         "affected_releases": affected,
                         "is_handled": bool(is_handled),
+                        "osv_fixed_version": osv_fixed_version,
+                        "handled_reason": handled_reason,
+                        "handled_notes": handled_notes,
                         "_created_at": created_at or datetime.now(timezone.utc),
                     }
                 )
@@ -352,14 +401,239 @@ def create_app() -> FastAPI:
                 }
             )
 
+    @app.get("/api/security/summary")
+    async def security_summary(
+        release_id: int | None = Query(None),
+        package_name: str | None = Query(None),
+        omit_subpackages: bool = Query(True),
+    ):
+        """Counts for the dashboard header row (respects the same filters as the tables)."""
+        from sqlalchemy import func, select
+
+        st = get_app_settings()
+        sp_suf = parse_omit_subpackage_suffixes(str(st.cve_scan_omit_subpackage_suffixes or ""))
+        sp_pred = tracked_rpm_not_subpackage_predicate(sp_suf) if omit_subpackages and sp_suf else None
+
+        async with async_session_maker() as db:
+
+            def cve_match_count_q(*, open_only: bool):
+                q = (
+                    select(func.count(func.distinct(CveMatch.id)))
+                    .select_from(CveMatch)
+                    .join(TrackedRpm, CveMatch.tracked_rpm_id == TrackedRpm.id)
+                )
+                if open_only:
+                    q = q.where(CveMatch.is_handled.is_(False))
+                if release_id is not None:
+                    q = q.join(CveMatchRelease, CveMatchRelease.cve_match_id == CveMatch.id).where(
+                        CveMatchRelease.release_id == release_id
+                    )
+                if package_name:
+                    q = q.where(TrackedRpm.package_name == package_name)
+                if sp_pred is not None:
+                    q = q.where(sp_pred)
+                return q
+
+            open_cve = int((await db.execute(cve_match_count_q(open_only=True))).scalar() or 0)
+            total_cve = int((await db.execute(cve_match_count_q(open_only=False))).scalar() or 0)
+
+            custom_q = (
+                select(func.count(func.distinct(SecurityAdvisory.id)))
+                .select_from(SecurityAdvisory)
+                .where(SecurityAdvisory.is_handled.is_(False))
+            )
+            if release_id is not None:
+                custom_q = custom_q.join(
+                    SecurityAdvisoryRelease, SecurityAdvisoryRelease.advisory_id == SecurityAdvisory.id
+                ).where(SecurityAdvisoryRelease.release_id == release_id)
+            if package_name:
+                custom_q = custom_q.where(SecurityAdvisory.package_name == package_name)
+            open_custom = int((await db.execute(custom_q)).scalar() or 0)
+
+            monitored_q = select(func.count()).select_from(TrackedRpm)
+            if package_name:
+                monitored_q = monitored_q.where(TrackedRpm.package_name == package_name)
+            if sp_pred is not None:
+                monitored_q = monitored_q.where(sp_pred)
+            monitored = int((await db.execute(monitored_q)).scalar() or 0)
+
+        return JSONResponse(
+            content={
+                "open_cve_match_count": open_cve,
+                "total_cve_match_count": total_cve,
+                "open_custom_advisory_count": open_custom,
+                "monitored_rpm_count": monitored,
+            }
+        )
+
+    @app.get("/api/security/diagnostics")
+    async def security_diagnostics(_admin=Depends(require_admin)):
+        """
+        Table row counts and R2 config flags so you can tell an empty UI from a wrong DATABASE_URL
+        or a separate empty Postgres instance.
+        """
+        from sqlalchemy import func, not_, select
+        from urllib.parse import urlparse
+
+        s = get_app_settings()
+        parsed = urlparse(str(s.database_url).replace("+asyncpg", ""))
+        db_host = parsed.hostname or "?"
+        db_name = (parsed.path or "").lstrip("/") or "?"
+
+        r2_configured = bool(
+            (s.r2_endpoint_url or "").strip()
+            and (s.r2_bucket_name or "").strip()
+            and (s.r2_access_key_id or "").strip()
+            and (s.r2_secret_access_key or "").strip()
+        )
+
+        async with async_session_maker() as db:
+            n_rel = int((await db.execute(select(func.count()).select_from(Release))).scalar() or 0)
+            n_tr = int((await db.execute(select(func.count()).select_from(TrackedRpm))).scalar() or 0)
+            n_cve = int((await db.execute(select(func.count()).select_from(CveMatch))).scalar() or 0)
+            n_art_rpm = int(
+                (
+                    await db.execute(
+                        select(func.count())
+                        .select_from(Artifact)
+                        .where(
+                            Artifact.kind == "rpm",
+                            Artifact.filename.like("%.rpm"),
+                            not_(Artifact.filename.like("%.src.rpm")),
+                        )
+                    )
+                ).scalar()
+                or 0
+            )
+            n_art_rpms_key = int(
+                (
+                    await db.execute(
+                        select(func.count())
+                        .select_from(Artifact)
+                        .where(
+                            Artifact.kind == "rpm",
+                            Artifact.filename.like("%.rpm"),
+                            not_(Artifact.filename.like("%.src.rpm")),
+                            Artifact.r2_key.like("%/RPMS/%"),
+                        )
+                    )
+                ).scalar()
+                or 0
+            )
+            n_art_builds_key = int(
+                (
+                    await db.execute(
+                        select(func.count())
+                        .select_from(Artifact)
+                        .where(
+                            Artifact.kind == "rpm",
+                            Artifact.filename.like("%.rpm"),
+                            not_(Artifact.filename.like("%.src.rpm")),
+                            Artifact.r2_key.like("%/builds/%"),
+                        )
+                    )
+                ).scalar()
+                or 0
+            )
+
+        content = {
+            "database_host": db_host,
+            "database_name": db_name,
+            "release_row_count": n_rel,
+            "tracked_rpm_row_count": n_tr,
+            "cve_match_row_count": n_cve,
+            "artifact_rpm_row_count": n_art_rpm,
+            "artifact_rpm_r2_key_contains_rpms": n_art_rpms_key,
+            "artifact_rpm_r2_key_contains_builds": n_art_builds_key,
+            "r2_env_configured": r2_configured,
+            "advisory_source": "manual_and_legacy_db_only",
+            "cve_scan_interval_minutes": int(getattr(s, "cve_scan_interval_minutes", 30) or 30),
+            "hint": "Watchdog does not call OSV, NVD, or R2 for CVEs. New advisories are custom entries you create. cve_match_row_count may be legacy rows from older runs. If tracked_rpm_row_count is 0 but you expect packages, confirm this process uses the same database as the build API.",
+        }
+        return JSONResponse(content=content)
+
+    @app.get("/api/security/tracked-packages")
+    async def list_tracked_packages(
+        package_name: str | None = Query(None),
+        omit_subpackages: bool = Query(True),
+        limit: int = Query(200, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+    ):
+        """
+        RPM name plus version-release from build artifacts (refreshed on the Watchdog schedule).
+        CVE-style rows in the advisories list are only from the database (legacy or future imports), not live OSV/NVD.
+        """
+        from sqlalchemy import func, select
+
+        st = get_app_settings()
+        sp_suf = parse_omit_subpackage_suffixes(str(st.cve_scan_omit_subpackage_suffixes or ""))
+        sp_pred = tracked_rpm_not_subpackage_predicate(sp_suf) if omit_subpackages and sp_suf else None
+
+        cve_n = (
+            select(func.count(CveMatch.id))
+            .where(CveMatch.tracked_rpm_id == TrackedRpm.id)
+            .scalar_subquery()
+        )
+        open_n = (
+            select(func.count(CveMatch.id))
+            .where(CveMatch.tracked_rpm_id == TrackedRpm.id, CveMatch.is_handled.is_(False))
+            .scalar_subquery()
+        )
+
+        async with async_session_maker() as db:
+            total_q = select(func.count()).select_from(TrackedRpm)
+            if package_name:
+                total_q = total_q.where(TrackedRpm.package_name == package_name)
+            if sp_pred is not None:
+                total_q = total_q.where(sp_pred)
+            total = int((await db.execute(total_q)).scalar() or 0)
+
+            q = select(
+                TrackedRpm.id,
+                TrackedRpm.package_name,
+                TrackedRpm.rpm_version,
+                TrackedRpm.rpm_release,
+                TrackedRpm.last_checked_at,
+                cve_n.label("cve_match_count"),
+                open_n.label("open_cve_match_count"),
+            )
+            if package_name:
+                q = q.where(TrackedRpm.package_name == package_name)
+            if sp_pred is not None:
+                q = q.where(sp_pred)
+            q = q.order_by(TrackedRpm.package_name, TrackedRpm.rpm_version, TrackedRpm.rpm_release).offset(
+                offset
+            ).limit(limit)
+            rows = (await db.execute(q)).all()
+
+        items = [
+            {
+                "id": int(rid),
+                "package_name": pn,
+                "package_version": f"{rv}-{rr}" if rv and rr else None,
+                "last_checked_at": _dt_to_iso(lat),
+                "cve_match_count": int(cve_c or 0),
+                "open_cve_match_count": int(open_c or 0),
+            }
+            for rid, pn, rv, rr, lat, cve_c, open_c in rows
+        ]
+        return JSONResponse(content={"items": items, "total": total})
+
     @app.post("/api/security/scan")
     async def trigger_scan(_account=Depends(require_admin)):
         # Fire-and-forget scan; return immediately.
         async def _run():
             try:
-                await scan_cves_once()
+                lock = getattr(app.state, "scan_lock", None)
+                if lock is None:
+                    await scan_cves_once()
+                    return
+                async with lock:
+                    logger.info("Watchdog inventory sync started reason=manual")
+                    await scan_cves_once()
+                    logger.info("Watchdog inventory sync finished reason=manual")
             except Exception:
-                logger.exception("Manual CVE scan failed")
+                logger.exception("Manual inventory sync failed")
 
         asyncio.create_task(_run())
         return JSONResponse(content={"ok": True})
@@ -381,6 +655,9 @@ def create_app() -> FastAPI:
                     CveMatch.is_handled,
                     CveMatch.handled_at,
                     CveMatch.handled_by_account_id,
+                    CveMatch.osv_fixed_version,
+                    CveMatch.handled_reason,
+                    CveMatch.handled_notes,
                     TrackedRpm.package_name,
                     TrackedRpm.rpm_version,
                     TrackedRpm.rpm_release,
@@ -403,6 +680,9 @@ def create_app() -> FastAPI:
                 is_handled,
                 handled_at,
                 handled_by_account_id,
+                osv_fixed_version,
+                handled_reason,
+                handled_notes,
                 pkg_name,
                 rpm_ver,
                 rpm_rel,
@@ -439,6 +719,9 @@ def create_app() -> FastAPI:
                     "is_handled": bool(is_handled),
                     "handled_at": _dt_to_iso(handled_at),
                     "handled_by_account_id": handled_by_account_id,
+                    "osv_fixed_version": osv_fixed_version,
+                    "handled_reason": handled_reason,
+                    "handled_notes": handled_notes,
                 }
             )
 
@@ -594,9 +877,23 @@ def create_app() -> FastAPI:
             return JSONResponse(content={"ok": True, "id": adv.id})
 
     @app.post("/api/security/advisories/cve/{cve_match_id}/resolve")
-    async def resolve_cve_advisory(cve_match_id: int, admin=Depends(require_admin)):
+    async def resolve_cve_advisory(
+        cve_match_id: int,
+        payload: CveResolveBody | None = Body(default=None),
+        admin=Depends(require_admin),
+    ):
         from datetime import datetime, timezone
         from sqlalchemy import select
+
+        reason = (payload.reason or "").strip() if payload else ""
+        notes = (payload.notes or "").strip() if payload else ""
+        if reason and reason not in CVE_RESOLVE_REASONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"reason must be one of: {', '.join(sorted(CVE_RESOLVE_REASONS))}",
+            )
+        reason_val = reason or None
+        notes_val = notes or None
 
         async with async_session_maker() as db:
             q = select(CveMatch).where(CveMatch.id == cve_match_id)
@@ -609,6 +906,8 @@ def create_app() -> FastAPI:
             m.is_handled = True
             m.handled_at = datetime.now(timezone.utc)
             m.handled_by_account_id = admin.id
+            m.handled_reason = reason_val
+            m.handled_notes = notes_val
             await db.commit()
             return JSONResponse(content={"ok": True})
 
