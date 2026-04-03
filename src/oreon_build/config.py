@@ -54,6 +54,13 @@ class Settings(BaseSettings):
     r2_bucket_name: str = Field(default="oreon-repos")
     r2_endpoint_url: str = Field(default="")
     r2_public_url: Optional[str] = Field(default=None)
+    oreon_repo_tmpdir: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional directory for createrepo temp dirs during R2 repodata refresh "
+            "(avoids filling /tmp). Same as env OREON_REPO_TMPDIR."
+        ),
+    )
 
     # GitHub (API + webhooks)
     github_api_url: str = Field(default="https://api.github.com", description="GitHub REST API base URL")
