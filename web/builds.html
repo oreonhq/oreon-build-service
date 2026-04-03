@@ -502,7 +502,7 @@
             render();
             var jobs = Array.isArray(data) ? data : (data ? [data] : []);
             if (jobs.length) alert('Builds triggered for ' + jobs.length + ' architecture(s).');
-            else alert('Build triggered.');
+            else alert('No new jobs queued. Every selected architecture that has a worker already has a successful build for this package and release.');
           })
           .catch(function(e) { alert('Failed: ' + e.message); });
       });
@@ -524,7 +524,12 @@
             else if (urls.length > 1) { newPackage.source_url = urls[0]; newPackage.source_urls = urls; }
           }
           api.post('/builds/trigger', { new_package: newPackage, release_id: selectedReleaseIdNew, architectures: arches })
-            .then(function() { render(); alert('Build triggered.'); })
+            .then(function(data) {
+              render();
+              var jobs = Array.isArray(data) ? data : (data ? [data] : []);
+              if (jobs.length) alert('Build triggered for ' + jobs.length + ' architecture(s).');
+              else alert('No new jobs queued. All selected arches already built for this package and release.');
+            })
             .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
         } else if (currentSourceType === 'upload') {
           var files = document.getElementById('source-upload-files') && document.getElementById('source-upload-files').files;
@@ -566,7 +571,12 @@
           var b = (document.getElementById('source-scm-branch') && document.getElementById('source-scm-branch').value || '').trim();
           if (b) newPackage.source_branch = b;
           api.post('/builds/trigger', { new_package: newPackage, release_id: selectedReleaseIdNew, architectures: arches })
-            .then(function() { render(); alert('Package created and build triggered.'); })
+            .then(function(data) {
+              render();
+              var jobs = Array.isArray(data) ? data : (data ? [data] : []);
+              if (jobs.length) alert('Build triggered for ' + jobs.length + ' architecture(s).');
+              else alert('No new jobs queued. All selected arches already built for this package and release.');
+            })
             .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
         } else if (currentSourceType === 'distgit') {
           var pkgsRaw = (document.getElementById('distgit-packages') && document.getElementById('distgit-packages').value) || '';
@@ -600,7 +610,10 @@
               body = { new_package: np, release_id: selectedReleaseIdNew, architectures: arches };
             }
             return api.post('/builds/trigger', body)
-              .then(function() { return { ok: true, name: pkgName, existing: existingId != null }; })
+              .then(function(data) {
+                var jobs = Array.isArray(data) ? data : (data ? [data] : []);
+                return { ok: true, name: pkgName, existing: existingId != null, jobCount: jobs.length };
+              })
               .catch(function(e) {
                 console.error('DistGit trigger failed for package', pkgName, e);
                 return { ok: false, name: pkgName, err: (e && e.message) ? e.message : String(e) };
@@ -609,15 +622,20 @@
           Promise.all(tasks).then(function(results) {
             render();
             var bad = (results || []).filter(function(r) { return r && !r.ok; });
-            var okExisting = (results || []).filter(function(r) { return r && r.ok && r.existing; }).length;
-            var okNew = (results || []).filter(function(r) { return r && r.ok && !r.existing; }).length;
+            var okRows = (results || []).filter(function(r) { return r && r.ok; });
+            var okExisting = okRows.filter(function(r) { return r.existing; }).length;
+            var okNew = okRows.filter(function(r) { return !r.existing; }).length;
+            var jobsQueued = okRows.reduce(function(n, r) { return n + (r.jobCount || 0); }, 0);
+            var allSkipped = okRows.length && okRows.every(function(r) { return (r.jobCount || 0) === 0; });
             if (bad.length) {
               alert('Some DistGit triggers failed (' + bad.length + '/' + pkgNames.length + '):\n' +
                 bad.map(function(b) { return b.name + ': ' + (b.err || 'error'); }).join('\n'));
             } else {
               var parts = [];
-              if (okExisting) parts.push(okExisting + ' existing package(s) queued for selected arch(es)');
-              if (okNew) parts.push(okNew + ' new package(s) created and queued');
+              if (okExisting) parts.push(okExisting + ' existing package trigger(s) finished');
+              if (okNew) parts.push(okNew + ' new package(s) created');
+              if (jobsQueued) parts.push(jobsQueued + ' build job(s) queued');
+              if (allSkipped) parts.push('no new jobs (all requested arches already built where applicable)');
               alert(parts.length ? parts.join('. ') + '.' : 'Trigger requested for ' + pkgNames.length + ' DistGit package(s).');
             }
           });

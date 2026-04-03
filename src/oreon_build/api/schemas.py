@@ -256,6 +256,13 @@ class BuildTrigger(BaseModel):
     package_version_id: Optional[int] = None
     target_id: Optional[int] = None
     priority: int = 0
+    skip_complete_arches: bool = Field(
+        default=True,
+        description=(
+            "If true, do not queue an arch when a successful job already exists for this package, "
+            "release, and resolved mock target. Missing arches still queue. Retries use POST /builds/jobs/{id}/retry."
+        ),
+    )
 
     @model_validator(mode="after")
     def require_package_or_new(self):

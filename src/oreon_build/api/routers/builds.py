@@ -31,6 +31,30 @@ logger = logging.getLogger(__name__)
 DEFAULT_ARCHITECTURES = ["x86_64", "aarch64"]
 
 
+async def _has_successful_build_for_target(
+    db: DbSession,
+    package_id: int,
+    release_id: int,
+    target_id: int,
+    package_version_id: int | None,
+) -> bool:
+    """True if there is already a successful job for this package, release, and build target."""
+    q = (
+        select(BuildJob.id)
+        .where(
+            BuildJob.package_id == package_id,
+            BuildJob.release_id == release_id,
+            BuildJob.target_id == target_id,
+            BuildJob.status == BuildStatus.SUCCESS,
+        )
+        .limit(1)
+    )
+    if package_version_id is not None:
+        q = q.where(BuildJob.package_version_id == package_version_id)
+    r = await db.execute(q)
+    return r.scalar_one_or_none() is not None
+
+
 async def _get_or_create_build_target(db: DbSession, release_id: int, architecture: str, mock_environment_id: int | None) -> BuildTarget:
     """Get or create a BuildTarget for (release_id, architecture, mock_environment_id)."""
     from oreon_build.models import MockEnvironment
@@ -286,6 +310,7 @@ async def trigger_build(
         workers_by_arch[normalize_machine_arch(w.architecture)] = True
 
     jobs_created: list[BuildJob] = []
+    saw_worker_for_requested = False
     for arch in architectures:
         arch = (arch or "").strip()
         if not arch:
@@ -294,7 +319,12 @@ async def trigger_build(
         has_worker = workers_by_arch.get(canon, False)
         if not has_worker:
             continue  # Skip arch with no worker; only create jobs that can run
+        saw_worker_for_requested = True
         target = await _get_or_create_build_target(db, data.release_id, canon, preferred_mock_environment_id)
+        if data.skip_complete_arches and await _has_successful_build_for_target(
+            db, package_id, data.release_id, target.id, package_version_id
+        ):
+            continue
         job = BuildJob(
             package_id=package_id,
             release_id=data.release_id,
@@ -314,14 +344,21 @@ async def trigger_build(
             {normalize_machine_arch(a) for a in architectures if (a or "").strip()}
         )
         avail_norm = sorted(workers_by_arch.keys())
-        detail = (
-            "No worker enrolled for any selected architecture. "
-            f"Requested: {', '.join(req_norm) if req_norm else '(none)'}. "
-            f"Workers cover: {', '.join(avail_norm) if avail_norm else '(no workers)'}. "
-            "Enroll a worker for at least one selected arch or fix its architecture field."
+        if not saw_worker_for_requested:
+            detail = (
+                "No worker enrolled for any selected architecture. "
+                f"Requested: {', '.join(req_norm) if req_norm else '(none)'}. "
+                f"Workers cover: {', '.join(avail_norm) if avail_norm else '(no workers)'}. "
+                "Enroll a worker for at least one selected arch or fix its architecture field."
+            )
+            logger.warning("build.trigger rejected release_id=%s package_id=%s %s", data.release_id, package_id, detail)
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+        logger.info(
+            "build.trigger skip_all_already_ok release_id=%s package_id=%s requested=%s",
+            data.release_id,
+            package_id,
+            req_norm,
         )
-        logger.warning("build.trigger rejected release_id=%s package_id=%s %s", data.release_id, package_id, detail)
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
     for job in jobs_created:
         await log_audit(
             db,
