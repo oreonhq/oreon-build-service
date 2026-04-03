@@ -61,3 +61,60 @@ def test_prune_skips_inflight_attempt_dirs(tmp_path, monkeypatch):
         with worker_main._inflight_attempt_lock:
             worker_main._inflight_attempt_ids.discard(inflight_id)
 
+
+def test_prune_skips_active_path_registered_dir(tmp_path, monkeypatch):
+    """Active-path set protects a dir even when attempt-id is NOT in the inflight set.
+
+    This covers the scenario where the prune runs from a parallel job's cleanup while the
+    inflight-id snapshot was taken between the id being removed and the path being removed,
+    or when two separate worker processes share the same TMPDIR.
+    """
+    monkeypatch.setenv("OREON_WORKER_TMP_PARENT", str(tmp_path))
+    monkeypatch.setenv("OREON_WORKER_PRUNE_TMP_AGE_SEC", "5")
+
+    from oreon_build.worker import main as worker_main
+
+    active_dir = tmp_path / "oreon-worker-789-activepath"
+    drop_dir = tmp_path / "oreon-worker-999-shoulddrop"
+    active_dir.mkdir(parents=True, exist_ok=True)
+    drop_dir.mkdir(parents=True, exist_ok=True)
+
+    _set_mtime(active_dir, age_sec=10)
+    _set_mtime(drop_dir, age_sec=10)
+
+    # Register path only (NOT in inflight attempt set) to simulate the timing window or
+    # a cross-process scenario where the in-memory set does not have the attempt-id.
+    with worker_main._inflight_attempt_lock:
+        worker_main._active_work_tmpdir_paths.add(str(active_dir))
+
+    try:
+        worker_main._prune_stale_oreon_worker_tempdirs()
+        assert active_dir.exists(), "active-path-registered dir got pruned despite being live"
+        assert not drop_dir.exists(), "old unregistered dir should be pruned"
+    finally:
+        with worker_main._inflight_attempt_lock:
+            worker_main._active_work_tmpdir_paths.discard(str(active_dir))
+
+
+def test_prune_skips_sentinel_file_dir(tmp_path, monkeypatch):
+    """The .oreon-active sentinel file inside the dir protects it cross-process."""
+    monkeypatch.setenv("OREON_WORKER_TMP_PARENT", str(tmp_path))
+    monkeypatch.setenv("OREON_WORKER_PRUNE_TMP_AGE_SEC", "5")
+
+    from oreon_build.worker import main as worker_main
+
+    sentinel_dir = tmp_path / "oreon-worker-111-sentinel"
+    drop_dir = tmp_path / "oreon-worker-222-nosent"
+    sentinel_dir.mkdir(parents=True, exist_ok=True)
+    drop_dir.mkdir(parents=True, exist_ok=True)
+
+    (sentinel_dir / ".oreon-active").write_text("12345", encoding="utf-8")
+
+    _set_mtime(sentinel_dir, age_sec=10)
+    _set_mtime(drop_dir, age_sec=10)
+
+    # Neither dir is in the in-memory sets (simulating a different process wrote the sentinel).
+    worker_main._prune_stale_oreon_worker_tempdirs()
+    assert sentinel_dir.exists(), "dir with .oreon-active sentinel got pruned"
+    assert not drop_dir.exists(), "dir without sentinel should be pruned"
+

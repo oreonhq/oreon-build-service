@@ -81,6 +81,10 @@ logger = logging.getLogger(__name__)
 # Ignore a second dispatch for the same build_attempt_id (duplicate poll / misbehaving client).
 _inflight_attempt_lock = threading.Lock()
 _inflight_attempt_ids: set[int] = set()
+# Active work-tmpdir paths (same process, multi-thread safety).
+# Belt over the attempt-id inflight set: the prune checks this set directly so it never
+# deletes a directory that a live thread is still writing to, even under unusual conditions.
+_active_work_tmpdir_paths: set[str] = set()
 
 T = TypeVar("T")
 
@@ -1375,8 +1379,11 @@ def _mark_inflight_attempt_external(attempt_id: int) -> None:
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(str(os.getpid()), encoding="utf-8")
-        except OSError:
-            pass
+        except OSError as exc:
+            logger.warning(
+                "Could not write inflight marker %s (cross-process prune protection disabled for attempt %s): %s",
+                p, attempt_id, exc,
+            )
 
 
 def _clear_inflight_attempt_external(attempt_id: int) -> None:
@@ -1499,6 +1506,17 @@ def _cleanup_job_disk(attempt_id: int, mock_config: str, mock_unique_ext: str, w
     Safe with parallel builds (everything keyed by attempt_id / known work path).
     """
     tmp_parent = _worker_temp_parent_dir()
+    # Remove the in-dir sentinel and deregister from the active-path set before any rmtree so that
+    # _prune_stale_oreon_worker_tempdirs called at the end of this function does not see our own
+    # (now-dead) dir as live while still correctly protecting other parallel jobs' dirs.
+    if work_tmpdir:
+        try:
+            (Path(work_tmpdir) / ".oreon-active").unlink(missing_ok=True)
+        except OSError:
+            pass
+    with _inflight_attempt_lock:
+        if work_tmpdir:
+            _active_work_tmpdir_paths.discard(work_tmpdir)
     _mock_scrub_unique_chroot(mock_config, mock_unique_ext, attempt_id)
     _rm_rf_var_lib_mock_for_attempt(attempt_id)
     _rm_rf_mock_cache_topdir_for_attempt(attempt_id)
@@ -1519,6 +1537,7 @@ def _prune_stale_oreon_worker_tempdirs() -> None:
     now = time.time()
     with _inflight_attempt_lock:
         inflight_ids = set(_inflight_attempt_ids)
+        active_paths = set(_active_work_tmpdir_paths)
 
     def _tempdir_attempt_id(name: str) -> int | None:
         m = re.match(r"^oreon-worker-(\d+)-", name)
@@ -1549,12 +1568,24 @@ def _prune_stale_oreon_worker_tempdirs() -> None:
             for p in root.glob("oreon-worker-*"):
                 if not p.is_dir():
                     continue
+                # Check 1 (same-process, most reliable): attempt-id in in-memory inflight set.
                 aid = _tempdir_attempt_id(p.name)
                 if aid is not None and aid in inflight_ids:
                     continue
+                # Check 2 (same-process, belt): path registered in active tmpdir set.
+                try:
+                    p_str = str(p.resolve())
+                except OSError:
+                    p_str = str(p)
+                if p_str in active_paths or str(p) in active_paths:
+                    continue
+                # Check 3 (cross-process): inflight marker file written before thread starts.
                 if aid is not None:
                     if any(mp.exists() for mp in _inflight_marker_paths(aid)):
                         continue
+                # Check 4 (cross-process fallback): sentinel file inside the dir itself.
+                if (p / ".oreon-active").exists():
+                    continue
                 try:
                     if now - p.stat().st_mtime < age:
                         continue
@@ -1646,6 +1677,17 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                 if tmp_parent
                 else tempfile.mkdtemp(prefix=tmp_prefix)
             )
+            # Register path in the same-process active set so _prune_stale_oreon_worker_tempdirs
+            # never deletes this directory from a parallel thread's cleanup run.
+            with _inflight_attempt_lock:
+                _active_work_tmpdir_paths.add(tmpdir)
+            # Write a sentinel file inside the dir for cross-process protection (different worker
+            # processes on the same host share /tmp but not in-memory state).  The file is removed
+            # at the start of _cleanup_job_disk before the rmtree so it does not linger.
+            try:
+                (Path(tmpdir) / ".oreon-active").write_text(str(os.getpid()), encoding="utf-8")
+            except OSError as _e:
+                logger.warning("Could not write .oreon-active sentinel in %s: %s", tmpdir, _e)
             tmp = Path(tmpdir)
             build_log_parts: list[str] = []
             log_max_lines = int(os.environ.get("OREON_WORKER_LOG_MAX_LINES", "40000"))

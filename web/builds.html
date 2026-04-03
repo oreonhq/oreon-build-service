@@ -589,30 +589,24 @@
           var releasename = rel && rel.releasename ? rel.releasename.trim() : '';
           if (!releasename) { alert('Selected release is missing a releasename.'); return; }
           var tasks = pkgNames.map(function(pkgName) {
-            var existingId = findPackageIdByName(pkgName);
-            var body;
-            if (existingId != null) {
-              body = { package_id: existingId, release_id: selectedReleaseIdNew, architectures: arches };
-            } else {
-              var specPath = releasename + '/' + pkgName + '/' + pkgName + '.spec';
-              var repoUrl = 'https://github.com/oreonhq/rpm-specfiles.git';
-              var branch = 'main';
-              var combinedUrl = repoUrl + '#' + branch + ':' + specPath;
-              var np = {
-                name: pkgName,
-                description: null,
-                preferred_mock_environment_id: mockIdVal ? parseInt(mockIdVal, 10) : null,
-                source_type: 'distgit',
-                source_url: combinedUrl,
-                source_branch: branch,
-                source_path: specPath
-              };
-              body = { new_package: np, release_id: selectedReleaseIdNew, architectures: arches };
-            }
+            var specPath = releasename + '/' + pkgName + '/' + pkgName + '.spec';
+            var repoUrl = 'https://github.com/oreonhq/rpm-specfiles.git';
+            var branch = 'main';
+            var combinedUrl = repoUrl + '#' + branch + ':' + specPath;
+            var np = {
+              name: pkgName,
+              description: null,
+              preferred_mock_environment_id: mockIdVal ? parseInt(mockIdVal, 10) : null,
+              source_type: 'distgit',
+              source_url: combinedUrl,
+              source_branch: branch,
+              source_path: specPath
+            };
+            var body = { new_package: np, release_id: selectedReleaseIdNew, architectures: arches };
             return api.post('/builds/trigger', body)
               .then(function(data) {
                 var jobs = Array.isArray(data) ? data : (data ? [data] : []);
-                return { ok: true, name: pkgName, existing: existingId != null, jobCount: jobs.length };
+                return { ok: true, name: pkgName, jobCount: jobs.length };
               })
               .catch(function(e) {
                 console.error('DistGit trigger failed for package', pkgName, e);
@@ -623,8 +617,6 @@
             render();
             var bad = (results || []).filter(function(r) { return r && !r.ok; });
             var okRows = (results || []).filter(function(r) { return r && r.ok; });
-            var okExisting = okRows.filter(function(r) { return r.existing; }).length;
-            var okNew = okRows.filter(function(r) { return !r.existing; }).length;
             var jobsQueued = okRows.reduce(function(n, r) { return n + (r.jobCount || 0); }, 0);
             var allSkipped = okRows.length && okRows.every(function(r) { return (r.jobCount || 0) === 0; });
             if (bad.length) {
@@ -632,8 +624,7 @@
                 bad.map(function(b) { return b.name + ': ' + (b.err || 'error'); }).join('\n'));
             } else {
               var parts = [];
-              if (okExisting) parts.push(okExisting + ' existing package trigger(s) finished');
-              if (okNew) parts.push(okNew + ' new package(s) created');
+              if (okRows.length) parts.push(okRows.length + ' package(s) triggered via DistGit');
               if (jobsQueued) parts.push(jobsQueued + ' build job(s) queued');
               if (allSkipped) parts.push('no new jobs (all requested arches already built where applicable)');
               alert(parts.length ? parts.join('. ') + '.' : 'Trigger requested for ' + pkgNames.length + ' DistGit package(s).');
