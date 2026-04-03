@@ -27,6 +27,9 @@ from oreon_build.config import get_settings
 
 logger = logging.getLogger(__name__)
 
+# Discord can be slow or blocked from some hosts, short timeouts caused noisy tracebacks.
+_DISCORD_TIMEOUT = httpx.Timeout(30.0, connect=20.0)
+
 
 async def _post(payload: dict, webhook_url: str | None = None) -> None:
     """Low-level helper to POST a payload to the Discord webhook, if configured."""
@@ -35,10 +38,14 @@ async def _post(payload: dict, webhook_url: str | None = None) -> None:
     if not url:
         return
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(timeout=_DISCORD_TIMEOUT) as client:
             await client.post(url, json=payload)
+    except httpx.RequestError as e:
+        logger.warning("Discord webhook request failed (%s)", e)
+    except httpx.HTTPStatusError as e:
+        logger.warning("Discord webhook HTTP error %s", e.response.status_code)
     except Exception:
-        logger.exception("Failed to send Discord webhook")
+        logger.exception("Discord webhook unexpected error")
 
 
 async def send_discord_message(text: str) -> None:

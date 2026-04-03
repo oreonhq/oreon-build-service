@@ -22,6 +22,7 @@ Repositories are written ONLY to R2, never stored locally.
 #
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import subprocess
@@ -29,10 +30,31 @@ import tempfile
 from pathlib import Path
 from typing import List
 
+from oreon_build.config import get_settings
 from oreon_build.services.r2 import R2Client, get_r2_client
 from oreon_build.services.signing import sign_repomd
 
 logger = logging.getLogger(__name__)
+
+
+def _repo_temp_dir_parent() -> str | None:
+    """Use OREON_REPO_TMPDIR / settings.oreon_repo_tmpdir when set and usable (avoids /tmp quota)."""
+    raw = (os.environ.get("OREON_REPO_TMPDIR") or "").strip()
+    candidates: list[str] = []
+    if raw:
+        candidates.append(raw)
+    try:
+        s = get_settings()
+        cfg = (getattr(s, "oreon_repo_tmpdir", None) or "").strip()
+        if cfg and cfg not in candidates:
+            candidates.append(cfg)
+    except Exception:
+        pass
+    for c in candidates:
+        p = Path(c)
+        if p.is_dir():
+            return str(p)
+    return None
 
 
 def _list_repodata_keys(client: R2Client, r2_prefix: str) -> list[str]:
@@ -89,6 +111,7 @@ def update_repodata_at_prefix(r2_prefix: str, r2_client: R2Client | None = None)
     RPMs are already at r2_prefix/RPMS/. Download them, run createrepo_c, upload only repodata.
     Use this when the worker (or other path) has already uploaded RPMs directly to the repo.
     """
+    _edquot = getattr(errno, "EDQUOT", 122)
     client = r2_client or get_r2_client()
     rpms_prefix = f"{r2_prefix}/RPMS/"
     objs = client.list_objects(rpms_prefix)
@@ -96,36 +119,47 @@ def update_repodata_at_prefix(r2_prefix: str, r2_client: R2Client | None = None)
     if not rpm_keys:
         logger.warning("No RPMs at %s, skipping createrepo", rpms_prefix)
         return False
-    with tempfile.TemporaryDirectory(prefix="oreon-repo-") as tmp:
-        repo_root = Path(tmp) / "repo"
-        rpms_dir = repo_root / "RPMS"
-        rpms_dir.mkdir(parents=True)
-        for key in rpm_keys:
-            data = client.get_object(key)
-            if data:
-                fname = key.split("/")[-1]
-                (rpms_dir / fname).write_bytes(data)
-        _run_createrepo(repo_root)
-        repodata_dir = repo_root / "repodata"
-        if repodata_dir.exists():
-            # Keep track of which repodata filenames we just generated so we can
-            # delete older R2 objects that createrepo no longer produces.
-            new_filenames = {f.name for f in repodata_dir.iterdir()}
+    tmp_parent = _repo_temp_dir_parent()
+    try:
+        with tempfile.TemporaryDirectory(prefix="oreon-repo-", dir=tmp_parent) as tmp:
+            repo_root = Path(tmp) / "repo"
+            rpms_dir = repo_root / "RPMS"
+            rpms_dir.mkdir(parents=True)
+            for key in rpm_keys:
+                data = client.get_object(key)
+                if data:
+                    fname = key.split("/")[-1]
+                    (rpms_dir / fname).write_bytes(data)
+            _run_createrepo(repo_root)
+            repodata_dir = repo_root / "repodata"
+            if repodata_dir.exists():
+                # Keep track of which repodata filenames we just generated so we can
+                # delete older R2 objects that createrepo no longer produces.
+                new_filenames = {f.name for f in repodata_dir.iterdir()}
 
-            repomd = repodata_dir / "repomd.xml"
-            if repomd.exists():
-                sign_repomd(repomd)
+                repomd = repodata_dir / "repomd.xml"
+                if repomd.exists():
+                    sign_repomd(repomd)
 
-            # Upload new repodata first; only after that do we purge stale objects.
-            for f in repodata_dir.iterdir():
-                r2_key = f"{r2_prefix}/repodata/{f.name}"
-                client.put_object(r2_key, f.read_bytes())
+                # Upload new repodata first; only after that do we purge stale objects.
+                for f in repodata_dir.iterdir():
+                    r2_key = f"{r2_prefix}/repodata/{f.name}"
+                    client.put_object(r2_key, f.read_bytes())
 
-            _cleanup_old_repodata(client, r2_prefix, new_filenames)
-            logger.info("Updated repodata at R2 prefix %s (%s RPMs)", r2_prefix, len(rpm_keys))
-            return True
-        logger.error("createrepo_c produced no repodata under %s", repo_root)
-        return False
+                _cleanup_old_repodata(client, r2_prefix, new_filenames)
+                logger.info("Updated repodata at R2 prefix %s (%s RPMs)", r2_prefix, len(rpm_keys))
+                return True
+            logger.error("createrepo_c produced no repodata under %s", repo_root)
+            return False
+    except OSError as e:
+        if getattr(e, "errno", None) == _edquot:
+            parent = tmp_parent or os.environ.get("TMPDIR", "") or "/tmp"
+            logger.error(
+                "Disk quota exceeded while composing repo metadata under %s. "
+                "Set OREON_REPO_TMPDIR or oreon_repo_tmpdir to a directory on a larger volume.",
+                parent,
+            )
+        raise
 
 
 def publish_rpms_to_r2(
@@ -138,7 +172,8 @@ def publish_rpms_to_r2(
     Flow: download RPMs to temp dir, run createrepo_c, upload repodata + RPMs (or just repodata if RPMs already at prefix).
     """
     client = r2_client or get_r2_client()
-    with tempfile.TemporaryDirectory(prefix="oreon-repo-") as tmp:
+    tmp_parent = _repo_temp_dir_parent()
+    with tempfile.TemporaryDirectory(prefix="oreon-repo-", dir=tmp_parent) as tmp:
         repo_root = Path(tmp) / "repo"
         rpms_dir = repo_root / "RPMS"
         rpms_dir.mkdir(parents=True)

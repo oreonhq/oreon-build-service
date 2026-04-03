@@ -27,13 +27,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from oreon_build.api.routers.builds import _get_or_create_build_target
+from oreon_build.config import get_settings
 from oreon_build.core.audit import log_audit
 from oreon_build.core.repo_branch import r2_publish_branch
 from oreon_build.models import BuildJob, BuildStatus, Package, PackageVersion, Release, Source
+from oreon_build.services.github import get_github_client
 
 logger = logging.getLogger(__name__)
 
 TriggerKind = Literal["webhook", "catchup"]
+
+# Webhook-only. Compare said there were commits but zero file paths, do not treat as "match all".
+GITHUB_PUSH_EMPTY_DIFF_SENTINEL = "__oreon_empty_diff__"
+
+GITHUB_COMPARE_MAX_FILES = 300
 
 
 def normalize_repo_url(url: str | None) -> str:
@@ -111,6 +118,8 @@ def latest_distgit_source(pkg: Package) -> tuple[str | None, str | None]:
 def push_touches_distgit_spec(changed: set[str], spec_rel: str | None) -> bool:
     if not spec_rel:
         return False
+    if GITHUB_PUSH_EMPTY_DIFF_SENTINEL in changed:
+        return False
     if not changed:
         return True
     spec_n = spec_rel.replace("\\", "/").lstrip("/")
@@ -176,6 +185,97 @@ def collect_paths_from_webhook_commits(body: dict[str, Any]) -> set[str]:
                 if isinstance(p, str) and p.strip():
                     out.add(p.strip().replace("\\", "/"))
     return out
+
+
+def _is_null_github_sha(sha: str | None) -> bool:
+    if not sha or not isinstance(sha, str):
+        return True
+    s = sha.strip().lower()
+    return len(s) == 40 and set(s) <= {"0"}
+
+
+async def resolve_github_webhook_changed_paths(
+    body: dict[str, Any],
+    repository: dict[str, Any],
+) -> set[str]:
+    """
+    Build the changed-path set for a push webhook.
+
+    A single commit that touches thousands of files can still break path discovery. The push JSON
+    is capped at 25 MB so GitHub may skip delivery entirely, and the commit file arrays in the
+    payload can be incomplete for very large diffs. The REST compare endpoint lists changed files
+    more reliably (still capped at about 300 files per response, see GITHUB_COMPARE_MAX_FILES).
+
+    When GITHUB_TOKEN is set we merge compare(base...head) paths with whatever the webhook sent.
+    If compare is truncated or returns a full file page we return an empty set so every matching
+    distgit package is considered touched. If the webhook never arrives, catch-up still needs
+    GITHUB_TOKEN and a running catch-up loop.
+    """
+    from_commits = collect_paths_from_webhook_commits(body)
+    settings = get_settings()
+    if not settings.github_token:
+        return from_commits
+
+    full_name = (repository.get("full_name") or "").strip()
+    if "/" not in full_name:
+        return from_commits
+
+    owner, repo_name = full_name.split("/", 1)
+    after = body.get("after")
+    if not isinstance(after, str) or not after.strip():
+        return from_commits
+    after_sha = after.strip()
+
+    before = body.get("before")
+    if _is_null_github_sha(before if isinstance(before, str) else None):
+        base = (repository.get("default_branch") or "main").strip() or "main"
+        head = after_sha
+    elif isinstance(before, str) and before.strip():
+        base = before.strip()
+        head = after_sha
+    else:
+        return from_commits
+
+    client = get_github_client()
+    try:
+        cmp = await client.compare_refs(owner, repo_name, base, head)
+        if cmp is None:
+            logger.warning(
+                "GitHub webhook compare failed repo=%s base=%s head=%s (using commit paths only)",
+                full_name,
+                base[:7] if len(base) >= 7 else base,
+                head[:7],
+            )
+            return from_commits
+        if cmp.get("truncated"):
+            logger.warning(
+                "GitHub webhook compare truncated repo=%s, auto-triggering all distgit packages on this branch",
+                full_name,
+            )
+            return set()
+        files = cmp.get("files") or []
+        if len(files) >= GITHUB_COMPARE_MAX_FILES:
+            logger.warning(
+                "GitHub webhook compare file list capped repo=%s n=%s, auto-triggering all distgit packages",
+                full_name,
+                len(files),
+            )
+            return set()
+        api_paths = collect_paths_from_compare_files(cmp)
+        merged = from_commits | api_paths
+        ahead = int(cmp.get("ahead_by") or 0)
+        if not merged:
+            if ahead > 0:
+                logger.warning(
+                    "GitHub webhook compare ahead_by=%s but zero file paths repo=%s, auto-triggering all distgit packages",
+                    ahead,
+                    full_name,
+                )
+                return set()
+            return {GITHUB_PUSH_EMPTY_DIFF_SENTINEL}
+        return merged
+    finally:
+        await client.close()
 
 
 def collect_paths_from_compare_files(compare_json: dict[str, Any]) -> set[str]:
