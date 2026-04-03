@@ -44,7 +44,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     <section class="card">
       <h2>Security Advisory Dashboard</h2>
       <p style="color:var(--text-muted); font-size:0.9rem; margin-bottom:1rem;">
-        Tracks only CVEs affecting RPM versions present in the Oreon repositories.
+        Matches lists advisories you record here (custom entries) plus any legacy CVE rows still in the database. Watchdog does not pull OSV, NVD, or R2 for new CVEs. Monitored RPMs is the inventory from build artifacts, refreshed on a schedule. Resolve rows from a detail page when appropriate (e.g. backport).
       </p>
 
       <div class="form-group">
@@ -57,10 +57,21 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         <label>Filter by RPM package name (optional)</label>
         <input type="text" id="advisories-package-name" class="form-control" placeholder="e.g. openssl">
       </div>
+      <div class="form-group" style="max-width:12rem;">
+        <label>Rows per page (both tables)</label>
+        <select id="watchdog-page-size" class="form-control">
+          <option value="25">25</option>
+          <option value="50">50</option>
+          <option value="100" selected>100</option>
+          <option value="200">200</option>
+        </select>
+      </div>
 
       <div class="modal-actions" style="margin-top:0.75rem;" id="watchdog-authed-actions">
-        <button type="button" class="btn primary" id="btn-scan-now" style="display:none;">Scan now</button>
+        <button type="button" class="btn primary" id="btn-scan-now" style="display:none;">Refresh inventory</button>
+        <button type="button" class="btn" id="btn-diagnostics" style="display:none;">DB diagnostics</button>
       </div>
+      <pre id="diagnostics-out" style="display:none; margin-top:0.75rem; padding:0.75rem; background:var(--card-bg, #1a1a1a); border:1px solid var(--border, #333); border-radius:6px; font-size:0.8rem; overflow:auto; max-height:14rem;"></pre>
 
       <div id="custom-advisory-create-wrap" style="display:none; margin-top:1rem;">
         <h3 style="margin:0 0 0.75rem;">Create custom advisory</h3>
@@ -113,6 +124,17 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           <div id="custom-create-status" style="color:var(--text-muted); font-size:0.9rem;"></div>
         </div>
       </div>
+
+      <div id="security-summary-wrap" style="margin-top:1.25rem; padding-top:1rem; border-top:1px solid var(--border, rgba(255,255,255,0.12));">
+        <div style="font-weight:600; margin-bottom:0.5rem;">Counts for filters above</div>
+        <div id="security-summary-row" style="display:flex; flex-wrap:wrap; gap:1rem 2rem; align-items:baseline; font-size:0.95rem;">
+          <span style="color:var(--text-muted);">Active CVE rows <span id="sum-open-cve" style="color:var(--text); font-weight:600;">–</span></span>
+          <span style="color:var(--text-muted);">All CVE rows <span id="sum-total-cve" style="color:var(--text); font-weight:600;">–</span></span>
+          <span style="color:var(--text-muted);">Active custom advisories <span id="sum-open-custom" style="color:var(--text); font-weight:600;">–</span></span>
+          <span style="color:var(--text-muted);">Monitored RPM identities <span id="sum-monitored" style="color:var(--text); font-weight:600;">–</span></span>
+        </div>
+        <p style="font-size:0.85rem; color:var(--text-muted); margin:0.6rem 0 0;">Active means not marked resolved. Monitored count ignores release (package filter applies). CVE counts only change when you add advisories or if older CVE rows remain in the database. If monitored RPM count is zero, log in as admin and use DB diagnostics to confirm this Watchdog uses the same Postgres as the build API.</p>
+      </div>
     </section>
 
     <section class="card">
@@ -129,12 +151,36 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             <th>Severity</th>
             <th>Upstream</th>
             <th>Fix</th>
+            <th>Fixed hint</th>
+            <th>Handled as</th>
             <th>Affected Oreon releases</th>
             <th>Actions</th>
           </tr>
         </thead>
         <tbody id="advisories-tbody"></tbody>
       </table>
+      <div id="advisories-pagination" aria-label="Matches pages"></div>
+    </section>
+
+    <section class="card">
+      <h2>Monitored RPMs</h2>
+      <p style="color:var(--text-muted); font-size:0.9rem; margin-bottom:0.75rem;">
+        Distinct name plus version-release from successful build artifacts (source package name must match the binary RPM name). Refreshed on the Watchdog schedule (admins can trigger a refresh). CVE columns count database rows only.
+      </p>
+      <div id="tracked-status" style="color:var(--text-muted); font-size:0.9rem; margin-bottom:0.75rem;">Loading…</div>
+      <table class="table-list">
+        <thead>
+          <tr>
+            <th>Package</th>
+            <th>Version</th>
+            <th>Last synced</th>
+            <th>CVE rows</th>
+            <th>Open CVEs</th>
+          </tr>
+        </thead>
+        <tbody id="tracked-tbody"></tbody>
+      </table>
+      <div id="tracked-pagination" aria-label="Monitored RPMs pages"></div>
     </section>
   </main>
 
@@ -144,6 +190,116 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       const api = window.oreonApi || {};
       const statusEl = document.getElementById('advisories-status');
       const tbody = document.getElementById('advisories-tbody');
+      const trackedStatusEl = document.getElementById('tracked-status');
+      const trackedTbody = document.getElementById('tracked-tbody');
+      const trackedPaginationEl = document.getElementById('tracked-pagination');
+      const advisoriesPaginationEl = document.getElementById('advisories-pagination');
+
+      var pgState = { trackedPage: 1, advisoriesPage: 1 };
+
+      function getPageSize() {
+        var sel = document.getElementById('watchdog-page-size');
+        var n = sel ? parseInt(sel.value, 10) : 100;
+        if (!Number.isFinite(n) || n < 10) return 100;
+        if (n > 500) return 500;
+        return n;
+      }
+
+      function renderPagination(el, navId, page, total, pageSize) {
+        if (!el) return;
+        el.dataset.total = String(total || 0);
+        el.dataset.nav = navId;
+        if (!total) {
+          el.innerHTML = '';
+          return;
+        }
+        var totalPages = Math.max(1, Math.ceil(total / pageSize));
+        page = Math.min(Math.max(1, page), totalPages);
+        var nums = [];
+        var tp = totalPages;
+        if (tp <= 12) {
+          for (var i = 1; i <= tp; i++) nums.push(i);
+        } else {
+          nums.push(1);
+          var lo = Math.max(2, page - 2);
+          var hi = Math.min(tp - 1, page + 2);
+          if (lo > 2) nums.push(0);
+          for (var j = lo; j <= hi; j++) nums.push(j);
+          if (hi < tp - 1) nums.push(0);
+          nums.push(tp);
+        }
+        var h = '<div style="display:flex;flex-wrap:wrap;gap:0.35rem;align-items:center;margin-top:0.75rem;">';
+        h += '<button type="button" class="btn" data-watchdog-pg="' + navId + '" data-goto="prev"' + (page <= 1 ? ' disabled' : '') + '>Prev</button>';
+        for (var k = 0; k < nums.length; k++) {
+          var n = nums[k];
+          if (n === 0) {
+            h += '<span style="color:var(--text-muted);padding:0 0.2rem;">…</span>';
+            continue;
+          }
+          var isCur = n === page;
+          h += '<button type="button" class="btn' + (isCur ? ' primary' : '') + '" data-watchdog-pg="' + navId + '" data-goto="' + n + '"' + (isCur ? ' disabled' : '') + '>' + n + '</button>';
+        }
+        h += '<button type="button" class="btn" data-watchdog-pg="' + navId + '" data-goto="next"' + (page >= totalPages ? ' disabled' : '') + '>Next</button>';
+        h += '<span style="color:var(--text-muted);font-size:0.88rem;margin-left:0.4rem;">Page ' + page + ' of ' + totalPages + ' · ' + total + ' rows</span>';
+        h += '</div>';
+        el.innerHTML = h;
+      }
+
+      document.body.addEventListener('click', function(ev) {
+        var btn = ev.target.closest('button[data-watchdog-pg][data-goto]');
+        if (!btn) return;
+        var navId = btn.getAttribute('data-watchdog-pg');
+        if (navId !== 'tracked' && navId !== 'advisories') return;
+        var wrap = navId === 'tracked' ? trackedPaginationEl : advisoriesPaginationEl;
+        if (!wrap || !wrap.contains(btn)) return;
+        var total = parseInt(wrap.dataset.total || '0', 10);
+        var pageSize = getPageSize();
+        var totalPages = Math.max(1, Math.ceil(total / pageSize));
+        var p = navId === 'tracked' ? pgState.trackedPage : pgState.advisoriesPage;
+        var g = btn.getAttribute('data-goto');
+        if (g === 'prev') p--;
+        else if (g === 'next') p++;
+        else p = parseInt(g, 10);
+        if (!Number.isFinite(p)) return;
+        p = Math.min(Math.max(1, p), totalPages);
+        if (navId === 'tracked') pgState.trackedPage = p;
+        else pgState.advisoriesPage = p;
+        if (navId === 'tracked') loadTrackedPackages();
+        else loadAdvisories();
+      });
+
+      function resetPages() {
+        pgState.trackedPage = 1;
+        pgState.advisoriesPage = 1;
+      }
+
+      function loadSummary() {
+        var releaseId = document.getElementById('advisories-release-id').value || '';
+        var pkg = document.getElementById('advisories-package-name').value || '';
+        var qs = [];
+        if (releaseId) qs.push('release_id=' + urlEncode(releaseId));
+        if (pkg) qs.push('package_name=' + urlEncode(pkg));
+        var path = '/security/summary' + (qs.length ? ('?' + qs.join('&')) : '');
+        var elOpen = document.getElementById('sum-open-cve');
+        var elTot = document.getElementById('sum-total-cve');
+        var elCust = document.getElementById('sum-open-custom');
+        var elMon = document.getElementById('sum-monitored');
+        if (elOpen) elOpen.textContent = '…';
+        if (elTot) elTot.textContent = '…';
+        if (elCust) elCust.textContent = '…';
+        if (elMon) elMon.textContent = '…';
+        api.get(path).then(function(s) {
+          if (elOpen) elOpen.textContent = String(s.open_cve_match_count != null ? s.open_cve_match_count : 0);
+          if (elTot) elTot.textContent = String(s.total_cve_match_count != null ? s.total_cve_match_count : 0);
+          if (elCust) elCust.textContent = String(s.open_custom_advisory_count != null ? s.open_custom_advisory_count : 0);
+          if (elMon) elMon.textContent = String(s.monitored_rpm_count != null ? s.monitored_rpm_count : 0);
+        }).catch(function() {
+          if (elOpen) elOpen.textContent = '?';
+          if (elTot) elTot.textContent = '?';
+          if (elCust) elCust.textContent = '?';
+          if (elMon) elMon.textContent = '?';
+        });
+      }
 
       function esc(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; }
       function urlEncode(v) { return encodeURIComponent((v || '').toString()); }
@@ -196,25 +352,90 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         }).catch(function(e) {});
       }
 
+      function loadTrackedPackages() {
+        if (!trackedStatusEl || !trackedTbody) return;
+        var pkg = document.getElementById('advisories-package-name').value || '';
+        var pageSize = getPageSize();
+        var offset = (pgState.trackedPage - 1) * pageSize;
+        var path = '/security/tracked-packages?limit=' + pageSize + '&offset=' + offset;
+        if (pkg) path += '&package_name=' + urlEncode(pkg);
+        trackedStatusEl.textContent = 'Loading…';
+        api.get(path).then(function(res) {
+          var items = (res && res.items) ? res.items : [];
+          total = (typeof res.total === 'number') ? res.total : items.length;
+          var totalPages = Math.max(1, Math.ceil(total / pageSize));
+          if (pgState.trackedPage > totalPages) {
+            pgState.trackedPage = totalPages;
+            loadTrackedPackages();
+            return;
+          }
+          renderPagination(trackedPaginationEl, 'tracked', pgState.trackedPage, total, pageSize);
+          if (!total) {
+            trackedTbody.innerHTML = '<tr><td colspan="5" style="color:var(--text-muted);">No tracked RPMs yet. Confirm R2 credentials on the Watchdog host, release names match your bucket prefixes, then use Scan now (admin) or wait for the periodic scan.</td></tr>';
+            trackedStatusEl.textContent = '0 monitored packages in database';
+            return;
+          }
+          if (!items.length) {
+            trackedTbody.innerHTML = '<tr><td colspan="5" style="color:var(--text-muted);">No rows on this page.</td></tr>';
+            trackedStatusEl.textContent = 'Page ' + pgState.trackedPage + ' (empty)';
+            return;
+          }
+          trackedTbody.innerHTML = items.map(function(r) {
+            return ''
+              + '<tr>'
+              + '<td>' + esc(r.package_name || '-') + '</td>'
+              + '<td>' + esc(r.package_version || '-') + '</td>'
+              + '<td>' + esc(r.last_checked_at || '—') + '</td>'
+              + '<td>' + esc(String(r.cve_match_count != null ? r.cve_match_count : 0)) + '</td>'
+              + '<td>' + esc(String(r.open_cve_match_count != null ? r.open_cve_match_count : 0)) + '</td>'
+              + '</tr>';
+          }).join('');
+          var start = (pgState.trackedPage - 1) * pageSize + 1;
+          var end = start + items.length - 1;
+          trackedStatusEl.textContent = 'Rows ' + start + '–' + end + ' of ' + total;
+        }).catch(function(e) {
+          trackedStatusEl.textContent = 'Failed to load inventory: ' + (e.message || e);
+          trackedTbody.innerHTML = '';
+          if (trackedPaginationEl) trackedPaginationEl.innerHTML = '';
+        });
+      }
+
       function loadAdvisories() {
         var adminNow = isAdmin();
         var releaseId = document.getElementById('advisories-release-id').value || '';
         var pkg = document.getElementById('advisories-package-name').value || '';
-        var path = '/security/advisories?limit=50&offset=0';
+        var pageSize = getPageSize();
+        var offset = (pgState.advisoriesPage - 1) * pageSize;
+        var path = '/security/advisories?limit=' + pageSize + '&offset=' + offset;
         if (releaseId) path += '&release_id=' + urlEncode(releaseId);
         if (pkg) path += '&package_name=' + urlEncode(pkg);
         statusEl.textContent = 'Loading…';
         api.get(path).then(function(res) {
           var items = (res && res.items) ? res.items : [];
-          if (!items.length) {
-            tbody.innerHTML = '<tr><td colspan="10" style="color:var(--text-muted);">No advisories.</td></tr>';
+          var total = (typeof res.total === 'number') ? res.total : items.length;
+          var totalPages = Math.max(1, Math.ceil(total / pageSize));
+          if (pgState.advisoriesPage > totalPages) {
+            pgState.advisoriesPage = totalPages;
+            loadAdvisories();
+            return;
+          }
+          renderPagination(advisoriesPaginationEl, 'advisories', pgState.advisoriesPage, total, pageSize);
+          if (!total) {
+            tbody.innerHTML = '<tr><td colspan="12" style="color:var(--text-muted);">No advisories.</td></tr>';
             statusEl.textContent = '0 advisories';
+            return;
+          }
+          if (!items.length) {
+            tbody.innerHTML = '<tr><td colspan="12" style="color:var(--text-muted);">No rows on this page.</td></tr>';
+            statusEl.textContent = 'Page ' + pgState.advisoriesPage + ' (empty)';
             return;
           }
           tbody.innerHTML = items.map(function(a) {
             var releases = (a.affected_releases || []).map(function(r) { return r.releasename || r.release_id; }).join(', ');
             var upstream = a.upstream_url ? '<a href="' + (a.upstream_url || '') + '" target="_blank" rel="noreferrer">Upstream</a>' : '-';
             var fix = esc(a.recommended_fix || '-');
+            var osvFixed = (a.kind === 'cve' && a.osv_fixed_version) ? esc(a.osv_fixed_version) : '-';
+            var handledAs = (a.is_handled && a.handled_reason) ? esc(a.handled_reason) : '-';
             var type = a.kind === 'custom' ? 'Custom' : 'CVE';
             var cveOrTitle = (a.kind === 'custom') ? (a.title || '-') : (a.cve_id || '-');
             var detailsUrl = a.kind === 'custom' ? ('/advisories/custom/' + a.id) : ('/advisories/cve/' + a.id);
@@ -233,6 +454,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
               + '<td>' + esc(a.severity || '-') + '</td>'
               + '<td>' + upstream + '</td>'
               + '<td>' + fix + '</td>'
+              + '<td>' + osvFixed + '</td>'
+              + '<td>' + handledAs + '</td>'
               + '<td>' + esc(releases || '-') + '</td>'
               + '<td>' + statusBadge
               + ' <a class="btn" href="' + esc(detailsUrl) + '" style="display:inline-block; text-decoration:none;">Details</a>'
@@ -240,7 +463,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
               + '</td>'
               + '</tr>';
           }).join('');
-          statusEl.textContent = items.length + ' shown';
+          var start = (pgState.advisoriesPage - 1) * pageSize + 1;
+          var end = start + items.length - 1;
+          statusEl.textContent = 'Rows ' + start + '–' + end + ' of ' + total;
 
           tbody.querySelectorAll('button[data-resolve-id]').forEach(function(btn) {
             btn.addEventListener('click', function() {
@@ -261,18 +486,78 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         }).catch(function(e) {
           statusEl.textContent = 'Failed to load: ' + (e.message || e);
           tbody.innerHTML = '';
+          if (advisoriesPaginationEl) advisoriesPaginationEl.innerHTML = '';
         });
       }
 
-      document.getElementById('advisories-release-id').addEventListener('change', loadAdvisories);
+      document.getElementById('advisories-release-id').addEventListener('change', function() {
+        resetPages();
+        loadSummary();
+        loadAdvisories();
+        loadTrackedPackages();
+      });
       document.getElementById('advisories-package-name').addEventListener('input', function() {
-        // simple debounce
         clearTimeout(window.__watchdogDebounce);
-        window.__watchdogDebounce = setTimeout(loadAdvisories, 250);
+        window.__watchdogDebounce = setTimeout(function() {
+          resetPages();
+          loadSummary();
+          loadAdvisories();
+          loadTrackedPackages();
+        }, 250);
       });
 
-      var btn = document.getElementById('btn-scan-now');
-      if (btn) { /* hidden by default; keep handler for debugging */ }
+      var pageSizeSel = document.getElementById('watchdog-page-size');
+      if (pageSizeSel) {
+        pageSizeSel.addEventListener('change', function() {
+          resetPages();
+          loadSummary();
+          loadAdvisories();
+          loadTrackedPackages();
+        });
+      }
+
+      var btnDiag = document.getElementById('btn-diagnostics');
+      if (btnDiag) {
+        btnDiag.addEventListener('click', function() {
+          if (!isAdmin()) return;
+          var out = document.getElementById('diagnostics-out');
+          btnDiag.disabled = true;
+          api.get('/security/diagnostics').then(function(d) {
+            if (out) {
+              out.style.display = 'block';
+              out.textContent = JSON.stringify(d, null, 2);
+            }
+            btnDiag.disabled = false;
+          }).catch(function(e) {
+            if (out) {
+              out.style.display = 'block';
+              out.textContent = 'Error: ' + (e.message || e);
+            }
+            btnDiag.disabled = false;
+          });
+        });
+      }
+
+      var btnScan = document.getElementById('btn-scan-now');
+      if (btnScan) {
+        btnScan.addEventListener('click', function() {
+          if (!isAdmin()) return;
+          btnScan.disabled = true;
+          api.post('/security/scan', {}).then(function() {
+            if (trackedStatusEl) trackedStatusEl.textContent = 'Scan requested. Wait a bit then refresh or reload the page.';
+            btnScan.disabled = false;
+            setTimeout(function() {
+              resetPages();
+              loadSummary();
+              loadAdvisories();
+              loadTrackedPackages();
+            }, 8000);
+          }).catch(function(e) {
+            btnScan.disabled = false;
+            if (trackedStatusEl) trackedStatusEl.textContent = 'Scan request failed: ' + (e.message || e);
+          });
+        });
+      }
 
       var btnCreate = document.getElementById('btn-create-custom-advisory');
       if (btnCreate) {
@@ -331,6 +616,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
         var btnScan = document.getElementById('btn-scan-now');
         if (btnScan) btnScan.style.display = isAdmin() ? 'inline-block' : 'none';
+        var btnDiag = document.getElementById('btn-diagnostics');
+        if (btnDiag) btnDiag.style.display = isAdmin() ? 'inline-block' : 'none';
 
         var actions = document.getElementById('watchdog-authed-actions');
         if (actions) actions.style.display = isAdmin() ? 'flex' : 'none';
@@ -338,16 +625,22 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
       if (isAuthed()) {
         loadReleases();
+        loadSummary();
         loadAdvisories();
+        loadTrackedPackages();
         refreshAdminUI();
       } else {
         loadReleases();
+        loadSummary();
         loadAdvisories();
+        loadTrackedPackages();
         refreshAdminUI();
       }
       window.addEventListener('auth-change', function() {
         loadReleases();
+        loadSummary();
         loadAdvisories();
+        loadTrackedPackages();
         refreshAdminUI();
       });
     })();
