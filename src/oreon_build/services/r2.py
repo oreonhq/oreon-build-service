@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import io
 import logging
-from typing import BinaryIO, Optional
+from typing import BinaryIO, Iterator, Optional
 
 import boto3
 from botocore.config import Config
@@ -90,10 +90,25 @@ class R2Client:
         """List objects under prefix."""
         paginator = self._client.get_paginator("list_objects_v2")
         out = []
-        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix, MaxKeys=max_keys):
+        for page in paginator.paginate(
+            Bucket=self.bucket,
+            Prefix=prefix,
+            PaginationConfig={"PageSize": min(max_keys, 1000)},
+        ):
             for obj in page.get("Contents", []):
                 out.append({"key": obj["Key"], "size": obj.get("Size", 0)})
         return out
+
+    def iter_keys_with_prefix(self, prefix: str, *, page_size: int = 1000) -> Iterator[str]:
+        """Yield every object key under prefix (full bucket walk, paginated)."""
+        paginator = self._client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(
+            Bucket=self.bucket,
+            Prefix=prefix,
+            PaginationConfig={"PageSize": min(page_size, 1000)},
+        ):
+            for obj in page.get("Contents", []):
+                yield obj["Key"]
 
     def object_exists(self, key: str) -> bool:
         try:
