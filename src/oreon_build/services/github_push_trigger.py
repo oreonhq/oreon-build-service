@@ -133,6 +133,13 @@ def push_touches_distgit_spec(changed: set[str], spec_rel: str | None) -> bool:
     for p in changed_n:
         if p == spec_n or p.startswith(prefix):
             return True
+    # Payload paths are sometimes missing the top release dir (e.g. bash/bash.spec) while
+    # distgit URLs store oreon-11-rp1/bash/bash.spec — still the same package tree.
+    for p in changed_n:
+        if not p or p.count("/") < 1:
+            continue
+        if spec_n.endswith(p):
+            return True
     return False
 
 
@@ -175,16 +182,37 @@ async def release_arch_combos_for_auto_build(db: AsyncSession, pkg: Package) -> 
     return combos
 
 
+def _paths_from_commit_object(c: dict[str, Any]) -> set[str]:
+    out: set[str] = set()
+    for key in ("added", "modified", "removed"):
+        for p in c.get(key) or []:
+            if isinstance(p, str) and p.strip():
+                out.add(p.strip().replace("\\", "/"))
+    return out
+
+
 def collect_paths_from_webhook_commits(body: dict[str, Any]) -> set[str]:
+    """Paths from push payload commits[] and head_commit (GitHub often omits file lists on commits[])."""
     out: set[str] = set()
     for c in body.get("commits") or []:
-        if not isinstance(c, dict):
-            continue
-        for key in ("added", "modified", "removed"):
-            for p in c.get(key) or []:
-                if isinstance(p, str) and p.strip():
-                    out.add(p.strip().replace("\\", "/"))
+        if isinstance(c, dict):
+            out |= _paths_from_commit_object(c)
+    hc = body.get("head_commit")
+    if isinstance(hc, dict):
+        out |= _paths_from_commit_object(hc)
     return out
+
+
+def push_webhook_ref_advanced(body: dict[str, Any]) -> bool:
+    """True if before/after say the branch tip moved (including new refs)."""
+    after = body.get("after")
+    if not isinstance(after, str) or not after.strip():
+        return False
+    after_s = after.strip()
+    before = body.get("before")
+    if _is_null_github_sha(before if isinstance(before, str) else None):
+        return True
+    return isinstance(before, str) and bool(before.strip()) and before.strip() != after_s
 
 
 def _is_null_github_sha(sha: str | None) -> bool:
@@ -272,6 +300,12 @@ async def resolve_github_webhook_changed_paths(
                     full_name,
                 )
                 return set()
+            if push_webhook_ref_advanced(body):
+                logger.warning(
+                    "GitHub webhook has zero resolved paths but the ref advanced repo=%s, auto-triggering all distgit packages",
+                    full_name,
+                )
+                return set()
             return {GITHUB_PUSH_EMPTY_DIFF_SENTINEL}
         return merged
     finally:
@@ -351,7 +385,10 @@ async def apply_github_push(
 
     # Narrow the candidate list to packages mentioned by changed paths.
     # This avoids evaluating the whole repo package set for every push.
-    if changed_paths:
+    # If changed_paths is non-empty but no package names can be extracted (e.g. all flat
+    # top-level files like .gitignore) we keep all matched packages so push_touches_distgit_spec
+    # can make the final call instead of silently skipping everyone.
+    if changed_paths and GITHUB_PUSH_EMPTY_DIFF_SENTINEL not in changed_paths:
         name_candidates = {n.lower() for n in candidate_package_names_from_paths(changed_paths)}
         if name_candidates:
             narrowed = [p for p in packages if (p.name or "").strip().lower() in name_candidates]
@@ -365,6 +402,24 @@ async def apply_github_push(
                     len(narrowed),
                 )
                 packages = narrowed
+            else:
+                # All extracted names are unregistered packages — nothing to do.
+                logger.warning(
+                    "GitHub push repo=%s changed_paths=%s names=%s — none registered in Oreon, no builds triggered "
+                    "(register the package via DistGit trigger first, then future pushes will auto-build it)",
+                    fn or "?",
+                    len(changed_paths),
+                    sorted(name_candidates)[:10],
+                )
+                return {"status": "ignored", "reason": "unregistered_packages", "jobs": [], "skipped": []}
+
+    logger.info(
+        "GitHub push changed_paths=%s sample=%s repo=%s kind=%s",
+        len(changed_paths),
+        sorted(changed_paths)[:10],
+        fn or "?",
+        kind,
+    )
 
     audit_action = "build.github_auto_trigger" if kind == "webhook" else "build.github_catchup_trigger"
     user_agent = "github-webhook" if kind == "webhook" else "github-catchup"
