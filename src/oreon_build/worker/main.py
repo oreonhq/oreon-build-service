@@ -1198,6 +1198,36 @@ def _copy_local_spec_sources_listed_by_spectool(spec_path: Path, staging_dir: Pa
     return True, "\n".join(parts)
 
 
+def _collect_url_source_basenames_from_spectool_list(spec_path: Path) -> list[str]:
+    """
+    Return basenames of every URL-based Source/Patch entry in the spec.
+
+    Used to validate that spectool -g actually downloaded each one; spectool can
+    silently return rc=0 even when a download fails (e.g. 404 or timeout), and the
+    missing file only surfaces as a cryptic "Bad file" error inside mock.
+    """
+    spec_dir = spec_path.parent
+    rc, out = _run(
+        ["spectool", "-l", str(spec_path.name)],
+        timeout_s=120,
+        cwd=str(spec_dir),
+    )
+    if rc != 0:
+        return []
+
+    basenames: list[str] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        _, _, rest = line.partition(":")
+        rest = rest.strip()
+        low = rest.lower()
+        if low.startswith(("http://", "https://", "ftp://")):
+            basenames.append(Path(rest.rstrip("/")).name)
+    return basenames
+
+
 def _prepare_mock_sources_with_spectool(spec_path: Path, staging_dir: Path) -> tuple[bool, str]:
     """
     Prepare sources for mock (spectool from rpmdevtools).
@@ -1210,6 +1240,9 @@ def _prepare_mock_sources_with_spectool(spec_path: Path, staging_dir: Path) -> t
     """
     spec_dir = spec_path.parent
     staging_dir.mkdir(parents=True, exist_ok=True)
+
+    # Collect expected URL source basenames BEFORE downloading so we can verify after.
+    expected_url_basenames = _collect_url_source_basenames_from_spectool_list(spec_path)
 
     rc, out = _run(
         ["spectool", "-g", "-C", str(staging_dir), str(spec_path.name)],
@@ -1227,10 +1260,23 @@ def _prepare_mock_sources_with_spectool(spec_path: Path, staging_dir: Path) -> t
         return False, err
 
     files = sorted(staging_dir.rglob("*")) if staging_dir.is_dir() else []
-    names = [f.name for f in files if f.is_file()]
-    head = ", ".join(names[:6])
+    names = {f.name for f in files if f.is_file()}
+    head = ", ".join(sorted(names)[:6])
     more = f" (+{len(names) - 6} more)" if len(names) > 6 else ""
     log_parts = [f"URL sources via spectool: {len(names)} file(s){(': ' + head + more) if names else ''}"]
+
+    # Verify every expected URL source was actually downloaded. spectool can return rc=0
+    # even when a download fails (server 404, timeout, etc.), which causes a confusing
+    # "Bad file: /builddir/build/SOURCES/foo" error deep inside mock rather than here.
+    missing_downloads = [b for b in expected_url_basenames if b not in names]
+    if missing_downloads:
+        shown = ", ".join(missing_downloads[:10])
+        extra = f" (+{len(missing_downloads) - 10} more)" if len(missing_downloads) > 10 else ""
+        log_parts.append(
+            f"spectool download failed (rc=0 but files missing): {shown}{extra}\n"
+            f"spectool output:\n{out[:3000]}"
+        )
+        return False, "\n".join(log_parts)
 
     ok_local, local_log = _copy_local_spec_sources_listed_by_spectool(spec_path, staging_dir)
     log_parts.append(local_log)

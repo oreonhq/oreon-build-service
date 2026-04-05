@@ -6,7 +6,7 @@
 
 Name:           oreon-build-worker
 Version:        1.0.0
-Release:        38%{?dist}
+Release:        39%{?dist}
 Summary:        Oreon Build Service worker daemon
 License:        GPLv3
 URL:            https://github.com/oreon/oreon-build-service
@@ -32,6 +32,7 @@ Requires:       rpmdevtools
 Requires:       pigz
 Requires:       rpmrebuild
 Requires:       pesign
+Requires:       git
 
 %description
 Worker daemon for Oreon Build Service.

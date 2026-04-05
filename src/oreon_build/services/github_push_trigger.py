@@ -275,21 +275,26 @@ async def resolve_github_webhook_changed_paths(
                 head[:7],
             )
             return from_commits
-        if cmp.get("truncated"):
-            logger.warning(
-                "GitHub webhook compare truncated repo=%s, auto-triggering all distgit packages on this branch",
-                full_name,
-            )
-            return set()
         files = cmp.get("files") or []
-        if len(files) >= GITHUB_COMPARE_MAX_FILES:
+        api_paths = collect_paths_from_compare_files(cmp)
+        if cmp.get("truncated") or len(files) >= GITHUB_COMPARE_MAX_FILES:
+            # Compare hit GitHub's per-request file cap. Use whatever files we got — they still
+            # identify real changed packages. Catch-up will pick up anything beyond the cap on the
+            # next cycle. Never return an empty set here (empty = "trigger every package").
             logger.warning(
-                "GitHub webhook compare file list capped repo=%s n=%s, auto-triggering all distgit packages",
+                "GitHub webhook compare truncated/capped repo=%s files=%s paths=%s, "
+                "triggering only matched packages (catch-up handles the rest)",
                 full_name,
                 len(files),
+                len(api_paths),
             )
-            return set()
-        api_paths = collect_paths_from_compare_files(cmp)
+            if not api_paths and not from_commits:
+                # Truly no paths at all from any source — fall back to triggering all.
+                logger.warning(
+                    "GitHub webhook compare returned no paths at all repo=%s, auto-triggering all distgit packages",
+                    full_name,
+                )
+                return set()
         merged = from_commits | api_paths
         ahead = int(cmp.get("ahead_by") or 0)
         if not merged:
