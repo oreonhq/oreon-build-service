@@ -33,7 +33,7 @@
       <pre id="repo-status">Loading...</pre>
     </section>
   </main>
-  <script src="/static/app.js?v=5"></script>
+  <script src="/static/app.js?v=6"></script>
   <script>
     (function() {
       var api = window.oreonApi;
@@ -50,13 +50,16 @@
       document.getElementById('btn-regen-all-repodata').addEventListener('click', function() {
         if (!api.isAdmin()) return;
         if (!confirm('Regenerate repodata on R2 for every known release prefix? Empty repos are skipped. This can take a while.')) return;
+        var btn = this;
         var st = document.getElementById('repo-regen-status');
         st.textContent = 'Running…';
-        api.post('/repos/regenerate-metadata', {}).then(function(r) {
-          st.textContent = 'Done. Refreshed ' + (r.refreshed ? r.refreshed.length : 0) + ', skipped (no RPMs) ' + (r.skipped_no_rpms ? r.skipped_no_rpms.length : 0) + '.';
-          loadStatus();
-        }).catch(function(e) {
-          st.textContent = 'Failed: ' + e.message;
+        oreonWithLoading(btn, function() {
+          return api.post('/repos/regenerate-metadata', {}).then(function(r) {
+            st.textContent = 'Done. Refreshed ' + (r.refreshed ? r.refreshed.length : 0) + ', skipped (no RPMs) ' + (r.skipped_no_rpms ? r.skipped_no_rpms.length : 0) + '.';
+            loadStatus();
+          }).catch(function(e) {
+            st.textContent = 'Failed: ' + e.message;
+          });
         });
       });
       loadStatus();
