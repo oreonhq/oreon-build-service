@@ -72,7 +72,7 @@
       </table>
     </section>
   </main>
-  <script src="/static/app.js?v=5"></script>
+  <script src="/static/app.js?v=6"></script>
   <script>
     (function() {
       const api = window.oreonApi;
@@ -103,7 +103,9 @@
             ids.forEach(function(id) {
               chain = chain.then(function() { return api.delete('/workers/' + id); });
             });
-            chain.then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+            oreonWithLoading(del, function() {
+              return chain.then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+            });
           });
           btns.appendChild(del);
         }
@@ -134,7 +136,9 @@
           tbody.querySelectorAll('.delete-worker').forEach(function(btn) {
             btn.addEventListener('click', function() {
               if (!confirm('Delete worker "' + (btn.dataset.name || '') + '"? The worker will need to re-enroll.')) return;
-              api.delete('/workers/' + btn.dataset.id).then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+              oreonWithLoading(btn, function() {
+                return api.delete('/workers/' + btn.dataset.id).then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+              });
             });
           });
           var numPages = workersTotal ? Math.ceil(workersTotal / workersPageSize) : 1;
@@ -155,16 +159,19 @@
       updateUI();
       window.addEventListener('auth-change', function() { updateUI(); load(); });
       document.getElementById('btn-enroll-worker').addEventListener('click', function() {
+        var btn = this;
         var name = document.getElementById('enroll-worker-name').value.trim();
         var token = document.getElementById('enroll-token').value;
         if (!name || !token) { alert('Worker name and enrollment token are required.'); return; }
-        api.post('/workers/enroll', { name: name, enrollment_token: token, architecture: document.getElementById('enroll-arch').value.trim() || null })
-          .then(function(data) {
-            load();
-            if (data.token) alert('Worker enrolled. One-time token (save it): ' + data.token);
-            else alert('Worker enrolled.');
-          })
-          .catch(function(e) { alert('Failed: ' + e.message); });
+        oreonWithLoading(btn, function() {
+          return api.post('/workers/enroll', { name: name, enrollment_token: token, architecture: document.getElementById('enroll-arch').value.trim() || null })
+            .then(function(data) {
+              load();
+              if (data.token) alert('Worker enrolled. One-time token (save it): ' + data.token);
+              else alert('Worker enrolled.');
+            })
+            .catch(function(e) { alert('Failed: ' + e.message); });
+        });
       });
       load();
     })();
