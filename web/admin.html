@@ -131,7 +131,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     </section>
   </main>
 
-  <script src="/static/app.js?v=5"></script>
+  <script src="/static/app.js?v=6"></script>
   <script>
     (function() {
       const api = window.oreonApi;
@@ -295,24 +295,28 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
       function wireActions() {
         var btnCreate = document.getElementById('btn-create-account');
-        if (btnCreate) btnCreate.addEventListener('click', async function() {
-          try {
-            await createAccount();
-            await loadAccounts();
-          } catch (e) {
-            alert('Create failed: ' + (e.message || e));
-          }
+        if (btnCreate) btnCreate.addEventListener('click', function() {
+          oreonWithLoading(btnCreate, async function() {
+            try {
+              await createAccount();
+              await loadAccounts();
+            } catch (e) {
+              alert('Create failed: ' + (e.message || e));
+            }
+          });
         });
 
         var btnSave = document.getElementById('btn-save-account');
-        if (btnSave) btnSave.addEventListener('click', async function() {
-          try {
-            await saveAccount();
-            setEditStatus('Saved.');
-            await loadAccounts();
-          } catch (e) {
-            setEditStatus('Save failed: ' + (e.message || e));
-          }
+        if (btnSave) btnSave.addEventListener('click', function() {
+          oreonWithLoading(btnSave, async function() {
+            try {
+              await saveAccount();
+              setEditStatus('Saved.');
+              await loadAccounts();
+            } catch (e) {
+              setEditStatus('Save failed: ' + (e.message || e));
+            }
+          });
         });
 
         var btnDelete = document.getElementById('btn-delete-account');
@@ -323,16 +327,18 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             return;
           }
           var aMsg = 'Delete account #' + id + '? This cannot be undone.';
-          window.oreonUI.confirm(aMsg, 'Confirm delete').then(async function(ok) {
+          window.oreonUI.confirm(aMsg, 'Confirm delete').then(function(ok) {
             if (!ok) return;
-            try {
-              await deleteAccount(id);
-              setEditSelected(null);
-              await loadAccounts();
-              setEditStatus('Deleted.');
-            } catch (e) {
-              setEditStatus('Delete failed: ' + (e.message || e));
-            }
+            oreonWithLoading(btnDelete, async function() {
+              try {
+                await deleteAccount(id);
+                setEditSelected(null);
+                await loadAccounts();
+                setEditStatus('Deleted.');
+              } catch (e) {
+                setEditStatus('Delete failed: ' + (e.message || e));
+              }
+            });
           });
         });
       }
