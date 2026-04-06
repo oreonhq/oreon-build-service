@@ -342,7 +342,7 @@
         }
         list.innerHTML = visible.map(function(p) {
           return '<label style="display:flex; align-items:center; gap:0.5rem; padding:0.2rem 0; cursor:pointer;">'
-            + '<input type="checkbox" class="cl-cb" data-name="' + escapeAttr(p.name) + '" data-spec="' + escapeAttr(p.spec_path) + '" checked>'
+            + '<input type="checkbox" class="cl-cb" data-name="' + escapeAttr(p.name) + '" data-spec="' + escapeAttr(p.spec_path) + '">'
             + '<span>' + escapeHtml(p.name) + '</span>'
             + '</label>';
         }).join('');
