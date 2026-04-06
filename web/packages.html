@@ -88,7 +88,7 @@
       </div>
     </div>
   </main>
-  <script src="/static/app.js?v=5"></script>
+  <script src="/static/app.js?v=6"></script>
   <script>
     (function() {
       const api = window.oreonApi;
@@ -166,7 +166,9 @@
               window.oreonUI.confirm('Delete package "' + (btn.dataset.name || '') + '"? This cannot be undone.', 'Delete package')
                 .then(function(ok) {
                   if (!ok) return;
-                  api.delete('/packages/' + btn.dataset.id).then(function() { load(); }).catch(function(e) { alert('Failed: ' + window.oreonErrorMessage(e)); });
+                  oreonWithLoading(btn, function() {
+                    return api.delete('/packages/' + btn.dataset.id).then(function() { load(); }).catch(function(e) { alert('Failed: ' + window.oreonErrorMessage(e)); });
+                  });
                 });
             });
           });
@@ -210,6 +212,7 @@
       fillMockEnvsForEdit();
       document.getElementById('edit-package-cancel').addEventListener('click', function() { document.getElementById('edit-package-modal').classList.remove('open'); });
       document.getElementById('edit-package-save').addEventListener('click', function() {
+        var btn = this;
         var id = document.getElementById('edit-package-id').value;
         var desc = document.getElementById('edit-package-desc').value.trim();
         var ghUrl = document.getElementById('edit-package-github-url').value.trim();
@@ -222,9 +225,11 @@
         } else payload.github_repository_id = null;
         if (mockIdVal) payload.preferred_mock_environment_id = parseInt(mockIdVal, 10);
         else payload.preferred_mock_environment_id = null;
-        api.patch('/packages/' + id, payload)
-          .then(function() { document.getElementById('edit-package-modal').classList.remove('open'); load(); })
-          .catch(function(e) { alert('Failed: ' + window.oreonErrorMessage(e)); });
+        oreonWithLoading(btn, function() {
+          return api.patch('/packages/' + id, payload)
+            .then(function() { document.getElementById('edit-package-modal').classList.remove('open'); load(); })
+            .catch(function(e) { alert('Failed: ' + window.oreonErrorMessage(e)); });
+        });
       });
       load();
     })();
