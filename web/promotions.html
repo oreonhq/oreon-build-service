@@ -70,7 +70,7 @@
       </table>
     </section>
   </main>
-  <script src="/static/app.js?v=5"></script>
+  <script src="/static/app.js?v=6"></script>
   <script>
     (function() {
       const api = window.oreonApi;
@@ -91,7 +91,7 @@
           });
           btns.appendChild(clear);
           if (!api.token) return;
-          function runPromote(pathSuffix) {
+          function runPromote(btn, pathSuffix) {
             var chain = Promise.resolve();
             ids.forEach(function(id) {
               var tr = tbody.querySelector('tr[data-id="' + id + '"]');
@@ -99,19 +99,21 @@
               if (st !== 'pending') return;
               chain = chain.then(function() { return api.post('/promotions/' + id + '/' + pathSuffix); });
             });
-            chain.then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+            oreonWithLoading(btn, function() {
+              return chain.then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+            });
           }
           var b1 = document.createElement('button');
           b1.type = 'button';
           b1.className = 'btn promo-testing';
           b1.textContent = 'Promote selected to Testing';
-          b1.addEventListener('click', function() { runPromote('to-testing'); });
+          b1.addEventListener('click', function() { runPromote(b1, 'to-testing'); });
           btns.appendChild(b1);
           var b2 = document.createElement('button');
           b2.type = 'button';
           b2.className = 'btn promo-stable';
           b2.textContent = 'Promote selected to Stable';
-          b2.addEventListener('click', function() { runPromote('to-stable'); });
+          b2.addEventListener('click', function() { runPromote(b2, 'to-stable'); });
           btns.appendChild(b2);
         }
       });
@@ -147,7 +149,9 @@
               var id = btn.dataset.id;
               var action = btn.dataset.action;
               var postPath = '/promotions/' + id + '/' + (action === 'to-testing' ? 'to-testing' : 'to-stable');
-              api.post(postPath).then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+              oreonWithLoading(btn, function() {
+                return api.post(postPath).then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+              });
             });
           });
           var numPages = promoTotal ? Math.ceil(promoTotal / promoPageSize) : 1;
