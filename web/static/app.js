@@ -226,6 +226,24 @@ window.oreonBindTableSelection = function(tbody, opts) {
   return { refresh: refresh, getSelectedIds: getSelectedIds };
 };
 
+/**
+ * Disable btn while asyncFn() is running, then restore it.
+ * Appends " ..." to the label during the operation.
+ * Returns the promise from asyncFn so callers can .catch() as normal.
+ */
+window.oreonWithLoading = function(btn, asyncFn) {
+  if (!btn) return asyncFn();
+  var orig = btn.textContent;
+  btn.disabled = true;
+  btn.classList.add('loading');
+  btn.textContent = orig + ' …';
+  return asyncFn().finally(function() {
+    btn.disabled = false;
+    btn.classList.remove('loading');
+    btn.textContent = orig;
+  });
+};
+
 /** Returns a function that runs fn after ms quiet time (use for server-backed list filters). */
 window.oreonDebounce = function(fn, ms) {
   var t;

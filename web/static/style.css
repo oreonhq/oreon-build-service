@@ -105,6 +105,8 @@ button:hover, .btn:hover { border-color: var(--accent); color: var(--accent); }
 button.primary, .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 button.primary:hover, .btn.primary:hover { opacity: 0.96; }
 button:active, .btn:active { opacity: 0.92; }
+button:disabled, .btn:disabled, button[disabled], .btn[disabled] { opacity: 0.55; cursor: not-allowed; pointer-events: none; }
+button.loading, .btn.loading { opacity: 0.65; cursor: wait; pointer-events: none; }
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--border); }
 th { color: var(--text-muted); font-weight: 500; font-size: 0.85rem; }
