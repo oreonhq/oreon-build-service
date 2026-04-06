@@ -188,7 +188,7 @@
       </table>
     </section>
   </main>
-  <script src="/static/app.js?v=5"></script>
+  <script src="/static/app.js?v=6"></script>
   <script>
     (function() {
       const api = window.oreonApi;
@@ -354,13 +354,14 @@
 
       document.getElementById('btn-load-checklist').addEventListener('click', function() {
         if (!selectedReleaseIdNew) { alert('Select a release first.'); return; }
+        var btn = this;
         var status = document.getElementById('checklist-status');
         var toolbar = document.getElementById('checklist-toolbar');
         var list = document.getElementById('checklist-list');
         if (status) status.textContent = 'Loading from GitHub...';
         if (toolbar) toolbar.style.display = 'none';
         if (list) list.style.display = 'none';
-        api.get('/builds/distgit-checklist?release_id=' + selectedReleaseIdNew).then(function(data) {
+        oreonWithLoading(btn, function() { return api.get('/builds/distgit-checklist?release_id=' + selectedReleaseIdNew).then(function(data) {
           checklistPackages = (data && data.packages) ? data.packages : [];
           checklistLoaded = true;
           var msg = checklistPackages.length + ' unbuilt package(s) found';
@@ -373,7 +374,7 @@
           if (list) list.style.display = 'block';
         }).catch(function(e) {
           if (status) status.textContent = 'Failed to load: ' + (e.message || e);
-        });
+        }); }); // end oreonWithLoading
       });
 
       document.getElementById('btn-checklist-all').addEventListener('click', function() {
@@ -395,6 +396,7 @@
 
       document.getElementById('btn-trigger-checklist-builds').addEventListener('click', function() {
         if (!selectedReleaseIdNew) { alert('Select a release.'); return; }
+        var _clBtn = this;
         var selected = Array.from(document.querySelectorAll('#checklist-list .cl-cb:checked'));
         if (!selected.length) { alert('Check at least one package.'); return; }
         var arches = getSelectedArchitecturesNew();
@@ -426,20 +428,21 @@
               return { ok: false, name: pkgName, err: (e && e.message) ? e.message : String(e) };
             });
         });
-        Promise.all(tasks).then(function(results) {
-          render();
-          var bad = results.filter(function(r) { return !r.ok; });
-          var ok = results.filter(function(r) { return r.ok; });
-          var queued = ok.reduce(function(n, r) { return n + (r.jobCount || 0); }, 0);
-          if (bad.length) {
-            alert(ok.length + ' triggered, ' + bad.length + ' failed:\n' + bad.slice(0, 10).map(function(b) { return b.name + ': ' + b.err; }).join('\n'));
-          } else {
-            alert(ok.length + ' package(s) queued for build (' + queued + ' job(s) created).');
-          }
-          // Reload checklist to refresh unbuilt list
-          if (checklistLoaded) {
-            document.getElementById('btn-load-checklist').click();
-          }
+        oreonWithLoading(_clBtn, function() {
+          return Promise.all(tasks).then(function(results) {
+            render();
+            var bad = results.filter(function(r) { return !r.ok; });
+            var ok = results.filter(function(r) { return r.ok; });
+            var queued = ok.reduce(function(n, r) { return n + (r.jobCount || 0); }, 0);
+            if (bad.length) {
+              alert(ok.length + ' triggered, ' + bad.length + ' failed:\n' + bad.slice(0, 10).map(function(b) { return b.name + ': ' + b.err; }).join('\n'));
+            } else {
+              alert(ok.length + ' package(s) queued for build (' + queued + ' job(s) created).');
+            }
+            if (checklistLoaded) {
+              document.getElementById('btn-load-checklist').click();
+            }
+          });
         });
       });
       (function initReleaseNewSelect() {
@@ -592,14 +595,18 @@
                 alert(RETRY_ALREADY_MESSAGE);
                 return;
               }
-              api.post('/builds/jobs/' + jid + '/retry')
-                .then(function() { markBuildJobRetried(jid); render(); })
-                .catch(function(e) { alert(e.message); });
+              oreonWithLoading(btn, function() {
+                return api.post('/builds/jobs/' + jid + '/retry')
+                  .then(function() { markBuildJobRetried(jid); render(); })
+                  .catch(function(e) { alert(e.message); });
+              });
             });
           });
           tbody.querySelectorAll('.cancel-build').forEach(function(btn) {
             btn.addEventListener('click', function() {
-              api.post('/builds/jobs/' + btn.dataset.id + '/cancel').then(render).catch(function(e) { alert(e.message); });
+              oreonWithLoading(btn, function() {
+                return api.post('/builds/jobs/' + btn.dataset.id + '/cancel').then(render).catch(function(e) { alert(e.message); });
+              });
             });
           });
           var numPages = buildsTotal ? Math.ceil(buildsTotal / buildsPageSize) : 1;
@@ -649,18 +656,22 @@
       }
       document.getElementById('btn-trigger-build').addEventListener('click', function() {
         if (!selectedPackageId || !selectedReleaseId) { alert('Select a package and a release.'); return; }
+        var btn = this;
         var architectures = getSelectedArchitecturesExisting();
-        api.post('/builds/trigger', { package_id: selectedPackageId, release_id: selectedReleaseId, architectures: architectures })
-          .then(function(data) {
-            render();
-            var jobs = Array.isArray(data) ? data : (data ? [data] : []);
-            if (jobs.length) alert('Builds triggered for ' + jobs.length + ' architecture(s).');
-            else alert('No new jobs queued. Every selected architecture that has a worker already has a successful build for this package and release.');
-          })
-          .catch(function(e) { alert('Failed: ' + e.message); });
+        oreonWithLoading(btn, function() {
+          return api.post('/builds/trigger', { package_id: selectedPackageId, release_id: selectedReleaseId, architectures: architectures })
+            .then(function(data) {
+              render();
+              var jobs = Array.isArray(data) ? data : (data ? [data] : []);
+              if (jobs.length) alert('Builds triggered for ' + jobs.length + ' architecture(s).');
+              else alert('No new jobs queued. Every selected architecture that has a worker already has a successful build for this package and release.');
+            })
+            .catch(function(e) { alert('Failed: ' + e.message); });
+        });
       });
       document.getElementById('btn-create-and-build').addEventListener('click', function() {
         if (!selectedReleaseIdNew) { alert('Select a release.'); return; }
+        var _btn = this;
         var mockIdVal = (document.getElementById('new-package-mock-env') && document.getElementById('new-package-mock-env').value || '').trim();
         var arches = getSelectedArchitecturesNew();
         if (currentSourceType === 'url') {
@@ -676,14 +687,16 @@
             if (urls.length === 1) newPackage.source_url = urls[0];
             else if (urls.length > 1) { newPackage.source_url = urls[0]; newPackage.source_urls = urls; }
           }
-          api.post('/builds/trigger', { new_package: newPackage, release_id: selectedReleaseIdNew, architectures: arches })
-            .then(function(data) {
-              render();
-              var jobs = Array.isArray(data) ? data : (data ? [data] : []);
-              if (jobs.length) alert('Build triggered for ' + jobs.length + ' architecture(s).');
-              else alert('No new jobs queued. All selected arches already built for this package and release.');
-            })
-            .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
+          oreonWithLoading(_btn, function() {
+            return api.post('/builds/trigger', { new_package: newPackage, release_id: selectedReleaseIdNew, architectures: arches })
+              .then(function(data) {
+                render();
+                var jobs = Array.isArray(data) ? data : (data ? [data] : []);
+                if (jobs.length) alert('Build triggered for ' + jobs.length + ' architecture(s).');
+                else alert('No new jobs queued. All selected arches already built for this package and release.');
+              })
+              .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
+          });
         } else if (currentSourceType === 'upload') {
           var files = document.getElementById('source-upload-files') && document.getElementById('source-upload-files').files;
           if (!files || !files.length) { alert('Select at least one .src.rpm or .spec file.'); return; }
@@ -692,25 +705,27 @@
           if (mockIdVal) formData.append('preferred_mock_environment_id', mockIdVal);
           formData.append('architectures', arches.join(','));
           for (var i = 0; i < files.length; i++) formData.append('files', files[i]);
-          fetch(api.base + '/builds/upload', {
-            method: 'POST',
-            headers: api.token ? { 'Authorization': 'Bearer ' + api.token } : {},
-            body: formData
-          }).then(function(r) {
-            if (r.status === 401) { api.setToken(null); window.dispatchEvent(new Event('auth-change')); throw new Error('Unauthorized'); }
-            if (!r.ok) {
+          oreonWithLoading(_btn, function() {
+            return fetch(api.base + '/builds/upload', {
+              method: 'POST',
+              headers: api.token ? { 'Authorization': 'Bearer ' + api.token } : {},
+              body: formData
+            }).then(function(r) {
+              if (r.status === 401) { api.setToken(null); window.dispatchEvent(new Event('auth-change')); throw new Error('Unauthorized'); }
+              if (!r.ok) {
+                return r.text().then(function(t) {
+                  var err = null;
+                  try { err = t ? JSON.parse(t) : {}; } catch (_) {}
+                  throw new Error((err && err.detail) || r.statusText);
+                });
+              }
               return r.text().then(function(t) {
-                var err = null;
-                try { err = t ? JSON.parse(t) : {}; } catch (_) {}
-                throw new Error((err && err.detail) || r.statusText);
+                if (!t || !t.trim()) return null;
+                try { return JSON.parse(t); } catch (_) { return null; }
               });
-            }
-            return r.text().then(function(t) {
-              if (!t || !t.trim()) return null;
-              try { return JSON.parse(t); } catch (_) { return null; }
-            });
-          }).then(function() { render(); alert('Package created and build triggered.'); document.getElementById('source-upload-files').value = ''; })
-            .catch(function(e) { alert('Failed: ' + (e.message || e)); });
+            }).then(function() { render(); alert('Package created and build triggered.'); document.getElementById('source-upload-files').value = ''; })
+              .catch(function(e) { alert('Failed: ' + (e.message || e)); });
+          });
           return;
         } else if (currentSourceType === 'scm') {
           var newPackage = {
@@ -723,14 +738,16 @@
           if (u) newPackage.source_url = u;
           var b = (document.getElementById('source-scm-branch') && document.getElementById('source-scm-branch').value || '').trim();
           if (b) newPackage.source_branch = b;
-          api.post('/builds/trigger', { new_package: newPackage, release_id: selectedReleaseIdNew, architectures: arches })
-            .then(function(data) {
-              render();
-              var jobs = Array.isArray(data) ? data : (data ? [data] : []);
-              if (jobs.length) alert('Build triggered for ' + jobs.length + ' architecture(s).');
-              else alert('No new jobs queued. All selected arches already built for this package and release.');
-            })
-            .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
+          oreonWithLoading(_btn, function() {
+            return api.post('/builds/trigger', { new_package: newPackage, release_id: selectedReleaseIdNew, architectures: arches })
+              .then(function(data) {
+                render();
+                var jobs = Array.isArray(data) ? data : (data ? [data] : []);
+                if (jobs.length) alert('Build triggered for ' + jobs.length + ' architecture(s).');
+                else alert('No new jobs queued. All selected arches already built for this package and release.');
+              })
+              .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
+          });
         } else if (currentSourceType === 'distgit') {
           var pkgsRaw = (document.getElementById('distgit-packages') && document.getElementById('distgit-packages').value) || '';
           var pkgNames = pkgsRaw
@@ -766,22 +783,24 @@
                 return { ok: false, name: pkgName, err: (e && e.message) ? e.message : String(e) };
               });
           });
-          Promise.all(tasks).then(function(results) {
-            render();
-            var bad = (results || []).filter(function(r) { return r && !r.ok; });
-            var okRows = (results || []).filter(function(r) { return r && r.ok; });
-            var jobsQueued = okRows.reduce(function(n, r) { return n + (r.jobCount || 0); }, 0);
-            var allSkipped = okRows.length && okRows.every(function(r) { return (r.jobCount || 0) === 0; });
-            if (bad.length) {
-              alert('Some DistGit triggers failed (' + bad.length + '/' + pkgNames.length + '):\n' +
-                bad.map(function(b) { return b.name + ': ' + (b.err || 'error'); }).join('\n'));
-            } else {
-              var parts = [];
-              if (okRows.length) parts.push(okRows.length + ' package(s) triggered via DistGit');
-              if (jobsQueued) parts.push(jobsQueued + ' build job(s) queued');
-              if (allSkipped) parts.push('no new jobs (all requested arches already built where applicable)');
-              alert(parts.length ? parts.join('. ') + '.' : 'Trigger requested for ' + pkgNames.length + ' DistGit package(s).');
-            }
+          oreonWithLoading(_btn, function() {
+            return Promise.all(tasks).then(function(results) {
+              render();
+              var bad = (results || []).filter(function(r) { return r && !r.ok; });
+              var okRows = (results || []).filter(function(r) { return r && r.ok; });
+              var jobsQueued = okRows.reduce(function(n, r) { return n + (r.jobCount || 0); }, 0);
+              var allSkipped = okRows.length && okRows.every(function(r) { return (r.jobCount || 0) === 0; });
+              if (bad.length) {
+                alert('Some DistGit triggers failed (' + bad.length + '/' + pkgNames.length + '):\n' +
+                  bad.map(function(b) { return b.name + ': ' + (b.err || 'error'); }).join('\n'));
+              } else {
+                var parts = [];
+                if (okRows.length) parts.push(okRows.length + ' package(s) triggered via DistGit');
+                if (jobsQueued) parts.push(jobsQueued + ' build job(s) queued');
+                if (allSkipped) parts.push('no new jobs (all requested arches already built where applicable)');
+                alert(parts.length ? parts.join('. ') + '.' : 'Trigger requested for ' + pkgNames.length + ' DistGit package(s).');
+              }
+            });
           });
           return;
         }
