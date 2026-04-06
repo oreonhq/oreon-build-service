@@ -114,7 +114,7 @@
       </div>
     </div>
   </main>
-  <script src="/static/app.js?v=5"></script>
+  <script src="/static/app.js?v=6"></script>
   <script>
     (function() {
       const api = window.oreonApi;
@@ -145,7 +145,9 @@
             ids.forEach(function(id) {
               chain = chain.then(function() { return api.delete('/mock-environments/' + id); });
             });
-            chain.then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+            oreonWithLoading(del, function() {
+              return chain.then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+            });
           });
           btns.appendChild(del);
         }
@@ -216,7 +218,9 @@
           tbody.querySelectorAll('.delete-mock').forEach(function(btn) {
             btn.addEventListener('click', function() {
               if (!confirm('Delete mock environment "' + (btn.dataset.name || '') + '"?')) return;
-              api.delete('/mock-environments/' + btn.dataset.id).then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+              oreonWithLoading(btn, function() {
+                return api.delete('/mock-environments/' + btn.dataset.id).then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+              });
             });
           });
           var numPages = mockTotal ? Math.ceil(mockTotal / mockPageSize) : 1;
@@ -258,37 +262,43 @@
         bindMockRepoRows(c);
       });
       document.getElementById('edit-mock-save').addEventListener('click', function() {
+        var btn = this;
         var id = document.getElementById('edit-mock-id').value;
-        api.patch('/mock-environments/' + id, {
-          name: document.getElementById('edit-mock-name').value.trim() || null,
-          config_name: document.getElementById('edit-mock-config').value.trim() || null,
-          config_content: document.getElementById('edit-mock-config-content').value.trim() || null,
-          additional_repo_urls: collectMockRepoUrls(document.getElementById('edit-mock-extra-repos')),
-          is_available: document.getElementById('edit-mock-available').checked,
-          priority: parseInt(document.getElementById('edit-mock-priority').value, 10) || 0
-        }).then(function() { document.getElementById('edit-mock-modal').classList.remove('open'); load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+        oreonWithLoading(btn, function() {
+          return api.patch('/mock-environments/' + id, {
+            name: document.getElementById('edit-mock-name').value.trim() || null,
+            config_name: document.getElementById('edit-mock-config').value.trim() || null,
+            config_content: document.getElementById('edit-mock-config-content').value.trim() || null,
+            additional_repo_urls: collectMockRepoUrls(document.getElementById('edit-mock-extra-repos')),
+            is_available: document.getElementById('edit-mock-available').checked,
+            priority: parseInt(document.getElementById('edit-mock-priority').value, 10) || 0
+          }).then(function() { document.getElementById('edit-mock-modal').classList.remove('open'); load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+        });
       });
       document.getElementById('btn-create-mock').addEventListener('click', function() {
+        var btn = this;
         var releaseId = document.getElementById('create-mock-release-id').value;
         var name = document.getElementById('create-mock-name').value.trim();
         var config = document.getElementById('create-mock-config').value.trim();
         if (!releaseId || !name || !config) { alert('Release, name, and config name are required.'); return; }
-        api.post('/mock-environments', {
-          release_id: parseInt(releaseId, 10),
-          name: name,
-          config_name: config,
-          additional_repo_urls: collectMockRepoUrls(document.getElementById('create-mock-extra-repos')),
-          is_available: true,
-          priority: 0
-        })
-          .then(function() {
-            load();
-            document.getElementById('create-mock-name').value = '';
-            document.getElementById('create-mock-config').value = '';
-            fillMockRepoRows(document.getElementById('create-mock-extra-repos'), []);
-            alert('Mock environment created.');
+        oreonWithLoading(btn, function() {
+          return api.post('/mock-environments', {
+            release_id: parseInt(releaseId, 10),
+            name: name,
+            config_name: config,
+            additional_repo_urls: collectMockRepoUrls(document.getElementById('create-mock-extra-repos')),
+            is_available: true,
+            priority: 0
           })
-          .catch(function(e) { alert('Failed: ' + e.message); });
+            .then(function() {
+              load();
+              document.getElementById('create-mock-name').value = '';
+              document.getElementById('create-mock-config').value = '';
+              fillMockRepoRows(document.getElementById('create-mock-extra-repos'), []);
+              alert('Mock environment created.');
+            })
+            .catch(function(e) { alert('Failed: ' + e.message); });
+        });
       });
       fillMockRepoRows(document.getElementById('create-mock-extra-repos'), []);
       load();
