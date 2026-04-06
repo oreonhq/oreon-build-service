@@ -116,7 +116,7 @@
       </div>
     </div>
   </main>
-  <script src="/static/app.js?v=5"></script>
+  <script src="/static/app.js?v=6"></script>
   <script>
     (function() {
       const api = window.oreonApi;
@@ -190,7 +190,9 @@
           tbody.querySelectorAll('.delete-rel').forEach(function(btn) {
             btn.addEventListener('click', function() {
               if (!confirm('Delete release "' + (btn.dataset.name || '') + '"? This cannot be undone.')) return;
-              api.delete('/releases/' + btn.dataset.id).then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+              oreonWithLoading(btn, function() {
+                return api.delete('/releases/' + btn.dataset.id).then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+              });
             });
           });
           var numPages = releasesTotal ? Math.ceil(releasesTotal / releasesPageSize) : 1;
@@ -212,22 +214,28 @@
       window.addEventListener('auth-change', function() { updateUI(); load(); });
       document.getElementById('edit-release-cancel').addEventListener('click', function() { document.getElementById('edit-release-modal').classList.remove('open'); });
       document.getElementById('edit-release-save').addEventListener('click', function() {
+        var btn = this;
         var id = document.getElementById('edit-release-id').value;
-        api.patch('/releases/' + id, {
-          description: document.getElementById('edit-release-desc').value.trim() || null,
-          architectures: document.getElementById('edit-release-arch').value.trim() || null,
-          default_channel: document.getElementById('edit-release-channel').value,
-          default_repo_branch: document.getElementById('edit-default-repo-branch').value.trim() || null,
-          is_active: document.getElementById('edit-release-active').checked
-        }).then(function() { document.getElementById('edit-release-modal').classList.remove('open'); load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+        oreonWithLoading(btn, function() {
+          return api.patch('/releases/' + id, {
+            description: document.getElementById('edit-release-desc').value.trim() || null,
+            architectures: document.getElementById('edit-release-arch').value.trim() || null,
+            default_channel: document.getElementById('edit-release-channel').value,
+            default_repo_branch: document.getElementById('edit-default-repo-branch').value.trim() || null,
+            is_active: document.getElementById('edit-release-active').checked
+          }).then(function() { document.getElementById('edit-release-modal').classList.remove('open'); load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+        });
       });
       document.getElementById('btn-create-release').addEventListener('click', function() {
+        var btn = this;
         var name = document.getElementById('create-releasename').value.trim();
         var arch = document.getElementById('create-architectures').value.trim();
         if (!name || !arch) { alert('Release name and architectures are required.'); return; }
-        api.post('/releases', { releasename: name, architectures: arch, default_channel: document.getElementById('create-default-channel').value, default_repo_branch: document.getElementById('create-default-repo-branch').value.trim() || 'dev', description: document.getElementById('create-description').value.trim() || null, base_repos: [] })
-          .then(function() { load(); document.getElementById('create-releasename').value = ''; document.getElementById('create-description').value = ''; document.getElementById('create-default-repo-branch').value = 'dev'; alert('Release created.'); })
-          .catch(function(e) { alert('Failed: ' + e.message); });
+        oreonWithLoading(btn, function() {
+          return api.post('/releases', { releasename: name, architectures: arch, default_channel: document.getElementById('create-default-channel').value, default_repo_branch: document.getElementById('create-default-repo-branch').value.trim() || 'dev', description: document.getElementById('create-description').value.trim() || null, base_repos: [] })
+            .then(function() { load(); document.getElementById('create-releasename').value = ''; document.getElementById('create-description').value = ''; document.getElementById('create-default-repo-branch').value = 'dev'; alert('Release created.'); })
+            .catch(function(e) { alert('Failed: ' + e.message); });
+        });
       });
       load();
     })();
