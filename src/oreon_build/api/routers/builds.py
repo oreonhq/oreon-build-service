@@ -204,6 +204,100 @@ async def list_artifacts(attempt_id: int, db: DbSession):
     return list(result.scalars().all())
 
 
+@router.get("/distgit-checklist")
+async def distgit_checklist(
+    release_id: int,
+    db: DbSession,
+    user: CurrentUser,
+):
+    """Return packages in the distgit repo (oreonhq/rpm-specfiles) that:
+    - have a spec file at <releasename>/<pkg>/<pkg>.spec
+    - do NOT have a dead.package marker
+    - do NOT yet have a successful build for this release
+
+    Uses the GitHub git-tree API (one call) to enumerate the full repo tree.
+    Returns {packages: [{name, spec_path}], truncated: bool}.
+    """
+    from oreon_build.services.github import get_github_client
+
+    rel_res = await db.execute(select(Release).where(Release.id == release_id))
+    rel = rel_res.scalar_one_or_none()
+    if not rel:
+        raise HTTPException(status_code=404, detail="Release not found")
+
+    releasename = (rel.releasename or "").strip()
+    if not releasename:
+        raise HTTPException(status_code=400, detail="Release has no releasename configured")
+
+    owner = "oreonhq"
+    repo = "rpm-specfiles"
+    branch = "main"
+    client = get_github_client()
+    try:
+        tree_data = await client.list_git_tree_recursive(owner, repo, branch)
+    except Exception as exc:
+        logger.warning("distgit-checklist: GitHub tree fetch failed: %s", exc)
+        raise HTTPException(status_code=502, detail=f"GitHub API error: {exc}") from exc
+    finally:
+        await client.close()
+
+    tree: list[dict] = tree_data.get("tree") or []
+    truncated: bool = bool(tree_data.get("truncated"))
+
+    prefix = releasename + "/"
+    has_spec: set[str] = set()
+    is_dead: set[str] = set()
+
+    for entry in tree:
+        path: str = entry.get("path") or ""
+        if not path.startswith(prefix):
+            continue
+        rest = path[len(prefix):]
+        parts = rest.split("/", 1)
+        if len(parts) != 2:
+            continue
+        pkg_dir, filename = parts
+        if not pkg_dir or not filename:
+            continue
+        if filename == f"{pkg_dir}.spec":
+            has_spec.add(pkg_dir)
+        elif filename == "dead.package":
+            is_dead.add(pkg_dir)
+
+    valid_names = sorted(has_spec - is_dead)
+
+    # Find which of those already have at least one successful build job for this release.
+    if valid_names:
+        success_q = (
+            select(Package.name)
+            .join(BuildJob, BuildJob.package_id == Package.id)
+            .where(
+                BuildJob.release_id == release_id,
+                BuildJob.status == BuildStatus.SUCCESS,
+                Package.name.in_(valid_names),
+            )
+            .distinct()
+        )
+        already_res = await db.execute(success_q)
+        already_built: set[str] = {row[0] for row in already_res.all()}
+    else:
+        already_built = set()
+
+    unbuilt = [
+        {"name": name, "spec_path": f"{releasename}/{name}/{name}.spec"}
+        for name in valid_names
+        if name not in already_built
+    ]
+
+    return {
+        "packages": unbuilt,
+        "total": len(unbuilt),
+        "already_built_count": len(already_built),
+        "truncated": truncated,
+        "releasename": releasename,
+    }
+
+
 def _source_url_from_new_package(np) -> str | None:
     """Primary URL for Source record from NewPackageForBuild."""
     if np.source_url:

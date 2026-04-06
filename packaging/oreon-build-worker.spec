@@ -33,6 +33,7 @@ Requires:       pigz
 Requires:       rpmrebuild
 Requires:       pesign
 Requires:       git
+Requires:       kf6-rpm-macros
 
 %description
 Worker daemon for Oreon Build Service.

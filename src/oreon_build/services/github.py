@@ -100,6 +100,33 @@ class GitHubClient:
         r.raise_for_status()
         return r.json()
 
+    async def list_git_tree_recursive(self, owner: str, repo: str, ref: str) -> dict[str, Any]:
+        """Return the full recursive git tree for a ref.
+
+        The response has ``tree`` (list of entries with ``path``, ``type``, ``sha``) and
+        ``truncated`` (bool). Callers must handle truncated=True (repo is too large).
+        """
+        r = await self._client.get(
+            f"/repos/{owner}/{repo}/git/trees/{quote(ref, safe='')}",
+            params={"recursive": "1"},
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def get_repo_contents(self, owner: str, repo: str, path: str, ref: str | None = None) -> Any:
+        """Return the GitHub Contents API response for a path (file or directory listing)."""
+        params = {}
+        if ref:
+            params["ref"] = ref
+        r = await self._client.get(
+            f"/repos/{owner}/{repo}/contents/{quote(path, safe='/')}",
+            params=params,
+        )
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
+
     async def close(self) -> None:
         await self._client.aclose()
 
