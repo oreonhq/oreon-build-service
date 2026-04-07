@@ -184,7 +184,7 @@ async def release_arch_combos_for_auto_build(db: AsyncSession, pkg: Package) -> 
 
 def _paths_from_commit_object(c: dict[str, Any]) -> set[str]:
     out: set[str] = set()
-    for key in ("added", "modified", "removed"):
+    for key in ("added", "modified"):
         for p in c.get(key) or []:
             if isinstance(p, str) and p.strip():
                 out.add(p.strip().replace("\\", "/"))
@@ -322,12 +322,16 @@ def collect_paths_from_compare_files(compare_json: dict[str, Any]) -> set[str]:
     for f in compare_json.get("files") or []:
         if not isinstance(f, dict):
             continue
+        status = (f.get("status") or "").lower()
+        if status == "removed":
+            continue
         fn = f.get("filename")
         if isinstance(fn, str) and fn.strip():
             out.add(fn.strip().replace("\\", "/"))
-        prev = f.get("previous_filename")
-        if isinstance(prev, str) and prev.strip():
-            out.add(prev.strip().replace("\\", "/"))
+        if status == "renamed":
+            prev = f.get("previous_filename")
+            if isinstance(prev, str) and prev.strip():
+                out.add(prev.strip().replace("\\", "/"))
     return out
 
 

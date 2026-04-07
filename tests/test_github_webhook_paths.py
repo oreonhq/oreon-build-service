@@ -54,6 +54,49 @@ def test_collect_paths_includes_head_commit_when_commits_empty() -> None:
     assert "oreon-11-rp1/foo/foo.spec" in collect_paths_from_webhook_commits(body)
 
 
+def test_collect_paths_excludes_removed_files() -> None:
+    from oreon_build.services.github_push_trigger import (
+        collect_paths_from_compare_files,
+        collect_paths_from_webhook_commits,
+    )
+
+    body = {
+        "commits": [
+            {
+                "added": [],
+                "modified": ["oreon-11-rp1/bash/bash.spec"],
+                "removed": ["oreon-11-rp1/kf5-kirigami/kf5-kirigami.spec"],
+            }
+        ],
+        "head_commit": {
+            "added": [],
+            "modified": [],
+            "removed": ["oreon-11-rp1/kf5-purpose/kf5-purpose.spec"],
+        },
+    }
+    paths = collect_paths_from_webhook_commits(body)
+    assert "oreon-11-rp1/bash/bash.spec" in paths
+    assert "oreon-11-rp1/kf5-kirigami/kf5-kirigami.spec" not in paths
+    assert "oreon-11-rp1/kf5-purpose/kf5-purpose.spec" not in paths
+
+    compare = {
+        "files": [
+            {"filename": "oreon-11-rp1/bash/bash.spec", "status": "modified"},
+            {"filename": "oreon-11-rp1/kf5-kirigami/kf5-kirigami.spec", "status": "removed"},
+            {
+                "filename": "oreon-11-rp1/vim/vim.spec",
+                "previous_filename": "oreon-11-rp1/vim-old/vim-old.spec",
+                "status": "renamed",
+            },
+        ]
+    }
+    cpaths = collect_paths_from_compare_files(compare)
+    assert "oreon-11-rp1/bash/bash.spec" in cpaths
+    assert "oreon-11-rp1/kf5-kirigami/kf5-kirigami.spec" not in cpaths
+    assert "oreon-11-rp1/vim/vim.spec" in cpaths
+    assert "oreon-11-rp1/vim-old/vim-old.spec" in cpaths
+
+
 def test_push_webhook_ref_advanced() -> None:
     from oreon_build.services.github_push_trigger import push_webhook_ref_advanced
 
