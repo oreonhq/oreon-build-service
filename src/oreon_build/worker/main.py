@@ -1570,6 +1570,7 @@ def _cleanup_job_disk(attempt_id: int, mock_config: str, mock_unique_ext: str, w
         shutil.rmtree(work_tmpdir, ignore_errors=True)
     _rm_rf_worker_tempdirs_for_attempt(attempt_id, tmp_parent)
     _prune_stale_oreon_worker_tempdirs()
+    _prune_stale_var_lib_mock_dirs()
 
 
 def _prune_stale_oreon_worker_tempdirs() -> None:
@@ -1637,6 +1638,93 @@ def _prune_stale_oreon_worker_tempdirs() -> None:
                         continue
                 except OSError:
                     continue
+                shutil.rmtree(p, ignore_errors=True)
+        except OSError:
+            pass
+
+
+def _prune_stale_var_lib_mock_dirs() -> None:
+    """
+    Scrub and remove ``/var/lib/mock/*-oreon-<id>`` and ``/var/cache/mock/oreon-<id>``
+    directories left behind by crashed or cancelled builds.
+
+    The per-build cleanup in ``_cleanup_job_disk`` handles the happy path. This sweeper
+    catches anything that slipped through (worker killed mid-cleanup, mock crash, etc.).
+
+    Age threshold: OREON_WORKER_PRUNE_MOCK_CHROOT_AGE_SEC (default 3600s / 1 hour).
+    Set to 0 to disable.
+    """
+    age = int(os.environ.get("OREON_WORKER_PRUNE_MOCK_CHROOT_AGE_SEC", "3600"))
+    if age <= 0:
+        return
+
+    with _inflight_attempt_lock:
+        inflight_ids = set(_inflight_attempt_ids)
+
+    now = time.time()
+
+    # Pattern: <anything>-oreon-<digits>  (skip -bootstrap- dirs; scrubbing the main handles them)
+    _mock_chroot_re = re.compile(r"^(.+)-oreon-(\d+)$")
+
+    mock_lib_base = Path("/var/lib/mock")
+    mock_cache_base = Path("/var/cache/mock")
+
+    if mock_lib_base.is_dir():
+        try:
+            for p in list(mock_lib_base.iterdir()):
+                if not p.is_dir():
+                    continue
+                # Skip bootstrap dirs - they are cleaned when the main chroot is scrubbed.
+                if "-bootstrap-oreon-" in p.name:
+                    continue
+                m = _mock_chroot_re.match(p.name)
+                if not m:
+                    continue
+                try:
+                    attempt_id = int(m.group(2))
+                except ValueError:
+                    continue
+                if attempt_id in inflight_ids:
+                    continue
+                try:
+                    if now - p.stat().st_mtime < age:
+                        continue
+                except OSError:
+                    continue
+                mock_config = m.group(1)
+                mock_unique_ext = f"oreon-{attempt_id}"
+                logger.info(
+                    "Pruning stale mock chroot %s (attempt %s, config %s)",
+                    p.name,
+                    attempt_id,
+                    mock_config,
+                )
+                # Run mock --scrub first to unmount any lingering bind mounts.
+                _mock_scrub_unique_chroot(mock_config, mock_unique_ext)
+                # Belt-and-suspenders: rm -rf anything still left.
+                for leftover in list(mock_lib_base.iterdir()):
+                    if leftover.is_dir() and leftover.name.endswith(f"-oreon-{attempt_id}"):
+                        shutil.rmtree(leftover, ignore_errors=True)
+        except OSError:
+            pass
+
+    if mock_cache_base.is_dir():
+        try:
+            for p in list(mock_cache_base.iterdir()):
+                if not p.is_dir() or not p.name.startswith("oreon-"):
+                    continue
+                try:
+                    attempt_id = int(p.name[len("oreon-"):])
+                except ValueError:
+                    continue
+                if attempt_id in inflight_ids:
+                    continue
+                try:
+                    if now - p.stat().st_mtime < age:
+                        continue
+                except OSError:
+                    continue
+                logger.info("Pruning stale mock cache_topdir %s (attempt %s)", p, attempt_id)
                 shutil.rmtree(p, ignore_errors=True)
         except OSError:
             pass
@@ -2182,13 +2270,21 @@ def main() -> None:
         max_jobs,
     )
 
+    # Clean up any stale mock chroot dirs left over from a previous worker crash/restart.
+    _prune_stale_var_lib_mock_dirs()
+
     active: list[threading.Thread] = []
     last_heartbeat = 0.0
+    last_mock_prune = 0.0
 
     while True:
         active = [t for t in active if t.is_alive()]
 
         now = time.time()
+        if now - last_mock_prune > 3600:
+            threading.Thread(target=_prune_stale_var_lib_mock_dirs, daemon=True, name="oreon-mock-pruner").start()
+            last_mock_prune = now
+
         if now - last_heartbeat > 30:
             try:
                 session.post(f"{controller_url}/api/worker/heartbeat", json={})
