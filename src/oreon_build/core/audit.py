@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from oreon_build.models import Account, AuditLog, BuildJob
-from oreon_build.services.discord import send_discord_embed
+from oreon_build.services.discord import _color_for_action, send_discord_embed
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +73,8 @@ async def log_audit(
                     fields.append(("Architecture", jb.build_target.architecture))
 
         if emit_discord:
-            await send_discord_embed(title=title, description=description, fields=fields)
+            color = _color_for_action(action, details)
+            await send_discord_embed(title=title, description=description, fields=fields, color=color)
     except Exception:
         logger.exception(
             "log_audit side-effects failed (audit row already flushed) action=%s resource_type=%s",

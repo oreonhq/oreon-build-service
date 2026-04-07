@@ -56,7 +56,62 @@ async def send_discord_message(text: str) -> None:
     await _post({"content": (text or "")[:1900]})
 
 
-async def send_discord_embed(title: str, description: str, fields: list[tuple[str, str]]) -> None:
+# Discord embed side-bar colors by event category.
+# Values are 24-bit integers (0xRRGGBB).
+DISCORD_COLOR_SUCCESS  = 0x16A34A  # green
+DISCORD_COLOR_FAILED   = 0xDC2626  # red
+DISCORD_COLOR_CANCELLED = 0x6B7280  # gray
+DISCORD_COLOR_WARNING  = 0xD97706  # amber / stale / timeout
+DISCORD_COLOR_INFO     = 0x2563EB  # blue (default, trigger / create / update)
+DISCORD_COLOR_PROMOTE  = 0x7C3AED  # purple (promotions)
+DISCORD_COLOR_RETRY    = 0xF59E0B  # yellow-orange
+
+
+def _color_for_action(action: str, details: str | None = None) -> int:
+    """Return the Discord embed color int for a given audit action + detail string."""
+    details_lower = (details or "").lower()
+
+    if action == "build.result":
+        if "status=success" in details_lower or "status=repaired_success" in details_lower:
+            return DISCORD_COLOR_SUCCESS
+        if "status=failed" in details_lower or "status=ignored" in details_lower:
+            return DISCORD_COLOR_FAILED
+        if "status=cancelled" in details_lower:
+            return DISCORD_COLOR_CANCELLED
+        return DISCORD_COLOR_INFO
+
+    if action in ("build.stale_timeout",):
+        return DISCORD_COLOR_WARNING
+
+    if action in ("build.cancel",):
+        return DISCORD_COLOR_CANCELLED
+
+    if action in ("build.retry",):
+        return DISCORD_COLOR_RETRY
+
+    if action in ("promotion.to_stable",):
+        return DISCORD_COLOR_SUCCESS
+
+    if action in ("promotion.to_testing",):
+        return DISCORD_COLOR_PROMOTE
+
+    if action in ("promotion.create",):
+        return DISCORD_COLOR_PROMOTE
+
+    if action in ("package.delete", "account.delete", "release.delete", "mock_env.delete", "schedule.delete"):
+        return DISCORD_COLOR_FAILED
+
+    # build.trigger, build.github_auto_trigger, build.github_catchup_trigger,
+    # package.create/update, account.create/update, release.create/update, etc.
+    return DISCORD_COLOR_INFO
+
+
+async def send_discord_embed(
+    title: str,
+    description: str,
+    fields: list[tuple[str, str]],
+    color: int | None = None,
+) -> None:
     """Send a single rich embed (no emojis) to the Discord webhook."""
     settings = get_settings()
     if not getattr(settings, "discord_webhook_url", None):
@@ -75,7 +130,7 @@ async def send_discord_embed(title: str, description: str, fields: list[tuple[st
     embed = {
         "title": title[:256] if title else "Oreon Build Service",
         "description": (description or "")[:1000],
-        "color": 0x2563EB,
+        "color": color if color is not None else DISCORD_COLOR_INFO,
         "fields": embed_fields,
     }
     await _post({"embeds": [embed]})
