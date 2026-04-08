@@ -286,6 +286,27 @@ class BuildJobResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class CurrentFailureItem(BaseModel):
+    """Latest job per package or release or arch slot is failed (ignores older jobs in that slot)."""
+
+    id: int
+    package_id: int
+    package_name: str
+    release_id: int
+    release_name: str
+    target_id: Optional[int] = None
+    architecture: Optional[str] = None
+    package_version_id: Optional[int] = None
+    status: str
+    priority: int
+    created_at: datetime
+    completed_at: Optional[datetime] = None
+    last_attempt_id: Optional[int] = None
+    last_error_message: Optional[str] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class BuildAttemptResponse(BaseModel):
     id: int
     build_job_id: int
