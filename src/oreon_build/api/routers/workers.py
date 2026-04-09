@@ -14,11 +14,28 @@ from oreon_build.models import Worker, WorkerState
 router = APIRouter(prefix="/workers", tags=["workers"])
 
 
+def _effective_worker_state(w: Worker) -> str:
+    """DB state stays idle/busy when a host dies. Treat stale or missing heartbeat as offline for API/UI."""
+    max_age = get_settings().worker_offline_after_seconds
+    if max_age <= 0:
+        return w.state.value
+    if w.last_heartbeat is None:
+        return WorkerState.OFFLINE.value
+    now = datetime.now(timezone.utc)
+    hb = w.last_heartbeat
+    if hb.tzinfo is None:
+        hb = hb.replace(tzinfo=timezone.utc)
+    age_sec = (now - hb).total_seconds()
+    if age_sec > max_age:
+        return WorkerState.OFFLINE.value
+    return w.state.value
+
+
 def _worker_response(w: Worker) -> WorkerResponse:
     return WorkerResponse(
         id=w.id,
         name=w.name,
-        state=w.state.value,
+        state=_effective_worker_state(w),
         architecture=w.architecture,
         last_seen_at=w.last_seen_at,
         last_heartbeat=w.last_heartbeat,

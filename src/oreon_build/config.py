@@ -99,6 +99,15 @@ class Settings(BaseSettings):
     worker_enrollment_secret: str = Field(default="change-me-worker-secret")
     controller_url: str = Field(default="http://localhost:8000")
     mock_config_dir: str = Field(default="/etc/mock")
+    worker_offline_after_seconds: int = Field(
+        default=120,
+        ge=0,
+        le=86400,
+        description=(
+            "List/get worker API reports state offline when last_heartbeat is older than this many "
+            "seconds (idle/busy in the DB are stale). Workers heartbeat about every 30s. 0 uses DB state only."
+        ),
+    )
 
     # Webhooks / integrations
     discord_webhook_url: Optional[str] = Field(default=None)

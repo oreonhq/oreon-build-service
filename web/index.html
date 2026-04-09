@@ -147,6 +147,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             } else {
               var byRelease = {};
               workers.forEach(function(w) {
+                if ((w.state || '') === 'offline') return;
                 var arch = (w.architecture || 'x86_64');
                 // Workers are global; just count by architecture
                 byRelease['_all'] = byRelease['_all'] || {};
