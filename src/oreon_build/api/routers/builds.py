@@ -33,6 +33,24 @@ logger = logging.getLogger(__name__)
 DEFAULT_ARCHITECTURES = ["x86_64", "aarch64"]
 
 
+def _attempt_to_response(a: BuildAttempt) -> BuildAttemptResponse:
+    w = a.worker
+    return BuildAttemptResponse(
+        id=a.id,
+        build_job_id=a.build_job_id,
+        worker_id=a.worker_id,
+        attempt_number=a.attempt_number,
+        status=a.status.value,
+        started_at=a.started_at,
+        finished_at=a.finished_at,
+        log_r2_key=a.log_r2_key,
+        error_message=a.error_message,
+        created_at=a.created_at,
+        worker_name=w.name if w else None,
+        worker_last_heartbeat=w.last_heartbeat if w else None,
+    )
+
+
 async def _has_successful_build_for_target(
     db: DbSession,
     package_id: int,
@@ -277,9 +295,13 @@ async def get_build_job(job_id: int, db: DbSession):
 @router.get("/jobs/{job_id}/attempts", response_model=list[BuildAttemptResponse])
 async def list_attempts(job_id: int, db: DbSession):
     result = await db.execute(
-        select(BuildAttempt).where(BuildAttempt.build_job_id == job_id).order_by(BuildAttempt.started_at.desc())
+        select(BuildAttempt)
+        .where(BuildAttempt.build_job_id == job_id)
+        .options(selectinload(BuildAttempt.worker))
+        .order_by(BuildAttempt.started_at.desc())
     )
-    return list(result.scalars().all())
+    rows = list(result.scalars().all())
+    return [_attempt_to_response(a) for a in rows]
 
 
 @router.get("/attempts/{attempt_id}/artifacts", response_model=list[ArtifactResponse])
