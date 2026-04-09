@@ -283,24 +283,67 @@ def _live_log_interval_sec() -> int:
     return max(0, min(v, 3600))
 
 
+def _mock_log_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def _read_inprogress_mock_build_log_snippet(result_dir: Path, max_bytes: int = 4 * 1024 * 1024) -> str:
+    """
+    Prefer the *newest* build.log under resultdir (mock can leave older nested paths).
+    During ``mock --rebuild``, dnf often streams to **root.log** while **build.log** still
+    shows the finished ``rpmbuild -bs`` block for a long time, so include **root.log** too.
+    """
+    chunks: list[str] = []
+
     try:
-        matches = sorted(result_dir.rglob("build.log"))
+        build_logs = [p for p in result_dir.rglob("build.log") if p.is_file()]
     except OSError:
-        return ""
-    if not matches:
-        return ""
-    path = matches[-1]
+        build_logs = []
+    if build_logs:
+        bl_path = max(build_logs, key=_mock_log_mtime)
+        try:
+            data = bl_path.read_bytes()
+        except OSError:
+            data = b""
+        rel = ""
+        try:
+            rel = str(bl_path.relative_to(result_dir))
+        except ValueError:
+            rel = bl_path.name
+        if len(data) > max_bytes:
+            data = data[-max_bytes:]
+            head = f"## build.log (newest, tail only) — {rel}\n\n[truncated first bytes]\n\n"
+        else:
+            head = f"## build.log (newest) — {rel}\n\n"
+        chunks.append(head + data.decode("utf-8", errors="replace"))
+
+    root_logs: list[Path] = []
+    rp = result_dir / "root.log"
+    if rp.is_file():
+        root_logs.append(rp)
     try:
-        data = path.read_bytes()
+        root_logs.extend(p for p in result_dir.rglob("root.log") if p.is_file())
     except OSError:
-        return ""
-    if len(data) > max_bytes:
-        data = data[-max_bytes:]
-        prefix = f"[truncated {max_bytes} bytes from start of build.log]\n\n"
-    else:
-        prefix = ""
-    return prefix + data.decode("utf-8", errors="replace")
+        pass
+    root_logs = list({p.resolve(): p for p in root_logs}.values())
+    if root_logs:
+        rr_path = max(root_logs, key=_mock_log_mtime)
+        root_cap = min(max_bytes // 2, 2 * 1024 * 1024)
+        try:
+            rdata = rr_path.read_bytes()
+        except OSError:
+            rdata = b""
+        if len(rdata) > root_cap:
+            rdata = rdata[-root_cap:]
+            rhead = f"## root.log tail (dnf / mock wrapper, last {root_cap} bytes)\n\n"
+        else:
+            rhead = "## root.log (dnf / mock wrapper)\n\n"
+        chunks.append(rhead + rdata.decode("utf-8", errors="replace"))
+
+    return "\n\n".join(chunks).strip()
 
 
 def _start_live_build_log_snapshot_thread(
