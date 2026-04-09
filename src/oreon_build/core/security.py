@@ -33,6 +33,11 @@ def hash_worker_token(plain: str, secret: str) -> str:
     return hashlib.sha256((secret + ":" + plain).encode()).hexdigest()
 
 
+def worker_token_fingerprint(plain: str) -> str:
+    """Stable SHA256 for indexed token lookup (hex). Not secret; verification still uses bcrypt."""
+    return hashlib.sha256(_to_bcrypt_input(plain)).hexdigest()
+
+
 def verify_worker_token(plain: str, secret: str, stored_hash: str) -> bool:
     """Verify either a stored bcrypt hash (per-worker token) or legacy hash."""
     if stored_hash.startswith("$2"):
