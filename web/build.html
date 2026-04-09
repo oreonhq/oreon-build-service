@@ -71,6 +71,18 @@
         if (m > 0) return m + 'm ' + s + 's';
         return s + 's';
       }
+      function fetchAttemptLogTail(attemptId, pre) {
+        pre.style.display = 'block';
+        pre.textContent = 'Loading…';
+        return api.get('/logs/attempts/' + attemptId + '/tail?lines=2000').then(function(r) {
+          var lines = (r && r.lines) ? r.lines : [];
+          pre.textContent = lines.join('\n') || '(empty log)';
+          pre.dataset.loaded = '1';
+        }).catch(function(e) {
+          pre.textContent = 'Log not available: ' + (e.message || 'Log not yet uploaded or build did not produce a log.');
+          pre.dataset.loaded = '1';
+        });
+      }
       function refreshAttemptElapsed(container) {
         if (!container) return;
         var now = Date.now();
@@ -146,7 +158,9 @@
               '<div class="attempt-elapsed-live" style="color:var(--text-muted);"></div>' +
               '<div><small>Started: ' + (a.started_at ? a.started_at.slice(0, 19) : '—') + ' &nbsp; Finished: ' + (a.finished_at ? a.finished_at.slice(0, 19) : '—') + '</small></div>' +
               '<div class="artifacts" id="artifacts-' + a.id + '" style="margin-top:0.5rem; font-size:0.9rem; color:var(--text-muted);">Artifacts: loading…</div>' +
-              '<div style="margin-top:0.5rem;"><button type="button" class="btn load-log" data-attempt-id="' + a.id + '">View log</button></div>' +
+              '<div style="margin-top:0.5rem;display:flex;gap:0.35rem;flex-wrap:wrap;align-items:center;">' +
+              '<button type="button" class="btn load-log" data-attempt-id="' + a.id + '">View log</button>' +
+              '<button type="button" class="btn refresh-log" data-attempt-id="' + a.id + '">Refresh log</button></div>' +
               '<pre id="' + logId + '" class="log-viewer" style="display:none; margin-top:0.5rem;"></pre>' +
               '</div>';
           }).join('');
@@ -162,16 +176,15 @@
                 pre.style.display = pre.style.display === 'none' ? 'block' : 'none';
                 return;
               }
-              pre.style.display = 'block';
-              pre.textContent = 'Loading…';
-              api.get('/logs/attempts/' + attemptId + '/tail?lines=2000').then(function(r) {
-                var lines = (r && r.lines) ? r.lines : [];
-                pre.textContent = lines.join('\n') || '(empty log)';
-                pre.dataset.loaded = '1';
-              }).catch(function(e) {
-                pre.textContent = 'Log not available: ' + (e.message || 'Log not yet uploaded or build did not produce a log.');
-                pre.dataset.loaded = '1';
-              });
+              oreonWithLoading(btn, function() { return fetchAttemptLogTail(attemptId, pre); });
+            });
+          });
+          container.querySelectorAll('.refresh-log').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+              var attemptId = btn.dataset.attemptId;
+              var pre = document.getElementById('log-' + attemptId);
+              if (!pre) return;
+              oreonWithLoading(btn, function() { return fetchAttemptLogTail(attemptId, pre); });
             });
           });
           // Load artifacts (including signing status) for each attempt

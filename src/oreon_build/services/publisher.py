@@ -106,6 +106,25 @@ def _run_createrepo(repo_dir: Path) -> None:
     )
 
 
+def _upload_repodata_dir_ordered(client: R2Client, r2_prefix: str, repodata_dir: Path) -> None:
+    """
+    Upload repodata so repomd.xml (and its signature) go last. Otherwise a client can
+    fetch a new repomd that references primary/filelists objects not visible yet.
+    """
+    files = [f for f in repodata_dir.iterdir() if f.is_file()]
+    by_name = {f.name: f for f in files}
+    tail: list[str] = []
+    if "repomd.xml" in by_name:
+        tail.append("repomd.xml")
+    if "repomd.xml.asc" in by_name:
+        tail.append("repomd.xml.asc")
+    head = sorted(n for n in by_name if n not in tail)
+    for name in head + tail:
+        f = by_name[name]
+        r2_key = f"{r2_prefix}/repodata/{name}"
+        client.put_object(r2_key, f.read_bytes())
+
+
 def update_repodata_at_prefix(r2_prefix: str, r2_client: R2Client | None = None) -> bool:
     """
     RPMs are already at r2_prefix/RPMS/. Download them, run createrepo_c, upload only repodata.
@@ -127,9 +146,17 @@ def update_repodata_at_prefix(r2_prefix: str, r2_client: R2Client | None = None)
             rpms_dir.mkdir(parents=True)
             for key in rpm_keys:
                 data = client.get_object(key)
-                if data:
-                    fname = key.split("/")[-1]
-                    (rpms_dir / fname).write_bytes(data)
+                if not data:
+                    raise RuntimeError(f"missing or empty RPM object at {key!r}, aborting repodata update")
+                fname = key.split("/")[-1]
+                dest = rpms_dir / fname
+                if dest.exists():
+                    logger.warning(
+                        "Duplicate RPM basename in R2 listing, overwriting %s (key %s)",
+                        fname,
+                        key,
+                    )
+                dest.write_bytes(data)
             _run_createrepo(repo_root)
             repodata_dir = repo_root / "repodata"
             if repodata_dir.exists():
@@ -142,9 +169,7 @@ def update_repodata_at_prefix(r2_prefix: str, r2_client: R2Client | None = None)
                     sign_repomd(repomd)
 
                 # Upload new repodata first; only after that do we purge stale objects.
-                for f in repodata_dir.iterdir():
-                    r2_key = f"{r2_prefix}/repodata/{f.name}"
-                    client.put_object(r2_key, f.read_bytes())
+                _upload_repodata_dir_ordered(client, r2_prefix, repodata_dir)
 
                 _cleanup_old_repodata(client, r2_prefix, new_filenames)
                 logger.info("Updated repodata at R2 prefix %s (%s RPMs)", r2_prefix, len(rpm_keys))
@@ -179,22 +204,29 @@ def publish_rpms_to_r2(
         rpms_dir.mkdir(parents=True)
         for key in rpm_keys:
             data = client.get_object(key)
-            if data:
-                fname = key.split("/")[-1]
-                (rpms_dir / fname).write_bytes(data)
+            if not data:
+                raise RuntimeError(f"missing or empty RPM object at {key!r}, aborting publish")
+            fname = key.split("/")[-1]
+            dest = rpms_dir / fname
+            if dest.exists():
+                logger.warning(
+                    "Duplicate RPM basename in publish list, overwriting %s (key %s)",
+                    fname,
+                    key,
+                )
+            dest.write_bytes(data)
         _run_createrepo(repo_root)
         repodata_dir = repo_root / "repodata"
         if repodata_dir.exists():
             new_filenames = {f.name for f in repodata_dir.iterdir()}
-            for f in repodata_dir.iterdir():
-                r2_key = f"{r2_prefix}/repodata/{f.name}"
-                client.put_object(r2_key, f.read_bytes())
+            _upload_repodata_dir_ordered(client, r2_prefix, repodata_dir)
 
             _cleanup_old_repodata(client, r2_prefix, new_filenames)
         for key in rpm_keys:
             data = client.get_object(key)
-            if data:
-                fname = key.split("/")[-1]
-                r2_key = f"{r2_prefix}/RPMS/{fname}"
-                client.put_object(r2_key, data)
+            if not data:
+                raise RuntimeError(f"missing or empty RPM object at {key!r} during RPMS upload")
+            fname = key.split("/")[-1]
+            r2_key = f"{r2_prefix}/RPMS/{fname}"
+            client.put_object(r2_key, data)
     logger.info("Published repo to R2 prefix %s", r2_prefix)
