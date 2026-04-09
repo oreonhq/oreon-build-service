@@ -792,7 +792,7 @@ def _make_mock_resultdir_world_readable(result_dir: Path) -> None:
             )
 
 
-def _run(cmd: list[str], timeout_s: int, cwd: str | None = None) -> tuple[int, str]:
+def _run(cmd: list[str], timeout_s: int | None, cwd: str | None = None) -> tuple[int, str]:
     try:
         res = subprocess.run(
             cmd,
@@ -1246,7 +1246,7 @@ def _prepare_mock_sources_with_spectool(spec_path: Path, staging_dir: Path) -> t
 
     rc, out = _run(
         ["spectool", "-g", "-C", str(staging_dir), str(spec_path.name)],
-        timeout_s=900,
+        timeout_s=None,
         cwd=str(spec_dir),
     )
 
