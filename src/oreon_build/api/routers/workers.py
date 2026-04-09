@@ -8,7 +8,7 @@ from sqlalchemy import func, select
 from oreon_build.api.deps import CurrentAdmin, DbSession
 from oreon_build.api.schemas import PaginatedResponse, WorkerEnroll, WorkerResponse
 from oreon_build.config import get_settings
-from oreon_build.core.security import hash_password, verify_worker_token
+from oreon_build.core.security import hash_password, worker_token_fingerprint
 from oreon_build.models import Worker, WorkerState
 
 router = APIRouter(prefix="/workers", tags=["workers"])
@@ -79,6 +79,7 @@ async def enroll_worker(data: WorkerEnroll, db: DbSession, _: CurrentAdmin):
     worker = Worker(
         name=data.name,
         token_hash=token_hash,
+        token_fingerprint=worker_token_fingerprint(worker_token),
         state=WorkerState.OFFLINE,
         architecture=data.architecture,
     )
@@ -106,9 +107,9 @@ async def _worker_from_token(
 ) -> Worker:
     if db is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="No session")
-    settings = get_settings()
-    result = await db.execute(select(Worker))
-    for w in result.scalars().all():
-        if verify_worker_token(x_worker_token, settings.secret_key, w.token_hash):
-            return w
+    from oreon_build.services.worker_token_resolve import resolve_worker_for_token
+
+    w = await resolve_worker_for_token(db, x_worker_token)
+    if w:
+        return w
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid worker token")
