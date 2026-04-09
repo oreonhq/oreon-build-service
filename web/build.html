@@ -54,11 +54,44 @@
         return params.get('job_id') || '';
       }
       function escapeHtml(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; }
+      function escapeAttr(s) { return escapeHtml(s || '').replace(/"/g, '&quot;'); }
       function statusClass(s) {
         if (s === 'success') return 'badge success';
         if (s === 'failed' || s === 'cancelled') return 'badge failed';
         if (s === 'running' || s === 'queued') return 'badge running';
         return 'badge pending';
+      }
+      function formatElapsed(ms) {
+        if (ms == null || ms < 0 || !isFinite(ms)) return '—';
+        var sec = Math.floor(ms / 1000);
+        var h = Math.floor(sec / 3600);
+        var m = Math.floor((sec % 3600) / 60);
+        var s = sec % 60;
+        if (h > 0) return h + 'h ' + m + 'm';
+        if (m > 0) return m + 'm ' + s + 's';
+        return s + 's';
+      }
+      function refreshAttemptElapsed(container) {
+        if (!container) return;
+        var now = Date.now();
+        container.querySelectorAll('.attempt-card').forEach(function(card) {
+          var st = card.getAttribute('data-attempt-status') || '';
+          var started = card.getAttribute('data-started-at') || '';
+          var el = card.querySelector('.attempt-elapsed-live');
+          if (!el) return;
+          if (st !== 'running' && st !== 'queued') {
+            el.textContent = '';
+            el.style.display = 'none';
+            return;
+          }
+          var t0 = Date.parse(started);
+          if (isNaN(t0)) {
+            el.textContent = '';
+            return;
+          }
+          el.style.display = '';
+          el.innerHTML = '<small>Elapsed (wall clock): ' + escapeHtml(formatElapsed(now - t0)) + '</small>';
+        });
       }
       function loadBuild() {
         var jobId = getJobId();
@@ -100,14 +133,26 @@
           }
           container.innerHTML = list.map(function(a, idx) {
             var logId = 'log-' + a.id;
-            return '<div class="attempt-card" data-attempt-id="' + a.id + '">' +
+            var st = (a.status || '').toLowerCase();
+            var workerLine = '';
+            if (a.worker_name || a.worker_id) {
+              var who = a.worker_name ? escapeHtml(a.worker_name) : ('#' + a.worker_id);
+              var hb = a.worker_last_heartbeat ? a.worker_last_heartbeat.slice(0, 19) : '—';
+              workerLine = '<div><small>Worker: ' + who + ' &nbsp; Last heartbeat (UTC): ' + hb + '</small></div>';
+            }
+            return '<div class="attempt-card" data-attempt-id="' + a.id + '" data-attempt-status="' + escapeAttr(st) + '" data-started-at="' + escapeAttr(a.started_at || '') + '">' +
               '<h4>Attempt #' + (a.attempt_number || (idx + 1)) + ' <span class="' + statusClass(a.status) + '">' + (a.status || '') + '</span></h4>' +
+              workerLine +
+              '<div class="attempt-elapsed-live" style="color:var(--text-muted);"></div>' +
               '<div><small>Started: ' + (a.started_at ? a.started_at.slice(0, 19) : '—') + ' &nbsp; Finished: ' + (a.finished_at ? a.finished_at.slice(0, 19) : '—') + '</small></div>' +
               '<div class="artifacts" id="artifacts-' + a.id + '" style="margin-top:0.5rem; font-size:0.9rem; color:var(--text-muted);">Artifacts: loading…</div>' +
               '<div style="margin-top:0.5rem;"><button type="button" class="btn load-log" data-attempt-id="' + a.id + '">View log</button></div>' +
               '<pre id="' + logId + '" class="log-viewer" style="display:none; margin-top:0.5rem;"></pre>' +
               '</div>';
           }).join('');
+          refreshAttemptElapsed(container);
+          if (window.__oreonBuildElapsedTimer) clearInterval(window.__oreonBuildElapsedTimer);
+          window.__oreonBuildElapsedTimer = setInterval(function() { refreshAttemptElapsed(container); }, 30000);
           container.querySelectorAll('.load-log').forEach(function(btn) {
             btn.addEventListener('click', function() {
               var attemptId = btn.dataset.attemptId;
