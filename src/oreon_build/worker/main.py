@@ -36,6 +36,8 @@ DistGit: Source(kind="distgit", url="<repo>.git#branch:spec_relpath") — mock -
 
 Poll may include ``mock_additional_repos`` (base URLs) from the job mock environment. Each becomes ``mock --addrepo``.
 Optional ``OREON_WORKER_EXTRA_MOCK_ADDREPO`` appends comma-separated URLs on the worker.
+During long ``mock`` runs, optional ``OREON_WORKER_LIVE_LOG_INTERVAL_SEC`` (default 60, 0 disables)
+uploads a tail of ``build.log`` so the web UI can show progress before the build finishes.
 By default the worker passes ``mock --define dist .orN`` where ``N`` is the first run of digits in the job
 ``releasename`` (e.g. ``oreon-11-rp1`` gives ``.or11``) so RPM names use ``orN`` instead of the chroot
 default like ``fc45``. See ``OREON_WORKER_RPM_DIST`` and ``OREON_WORKER_SKIP_RPM_DIST_OVERRIDE`` in deploy docs.
@@ -248,6 +250,92 @@ def _upload_build_log_via_controller(
         return str(r.json().get("log_r2_key") or "")
 
     return _with_http_retries(f"build-log upload attempt_id={attempt_id}", _do)
+
+
+_OREON_MAX_BUILD_LOG_BYTES = 64 * 1024 * 1024
+
+
+def _upload_build_log_direct_put(
+    session: httpx.Client,
+    controller_url: str,
+    attempt_id: int,
+    data: bytes,
+) -> None:
+    """
+    PUT log through the controller (no presign+complete). Used for periodic live snapshots so we
+    do not hash the full object on every tick.
+    """
+    r = session.put(
+        f"{controller_url}/api/worker/build-log/{attempt_id}",
+        content=data,
+        headers={"Content-Type": "text/plain; charset=utf-8"},
+        timeout=_build_log_put_timeout(),
+    )
+    r.raise_for_status()
+
+
+def _live_log_interval_sec() -> int:
+    raw = (os.environ.get("OREON_WORKER_LIVE_LOG_INTERVAL_SEC") or "60").strip()
+    try:
+        v = int(raw)
+    except ValueError:
+        v = 60
+    return max(0, min(v, 3600))
+
+
+def _read_inprogress_mock_build_log_snippet(result_dir: Path, max_bytes: int = 4 * 1024 * 1024) -> str:
+    try:
+        matches = sorted(result_dir.rglob("build.log"))
+    except OSError:
+        return ""
+    if not matches:
+        return ""
+    path = matches[-1]
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    if len(data) > max_bytes:
+        data = data[-max_bytes:]
+        prefix = f"[truncated {max_bytes} bytes from start of build.log]\n\n"
+    else:
+        prefix = ""
+    return prefix + data.decode("utf-8", errors="replace")
+
+
+def _start_live_build_log_snapshot_thread(
+    session: httpx.Client,
+    controller_url: str,
+    attempt_id: int,
+    result_dir: Path,
+    stop_flag: threading.Event,
+) -> None:
+    interval = _live_log_interval_sec()
+    if interval <= 0:
+        return
+
+    def runner() -> None:
+        while not stop_flag.wait(timeout=interval):
+            try:
+                snippet = _read_inprogress_mock_build_log_snippet(result_dir)
+                if not snippet.strip():
+                    continue
+                banner = (
+                    "## Live log snapshot (mock still running) "
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} worker-local\n\n"
+                )
+                body_bytes = (banner + snippet).encode("utf-8")
+                if len(body_bytes) > _OREON_MAX_BUILD_LOG_BYTES:
+                    continue
+
+                def _snap() -> None:
+                    _upload_build_log_direct_put(session, controller_url, attempt_id, body_bytes)
+
+                _with_http_retries(f"live build-log snapshot attempt_id={attempt_id}", _snap)
+            except Exception:
+                logger.debug("Live build log snapshot failed (attempt %s)", attempt_id, exc_info=True)
+
+    threading.Thread(target=runner, daemon=True, name=f"oreon-live-log-{attempt_id}").start()
 
 
 def _download_source_via_controller(
@@ -1918,17 +2006,24 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
 
                 srpm_result_dir = tmp / "srpm_result"
                 srpm_result_dir.mkdir()
-                ok, srpm_path, srpm_out, srpm_cancelled = _mock_build_srpm_from_spec(
-                    mock_config=mock_config,
-                    spec_path=spec_path,
-                    sources_dir=sources_staging,
-                    result_dir=srpm_result_dir,
-                    abort_event=abort_event,
-                    mock_unique_ext=mock_unique_ext,
-                    addrepo_baseurls=mock_addrepos,
-                    rpm_dist=rpm_dist,
-                    attempt_id=attempt_id,
+                live_srpm_stop = threading.Event()
+                _start_live_build_log_snapshot_thread(
+                    session, controller_url, attempt_id, srpm_result_dir, live_srpm_stop
                 )
+                try:
+                    ok, srpm_path, srpm_out, srpm_cancelled = _mock_build_srpm_from_spec(
+                        mock_config=mock_config,
+                        spec_path=spec_path,
+                        sources_dir=sources_staging,
+                        result_dir=srpm_result_dir,
+                        abort_event=abort_event,
+                        mock_unique_ext=mock_unique_ext,
+                        addrepo_baseurls=mock_addrepos,
+                        rpm_dist=rpm_dist,
+                        attempt_id=attempt_id,
+                    )
+                finally:
+                    live_srpm_stop.set()
                 _make_mock_resultdir_world_readable(srpm_result_dir)
                 build_log_parts.extend(
                     _mock_stage_log_sections(
@@ -1978,16 +2073,23 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
 
             result_dir = tmp / "result"
             result_dir.mkdir()
-            ok, rebuild_out, rebuild_cancelled = _mock_rebuild_srpm(
-                mock_config=mock_config,
-                srpm_path=srpm_path,
-                result_dir=result_dir,
-                abort_event=abort_event,
-                mock_unique_ext=mock_unique_ext,
-                addrepo_baseurls=mock_addrepos,
-                rpm_dist=rpm_dist,
-                attempt_id=attempt_id,
+            live_rebuild_stop = threading.Event()
+            _start_live_build_log_snapshot_thread(
+                session, controller_url, attempt_id, result_dir, live_rebuild_stop
             )
+            try:
+                ok, rebuild_out, rebuild_cancelled = _mock_rebuild_srpm(
+                    mock_config=mock_config,
+                    srpm_path=srpm_path,
+                    result_dir=result_dir,
+                    abort_event=abort_event,
+                    mock_unique_ext=mock_unique_ext,
+                    addrepo_baseurls=mock_addrepos,
+                    rpm_dist=rpm_dist,
+                    attempt_id=attempt_id,
+                )
+            finally:
+                live_rebuild_stop.set()
             _make_mock_resultdir_world_readable(result_dir)
             build_log_parts.extend(
                 _mock_stage_log_sections(
