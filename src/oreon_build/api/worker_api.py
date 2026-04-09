@@ -915,6 +915,21 @@ async def _resolve_worker_build_log_r2_key(
     return log_r2_key(release.releasename, attempt_id)
 
 
+async def _assign_attempt_build_log_key(db: DbSession, worker: Worker, attempt_id: int, key: str) -> None:
+    """Expose build logs in the UI while the job is still running (not only after result POST)."""
+    r = await db.execute(
+        select(BuildAttempt).where(
+            BuildAttempt.id == attempt_id,
+            BuildAttempt.worker_id == worker.id,
+        )
+    )
+    att = r.scalar_one_or_none()
+    if att is None:
+        return
+    att.log_r2_key = key
+    await db.flush()
+
+
 class WorkerBuildLogCompleteBody(BaseModel):
     checksum_sha256: str
     size_bytes: int
@@ -1013,6 +1028,8 @@ async def worker_build_log_complete(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 
+    await _assign_attempt_build_log_key(db, worker, attempt_id, key)
+
     await log_audit(
         db,
         action="worker.build_log_presign_complete",
@@ -1046,6 +1063,7 @@ async def worker_upload_build_log(
         get_r2_client().put_object(key, content, content_type=_BUILD_LOG_PUT_CONTENT_TYPE)
 
     await asyncio.to_thread(_put)
+    await _assign_attempt_build_log_key(db, worker, attempt_id, key)
     return {"log_r2_key": key}
 
 

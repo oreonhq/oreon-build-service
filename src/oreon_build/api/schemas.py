@@ -318,6 +318,8 @@ class BuildAttemptResponse(BaseModel):
     log_r2_key: Optional[str] = None
     error_message: Optional[str] = None
     created_at: datetime
+    worker_name: Optional[str] = None
+    worker_last_heartbeat: Optional[datetime] = None
 
     model_config = ConfigDict(from_attributes=True)
 
