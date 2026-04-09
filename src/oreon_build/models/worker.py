@@ -27,6 +27,7 @@ class Worker(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
     token_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    token_fingerprint: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, unique=True, index=True)
     state: Mapped[WorkerState] = mapped_column(
         Enum(WorkerState, values_callable=lambda x: [e.value for e in x]),
         default=WorkerState.OFFLINE,
