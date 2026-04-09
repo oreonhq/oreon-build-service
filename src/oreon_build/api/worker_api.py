@@ -42,7 +42,7 @@ from oreon_build.api.deps import DbSession
 from oreon_build.config import get_settings
 from oreon_build.core.machine_arch import sql_arch_match_values
 from oreon_build.core.repo_branch import r2_publish_branch
-from oreon_build.core.security import verify_worker_token
+from oreon_build.services.worker_token_resolve import resolve_worker_for_token
 from oreon_build.core.audit import log_audit
 from sqlalchemy.orm import selectinload
 
@@ -109,15 +109,13 @@ async def get_worker(
 ) -> Worker:
     if not x_worker_token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="X-Worker-Token required")
-    settings = get_settings()
-    result = await db.execute(select(Worker))
-    for w in result.scalars().all():
-        if verify_worker_token(x_worker_token, settings.secret_key, w.token_hash):
-            w.last_seen_at = datetime.now(timezone.utc)
-            w.last_heartbeat = datetime.now(timezone.utc)
-            await db.flush()
-            return w
-    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid worker token")
+    w = await resolve_worker_for_token(db, x_worker_token)
+    if not w:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid worker token")
+    w.last_seen_at = datetime.now(timezone.utc)
+    w.last_heartbeat = datetime.now(timezone.utc)
+    await db.flush()
+    return w
 
 
 async def _require_worker(
@@ -126,15 +124,13 @@ async def _require_worker(
 ) -> Worker:
     if not x_worker_token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="X-Worker-Token required")
-    settings = get_settings()
-    result = await db.execute(select(Worker))
-    for w in result.scalars().all():
-        if verify_worker_token(x_worker_token, settings.secret_key, w.token_hash):
-            w.last_seen_at = datetime.now(timezone.utc)
-            w.last_heartbeat = datetime.now(timezone.utc)
-            await db.flush()
-            return w
-    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid worker token")
+    w = await resolve_worker_for_token(db, x_worker_token)
+    if not w:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid worker token")
+    w.last_seen_at = datetime.now(timezone.utc)
+    w.last_heartbeat = datetime.now(timezone.utc)
+    await db.flush()
+    return w
 
 
 class ResultPayload(BaseModel):
