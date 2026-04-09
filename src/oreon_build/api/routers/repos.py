@@ -17,7 +17,7 @@
 """Repository status - read-only; publish/compose may be triggered (auth)."""
 import logging
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import select
 
@@ -117,33 +117,15 @@ class RegenerateMetadataFailure(BaseModel):
     detail: str
 
 
-class RegenerateMetadataResult(BaseModel):
+class RegenerateMetadataQueued(BaseModel):
+    """Immediate response while createrepo runs on the API host (see API logs for completion)."""
+
     status: str
-    prefixes: list[str]
-    refreshed: list[str]
-    skipped_no_rpms: list[str]
-    failed: list[RegenerateMetadataFailure]
-    not_attempted: list[str]
+    message: str
+    prefix_count: int
 
 
-@router.post("/regenerate-metadata", response_model=RegenerateMetadataResult)
-async def regenerate_metadata_all_releases(_: CurrentAdmin, db: DbSession):
-    """
-    Re-run createrepo for every R2 prefix we know about (DB repositories plus each release's default repo branch,
-    testing, and stable, times x86_64 and aarch64). Prefixes with no RPMs under RPMS/ are skipped after a quick list.
-    """
-    prefixes: set[str] = set()
-    rrepo = await db.execute(select(Repository.r2_prefix))
-    for p in rrepo.scalars().all():
-        if p:
-            prefixes.add(p)
-    rels = await db.execute(select(Release).where(Release.is_active.is_(True)))
-    for rel in rels.scalars().all():
-        dev_seg = r2_publish_branch(rel)
-        for ch in (dev_seg, "testing", "stable"):
-            for arch in ("x86_64", "aarch64"):
-                prefixes.add(repo_r2_prefix(rel.releasename, ch, arch))
-    ordered = sorted(prefixes)
+def _regenerate_metadata_job(ordered: list[str]) -> None:
     refreshed: list[str] = []
     skipped: list[str] = []
     failed: list[RegenerateMetadataFailure] = []
@@ -171,11 +153,51 @@ async def regenerate_metadata_all_releases(_: CurrentAdmin, db: DbSession):
     st = "ok"
     if failed or not_attempted:
         st = "partial"
-    return RegenerateMetadataResult(
-        status=st,
-        prefixes=ordered,
-        refreshed=refreshed,
-        skipped_no_rpms=skipped,
-        failed=failed,
-        not_attempted=not_attempted,
+    logger.info(
+        "repodata regeneration job finished status=%s refreshed=%d skipped_no_rpms=%d failed=%d not_attempted=%d",
+        st,
+        len(refreshed),
+        len(skipped),
+        len(failed),
+        len(not_attempted),
+    )
+    if failed:
+        for f in failed[:20]:
+            logger.warning("repodata job failure prefix=%s kind=%s detail=%s", f.prefix, f.kind, f.detail)
+        if len(failed) > 20:
+            logger.warning("repodata job: %d more failures not listed", len(failed) - 20)
+
+
+@router.post(
+    "/regenerate-metadata",
+    response_model=RegenerateMetadataQueued,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def regenerate_metadata_all_releases(
+    _: CurrentAdmin,
+    db: DbSession,
+    background_tasks: BackgroundTasks,
+):
+    """
+    Queue createrepo for every R2 prefix we know about (DB repositories plus each release's default repo branch,
+    testing, and stable, times x86_64 and aarch64). Work runs in a background thread on the API server so the HTTP
+    request returns immediately (avoids proxy timeouts). Prefixes with no RPMs under RPMS/ are skipped after a quick list.
+    """
+    prefixes: set[str] = set()
+    rrepo = await db.execute(select(Repository.r2_prefix))
+    for p in rrepo.scalars().all():
+        if p:
+            prefixes.add(p)
+    rels = await db.execute(select(Release).where(Release.is_active.is_(True)))
+    for rel in rels.scalars().all():
+        dev_seg = r2_publish_branch(rel)
+        for ch in (dev_seg, "testing", "stable"):
+            for arch in ("x86_64", "aarch64"):
+                prefixes.add(repo_r2_prefix(rel.releasename, ch, arch))
+    ordered = sorted(prefixes)
+    background_tasks.add_task(_regenerate_metadata_job, list(ordered))
+    return RegenerateMetadataQueued(
+        status="queued",
+        message="Repodata regeneration is running on the API server. Check oreon-api logs for refreshed counts and errors.",
+        prefix_count=len(ordered),
     )
