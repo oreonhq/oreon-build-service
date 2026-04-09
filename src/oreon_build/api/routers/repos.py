@@ -15,6 +15,8 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """Repository status - read-only; publish/compose may be triggered (auth)."""
+import logging
+
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -23,8 +25,10 @@ from oreon_build.api.deps import CurrentAdmin, CurrentUser, DbSession
 from oreon_build.api.schemas import RepositoryResponse
 from oreon_build.core.repo_branch import r2_publish_branch
 from oreon_build.models import Release, Repository
-from oreon_build.services.publisher import update_repodata_at_prefix
+from oreon_build.services.publisher import RepodataDiskQuotaError, update_repodata_at_prefix
 from oreon_build.services.r2 import repo_r2_prefix
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/repos", tags=["repos"])
 
@@ -107,11 +111,19 @@ async def trigger_publish(
     return {"status": "accepted", "r2_prefix": prefix}
 
 
+class RegenerateMetadataFailure(BaseModel):
+    prefix: str
+    kind: str
+    detail: str
+
+
 class RegenerateMetadataResult(BaseModel):
     status: str
     prefixes: list[str]
     refreshed: list[str]
     skipped_no_rpms: list[str]
+    failed: list[RegenerateMetadataFailure]
+    not_attempted: list[str]
 
 
 @router.post("/regenerate-metadata", response_model=RegenerateMetadataResult)
@@ -134,14 +146,36 @@ async def regenerate_metadata_all_releases(_: CurrentAdmin, db: DbSession):
     ordered = sorted(prefixes)
     refreshed: list[str] = []
     skipped: list[str] = []
+    failed: list[RegenerateMetadataFailure] = []
+    not_attempted: list[str] = []
+    aborted_disk = False
     for prefix in ordered:
-        if update_repodata_at_prefix(prefix):
-            refreshed.append(prefix)
-        else:
-            skipped.append(prefix)
+        if aborted_disk:
+            not_attempted.append(prefix)
+            continue
+        try:
+            if update_repodata_at_prefix(prefix):
+                refreshed.append(prefix)
+            else:
+                skipped.append(prefix)
+        except RepodataDiskQuotaError as e:
+            failed.append(
+                RegenerateMetadataFailure(prefix=prefix, kind="disk_quota", detail=str(e))
+            )
+            aborted_disk = True
+        except Exception as e:
+            logger.exception("repodata refresh failed for %s", prefix)
+            failed.append(
+                RegenerateMetadataFailure(prefix=prefix, kind="error", detail=str(e))
+            )
+    st = "ok"
+    if failed or not_attempted:
+        st = "partial"
     return RegenerateMetadataResult(
-        status="ok",
+        status=st,
         prefixes=ordered,
         refreshed=refreshed,
         skipped_no_rpms=skipped,
+        failed=failed,
+        not_attempted=not_attempted,
     )

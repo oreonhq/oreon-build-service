@@ -37,8 +37,44 @@ from oreon_build.services.signing import sign_repomd
 logger = logging.getLogger(__name__)
 
 
+class RepodataDiskQuotaError(RuntimeError):
+    """Createrepo temp workspace hit EDQUOT or ENOSPC. Override OREON_REPO_TMPDIR or oreon_repo_tmpdir (default is ~/.oreon/repo-tmp)."""
+
+
+def _repo_temp_dir_label(tmp_parent: str | None) -> str:
+    """Human-readable path for logs (matches tempfile parent when set, else system tmp)."""
+    if tmp_parent:
+        return tmp_parent
+    return os.environ.get("TMPDIR") or "/tmp"
+
+
+def _is_disk_quota_or_no_space(err: OSError) -> bool:
+    en = getattr(err, "errno", None)
+    if en is None:
+        return False
+    if en == getattr(errno, "ENOSPC", 28):
+        return True
+    return en == getattr(errno, "EDQUOT", 122)
+
+
+def _ensure_dir_parent(path: Path) -> str | None:
+    """Create path if needed and return it as str, or None if unusable."""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    if path.is_dir():
+        return str(path)
+    return None
+
+
 def _repo_temp_dir_parent() -> str | None:
-    """Use OREON_REPO_TMPDIR / settings.oreon_repo_tmpdir when set and usable (avoids /tmp quota)."""
+    """
+    Parent directory for createrepo temp dirs (oreon-repo-*/repo/RPMS).
+
+    Order: OREON_REPO_TMPDIR, then settings.oreon_repo_tmpdir, else ~/.oreon/repo-tmp
+    (real disk under $HOME, not tmpfs /tmp).
+    """
     raw = (os.environ.get("OREON_REPO_TMPDIR") or "").strip()
     candidates: list[str] = []
     if raw:
@@ -51,9 +87,17 @@ def _repo_temp_dir_parent() -> str | None:
     except Exception:
         pass
     for c in candidates:
-        p = Path(c)
-        if p.is_dir():
-            return str(p)
+        p = Path(c).expanduser()
+        resolved = _ensure_dir_parent(p)
+        if resolved:
+            return resolved
+    try:
+        home_default = Path.home() / ".oreon" / "repo-tmp"
+        resolved = _ensure_dir_parent(home_default)
+        if resolved:
+            return resolved
+    except OSError:
+        pass
     return None
 
 
@@ -130,7 +174,6 @@ def update_repodata_at_prefix(r2_prefix: str, r2_client: R2Client | None = None)
     RPMs are already at r2_prefix/RPMS/. Download them, run createrepo_c, upload only repodata.
     Use this when the worker (or other path) has already uploaded RPMs directly to the repo.
     """
-    _edquot = getattr(errno, "EDQUOT", 122)
     client = r2_client or get_r2_client()
     rpms_prefix = f"{r2_prefix}/RPMS/"
     objs = client.list_objects(rpms_prefix)
@@ -177,13 +220,14 @@ def update_repodata_at_prefix(r2_prefix: str, r2_client: R2Client | None = None)
             logger.error("createrepo_c produced no repodata under %s", repo_root)
             return False
     except OSError as e:
-        if getattr(e, "errno", None) == _edquot:
-            parent = tmp_parent or os.environ.get("TMPDIR", "") or "/tmp"
-            logger.error(
-                "Disk quota exceeded while composing repo metadata under %s. "
-                "Set OREON_REPO_TMPDIR or oreon_repo_tmpdir to a directory on a larger volume.",
-                parent,
+        if _is_disk_quota_or_no_space(e):
+            label = _repo_temp_dir_label(tmp_parent)
+            msg = (
+                f"disk quota or no space while composing repo metadata under {label}. "
+                "Set OREON_REPO_TMPDIR or oreon_repo_tmpdir to a larger path (default is ~/.oreon/repo-tmp)."
             )
+            logger.error(msg)
+            raise RepodataDiskQuotaError(msg) from e
         raise
 
 
@@ -198,35 +242,46 @@ def publish_rpms_to_r2(
     """
     client = r2_client or get_r2_client()
     tmp_parent = _repo_temp_dir_parent()
-    with tempfile.TemporaryDirectory(prefix="oreon-repo-", dir=tmp_parent) as tmp:
-        repo_root = Path(tmp) / "repo"
-        rpms_dir = repo_root / "RPMS"
-        rpms_dir.mkdir(parents=True)
-        for key in rpm_keys:
-            data = client.get_object(key)
-            if not data:
-                raise RuntimeError(f"missing or empty RPM object at {key!r}, aborting publish")
-            fname = key.split("/")[-1]
-            dest = rpms_dir / fname
-            if dest.exists():
-                logger.warning(
-                    "Duplicate RPM basename in publish list, overwriting %s (key %s)",
-                    fname,
-                    key,
-                )
-            dest.write_bytes(data)
-        _run_createrepo(repo_root)
-        repodata_dir = repo_root / "repodata"
-        if repodata_dir.exists():
-            new_filenames = {f.name for f in repodata_dir.iterdir()}
-            _upload_repodata_dir_ordered(client, r2_prefix, repodata_dir)
+    try:
+        with tempfile.TemporaryDirectory(prefix="oreon-repo-", dir=tmp_parent) as tmp:
+            repo_root = Path(tmp) / "repo"
+            rpms_dir = repo_root / "RPMS"
+            rpms_dir.mkdir(parents=True)
+            for key in rpm_keys:
+                data = client.get_object(key)
+                if not data:
+                    raise RuntimeError(f"missing or empty RPM object at {key!r}, aborting publish")
+                fname = key.split("/")[-1]
+                dest = rpms_dir / fname
+                if dest.exists():
+                    logger.warning(
+                        "Duplicate RPM basename in publish list, overwriting %s (key %s)",
+                        fname,
+                        key,
+                    )
+                dest.write_bytes(data)
+            _run_createrepo(repo_root)
+            repodata_dir = repo_root / "repodata"
+            if repodata_dir.exists():
+                new_filenames = {f.name for f in repodata_dir.iterdir()}
+                _upload_repodata_dir_ordered(client, r2_prefix, repodata_dir)
 
-            _cleanup_old_repodata(client, r2_prefix, new_filenames)
-        for key in rpm_keys:
-            data = client.get_object(key)
-            if not data:
-                raise RuntimeError(f"missing or empty RPM object at {key!r} during RPMS upload")
-            fname = key.split("/")[-1]
-            r2_key = f"{r2_prefix}/RPMS/{fname}"
-            client.put_object(r2_key, data)
+                _cleanup_old_repodata(client, r2_prefix, new_filenames)
+            for key in rpm_keys:
+                data = client.get_object(key)
+                if not data:
+                    raise RuntimeError(f"missing or empty RPM object at {key!r} during RPMS upload")
+                fname = key.split("/")[-1]
+                r2_key = f"{r2_prefix}/RPMS/{fname}"
+                client.put_object(r2_key, data)
+    except OSError as e:
+        if _is_disk_quota_or_no_space(e):
+            label = _repo_temp_dir_label(tmp_parent)
+            msg = (
+                f"disk quota or no space while publishing repo under {label}. "
+                "Set OREON_REPO_TMPDIR or oreon_repo_tmpdir to a larger path (default is ~/.oreon/repo-tmp)."
+            )
+            logger.error(msg)
+            raise RepodataDiskQuotaError(msg) from e
+        raise
     logger.info("Published repo to R2 prefix %s", r2_prefix)

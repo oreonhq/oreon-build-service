@@ -57,8 +57,8 @@ class Settings(BaseSettings):
     oreon_repo_tmpdir: Optional[str] = Field(
         default=None,
         description=(
-            "Optional directory for createrepo temp dirs during R2 repodata refresh "
-            "(avoids filling /tmp). Same as env OREON_REPO_TMPDIR."
+            "Directory for createrepo temp dirs during R2 repodata refresh. "
+            "If unset, defaults to ~/.oreon/repo-tmp (not tmpfs /tmp). Same as env OREON_REPO_TMPDIR."
         ),
     )
 
