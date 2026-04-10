@@ -871,6 +871,47 @@ def _mock_cache_topdir_for_attempt(attempt_id: int) -> str:
     return f"{parent}/oreon-{attempt_id}"
 
 
+# Upper bound when choosing default rpmbuild parallel jobs (%_smp_*). Env OREON_WORKER_MOCK_SMP_JOBS=0 means no cap.
+_MOCK_SMP_JOBS_DEFAULT_CAP = 4
+
+
+def _mock_rpmbuild_smp_define_args() -> list[str]:
+    """
+    Cap compile parallelism inside mock (rpmbuild macros).
+
+    Large C++/LTO builds often default to ``-j$(nproc)`` via ``%_smp_mflags``, which can OOM small
+    workers. When unset, uses ``min(4, CPU count)`` so a 2 vCPU host gets ``-j2``, not ``-j4``.
+
+    Set ``OREON_WORKER_MOCK_SMP_JOBS=0`` to omit these defines (rpmbuild/mock default parallelism).
+
+    Not every spec respects these (some hard-code ninja -j). For those, adjust the spec or mock config.
+    """
+    raw = (os.environ.get("OREON_WORKER_MOCK_SMP_JOBS") or "").strip()
+    if not raw:
+        cpus = os.cpu_count() or 1
+        n = min(_MOCK_SMP_JOBS_DEFAULT_CAP, max(1, cpus))
+    else:
+        try:
+            n = int(raw)
+        except ValueError:
+            cpus = os.cpu_count() or 1
+            fallback = min(_MOCK_SMP_JOBS_DEFAULT_CAP, max(1, cpus))
+            logger.warning(
+                "OREON_WORKER_MOCK_SMP_JOBS is not an integer, using default %s",
+                fallback,
+            )
+            n = fallback
+    if n == 0:
+        return []
+    n = max(1, min(n, 128))
+    return [
+        "--define",
+        f"_smp_mflags -j{n}",
+        "--define",
+        f"_smp_build_ncpus {n}",
+    ]
+
+
 def _mock_cmd_base(
     mock_config: str,
     mock_unique_ext: str | None,
@@ -886,6 +927,7 @@ def _mock_cmd_base(
         cmd += ["--config-opts", f"cache_topdir={_mock_cache_topdir_for_attempt(attempt_id)}"]
     for url in addrepo_baseurls:
         cmd += ["--addrepo", url]
+    cmd += _mock_rpmbuild_smp_define_args()
     if rpm_dist:
         cmd += ["--define", f"dist {rpm_dist}"]
     return cmd
