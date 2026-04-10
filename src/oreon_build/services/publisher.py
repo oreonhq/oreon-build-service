@@ -143,11 +143,15 @@ def _cleanup_old_repodata(
 
 
 def _run_createrepo(repo_dir: Path) -> None:
+    # Never use capture_output/PIPE here. createrepo_c can write a lot to stderr; a full pipe blocks the child
+    # while the parent waits forever (looks like a hang with RPMs already on disk).
+    logger.info("createrepo_c starting repo_root=%s", repo_dir)
     subprocess.run(
         ["createrepo_c", str(repo_dir)],
         check=True,
-        capture_output=True,
+        stdin=subprocess.DEVNULL,
     )
+    logger.info("createrepo_c finished repo_root=%s", repo_dir)
 
 
 def _upload_repodata_dir_ordered(client: R2Client, r2_prefix: str, repodata_dir: Path) -> None:
