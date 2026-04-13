@@ -17,6 +17,7 @@
 """Oreon Build Service API - main application."""
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -252,7 +253,12 @@ async def lifespan(app: FastAPI):
 
         while True:
             try:
-                interval_s = 30
+                raw_idle = (os.environ.get("OREON_PUBLISH_TASK_IDLE_POLL_SEC") or "2").strip()
+                try:
+                    idle_interval_s = float(raw_idle)
+                except ValueError:
+                    idle_interval_s = 2.0
+                idle_interval_s = max(0.5, min(idle_interval_s, 30.0))
                 batch = 5
                 async with async_session_maker() as db:
                     now = datetime.now(timezone.utc)
@@ -266,7 +272,7 @@ async def lifespan(app: FastAPI):
                     result = await db.execute(q)
                     tasks = list(result.scalars().all())
                     if not tasks:
-                        await asyncio.sleep(interval_s)
+                        await asyncio.sleep(idle_interval_s)
                         continue
                     for t in tasks:
                         t.status = "running"
@@ -352,7 +358,10 @@ async def lifespan(app: FastAPI):
                             t.build_job_id,
                         )
 
-                await asyncio.sleep(interval_s)
+                # Don't sleep after successful processing: immediately check for more pending rows
+                # so repodata refresh starts as soon as artifacts are queued.
+                if len(tasks) < batch:
+                    await asyncio.sleep(0)
             except asyncio.CancelledError:
                 break
             except Exception:
