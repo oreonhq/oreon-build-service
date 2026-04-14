@@ -347,15 +347,18 @@ function updateAuthUI() {
  */
 function oreonControllerKeyHtml(controllerStatus) {
   var ss = (controllerStatus || 'not_started').toLowerCase();
+  if (ss === 'uploading') {
+    ss = 'running';
+  }
   var c = '#94a3b8';
   var label = 'Pending';
   var tip =
-    'Controller: waiting for worker to upload RPMs. GPG signing happens on the controller after upload.';
-  if (ss === 'uploading') {
-    c = '#f59e0b';
-    label = 'Uploading';
+    'Controller: waiting for the build to finish (mock still running or worker has not notified yet).';
+  if (ss === 'running') {
+    c = '#3b82f6';
+    label = 'Running';
     tip =
-      'Worker is uploading RPMs to the controller. GPG signing and repo publish run on the controller after each upload.';
+      'Controller pipeline in progress (RPM upload, GPG signing, R2, repodata) after mock succeeded.';
   } else if (ss === 'signed') {
     c = '#22c55e';
     label = 'Complete';
