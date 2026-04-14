@@ -1,6 +1,9 @@
 """
-Repository publishing: createrepo_c and upload to R2.
-Repositories are written ONLY to R2, never stored locally.
+Repository publishing: stage RPMs from R2 under a persistent tree in ``~/.oreon/repo-tmp``,
+run ``createrepo_c``, upload only ``repodata/`` to R2.
+
+The local stage is reused across calls (no fresh temp dir per run). RPMs are only
+downloaded when missing or when the size no longer matches R2.
 """
 
 #
@@ -23,10 +26,13 @@ Repositories are written ONLY to R2, never stored locally.
 from __future__ import annotations
 
 import errno
+import fcntl
+import hashlib
 import logging
 import os
 import subprocess
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import List
 
@@ -35,6 +41,17 @@ from oreon_build.services.r2 import R2Client, get_r2_client
 from oreon_build.services.signing import sign_repomd
 
 logger = logging.getLogger(__name__)
+
+
+def _progress_stdout_enabled() -> bool:
+    v = (os.environ.get("OREON_REPO_PROGRESS_STDOUT") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _progress(msg: str) -> None:
+    """Emit lines for migrate-rpmrepo-metadata.sh (OREON_REPO_PROGRESS_STDOUT=1)."""
+    if _progress_stdout_enabled():
+        print(f"PROGRESS {msg}", flush=True)
 
 
 class RepodataDiskQuotaError(RuntimeError):
@@ -101,6 +118,97 @@ def _repo_temp_dir_parent() -> str | None:
     return None
 
 
+def _stage_container_for_prefix(r2_prefix: str) -> Path:
+    """Stable directory for one repo prefix (holds ``repo/`` and lock)."""
+    parent = _repo_temp_dir_parent()
+    if not parent:
+        parent = str(Path.home() / ".oreon" / "repo-tmp")
+    h = hashlib.sha256(r2_prefix.strip().encode()).hexdigest()[:24]
+    return Path(parent) / "stages" / h
+
+
+def _persistent_repo_root(r2_prefix: str) -> Path:
+    """Local createrepo root: ``.../stages/<hash>/repo`` (RPMS + repodata under it)."""
+    return _stage_container_for_prefix(r2_prefix) / "repo"
+
+
+def _ensure_stage_sidecar(container: Path, r2_prefix: str) -> None:
+    p = container / ".r2_prefix.txt"
+    if p.exists():
+        return
+    try:
+        p.write_text(r2_prefix.strip() + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+@contextmanager
+def _repo_stage_lock(container: Path) -> object:
+    """Exclusive lock so two processes do not run createrepo on the same stage."""
+    container.mkdir(parents=True, exist_ok=True)
+    lock_path = container / ".oreon-repodata.lock"
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _createrepo_workers() -> int:
+    raw = (os.environ.get("OREON_CREATEREPO_WORKERS") or "50").strip()
+    try:
+        w = int(raw)
+    except ValueError:
+        w = 50
+    return max(1, min(w, 128))
+
+
+def _sync_rpms_dir_from_r2(client: R2Client, rpms_prefix: str, rpms_dir: Path) -> int:
+    """
+    Ensure ``rpms_dir`` matches R2 under ``rpms_prefix``. Skip download if file exists with same size.
+    Remove local ``*.rpm`` files that no longer exist in R2.
+    Returns number of RPM objects listed in R2.
+    """
+    rpms_dir.mkdir(parents=True, exist_ok=True)
+    objs = client.list_objects(rpms_prefix)
+    wanted: dict[str, tuple[str, int]] = {}
+    for o in objs:
+        key = o.get("key")
+        if not key:
+            continue
+        base = key.split("/")[-1]
+        if not base.endswith(".rpm"):
+            continue
+        sz = int(o.get("size") or 0)
+        if base in wanted:
+            logger.warning(
+                "Duplicate RPM basename in R2 listing, using last key base=%s key=%s",
+                base,
+                key,
+            )
+        wanted[base] = (key, sz)
+
+    for f in list(rpms_dir.iterdir()):
+        if f.is_file() and f.suffix == ".rpm" and f.name not in wanted:
+            try:
+                f.unlink()
+            except OSError as e:
+                logger.warning("Could not remove stale local RPM %s: %s", f, e)
+
+    for fname, (key, sz) in wanted.items():
+        dest = rpms_dir / fname
+        if sz > 0 and dest.is_file() and dest.stat().st_size == sz:
+            continue
+        data = client.get_object(key)
+        if not data:
+            raise RuntimeError(f"missing or empty RPM object at {key!r}, aborting repodata update")
+        dest.write_bytes(data)
+
+    return len(wanted)
+
+
 def _list_repodata_keys(client: R2Client, r2_prefix: str) -> list[str]:
     repodata_prefix = f"{r2_prefix}/repodata/"
     objs = client.list_objects(repodata_prefix)
@@ -145,9 +253,14 @@ def _cleanup_old_repodata(
 def _run_createrepo(repo_dir: Path) -> None:
     # Never use capture_output/PIPE here. createrepo_c can write a lot to stderr; a full pipe blocks the child
     # while the parent waits forever (looks like a hang with RPMs already on disk).
-    logger.info("createrepo_c starting repo_root=%s", repo_dir)
+    w = _createrepo_workers()
+    logger.info("createrepo_c starting repo_root=%s workers=%s", repo_dir, w)
     subprocess.run(
-        ["createrepo_c", str(repo_dir)],
+        [
+            "createrepo_c",
+            str(repo_dir),
+            f"--workers={w}",
+        ],
         check=True,
         stdin=subprocess.DEVNULL,
     )
@@ -181,30 +294,27 @@ def update_repodata_at_prefix(r2_prefix: str, r2_client: R2Client | None = None)
     client = r2_client or get_r2_client()
     rpms_prefix = f"{r2_prefix}/RPMS/"
     objs = client.list_objects(rpms_prefix)
-    rpm_keys = [o["key"] for o in objs if o.get("key")]
+    rpm_keys = [
+        o["key"]
+        for o in objs
+        if o.get("key") and o["key"].split("/")[-1].lower().endswith(".rpm")
+    ]
     if not rpm_keys:
         logger.warning("No RPMs at %s, skipping createrepo", rpms_prefix)
         return False
+    _progress(f"{r2_prefix} listed {len(rpm_keys)} RPM keys from R2")
     tmp_parent = _repo_temp_dir_parent()
+    container = _stage_container_for_prefix(r2_prefix)
+    _ensure_stage_sidecar(container, r2_prefix)
+    repo_root = _persistent_repo_root(r2_prefix)
+    rpms_dir = repo_root / "RPMS"
     try:
-        with tempfile.TemporaryDirectory(prefix="oreon-repo-", dir=tmp_parent) as tmp:
-            repo_root = Path(tmp) / "repo"
-            rpms_dir = repo_root / "RPMS"
-            rpms_dir.mkdir(parents=True)
-            for key in rpm_keys:
-                data = client.get_object(key)
-                if not data:
-                    raise RuntimeError(f"missing or empty RPM object at {key!r}, aborting repodata update")
-                fname = key.split("/")[-1]
-                dest = rpms_dir / fname
-                if dest.exists():
-                    logger.warning(
-                        "Duplicate RPM basename in R2 listing, overwriting %s (key %s)",
-                        fname,
-                        key,
-                    )
-                dest.write_bytes(data)
+        with _repo_stage_lock(container):
+            _progress(f"{r2_prefix} syncing RPMs to local stage (may take a while)")
+            n = _sync_rpms_dir_from_r2(client, rpms_prefix, rpms_dir)
+            _progress(f"{r2_prefix} synced {n} RPMs, running createrepo_c")
             _run_createrepo(repo_root)
+            _progress(f"{r2_prefix} createrepo_c done, uploading repodata to R2")
             repodata_dir = repo_root / "repodata"
             if repodata_dir.exists():
                 # Keep track of which repodata filenames we just generated so we can
@@ -219,7 +329,7 @@ def update_repodata_at_prefix(r2_prefix: str, r2_client: R2Client | None = None)
                 _upload_repodata_dir_ordered(client, r2_prefix, repodata_dir)
 
                 _cleanup_old_repodata(client, r2_prefix, new_filenames)
-                logger.info("Updated repodata at R2 prefix %s (%s RPMs)", r2_prefix, len(rpm_keys))
+                logger.info("Updated repodata at R2 prefix %s (%s RPMs in metadata)", r2_prefix, n)
                 return True
             logger.error("createrepo_c produced no repodata under %s", repo_root)
             return False
