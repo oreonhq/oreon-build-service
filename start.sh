@@ -17,14 +17,34 @@
 
 # Start Oreon Build Service (API + scheduler) in the background.
 # Run from repo root. Stop with ./stop.sh
+#
+# Optional: ./start.sh --regen  (background repodata refresh for all DB prefixes; heavy, uses scripts/migrate-rpmrepo-metadata.sh)
 
 set -e
 cd "$(dirname "$0")"
 ROOT="$(pwd)"
 
+DO_REGEN=0
+for _arg in "$@"; do
+  case "$_arg" in
+    --regen) DO_REGEN=1 ;;
+    -h|--help)
+      echo "Usage: $0 [--regen]"
+      echo "  --regen   After starting services, run full repodata refresh in the background (parallel jobs, see MIGRATE_PARALLEL)."
+      exit 0
+      ;;
+  esac
+done
+
 if [ ! -d .venv ]; then
   echo "No .venv found. Run ./scripts/deploy.sh first."
   exit 1
+fi
+
+if [ -f .oreon-repodata-refresh.pid ] && kill -0 "$(cat .oreon-repodata-refresh.pid)" 2>/dev/null; then
+  _oreon_old_rep="$(cat .oreon-repodata-refresh.pid 2>/dev/null || true)"
+  echo "Stale repodata refresh pid file (PID $_oreon_old_rep not running). Removing."
+  rm -f .oreon-repodata-refresh.pid
 fi
 
 if [ -f .oreon-api.pid ] && kill -0 "$(cat .oreon-api.pid)" 2>/dev/null; then
@@ -70,6 +90,10 @@ for i in 1 2 3 4 5; do
 done
 
 source .venv/bin/activate
+
+if ! command -v createrepo_c &>/dev/null; then
+  echo "WARNING: createrepo_c not on PATH. Install it for repodata refresh (e.g. dnf install createrepo_c)."
+fi
 
 # Logs
 LOG_DIR="${OREON_LOG_DIR:-.oreon-logs}"
@@ -119,3 +143,14 @@ echo "---- Tail: Watchdog ($LOG_SHOW_LINES lines) ----"
 tail -n "$LOG_SHOW_LINES" "$LOG_DIR/oreon-watchdog.log" 2>/dev/null || true
 
 echo "Done. Run ./stop.sh to stop."
+
+# Background repodata refresh only when ./start.sh --regen (uses persistent ~/.oreon/repo-tmp stages + MIGRATE_PARALLEL).
+if [ "$DO_REGEN" -eq 1 ]; then
+  echo "Starting background repodata refresh (logs: $LOG_DIR/repodata-refresh.log, parallel=${MIGRATE_PARALLEL:-50})..."
+  nohup env MIGRATE_PARALLEL="${MIGRATE_PARALLEL:-50}" bash -c "cd \"$ROOT\" && exec bash ./scripts/migrate-rpmrepo-metadata.sh" \
+    >> "$LOG_DIR/repodata-refresh.log" 2>&1 &
+  echo $! > "$ROOT/.oreon-repodata-refresh.pid"
+  echo "Repodata refresh PID $(cat "$ROOT/.oreon-repodata-refresh.pid")"
+else
+  echo "Repodata refresh not started (use ./start.sh --regen to queue it)."
+fi
