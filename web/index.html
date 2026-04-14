@@ -22,6 +22,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Oreon Build Service</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" crossorigin="anonymous" referrerpolicy="no-referrer">
   <link rel="stylesheet" href="/static/style.css?v=3">
 </head>
 <body>
@@ -72,7 +73,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     </section>
   </main>
   <footer class="footer">Oreon Build Service</footer>
-  <script src="/static/app.js?v=6"></script>
+  <script src="/static/app.js?v=8"></script>
   <script>
     (function() {
       const api = window.oreonApi || {};
@@ -113,6 +114,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             if (s === 'running' || s === 'queued') return '<span class="badge running">' + s + '</span>';
             return '<span class="badge pending">' + (s || 'pending') + '</span>';
           }
+          function jobDisplayStatus(b) {
+            return window.oreonJobDisplayStatus ? window.oreonJobDisplayStatus(b) : String(b.status || '');
+          }
           if (buildsHost) {
             if (!builds.length) {
               buildsHost.innerHTML = '<p style="color:var(--text-muted); font-size:0.9rem;">No builds yet.</p>';
@@ -124,17 +128,20 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                 var relLabel = rel && (rel.releasename || '').trim() ? (rel.releasename + ' (' + b.release_id + ')') : ('#' + b.release_id);
                 var arch = b.architecture || '—';
                 var created = (b.created_at || '').slice(0, 19);
+                var sd = jobDisplayStatus(b);
+                var signCell = window.oreonControllerKeyHtml ? window.oreonControllerKeyHtml(b.signing_status) : '—';
                 return '<tr>'
                   + '<td><a href="/build.html?job_id=' + b.id + '">#' + b.id + '</a></td>'
                   + '<td>' + pkgLabel + '</td>'
                   + '<td>' + relLabel + '</td>'
                   + '<td>' + arch + '</td>'
-                  + '<td>' + statusBadge(b.status) + '</td>'
+                  + '<td>' + statusBadge(sd) + '</td>'
+                  + '<td>' + signCell + '</td>'
                   + '<td>' + created + '</td>'
                   + '</tr>';
               }).join('');
               buildsHost.innerHTML = '<table class="table-compact"><thead><tr>'
-                + '<th>ID</th><th>Package</th><th>Release</th><th>Arch</th><th>Status</th><th>Created</th>'
+                + '<th>ID</th><th>Package</th><th>Release</th><th>Arch</th><th>Status</th><th>Controller</th><th>Created</th>'
                 + '</tr></thead><tbody>' + rows + '</tbody></table>';
             }
           }
