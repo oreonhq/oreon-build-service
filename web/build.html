@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Build - Oreon Build Service</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" crossorigin="anonymous" referrerpolicy="no-referrer">
   <link rel="stylesheet" href="/static/style.css?v=3">
   <style>
     .build-meta { margin-bottom: 1rem; }
@@ -45,7 +46,7 @@
       <div id="attempts-list"></div>
     </section>
   </main>
-  <script src="/static/app.js?v=6"></script>
+  <script src="/static/app.js?v=8"></script>
   <script>
     (function() {
       const api = window.oreonApi;
@@ -128,11 +129,16 @@
           var rel = releases.find(function(r) { return r.id === job.release_id; });
           var pkgLabel = pkg && (pkg.name || '').trim() ? escapeHtml(pkg.name) + ' (' + job.package_id + ')' : ('#' + (job.package_id || '—'));
           var relLabel = rel && (rel.releasename || '').trim() ? escapeHtml(rel.releasename) + ' (' + job.release_id + ')' : ('#' + (job.release_id || '—'));
+          var jobDisp = window.oreonJobDisplayStatus ? window.oreonJobDisplayStatus(job) : String(job.status || '');
           var meta = document.getElementById('build-meta');
+          var signingRow = window.oreonControllerKeyHtml
+            ? '<dt>Controller</dt><dd>' + window.oreonControllerKeyHtml(job.signing_status) + '</dd>'
+            : '';
           meta.innerHTML = '<dl><dt>Package</dt><dd>' + pkgLabel + '</dd>' +
             '<dt>Release</dt><dd>' + relLabel + '</dd>' +
             '<dt>Architecture</dt><dd>' + escapeHtml(job.architecture || '—') + '</dd>' +
-            '<dt>Status</dt><dd><span class="' + statusClass(job.status) + '">' + (job.status || '') + '</span></dd>' +
+            '<dt>Status</dt><dd><span class="' + statusClass(jobDisp) + '">' + escapeHtml(jobDisp) + '</span></dd>' +
+            signingRow +
             '<dt>Created</dt><dd>' + (job.created_at || '').slice(0, 19) + '</dd>' +
             '<dt>Completed</dt><dd>' + (job.completed_at ? job.completed_at.slice(0, 19) : '—') + '</dd></dl>';
           return api.get('/builds/jobs/' + jobId + '/attempts');
@@ -146,6 +152,12 @@
           container.innerHTML = list.map(function(a, idx) {
             var logId = 'log-' + a.id;
             var st = (a.status || '').toLowerCase();
+            var adisp = window.oreonJobDisplayStatus
+              ? window.oreonJobDisplayStatus({ display_status: a.display_status, status: a.status })
+              : st;
+            var signingLine = window.oreonControllerKeyHtml
+              ? '<div style="margin-top:0.35rem">' + window.oreonControllerKeyHtml(a.signing_status) + '</div>'
+              : '';
             var workerLine = '';
             if (a.worker_name || a.worker_id) {
               var who = a.worker_name ? escapeHtml(a.worker_name) : ('#' + a.worker_id);
@@ -153,7 +165,8 @@
               workerLine = '<div><small>Worker: ' + who + ' &nbsp; Last heartbeat (UTC): ' + hb + '</small></div>';
             }
             return '<div class="attempt-card" data-attempt-id="' + a.id + '" data-attempt-status="' + escapeAttr(st) + '" data-started-at="' + escapeAttr(a.started_at || '') + '">' +
-              '<h4>Attempt #' + (a.attempt_number || (idx + 1)) + ' <span class="' + statusClass(a.status) + '">' + (a.status || '') + '</span></h4>' +
+              '<h4>Attempt #' + (a.attempt_number || (idx + 1)) + ' <span class="' + statusClass(adisp) + '">' + escapeHtml(adisp) + '</span></h4>' +
+              signingLine +
               workerLine +
               '<div class="attempt-elapsed-live" style="color:var(--text-muted);"></div>' +
               '<div><small>Started: ' + (a.started_at ? a.started_at.slice(0, 19) : '—') + ' &nbsp; Finished: ' + (a.finished_at ? a.finished_at.slice(0, 19) : '—') + '</small></div>' +
