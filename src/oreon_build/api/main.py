@@ -199,57 +199,9 @@ async def lifespan(app: FastAPI):
     catchup_task = asyncio.create_task(_github_push_catchup_loop(), name="github-push-catchup")
 
     async def _publish_tasks_loop() -> None:
-        from datetime import datetime, timezone
-
-        from oreon_build.core.repo_branch import r2_publish_branch
         from oreon_build.db.session import async_session_maker
-        from oreon_build.models import Artifact, BuildAttempt, BuildJob, BuildTarget, PublishTask, Release
-        from oreon_build.services.publisher import update_repodata_at_prefix
-        from oreon_build.services.r2 import get_r2_client, repo_r2_prefix, repo_rpms_key, src_r2_key
-        from oreon_build.api.worker_api import ArtifactPayload, _prune_superseded_repo_objects
-
-        def _process_repo_publish_sync(
-            *,
-            releasename: str,
-            branch: str,
-            arch: str,
-            attempt_id: int,
-            payload_artifacts: list[ArtifactPayload],
-            build_attempt_r2_keys: list[str],
-        ) -> None:
-            r2 = get_r2_client()
-
-            # If worker uploaded into builds/ keys, copy into repo layout first.
-            for a in payload_artifacts:
-                if a.r2_key and "/builds/" in a.r2_key and a.filename:
-                    data = r2.get_object(a.r2_key)
-                    if not data:
-                        continue
-                    if a.filename.endswith(".src.rpm"):
-                        dest = src_r2_key(releasename, branch, a.filename)
-                    else:
-                        dest = repo_rpms_key(releasename, branch, arch, a.filename)
-                    r2.put_object(dest, data)
-
-            keep = {a.filename for a in payload_artifacts if a.filename}
-            _prune_superseded_repo_objects(
-                releasename=releasename,
-                branch=branch,
-                arch=arch,
-                keep_artifact_filenames=keep,
-                payload_artifacts=payload_artifacts,
-            )
-
-            prefix = repo_r2_prefix(releasename, branch, arch)
-            update_repodata_at_prefix(prefix)
-
-            exact_builds_prefix = f"{releasename}/builds/{attempt_id}/"
-            for key in build_attempt_r2_keys:
-                if key and key.startswith(exact_builds_prefix):
-                    try:
-                        r2.delete_object(key)
-                    except Exception:
-                        pass
+        from oreon_build.models import PublishTask
+        from oreon_build.services.repo_publish import run_repo_publish_for_attempt
 
         while True:
             try:
@@ -261,7 +213,6 @@ async def lifespan(app: FastAPI):
                 idle_interval_s = max(0.5, min(idle_interval_s, 30.0))
                 batch = 5
                 async with async_session_maker() as db:
-                    now = datetime.now(timezone.utc)
                     q = (
                         select(PublishTask)
                         .where(PublishTask.status == "pending")
@@ -274,83 +225,12 @@ async def lifespan(app: FastAPI):
                     if not tasks:
                         await asyncio.sleep(idle_interval_s)
                         continue
-                    for t in tasks:
-                        t.status = "running"
-                        t.started_at = now
                     await db.commit()
 
                 for t in tasks:
-                    attempt_id = t.attempt_id
                     try:
-                        async with async_session_maker() as db2:
-                            job_id = t.build_job_id
-
-                            job_r = await db2.execute(select(BuildJob).where(BuildJob.id == job_id))
-                            job = job_r.scalar_one_or_none()
-                            if not job:
-                                raise RuntimeError(f"build job not found: {job_id}")
-
-                            rel_r = await db2.execute(select(Release).where(Release.id == job.release_id))
-                            release = rel_r.scalar_one_or_none()
-                            if not release:
-                                raise RuntimeError(f"release not found: {job.release_id}")
-
-                            if not job.target_id:
-                                raise RuntimeError(f"build target missing for job: {job_id}")
-                            target_r = await db2.execute(
-                                select(BuildTarget).where(BuildTarget.id == job.target_id)
-                            )
-                            target = target_r.scalar_one_or_none()
-                            if not target or not target.architecture:
-                                raise RuntimeError(f"build target arch missing for job: {job_id}")
-
-                            branch = r2_publish_branch(release)
-                            arch = target.architecture
-
-                            art_r = await db2.execute(
-                                select(Artifact).where(Artifact.build_attempt_id == attempt_id)
-                            )
-                            artifacts = list(art_r.scalars().all())
-                            payload_artifacts = [
-                                ArtifactPayload(
-                                    kind=a.kind,
-                                    filename=a.filename,
-                                    r2_key=a.r2_key,
-                                    size_bytes=a.size_bytes,
-                                    checksum_sha256=a.checksum_sha256,
-                                    signed=bool(a.is_signed),
-                                )
-                                for a in artifacts
-                            ]
-                            r2_keys = [a.r2_key for a in artifacts if a.r2_key]
-
-                        await asyncio.to_thread(
-                            _process_repo_publish_sync,
-                            releasename=release.releasename,
-                            branch=branch,
-                            arch=arch,
-                            attempt_id=attempt_id,
-                            payload_artifacts=payload_artifacts,
-                            build_attempt_r2_keys=r2_keys,
-                        )
-
-                        async with async_session_maker() as db3:
-                            task_row = await db3.get(PublishTask, t.id)
-                            if task_row:
-                                task_row.status = "success"
-                                task_row.finished_at = datetime.now(timezone.utc)
-                                task_row.error_message = None
-                                await db3.flush()
-                                await db3.commit()
-                    except Exception as e:
-                        async with async_session_maker() as db3:
-                            task_row = await db3.get(PublishTask, t.id)
-                            if task_row:
-                                task_row.status = "failed"
-                                task_row.finished_at = datetime.now(timezone.utc)
-                                task_row.error_message = str(e)
-                                await db3.flush()
-                                await db3.commit()
+                        await run_repo_publish_for_attempt(t.attempt_id, publish_task_id=t.id)
+                    except Exception:
                         logger.exception(
                             "Publish task failed id=%s attempt_id=%s job_id=%s",
                             t.id,

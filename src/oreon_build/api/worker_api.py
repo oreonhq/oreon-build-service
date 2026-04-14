@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, Body, Depends, File, Header, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Header, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
@@ -63,8 +63,8 @@ from oreon_build.models import (
     Worker,
     WorkerState,
 )
+from oreon_build.services.repo_publish import run_repo_publish_for_attempt
 from oreon_build.services.r2 import get_r2_client, log_r2_key, repo_r2_prefix, repo_rpms_key, src_r2_key
-from oreon_build.services.publisher import update_repodata_at_prefix
 from oreon_build.services.signing import sign_rpm
 from oreon_build.services.worker_artifact_access import source_r2_keys_for_attempt
 from oreon_build.services.worker_state_sync import sync_worker_state_after_attempt_finished
@@ -1246,12 +1246,39 @@ async def upload_worker_rpm(
     }
 
 
+@router.post("/mock-complete/{attempt_id}")
+async def worker_mock_complete(
+    attempt_id: int,
+    db: DbSession,
+    worker: Annotated[Worker, Depends(_require_worker)],
+):
+    """Worker calls this after ``mock --rebuild`` succeeds so the UI can show success while RPMs upload and the controller signs/publishes."""
+    result = await db.execute(
+        select(BuildAttempt)
+        .where(BuildAttempt.id == attempt_id, BuildAttempt.worker_id == worker.id)
+        .with_for_update()
+    )
+    attempt = result.scalar_one_or_none()
+    if not attempt:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attempt not found")
+    if attempt.status != BuildStatus.RUNNING:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Attempt is not running",
+        )
+    attempt.mock_succeeded_at = datetime.now(timezone.utc)
+    attempt.signing_status = "uploading"
+    await db.flush()
+    return {"status": "ok"}
+
+
 @router.post("/result/{attempt_id}")
 async def report_result(
     attempt_id: int,
     payload: ResultPayload,
     db: DbSession,
     worker: Annotated[Worker, Depends(_require_worker)],
+    background_tasks: BackgroundTasks,
 ):
     result = await db.execute(
         select(BuildAttempt)
@@ -1309,6 +1336,7 @@ async def report_result(
         if attempt.status == BuildStatus.RUNNING:
             attempt.status = BuildStatus.CANCELLED
             attempt.finished_at = datetime.now(timezone.utc)
+        attempt.signing_status = "failed"
         await db.flush()
         await sync_worker_state_after_attempt_finished(db, worker)
         await log_audit(
@@ -1347,6 +1375,7 @@ async def report_result(
                 attempt.status = BuildStatus.SUCCESS
                 attempt.error_message = None
                 attempt.finished_at = datetime.now(timezone.utc)
+                attempt.signing_status = "signed"
                 job.status = BuildStatus.SUCCESS
                 job.completed_at = attempt.finished_at
                 if payload.log_r2_key:
@@ -1380,6 +1409,7 @@ async def report_result(
                 job.branch = branch
                 if release and arch:
                     await _enqueue_repo_publish_task()
+                    background_tasks.add_task(run_repo_publish_for_attempt, attempt_id)
 
                 await log_audit(
                     db,
@@ -1396,6 +1426,11 @@ async def report_result(
 
     attempt.status = BuildStatus(payload.status)
     attempt.finished_at = datetime.now(timezone.utc)
+    st_l = str(payload.status).lower()
+    if st_l == "success":
+        attempt.signing_status = "signed"
+    elif st_l in ("failed", "cancelled"):
+        attempt.signing_status = "failed"
     if payload.error_message:
         attempt.error_message = payload.error_message
     if payload.log_r2_key:
@@ -1424,7 +1459,7 @@ async def report_result(
 
     # On success: ensure RPMs are in dev/, then update repodata, create promotion
     # Worker may upload to builds/ or dev/. If builds/: copy to dev/ FIRST, then we delete builds/ later.
-    if payload.status == "success" and payload.artifacts:
+    if str(payload.status).lower() == "success":
         pkg_result = await db.execute(select(Package).where(Package.id == job.package_id))
         pkg = pkg_result.scalar_one_or_none()
         rel_result = await db.execute(select(Release).where(Release.id == job.release_id))
@@ -1435,9 +1470,9 @@ async def report_result(
         branch = r2_publish_branch(release)
         job.branch = branch
         if release and arch:
-            # Queue expensive R2 copy/prune/createrepo work. This makes POST /worker/result fast and safe
-            # under HTTP timeouts.
+            # Durable row for orphan recovery; immediate run via BackgroundTasks (same work, lock dedupes).
             await _enqueue_repo_publish_task()
+            background_tasks.add_task(run_repo_publish_for_attempt, attempt_id)
             # Copy package SRPM to releasename/branch/src/ (from uploads) if we have one
             if job.package_version_id:
                 src_result = await db.execute(

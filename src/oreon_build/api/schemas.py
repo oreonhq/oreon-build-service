@@ -279,6 +279,10 @@ class BuildJobResponse(BaseModel):
     architecture: Optional[str] = None
     package_version_id: Optional[int] = None
     status: str
+    #: Badge-friendly status: ``success`` once mock finished, even if controller pipeline still running.
+    display_status: str = ""
+    #: Latest attempt controller pipeline (GPG on controller): ``not_started`` | ``uploading`` | ``signed`` | ``failed``.
+    signing_status: Optional[str] = None
     priority: int
     created_at: datetime
     completed_at: Optional[datetime] = None
@@ -313,6 +317,11 @@ class BuildAttemptResponse(BaseModel):
     worker_id: Optional[int] = None
     attempt_number: int
     status: str
+    #: Badge: ``success`` when mock succeeded, even if ``status`` is still ``running`` (upload to controller).
+    display_status: str = ""
+    mock_succeeded_at: Optional[datetime] = None
+    #: Controller pipeline after mock (GPG signing runs on controller, not worker).
+    signing_status: Optional[str] = None
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
     log_r2_key: Optional[str] = None
