@@ -108,8 +108,8 @@ class BuildAttempt(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     #: Set when mock --rebuild reported success (before RPM upload / POST result).
     mock_succeeded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    #: Post-mock pipeline tracked for UI: worker upload then **controller** GPG + R2 + repodata.
-    #: Values: ``not_started`` | ``uploading`` | ``signed`` (controller finished) | ``failed``.
+    #: Post-mock pipeline on the controller (GPG, R2, repodata). Worker calls mock-complete when mock ends.
+    #: Values: ``not_started`` | ``running`` | ``signed`` | ``failed`` (legacy ``uploading`` treated as running).
     signing_status: Mapped[str] = mapped_column(String(32), default="not_started", nullable=False)
 
     build_job: Mapped["BuildJob"] = relationship("BuildJob", back_populates="attempts")
