@@ -33,6 +33,65 @@ logger = logging.getLogger(__name__)
 DEFAULT_ARCHITECTURES = ["x86_64", "aarch64"]
 
 
+def _attempt_display_status(a: BuildAttempt) -> str:
+    if a.status == BuildStatus.SUCCESS:
+        return "success"
+    if a.mock_succeeded_at is not None and a.status == BuildStatus.RUNNING:
+        return "success"
+    return a.status.value
+
+
+def _job_display_status(job: BuildJob, latest: BuildAttempt | None) -> str:
+    if job.status == BuildStatus.SUCCESS:
+        return "success"
+    if latest is not None and latest.mock_succeeded_at is not None and job.status == BuildStatus.RUNNING:
+        return "success"
+    return job.status.value
+
+
+async def _latest_attempt_by_job_ids(db: DbSession, job_ids: list[int]) -> dict[int, BuildAttempt]:
+    if not job_ids:
+        return {}
+    r = await db.execute(
+        select(BuildAttempt)
+        .where(BuildAttempt.build_job_id.in_(job_ids))
+        .order_by(BuildAttempt.build_job_id.asc(), BuildAttempt.id.desc())
+    )
+    out: dict[int, BuildAttempt] = {}
+    for att in r.scalars().all():
+        if att.build_job_id not in out:
+            out[att.build_job_id] = att
+    return out
+
+
+def _effective_signing_status_attempt(a: BuildAttempt) -> str:
+    """Infer controller pipeline phase when DB still has default not_started (older rows or no mock-complete)."""
+    raw = (a.signing_status or "").strip() or "not_started"
+    if raw != "not_started":
+        return raw
+    if a.status == BuildStatus.SUCCESS:
+        return "signed"
+    if a.status in (BuildStatus.FAILED, BuildStatus.CANCELLED, BuildStatus.SKIPPED):
+        return "failed"
+    return "not_started"
+
+
+def _effective_signing_status_job(job: BuildJob, latest: BuildAttempt | None) -> str | None:
+    """Prefer stored status; for finished jobs with default not_started, infer from job + attempt."""
+    if latest is None:
+        return None
+    raw = (latest.signing_status or "").strip() or "not_started"
+    if raw != "not_started":
+        return raw
+    if job.status == BuildStatus.SUCCESS:
+        return "signed"
+    if job.status in (BuildStatus.FAILED, BuildStatus.CANCELLED, BuildStatus.SKIPPED):
+        return "failed"
+    if job.status == BuildStatus.RUNNING and latest.mock_succeeded_at is not None:
+        return "uploading"
+    return "not_started"
+
+
 def _attempt_to_response(a: BuildAttempt) -> BuildAttemptResponse:
     w = a.worker
     return BuildAttemptResponse(
@@ -41,6 +100,9 @@ def _attempt_to_response(a: BuildAttempt) -> BuildAttemptResponse:
         worker_id=a.worker_id,
         attempt_number=a.attempt_number,
         status=a.status.value,
+        display_status=_attempt_display_status(a),
+        mock_succeeded_at=a.mock_succeeded_at,
+        signing_status=_effective_signing_status_attempt(a),
         started_at=a.started_at,
         finished_at=a.finished_at,
         log_r2_key=a.log_r2_key,
@@ -280,7 +342,9 @@ async def list_builds(
     q = q.limit(limit).offset(offset)
     result = await db.execute(q)
     jobs = list(result.scalars().all())
-    return PaginatedResponse(items=jobs, total=total)
+    att_map = await _latest_attempt_by_job_ids(db, [j.id for j in jobs])
+    items = [await _job_to_response(db, j, att_map.get(j.id)) for j in jobs]
+    return PaginatedResponse(items=items, total=total)
 
 
 @router.get("/jobs/{job_id}", response_model=BuildJobResponse)
@@ -589,7 +653,8 @@ async def trigger_build(
             ip_address=get_client_ip(request),
             user_agent=get_user_agent(request),
         )
-    return jobs_created
+    att_map = await _latest_attempt_by_job_ids(db, [j.id for j in jobs_created])
+    return [await _job_to_response(db, j, att_map.get(j.id)) for j in jobs_created]
 
 
 ALLOWED_UPLOAD_EXTENSIONS = (".src.rpm", ".spec")
@@ -754,33 +819,25 @@ async def upload_and_trigger(
         logger.warning("build.upload trigger rejected release_id=%s package_id=%s %s", release_id, pkg.id, detail)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
     first = jobs_created[0]
-    # Get architecture without touching job.build_target (avoids async lazy-load)
-    arch = None
-    if first.target_id:
-        arch_row = await db.execute(
-            select(BuildTarget.architecture).where(BuildTarget.id == first.target_id)
-        )
-        arch = arch_row.scalars().one_or_none()
-    payload = BuildJobResponse(
-        id=first.id,
-        package_id=first.package_id,
-        release_id=first.release_id,
-        target_id=first.target_id,
-        architecture=arch,
-        package_version_id=first.package_version_id,
-        status=first.status.value,
-        priority=first.priority,
-        created_at=first.created_at,
-        completed_at=first.completed_at,
-    )
+    payload = await _job_to_response(db, first)
     return JSONResponse(
         status_code=status.HTTP_201_CREATED,
         content=payload.model_dump(mode="json"),
     )
 
 
-async def _job_to_response(db: DbSession, job: BuildJob) -> BuildJobResponse:
+async def _job_to_response(
+    db: DbSession, job: BuildJob, latest: BuildAttempt | None = None
+) -> BuildJobResponse:
     """Build BuildJobResponse without touching job.build_target (avoids async lazy-load)."""
+    if latest is None:
+        r = await db.execute(
+            select(BuildAttempt)
+            .where(BuildAttempt.build_job_id == job.id)
+            .order_by(BuildAttempt.id.desc())
+            .limit(1)
+        )
+        latest = r.scalar_one_or_none()
     arch = None
     if job.target_id:
         r = await db.execute(select(BuildTarget.architecture).where(BuildTarget.id == job.target_id))
@@ -793,6 +850,8 @@ async def _job_to_response(db: DbSession, job: BuildJob) -> BuildJobResponse:
         architecture=arch,
         package_version_id=job.package_version_id,
         status=job.status.value,
+        display_status=_job_display_status(job, latest),
+        signing_status=_effective_signing_status_job(job, latest),
         priority=job.priority,
         created_at=job.created_at,
         completed_at=job.completed_at,
