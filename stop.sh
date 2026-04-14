@@ -32,6 +32,7 @@ stop_pid() {
   rm -f "$file"
 }
 
+stop_pid "Repodata refresh" .oreon-repodata-refresh.pid
 stop_pid "API"       .oreon-api.pid
 stop_pid "Scheduler" .oreon-scheduler.pid
 stop_pid "Watchdog"  .oreon-watchdog.pid
@@ -72,5 +73,5 @@ kill_uvicorn_on_port 8000 "uvicorn oreon_build.api.main:app"
 kill_uvicorn_on_port 8001 "uvicorn oreon_build.watchdog.main:app"
 
 # Clean up pid files even if they weren't present.
-rm -f .oreon-api.pid .oreon-scheduler.pid .oreon-watchdog.pid 2>/dev/null || true
+rm -f .oreon-repodata-refresh.pid .oreon-api.pid .oreon-scheduler.pid .oreon-watchdog.pid 2>/dev/null || true
 echo "Stopped."
