@@ -1267,7 +1267,7 @@ async def worker_mock_complete(
             detail="Attempt is not running",
         )
     attempt.mock_succeeded_at = datetime.now(timezone.utc)
-    attempt.signing_status = "uploading"
+    attempt.signing_status = "running"
     await db.flush()
     return {"status": "ok"}
 

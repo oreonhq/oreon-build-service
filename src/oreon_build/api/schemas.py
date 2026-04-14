@@ -281,7 +281,7 @@ class BuildJobResponse(BaseModel):
     status: str
     #: Badge-friendly status: ``success`` once mock finished, even if controller pipeline still running.
     display_status: str = ""
-    #: Latest attempt controller pipeline (GPG on controller): ``not_started`` | ``uploading`` | ``signed`` | ``failed``.
+    #: Latest attempt controller pipeline: ``not_started`` | ``running`` | ``signed`` | ``failed``.
     signing_status: Optional[str] = None
     priority: int
     created_at: datetime
