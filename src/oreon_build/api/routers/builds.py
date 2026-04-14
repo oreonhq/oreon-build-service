@@ -875,6 +875,37 @@ async def retry_build(
     job = result.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Build job not found")
+
+    # Re-resolve target on retry so package mock-env changes are respected.
+    pkg_result = await db.execute(select(Package).where(Package.id == job.package_id))
+    pkg = pkg_result.scalar_one_or_none()
+    if pkg is not None:
+        target_arch: str | None = None
+        if job.target_id:
+            t_result = await db.execute(
+                select(BuildTarget.architecture).where(BuildTarget.id == job.target_id)
+            )
+            target_arch = t_result.scalars().one_or_none()
+        if target_arch:
+            preferred_env_id = pkg.preferred_mock_environment_id
+            if preferred_env_id is not None:
+                from oreon_build.models import MockEnvironment
+
+                me_result = await db.execute(
+                    select(MockEnvironment.id).where(
+                        MockEnvironment.id == preferred_env_id,
+                        MockEnvironment.release_id == job.release_id,
+                    )
+                )
+                if me_result.scalar_one_or_none() is None:
+                    preferred_env_id = None
+            target = await _get_or_create_build_target(
+                db,
+                job.release_id,
+                normalize_machine_arch(target_arch),
+                preferred_env_id,
+            )
+            job.target_id = target.id
     job.status = BuildStatus.PENDING
     job.completed_at = None
     await log_audit(

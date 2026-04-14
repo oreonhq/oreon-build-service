@@ -1382,6 +1382,9 @@ async def report_result(
                     attempt.log_r2_key = payload.log_r2_key
                 await db.flush()
                 await sync_worker_state_after_attempt_finished(db, worker)
+                # Durably persist the repaired terminal status before follow-up side effects.
+                # If any later step fails, worker retry should continue from SUCCESS, not RUNNING.
+                await db.commit()
                 promo_count = await db.scalar(
                     select(func.count(Promotion.id)).where(Promotion.build_job_id == job.id)
                 )
@@ -1439,6 +1442,10 @@ async def report_result(
     job.completed_at = attempt.finished_at
     await db.flush()
     await sync_worker_state_after_attempt_finished(db, worker)
+    # Critical durability boundary.
+    # Final status transitions must survive failures in artifact insert / repo publish enqueue /
+    # promotion creation / R2 cleanup during large autobuild bursts.
+    await db.commit()
     for a in payload.artifacts:
         stmt = (
             pg_insert(Artifact.__table__)

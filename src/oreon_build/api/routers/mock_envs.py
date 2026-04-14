@@ -16,7 +16,7 @@
 
 """Mock environments - list public; create/update/delete require admin."""
 from fastapi import APIRouter, HTTPException, Query, Request, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from oreon_build.api.deps import CurrentAdmin, DbSession
 from oreon_build.api.schemas import (
@@ -26,7 +26,7 @@ from oreon_build.api.schemas import (
     PaginatedResponse,
 )
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
-from oreon_build.models import MockEnvironment, Release
+from oreon_build.models import BuildJob, BuildTarget, MockEnvironment, Package, Release
 
 router = APIRouter(prefix="/mock-environments", tags=["mock-environments"])
 
@@ -139,6 +139,43 @@ async def delete_mock_environment(
     env = result.scalar_one_or_none()
     if not env:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mock environment not found")
+
+    # Detach package preferences so FK does not fail on delete.
+    await db.execute(
+        update(Package)
+        .where(Package.preferred_mock_environment_id == env_id)
+        .values(preferred_mock_environment_id=None)
+    )
+
+    # BuildTarget rows can still point to this env, including historical job references.
+    # Remap jobs to an existing NULL-mock target per (release, arch) when present;
+    # otherwise convert the current target to NULL-mock in place.
+    targets_result = await db.execute(
+        select(BuildTarget).where(BuildTarget.mock_environment_id == env_id)
+    )
+    targets = list(targets_result.scalars().all())
+    for target in targets:
+        null_target_result = await db.execute(
+            select(BuildTarget)
+            .where(
+                BuildTarget.release_id == target.release_id,
+                BuildTarget.architecture == target.architecture,
+                BuildTarget.mock_environment_id.is_(None),
+            )
+            .order_by(BuildTarget.id.asc())
+            .limit(1)
+        )
+        null_target = null_target_result.scalar_one_or_none()
+        if null_target is not None and null_target.id != target.id:
+            await db.execute(
+                update(BuildJob)
+                .where(BuildJob.target_id == target.id)
+                .values(target_id=null_target.id)
+            )
+            await db.delete(target)
+            continue
+        target.mock_environment_id = None
+
     await db.delete(env)
     await log_audit(
         db,
