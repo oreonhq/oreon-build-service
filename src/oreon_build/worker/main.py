@@ -573,6 +573,18 @@ def _post_worker_build_result(
     return _with_http_retries(f"worker result attempt_id={attempt_id}", _do)
 
 
+def _post_mock_complete(session: httpx.Client, controller_url: str, attempt_id: int) -> httpx.Response:
+    """Tell the controller mock finished so the UI can show build success while the controller pipeline runs."""
+
+    def _do() -> httpx.Response:
+        return session.post(
+            f"{controller_url}/api/worker/mock-complete/{attempt_id}",
+            timeout=httpx.Timeout(60.0, connect=30.0),
+        )
+
+    return _with_http_retries(f"mock-complete attempt_id={attempt_id}", _do)
+
+
 def _try_post_orphan_failure(
     controller_url: str,
     worker_headers: dict[str, str],
@@ -2201,6 +2213,28 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                     },
                 )
                 return
+            if not ok:
+                full_log = "\n\n".join([p for p in build_log_parts if p]).strip() + "\n"
+                log_key = _upload_build_log_via_controller(
+                    session, controller_url, attempt_id, full_log.encode("utf-8")
+                )
+                _post_worker_build_result(
+                    session,
+                    controller_url,
+                    attempt_id,
+                    {
+                        "status": "failed",
+                        "log_r2_key": log_key,
+                        "error_message": (full_log[:2000] if full_log else "mock --rebuild failed"),
+                        "artifacts": [],
+                    },
+                )
+                return
+            try:
+                _post_mock_complete(session, controller_url, attempt_id)
+            except Exception:
+                logger.exception("mock-complete failed (non-fatal) attempt_id=%s", attempt_id)
+
             full_log = "\n\n".join([p for p in build_log_parts if p]).strip() + "\n"
 
             rpm_upload_stage = tmp / "rpm_upload_staging"
