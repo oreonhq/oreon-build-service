@@ -64,9 +64,15 @@ async def _latest_attempt_by_job_ids(db: DbSession, job_ids: list[int]) -> dict[
     return out
 
 
+def _normalize_signing_status(raw: str) -> str:
+    if raw == "uploading":
+        return "running"
+    return raw
+
+
 def _effective_signing_status_attempt(a: BuildAttempt) -> str:
     """Infer controller pipeline phase when DB still has default not_started (older rows or no mock-complete)."""
-    raw = (a.signing_status or "").strip() or "not_started"
+    raw = _normalize_signing_status((a.signing_status or "").strip() or "not_started")
     if raw != "not_started":
         return raw
     if a.status == BuildStatus.SUCCESS:
@@ -80,7 +86,7 @@ def _effective_signing_status_job(job: BuildJob, latest: BuildAttempt | None) ->
     """Prefer stored status; for finished jobs with default not_started, infer from job + attempt."""
     if latest is None:
         return None
-    raw = (latest.signing_status or "").strip() or "not_started"
+    raw = _normalize_signing_status((latest.signing_status or "").strip() or "not_started")
     if raw != "not_started":
         return raw
     if job.status == BuildStatus.SUCCESS:
@@ -88,7 +94,7 @@ def _effective_signing_status_job(job: BuildJob, latest: BuildAttempt | None) ->
     if job.status in (BuildStatus.FAILED, BuildStatus.CANCELLED, BuildStatus.SKIPPED):
         return "failed"
     if job.status == BuildStatus.RUNNING and latest.mock_succeeded_at is not None:
-        return "uploading"
+        return "running"
     return "not_started"
 
 
