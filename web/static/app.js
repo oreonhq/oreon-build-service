@@ -341,6 +341,61 @@ function updateAuthUI() {
   }
 }
 
+/**
+ * Controller pipeline after mock (GPG and repodata run on the controller, not on the worker).
+ * Needs Font Awesome 6 (``fa-solid fa-key``) on the page.
+ */
+function oreonControllerKeyHtml(controllerStatus) {
+  var ss = (controllerStatus || 'not_started').toLowerCase();
+  var c = '#94a3b8';
+  var label = 'Pending';
+  var tip =
+    'Controller: waiting for worker to upload RPMs. GPG signing happens on the controller after upload.';
+  if (ss === 'uploading') {
+    c = '#f59e0b';
+    label = 'Uploading';
+    tip =
+      'Worker is uploading RPMs to the controller. GPG signing and repo publish run on the controller after each upload.';
+  } else if (ss === 'signed') {
+    c = '#22c55e';
+    label = 'Complete';
+    tip = 'Controller finished GPG signing, repo publish, and finalization.';
+  } else if (ss === 'failed') {
+    c = '#ef4444';
+    label = 'Failed';
+    tip = 'Failed during upload or on the controller (signing, R2, or repodata).';
+  }
+  function esc(s) {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/"/g, '&quot;');
+  }
+  return (
+    '<span class="oreon-controller-key" title="' +
+    esc(tip) +
+    '" style="display:inline-flex;align-items:center;gap:0.35rem;">' +
+    '<i class="fa-solid fa-key" aria-hidden="true" style="color:' +
+    c +
+    ';"></i>' +
+    '<span style="font-size:0.85rem;color:var(--text-muted);">' +
+    esc(label) +
+    '</span></span>'
+  );
+}
+
+/** Prefer API ``display_status`` (success right after mock) over raw ``status``. */
+function oreonJobDisplayStatus(job) {
+  if (!job) return '';
+  var d = job.display_status;
+  if (d != null && String(d).trim() !== '') return String(d).trim().toLowerCase();
+  return String(job.status || '').toLowerCase();
+}
+
+window.oreonControllerKeyHtml = oreonControllerKeyHtml;
+window.oreonSigningKeyHtml = oreonControllerKeyHtml;
+window.oreonJobDisplayStatus = oreonJobDisplayStatus;
+
 document.addEventListener('DOMContentLoaded', function() {
   oreonLoadStoredAuth(window.oreonApi);
   updateAuthUI();
