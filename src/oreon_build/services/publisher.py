@@ -30,6 +30,7 @@ import fcntl
 import hashlib
 import logging
 import os
+import shutil
 import subprocess
 import tempfile
 from contextlib import contextmanager
@@ -253,6 +254,15 @@ def _cleanup_old_repodata(
 def _run_createrepo(repo_dir: Path) -> None:
     # Never use capture_output/PIPE here. createrepo_c can write a lot to stderr; a full pipe blocks the child
     # while the parent waits forever (looks like a hang with RPMs already on disk).
+    tmp_repodata = repo_dir / ".repodata"
+    if tmp_repodata.exists():
+        # Previous interrupted createrepo runs can leave this behind and every future run
+        # fails with "Temporary repodata directory ... already exists".
+        try:
+            shutil.rmtree(tmp_repodata)
+            logger.warning("Removed stale createrepo temp dir %s", tmp_repodata)
+        except OSError as e:
+            logger.warning("Could not remove stale createrepo temp dir %s: %s", tmp_repodata, e)
     w = _createrepo_workers()
     logger.info("createrepo_c starting repo_root=%s workers=%s", repo_dir, w)
     subprocess.run(

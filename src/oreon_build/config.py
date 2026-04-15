@@ -38,22 +38,43 @@ class Settings(BaseSettings):
         description="PostgreSQL connection URL (async)",
     )
     database_pool_size: int = Field(
-        default=20,
-        ge=5,
+        default=8,
+        ge=1,
         le=200,
-        description="SQLAlchemy async pool size (concurrent API + worker poll sessions).",
+        description=(
+            "Per-process SQLAlchemy async pool size. Keep conservative because API, scheduler, "
+            "and watchdog each maintain their own pool."
+        ),
     )
     database_max_overflow: int = Field(
-        default=40,
+        default=4,
         ge=0,
         le=200,
-        description="Extra connections beyond pool_size when the pool is exhausted.",
+        description=(
+            "Per-process burst connections beyond pool_size. Lower values prevent stampeding "
+            "PostgreSQL under load."
+        ),
     )
     database_pool_timeout: int = Field(
-        default=60,
+        default=30,
         ge=5,
         le=600,
         description="Seconds to wait for a free connection before failing (avoids indefinite hangs).",
+    )
+    database_idle_in_transaction_timeout_seconds: int = Field(
+        default=120,
+        ge=0,
+        le=3600,
+        description=(
+            "Server-side timeout for idle open transactions. 0 disables. Helps prevent leaked "
+            "sessions from exhausting PostgreSQL."
+        ),
+    )
+    database_application_name: str = Field(
+        default="oreon-build-service",
+        min_length=1,
+        max_length=128,
+        description="PostgreSQL application_name tag used in pg_stat_activity.",
     )
 
     # Auth

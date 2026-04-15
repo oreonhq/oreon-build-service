@@ -7,13 +7,23 @@ from oreon_build.config import get_settings
 from oreon_build.db.base import Base
 
 _settings = get_settings()
+_server_settings = {
+    "application_name": _settings.database_application_name,
+}
+if _settings.database_idle_in_transaction_timeout_seconds > 0:
+    _server_settings["idle_in_transaction_session_timeout"] = str(
+        _settings.database_idle_in_transaction_timeout_seconds * 1000
+    )
 _engine = create_async_engine(
     _settings.database_url,
     echo=False,
     pool_pre_ping=True,
+    pool_use_lifo=True,
+    pool_recycle=1800,
     pool_size=_settings.database_pool_size,
     max_overflow=_settings.database_max_overflow,
     pool_timeout=_settings.database_pool_timeout,
+    connect_args={"server_settings": _server_settings},
 )
 async_session_maker = async_sessionmaker(
     _engine,

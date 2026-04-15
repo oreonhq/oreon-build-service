@@ -94,6 +94,32 @@ def _pesign_material_configured(settings) -> bool:
     return False
 
 
+def _worker_declared_max_parallel_attempts(worker: Worker) -> int:
+    """
+    Capacity check for poll-claim readiness.
+    Prefers worker.capabilities JSON (`max_jobs` or `max_parallel_builds`) and
+    falls back to worker runtime default (4) when not declared.
+    """
+    fallback = 4
+    raw = (worker.capabilities or "").strip()
+    if not raw:
+        return fallback
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return fallback
+    if not isinstance(obj, dict):
+        return fallback
+    val = obj.get("max_jobs")
+    if val is None:
+        val = obj.get("max_parallel_builds")
+    try:
+        n = int(val)
+    except Exception:
+        return fallback
+    return max(1, min(n, 64))
+
+
 def _build_pesign_bundle_file(dest: Path, nss_dir: Path, manifest: dict) -> None:
     raw = json.dumps(manifest, indent=2).encode("utf-8")
     with tarfile.open(dest, "w:gz") as tf:
@@ -184,6 +210,7 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
         ).scalar()
         or 0
     )
+    max_parallel = _worker_declared_max_parallel_attempts(locked_worker)
     # Readiness reconciliation only.
     # Keep BUSY workers eligible to poll so one worker host can run parallel builds.
     # If DB state says BUSY but no RUNNING attempts remain, heal back to IDLE.
@@ -191,6 +218,21 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
         locked_worker.state = WorkerState.IDLE
         locked_worker.current_build_attempt_id = None
         await db.flush()
+    elif running_attempts >= max_parallel:
+        locked_worker.state = WorkerState.BUSY
+        if locked_worker.current_build_attempt_id is None:
+            newest_running_attempt_id = await db.scalar(
+                select(BuildAttempt.id)
+                .where(
+                    BuildAttempt.worker_id == locked_worker.id,
+                    BuildAttempt.status == BuildStatus.RUNNING,
+                )
+                .order_by(BuildAttempt.id.desc())
+                .limit(1)
+            )
+            locked_worker.current_build_attempt_id = newest_running_attempt_id
+        await db.flush()
+        return {"job": None}
     elif running_attempts > 0 and locked_worker.current_build_attempt_id is None:
         newest_running_attempt_id = await db.scalar(
             select(BuildAttempt.id)
