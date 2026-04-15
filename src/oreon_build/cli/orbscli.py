@@ -1,0 +1,1305 @@
+# Oreon Build Service
+# Copyright (C) 2026 Oreon HQ
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""orbscli - non-interactive CLI for Oreon Build Service (mirrors web API + Watchdog)."""
+from __future__ import annotations
+
+import base64
+import json
+import os
+import re
+import stat
+import sys
+import time
+from pathlib import Path
+from typing import Any
+from urllib.parse import urljoin
+
+import click
+import httpx
+
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "orbscli"
+CREDENTIALS_PATH = CONFIG_DIR / "credentials.json"
+CONFIG_PATH = CONFIG_DIR / "config.json"
+
+
+def _current_ctx() -> click.Context | None:
+    return click.get_current_context(silent=True)
+
+
+def _ensure_config_dir() -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_json(path: Path, data: dict[str, Any]) -> None:
+    _ensure_config_dir()
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    try:
+        path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass
+
+
+def get_api_url() -> str:
+    ctx = _current_ctx()
+    if ctx and ctx.obj.get("API_URL"):
+        return str(ctx.obj["API_URL"]).rstrip("/")
+    env = (os.environ.get("ORBSCLI_API_URL") or os.environ.get("OREON_API_URL") or "").strip()
+    if env:
+        return env.rstrip("/")
+    cfg = _load_json(CONFIG_PATH)
+    return str(cfg.get("api_url", "http://localhost:8000")).rstrip("/")
+
+
+def get_watchdog_url() -> str:
+    ctx = _current_ctx()
+    if ctx and ctx.obj.get("WATCHDOG_URL"):
+        return str(ctx.obj["WATCHDOG_URL"]).rstrip("/")
+    env = os.environ.get("ORBSCLI_WATCHDOG_URL", "").strip()
+    if env:
+        return env.rstrip("/")
+    cfg = _load_json(CONFIG_PATH)
+    return str(cfg.get("watchdog_url", "http://localhost:8001")).rstrip("/")
+
+
+def get_token() -> str | None:
+    cred = _load_json(CREDENTIALS_PATH)
+    t = (cred.get("access_token") or "").strip()
+    if t:
+        return t
+    return (os.environ.get("ORBSCLI_TOKEN") or os.environ.get("OREON_TOKEN") or "").strip() or None
+
+
+def _jwt_payload_unverified(token: str) -> dict[str, Any]:
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return {}
+        pad = "=" * (-len(parts[1]) % 4)
+        raw = base64.urlsafe_b64decode(parts[1] + pad)
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return {}
+
+
+def jwt_role(token: str) -> str:
+    return str(_jwt_payload_unverified(token).get("role") or "")
+
+
+def require_auth(token: str | None) -> str:
+    if not token:
+        click.echo("Not logged in. Run: orbscli login ...", err=True)
+        sys.exit(2)
+    return token
+
+
+def require_maintainer(token: str) -> None:
+    role = jwt_role(token)
+    if role not in ("admin", "maintainer"):
+        click.echo("Maintainer or admin role required (your role: %s)." % (role or "unknown"), err=True)
+        sys.exit(3)
+
+
+def require_admin(token: str) -> None:
+    role = jwt_role(token)
+    if role != "admin":
+        click.echo("Admin role required (your role: %s)." % (role or "unknown"), err=True)
+        sys.exit(3)
+
+
+def http_request_raw(
+    method: str,
+    base: str,
+    path: str,
+    *,
+    token: str | None = None,
+    json_body: dict[str, Any] | list[Any] | None = None,
+    params: dict[str, Any] | None = None,
+    timeout: float = 120.0,
+) -> httpx.Response:
+    url = urljoin(base.rstrip("/") + "/", path.lstrip("/"))
+    headers: dict[str, str] = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    with httpx.Client(timeout=timeout) as client:
+        return client.request(method, url, headers=headers, json=json_body, params=params)
+
+
+def http_json(
+    method: str,
+    base: str,
+    path: str,
+    *,
+    token: str | None = None,
+    json_body: dict[str, Any] | list[Any] | None = None,
+    params: dict[str, Any] | None = None,
+    timeout: float = 120.0,
+) -> Any:
+    r = http_request_raw(method, base, path, token=token, json_body=json_body, params=params, timeout=timeout)
+    if r.status_code == 204:
+        return None
+    if not r.is_success:
+        detail = ""
+        try:
+            detail = str(r.json().get("detail", r.text))
+        except Exception:
+            detail = r.text[:500]
+        click.echo("HTTP %s %s\n%s" % (r.status_code, path, detail), err=True)
+        sys.exit(1)
+    if r.headers.get("content-type", "").startswith("application/json"):
+        return r.json()
+    return r.text
+
+
+def parse_package_names(args: tuple[str, ...]) -> list[str]:
+    """Join argv fragments and split on commas and whitespace."""
+    joined = " ".join(args).strip()
+    if not joined:
+        return []
+    parts = re.split(r"[\s,]+", joined)
+    return [p for p in parts if p]
+
+
+def resolve_release_id(api_base: str, token: str | None, release: str) -> int:
+    release = release.strip()
+    if release.isdigit():
+        return int(release)
+    out = http_json("GET", api_base, "/api/releases", token=token, params={"limit": 1000, "offset": 0})
+    for item in out.get("items", []):
+        if item.get("releasename") == release:
+            return int(item["id"])
+    click.echo("Release not found: %s" % release, err=True)
+    sys.exit(1)
+
+
+def find_package_by_name(api_base: str, token: str | None, name: str) -> dict[str, Any] | None:
+    out = http_json(
+        "GET",
+        api_base,
+        "/api/packages",
+        token=token,
+        params={"search": name, "limit": 100, "offset": 0},
+    )
+    exact = None
+    for p in out.get("items", []):
+        if p.get("name") == name:
+            exact = p
+            break
+    return exact
+
+
+def distgit_new_package_payload(
+    pkg: str,
+    releasename: str,
+    *,
+    distgit_url: str,
+    distgit_branch: str,
+) -> dict[str, Any]:
+    spec_rel = f"{releasename}/{pkg}/{pkg}.spec"
+    url = f"{distgit_url.rstrip('/')}#{distgit_branch}:{spec_rel}"
+    return {
+        "name": pkg,
+        "description": None,
+        "preferred_mock_environment_id": None,
+        "github_repository_id": None,
+        "github_html_url": "https://github.com/oreonhq/rpm-specfiles",
+        "source_type": "distgit",
+        "source_url": url,
+        "source_urls": None,
+        "source_branch": distgit_branch,
+        "source_path": None,
+        "version": "0.0.1",
+    }
+
+
+@click.group()
+@click.option(
+    "--api-url",
+    envvar="ORBSCLI_API_URL",
+    default=None,
+    help="Build API base URL (saved on login unless --no-save). Also OREON_API_URL.",
+)
+@click.option(
+    "--watchdog-url",
+    envvar="ORBSCLI_WATCHDOG_URL",
+    default=None,
+    help="Watchdog base URL for advisory commands. Default http://localhost:8001",
+)
+@click.version_option(version="1.0.0", prog_name="orbscli")
+@click.pass_context
+def cli(ctx: click.Context, api_url: str | None, watchdog_url: str | None) -> None:
+    """Oreon Build Service CLI (non-interactive, mirrors web permissions)."""
+    ctx.ensure_object(dict)
+    ctx.obj["API_URL"] = api_url
+    ctx.obj["WATCHDOG_URL"] = watchdog_url
+
+
+@cli.command("login")
+@click.option("--url", "api_url", default=None, help="API base URL, e.g. https://build.example.com")
+@click.option("-u", "--username", required=True)
+@click.option("-p", "--password", envvar="ORBSCLI_PASSWORD", default=None, help="Password (use env ORBSCLI_PASSWORD)")
+@click.option("--watchdog-url", default=None, help="Also store Watchdog base URL in config")
+@click.option("--no-save", is_flag=True, help="Print token only, do not write credentials to disk")
+@click.pass_context
+def cmd_login(
+    ctx: click.Context,
+    api_url: str | None,
+    username: str,
+    password: str | None,
+    watchdog_url: str | None,
+    no_save: bool,
+) -> None:
+    """Login and store JWT in ~/.config/orbscli/credentials.json (mode 0600)."""
+    base = (api_url or get_api_url()).rstrip("/")
+    if not password:
+        click.echo("Password required (-p or ORBSCLI_PASSWORD).", err=True)
+        sys.exit(2)
+    out = http_json(
+        "POST",
+        base,
+        "/api/auth/login",
+        json_body={"username": username, "password": password},
+        token=None,
+    )
+    token = out.get("access_token")
+    if not token:
+        click.echo("Login response missing access_token", err=True)
+        sys.exit(1)
+    if no_save:
+        click.echo(token)
+        return
+    _ensure_config_dir()
+    _save_json(CREDENTIALS_PATH, {"access_token": token})
+    cfg = _load_json(CONFIG_PATH)
+    cfg["api_url"] = base
+    if watchdog_url:
+        cfg["watchdog_url"] = watchdog_url.rstrip("/")
+    _save_json(CONFIG_PATH, cfg)
+    click.echo("Logged in as %s. Token stored in %s" % (username, CREDENTIALS_PATH))
+
+
+@cli.command("logout")
+def cmd_logout() -> None:
+    """Remove stored credentials."""
+    if CREDENTIALS_PATH.is_file():
+        CREDENTIALS_PATH.unlink()
+    click.echo("Logged out (credentials removed).")
+
+
+@cli.command("whoami")
+def cmd_whoami() -> None:
+    """Show username and role from stored JWT (unverified decode for display)."""
+    token = require_auth(get_token())
+    p = _jwt_payload_unverified(token)
+    click.echo("user: %s\nrole: %s" % (p.get("sub", "?"), p.get("role", "?")))
+
+
+@cli.command("build")
+@click.argument("packages", nargs=-1, required=True)
+@click.option("--release", "release_ref", required=True, help="Release id or releasename (e.g. oreon-11-rp1)")
+@click.option(
+    "--arch",
+    default="x86_64,aarch64",
+    help="Comma-separated arches (default x86_64,aarch64)",
+)
+@click.option(
+    "--log",
+    "log_dir",
+    type=click.Path(),
+    default=None,
+    help="Directory for per-job logs (build-<job_id>.log); polls until each job finishes then downloads",
+)
+@click.option(
+    "--wait/--no-wait",
+    default=False,
+    help="Poll until each job reaches a terminal state. With --log, waiting always happens so logs can be saved.",
+)
+@click.option(
+    "--skip-complete/--no-skip-complete",
+    "skip_complete",
+    default=True,
+    help="Skip arches that already have a successful build (API default)",
+)
+@click.option(
+    "--distgit-url",
+    envvar="ORBSCLI_DISTGIT_URL",
+    default="https://github.com/oreonhq/rpm-specfiles.git",
+    help="Git URL for distgit sources",
+)
+@click.option(
+    "--distgit-branch",
+    envvar="ORBSCLI_DISTGIT_BRANCH",
+    default="main",
+    help="Branch fragment in distgit URL",
+)
+@click.pass_context
+def cmd_build(
+    ctx: click.Context,
+    packages: tuple[str, ...],
+    release_ref: str,
+    arch: str,
+    log_dir: str | None,
+    wait: bool,
+    skip_complete: bool,
+    distgit_url: str,
+    distgit_branch: str,
+) -> None:
+    """Queue distgit builds for one or more packages (CLI only supports distgit new_package or existing package)."""
+    token = require_auth(get_token())
+    require_maintainer(token)
+    api_base = get_api_url()
+    rid = resolve_release_id(api_base, token, release_ref)
+    rel = http_json("GET", api_base, f"/api/releases/{rid}", token=token)
+    releasename = rel.get("releasename") or ""
+    if not releasename:
+        click.echo("Release has no releasename", err=True)
+        sys.exit(1)
+    arches = [a.strip() for a in arch.split(",") if a.strip()]
+    names = parse_package_names(packages)
+    if not names:
+        click.echo("No package names given.", err=True)
+        sys.exit(2)
+    log_path = Path(log_dir) if log_dir else None
+    if log_path:
+        log_path.mkdir(parents=True, exist_ok=True)
+
+    jobs_out: list[dict[str, Any]] = []
+    for pkg in names:
+        existing = find_package_by_name(api_base, token, pkg)
+        if existing:
+            body: dict[str, Any] = {
+                "package_id": int(existing["id"]),
+                "release_id": rid,
+                "architectures": arches,
+                "skip_complete_arches": skip_complete,
+            }
+        else:
+            body = {
+                "new_package": distgit_new_package_payload(
+                    pkg, releasename, distgit_url=distgit_url, distgit_branch=distgit_branch
+                ),
+                "release_id": rid,
+                "architectures": arches,
+                "skip_complete_arches": skip_complete,
+            }
+        created = http_json("POST", api_base, "/api/builds/trigger", token=token, json_body=body, timeout=300.0)
+        if not isinstance(created, list):
+            click.echo("Unexpected trigger response", err=True)
+            sys.exit(1)
+        for job in created:
+            jid = int(job["id"])
+            click.echo("queued build job %s package=%s arch=%s" % (jid, pkg, job.get("architecture") or ""))
+            jobs_out.append(job)
+
+    need_poll = wait or log_path is not None
+    if need_poll and jobs_out:
+        for job in jobs_out:
+            _wait_job_and_maybe_log(api_base, token, int(job["id"]), log_path)
+
+
+def _wait_job_and_maybe_log(api_base: str, token: str, job_id: int, log_dir: Path | None) -> None:
+    terminal = {"success", "failed", "cancelled", "skipped"}
+    attempt_id: int | None = None
+    while True:
+        j = http_json("GET", api_base, f"/api/builds/jobs/{job_id}", token=token)
+        st = (j.get("status") or "").lower()
+        att = http_json("GET", api_base, f"/api/builds/jobs/{job_id}/attempts", token=token)
+        latest = att[0] if att else None
+        if latest:
+            attempt_id = int(latest["id"])
+        if st in terminal:
+            click.echo("job %s finished: %s" % (job_id, st))
+            break
+        time.sleep(5)
+    if log_dir and attempt_id:
+        _fetch_attempt_log(api_base, attempt_id, log_dir / f"build-{job_id}.log")
+
+
+def _fetch_attempt_log(api_base: str, attempt_id: int, dest: Path) -> None:
+    r = http_request_raw("GET", api_base, f"/api/logs/attempts/{attempt_id}", token=None)
+    if r.status_code != 200:
+        click.echo("log not available for attempt %s (HTTP %s)" % (attempt_id, r.status_code), err=True)
+        return
+    dest.write_bytes(r.content)
+    click.echo("wrote %s" % dest)
+
+
+@cli.group("builds")
+def grp_builds() -> None:
+    """List, show, retry, cancel builds."""
+    pass
+
+
+@grp_builds.command("list")
+@click.option("--release-id", type=int, default=None)
+@click.option("--package-id", type=int, default=None)
+@click.option("--status", default=None)
+@click.option("--limit", type=int, default=50)
+def builds_list(release_id: int | None, package_id: int | None, status: str | None, limit: int) -> None:
+    token = get_token()
+    params: dict[str, Any] = {"limit": limit, "offset": 0}
+    if release_id is not None:
+        params["release_id"] = release_id
+    if package_id is not None:
+        params["package_id"] = package_id
+    if status:
+        params["status"] = status
+    out = http_json("GET", get_api_url(), "/api/builds", token=token, params=params)
+    for j in out.get("items", []):
+        click.echo(
+            "%s\t%s\t%s\t%s\t%s"
+            % (
+                j.get("id"),
+                j.get("package_id"),
+                j.get("release_id"),
+                j.get("architecture") or "-",
+                j.get("status"),
+            )
+        )
+
+
+@grp_builds.command("show")
+@click.argument("job_id", type=int)
+def builds_show(job_id: int) -> None:
+    token = get_token()
+    j = http_json("GET", get_api_url(), f"/api/builds/jobs/{job_id}", token=token)
+    click.echo(json.dumps(j, indent=2))
+
+
+@grp_builds.command("retry")
+@click.argument("job_id", type=int)
+def builds_retry(job_id: int) -> None:
+    token = require_auth(get_token())
+    require_maintainer(token)
+    http_json("POST", get_api_url(), f"/api/builds/jobs/{job_id}/retry", token=token)
+    click.echo("retry ok job %s" % job_id)
+
+
+@grp_builds.command("cancel")
+@click.argument("job_id", type=int)
+def builds_cancel(job_id: int) -> None:
+    token = require_auth(get_token())
+    require_maintainer(token)
+    http_json("POST", get_api_url(), f"/api/builds/jobs/{job_id}/cancel", token=token)
+    click.echo("cancel ok job %s" % job_id)
+
+
+@grp_builds.command("failures")
+@click.option("--release-id", type=int, default=None)
+def builds_failures(release_id: int | None) -> None:
+    token = get_token()
+    params = {}
+    if release_id is not None:
+        params["release_id"] = release_id
+    out = http_json("GET", get_api_url(), "/api/builds/current-failures", token=token, params=params or None)
+    for row in out:
+        click.echo(
+            "%s\t%s\t%s\t%s"
+            % (
+                row.get("id"),
+                row.get("package_name"),
+                row.get("release_name"),
+                row.get("architecture") or "-",
+            )
+        )
+
+
+@cli.group("logs")
+def grp_logs() -> None:
+    """Fetch build logs."""
+    pass
+
+
+@grp_logs.command("view")
+@click.argument("attempt_id", type=int)
+@click.option("--out", type=click.Path(), default=None, help="Write full log to file instead of stdout")
+@click.option("--tail", type=int, default=None, help="If set, show last N lines as JSON (no file write)")
+def logs_view(attempt_id: int, out: str | None, tail: int | None) -> None:
+    base = get_api_url()
+    if tail is not None:
+        data = http_json("GET", base, f"/api/logs/attempts/{attempt_id}/tail", token=None, params={"lines": tail})
+        for line in data.get("lines", []):
+            click.echo(line)
+        return
+    r = http_request_raw("GET", base, f"/api/logs/attempts/{attempt_id}", token=None)
+    if r.status_code != 200:
+        click.echo("log not available (HTTP %s)" % r.status_code, err=True)
+        sys.exit(1)
+    if out:
+        Path(out).write_bytes(r.content)
+        click.echo("wrote %s" % out)
+    else:
+        click.echo(r.text, nl=False)
+
+
+@cli.command("promote")
+@click.argument("from_channel")
+@click.argument("to_channel")
+@click.option("--release-id", type=int, required=True)
+@click.option("--package-name", default=None)
+@click.option("--build-job-id", type=int, default=None)
+@click.pass_context
+def cmd_promote(
+    ctx: click.Context,
+    from_channel: str,
+    to_channel: str,
+    release_id: int,
+    package_name: str | None,
+    build_job_id: int | None,
+) -> None:
+    """Create a promotion record (same as GUI promote)."""
+    token = require_auth(get_token())
+    require_maintainer(token)
+    body: dict[str, Any] = {
+        "release_id": release_id,
+        "from_channel": from_channel,
+        "to_channel": to_channel,
+    }
+    if package_name:
+        body["package_name"] = package_name
+    if build_job_id is not None:
+        body["build_job_id"] = build_job_id
+    out = http_json("POST", get_api_url(), "/api/promotions/promote", token=token, json_body=body)
+    click.echo(json.dumps(out, indent=2))
+
+
+@cli.group("promotions")
+def grp_promotions() -> None:
+    pass
+
+
+@grp_promotions.command("list")
+@click.option("--release-id", type=int, default=None)
+@click.option("--status", default=None)
+@click.option("--limit", type=int, default=50)
+@click.pass_context
+def promotions_list(ctx: click.Context, release_id: int | None, status: str | None, limit: int) -> None:
+    token = get_token()
+    params: dict[str, Any] = {"limit": limit, "offset": 0}
+    if release_id is not None:
+        params["release_id"] = release_id
+    if status:
+        params["status_filter"] = status
+    out = http_json("GET", get_api_url(), "/api/promotions", token=token, params=params)
+    for p in out.get("items", []):
+        click.echo("%s\t%s\t%s\t%s" % (p.get("id"), p.get("package_name"), p.get("status"), p.get("from_channel")))
+
+
+@cli.group("mockenv")
+def grp_mockenv() -> None:
+    """Mock environments (admin)."""
+    pass
+
+
+@grp_mockenv.command("list")
+@click.option("--release-id", type=int, default=None)
+@click.pass_context
+def mockenv_list(ctx: click.Context, release_id: int | None) -> None:
+    token = get_token()
+    params: dict[str, Any] = {"limit": 200, "offset": 0}
+    if release_id is not None:
+        params["release_id"] = release_id
+    out = http_json("GET", get_api_url(), "/api/mock-environments", token=token, params=params)
+    for e in out.get("items", []):
+        click.echo("%s\t%s\trelease=%s\t%s" % (e.get("id"), e.get("name"), e.get("release_id"), e.get("config_name")))
+
+
+@grp_mockenv.command("show")
+@click.argument("env_id", type=int)
+@click.pass_context
+def mockenv_show(ctx: click.Context, env_id: int) -> None:
+    token = get_token()
+    out = http_json("GET", get_api_url(), f"/api/mock-environments/{env_id}", token=token)
+    click.echo(json.dumps(out, indent=2, default=str))
+
+
+@grp_mockenv.command("create")
+@click.option("--release-id", type=int, required=True)
+@click.option("--name", required=True)
+@click.option("--config-name", required=True)
+@click.option("--config-content", default="")
+@click.option("--priority", type=int, default=0)
+@click.option("--available/--unavailable", default=True)
+@click.pass_context
+def mockenv_create(
+    ctx: click.Context,
+    release_id: int,
+    name: str,
+    config_name: str,
+    config_content: str,
+    priority: int,
+    available: bool,
+) -> None:
+    token = require_auth(get_token())
+    require_admin(token)
+    body = {
+        "release_id": release_id,
+        "name": name,
+        "config_name": config_name,
+        "config_content": config_content or None,
+        "additional_repo_urls": [],
+        "is_available": available,
+        "priority": priority,
+    }
+    out = http_json("POST", get_api_url(), "/api/mock-environments", token=token, json_body=body)
+    click.echo(json.dumps(out, indent=2, default=str))
+
+
+@grp_mockenv.command("update")
+@click.argument("env_id", type=int)
+@click.option("--name", default=None)
+@click.option("--config-name", default=None)
+@click.option("--config-content", default=None)
+@click.option("--priority", type=int, default=None)
+@click.option("--available/--unavailable", default=None)
+@click.pass_context
+def mockenv_update(
+    ctx: click.Context,
+    env_id: int,
+    name: str | None,
+    config_name: str | None,
+    config_content: str | None,
+    priority: int | None,
+    available: bool | None,
+) -> None:
+    token = require_auth(get_token())
+    require_admin(token)
+    patch: dict[str, Any] = {}
+    if name is not None:
+        patch["name"] = name
+    if config_name is not None:
+        patch["config_name"] = config_name
+    if config_content is not None:
+        patch["config_content"] = config_content
+    if priority is not None:
+        patch["priority"] = priority
+    if available is not None:
+        patch["is_available"] = available
+    out = http_json("PATCH", get_api_url(), f"/api/mock-environments/{env_id}", token=token, json_body=patch)
+    click.echo(json.dumps(out, indent=2, default=str))
+
+
+@grp_mockenv.command("delete")
+@click.argument("env_id", type=int)
+@click.pass_context
+def mockenv_delete(ctx: click.Context, env_id: int) -> None:
+    token = require_auth(get_token())
+    require_admin(token)
+    http_json("DELETE", get_api_url(), f"/api/mock-environments/{env_id}", token=token)
+    click.echo("deleted mock env %s" % env_id)
+
+
+@cli.group("worker")
+def grp_worker() -> None:
+    """Workers (enroll/delete admin; list public)."""
+    pass
+
+
+@grp_worker.command("list")
+@click.pass_context
+def worker_list(ctx: click.Context) -> None:
+    out = http_json("GET", get_api_url(), "/api/workers", token=get_token())
+    for w in out.get("items", []):
+        click.echo("%s\t%s\t%s\t%s" % (w.get("id"), w.get("name"), w.get("state"), w.get("architecture") or ""))
+
+
+@grp_worker.command("enroll")
+@click.option("--name", required=True)
+@click.option("--architecture", default=None)
+@click.option(
+    "--secret",
+    "enrollment_secret",
+    envvar=["OREON_WORKER_ENROLLMENT_SECRET", "ORBSCLI_WORKER_ENROLLMENT_SECRET"],
+    required=True,
+)
+@click.pass_context
+def worker_enroll(ctx: click.Context, name: str, architecture: str | None, enrollment_secret: str) -> None:
+    token = require_auth(get_token())
+    require_admin(token)
+    body = {"name": name, "enrollment_token": enrollment_secret, "architecture": architecture}
+    out = http_json("POST", get_api_url(), "/api/workers/enroll", token=token, json_body=body)
+    click.echo(json.dumps(out, indent=2))
+
+
+@grp_worker.command("delete")
+@click.argument("worker_id", type=int)
+@click.pass_context
+def worker_delete(ctx: click.Context, worker_id: int) -> None:
+    token = require_auth(get_token())
+    require_admin(token)
+    http_json("DELETE", get_api_url(), f"/api/workers/{worker_id}", token=token)
+    click.echo("deleted worker %s" % worker_id)
+
+
+@cli.group("release")
+def grp_release() -> None:
+    """Releases (mutations admin-only)."""
+    pass
+
+
+@grp_release.command("list")
+@click.pass_context
+def release_list(ctx: click.Context) -> None:
+    out = http_json("GET", get_api_url(), "/api/releases", token=get_token(), params={"limit": 500, "offset": 0})
+    for r in out.get("items", []):
+        click.echo("%s\t%s\tactive=%s" % (r.get("id"), r.get("releasename"), r.get("is_active")))
+
+
+@grp_release.command("show")
+@click.argument("release_id", type=int)
+@click.pass_context
+def release_show(ctx: click.Context, release_id: int) -> None:
+    out = http_json("GET", get_api_url(), f"/api/releases/{release_id}", token=get_token())
+    click.echo(json.dumps(out, indent=2, default=str))
+
+
+@grp_release.command("create")
+@click.option("--releasename", required=True)
+@click.option("--description", default="")
+@click.option("--architectures", default="x86_64,aarch64")
+@click.option("--default-channel", default="dev")
+@click.option("--default-repo-branch", default="dev")
+@click.pass_context
+def release_create(
+    ctx: click.Context,
+    releasename: str,
+    description: str,
+    architectures: str,
+    default_channel: str,
+    default_repo_branch: str,
+) -> None:
+    token = require_auth(get_token())
+    require_admin(token)
+    body = {
+        "releasename": releasename,
+        "description": description or None,
+        "architectures": architectures,
+        "default_channel": default_channel,
+        "default_repo_branch": default_repo_branch,
+        "base_repos": [],
+    }
+    out = http_json("POST", get_api_url(), "/api/releases", token=token, json_body=body)
+    click.echo(json.dumps(out, indent=2, default=str))
+
+
+@grp_release.command("update")
+@click.argument("release_id", type=int)
+@click.option("--description", default=None)
+@click.option("--architectures", default=None, help="Comma-separated")
+@click.option("--default-channel", default=None)
+@click.option("--default-repo-branch", default=None)
+@click.option("--deactivate", is_flag=True, help="Set is_active=false (end of support)")
+@click.option("--activate", is_flag=True, help="Set is_active=true")
+@click.pass_context
+def release_update(
+    ctx: click.Context,
+    release_id: int,
+    description: str | None,
+    architectures: str | None,
+    default_channel: str | None,
+    default_repo_branch: str | None,
+    deactivate: bool,
+    activate: bool,
+) -> None:
+    token = require_auth(get_token())
+    require_admin(token)
+    patch: dict[str, Any] = {}
+    if description is not None:
+        patch["description"] = description
+    if architectures is not None:
+        arch_list = [a.strip() for a in architectures.split(",") if a.strip()]
+        patch["architectures"] = ",".join(arch_list)
+    if default_channel is not None:
+        patch["default_channel"] = default_channel
+    if default_repo_branch is not None:
+        patch["default_repo_branch"] = default_repo_branch
+    if deactivate:
+        patch["is_active"] = False
+    if activate:
+        patch["is_active"] = True
+    if not patch:
+        click.echo("No fields to update.", err=True)
+        sys.exit(2)
+    out = http_json("PATCH", get_api_url(), f"/api/releases/{release_id}", token=token, json_body=patch)
+    click.echo(json.dumps(out, indent=2, default=str))
+
+
+@grp_release.command("delete")
+@click.argument("release_id", type=int)
+@click.pass_context
+def release_delete(ctx: click.Context, release_id: int) -> None:
+    token = require_auth(get_token())
+    require_admin(token)
+    http_json("DELETE", get_api_url(), f"/api/releases/{release_id}", token=token)
+    click.echo("deleted release %s" % release_id)
+
+
+@cli.group("package")
+def grp_package() -> None:
+    """Packages."""
+    pass
+
+
+@grp_package.command("list")
+@click.option("--search", default=None)
+@click.option("--limit", type=int, default=100)
+@click.pass_context
+def package_list(ctx: click.Context, search: str | None, limit: int) -> None:
+    token = get_token()
+    params: dict[str, Any] = {"limit": limit, "offset": 0}
+    if search:
+        params["search"] = search
+    out = http_json("GET", get_api_url(), "/api/packages", token=token, params=params)
+    for p in out.get("items", []):
+        click.echo("%s\t%s" % (p.get("id"), p.get("name")))
+
+
+@grp_package.command("show")
+@click.argument("package_id", type=int)
+@click.pass_context
+def package_show(ctx: click.Context, package_id: int) -> None:
+    out = http_json("GET", get_api_url(), f"/api/packages/{package_id}", token=get_token())
+    click.echo(json.dumps(out, indent=2, default=str))
+
+
+@grp_package.command("create")
+@click.option("--name", required=True)
+@click.option("--description", default=None)
+@click.option("--github-repository-id", type=int, default=None)
+@click.option("--github-html-url", default=None)
+@click.pass_context
+def package_create(
+    ctx: click.Context,
+    name: str,
+    description: str | None,
+    github_repository_id: int | None,
+    github_html_url: str | None,
+) -> None:
+    token = require_auth(get_token())
+    require_maintainer(token)
+    body: dict[str, Any] = {"name": name}
+    if description:
+        body["description"] = description
+    if github_repository_id is not None:
+        body["github_repository_id"] = github_repository_id
+    if github_html_url:
+        body["github_html_url"] = github_html_url
+    out = http_json("POST", get_api_url(), "/api/packages", token=token, json_body=body)
+    click.echo(json.dumps(out, indent=2, default=str))
+
+
+@grp_package.command("update")
+@click.argument("package_id", type=int)
+@click.option("--description", default=None)
+@click.option("--github-repository-id", type=int, default=None)
+@click.option("--github-html-url", default=None)
+@click.option("--preferred-mock-environment-id", type=int, default=None)
+@click.pass_context
+def package_update(
+    ctx: click.Context,
+    package_id: int,
+    description: str | None,
+    github_repository_id: int | None,
+    github_html_url: str | None,
+    preferred_mock_environment_id: int | None,
+) -> None:
+    token = require_auth(get_token())
+    require_maintainer(token)
+    patch: dict[str, Any] = {}
+    if description is not None:
+        patch["description"] = description
+    if github_repository_id is not None:
+        patch["github_repository_id"] = github_repository_id
+    if github_html_url is not None:
+        patch["github_html_url"] = github_html_url
+    if preferred_mock_environment_id is not None:
+        patch["preferred_mock_environment_id"] = preferred_mock_environment_id
+    out = http_json("PATCH", get_api_url(), f"/api/packages/{package_id}", token=token, json_body=patch)
+    click.echo(json.dumps(out, indent=2, default=str))
+
+
+@grp_package.command("delete")
+@click.argument("package_id", type=int)
+@click.pass_context
+def package_delete(ctx: click.Context, package_id: int) -> None:
+    token = require_auth(get_token())
+    require_admin(token)
+    http_json("DELETE", get_api_url(), f"/api/packages/{package_id}", token=token)
+    click.echo("deleted package %s" % package_id)
+
+
+@cli.group("schedule")
+def grp_schedule() -> None:
+    """Schedules (admin)."""
+    pass
+
+
+@grp_schedule.command("list")
+@click.pass_context
+def schedule_list(ctx: click.Context) -> None:
+    token = require_auth(get_token())
+    require_admin(token)
+    out = http_json("GET", get_api_url(), "/api/schedules", token=token)
+    click.echo(json.dumps(out, indent=2, default=str))
+
+
+@grp_schedule.command("show")
+@click.argument("schedule_id", type=int)
+@click.pass_context
+def schedule_show(ctx: click.Context, schedule_id: int) -> None:
+    token = require_auth(get_token())
+    require_admin(token)
+    out = http_json("GET", get_api_url(), f"/api/schedules/{schedule_id}", token=token)
+    click.echo(json.dumps(out, indent=2, default=str))
+
+
+@grp_schedule.command("create")
+@click.option("--release-id", type=int, required=True)
+@click.option("--name", required=True)
+@click.option("--kind", required=True)
+@click.option("--cron", "cron_expression", default=None)
+@click.option("--config", default=None)
+@click.option("--enabled/--disabled", "is_enabled", default=True)
+@click.pass_context
+def schedule_create(
+    ctx: click.Context,
+    release_id: int,
+    name: str,
+    kind: str,
+    cron_expression: str | None,
+    config: str | None,
+    is_enabled: bool,
+) -> None:
+    token = require_auth(get_token())
+    require_admin(token)
+    body = {
+        "release_id": release_id,
+        "name": name,
+        "kind": kind,
+        "cron_expression": cron_expression,
+        "config": config,
+        "is_enabled": is_enabled,
+    }
+    out = http_json("POST", get_api_url(), "/api/schedules", token=token, json_body=body)
+    click.echo(json.dumps(out, indent=2, default=str))
+
+
+@grp_schedule.command("update")
+@click.argument("schedule_id", type=int)
+@click.option("--cron", "cron_expression", default=None)
+@click.option("--config", default=None)
+@click.option("--enabled/--disabled", "is_enabled", default=None)
+@click.pass_context
+def schedule_update(
+    ctx: click.Context,
+    schedule_id: int,
+    cron_expression: str | None,
+    config: str | None,
+    is_enabled: bool | None,
+) -> None:
+    token = require_auth(get_token())
+    require_admin(token)
+    patch: dict[str, Any] = {}
+    if cron_expression is not None:
+        patch["cron_expression"] = cron_expression
+    if config is not None:
+        patch["config"] = config
+    if is_enabled is not None:
+        patch["is_enabled"] = is_enabled
+    out = http_json("PATCH", get_api_url(), f"/api/schedules/{schedule_id}", token=token, json_body=patch)
+    click.echo(json.dumps(out, indent=2, default=str))
+
+
+@grp_schedule.command("delete")
+@click.argument("schedule_id", type=int)
+@click.pass_context
+def schedule_delete(ctx: click.Context, schedule_id: int) -> None:
+    token = require_auth(get_token())
+    require_admin(token)
+    http_json("DELETE", get_api_url(), f"/api/schedules/{schedule_id}", token=token)
+    click.echo("deleted schedule %s" % schedule_id)
+
+
+@cli.group("repo")
+def grp_repo() -> None:
+    """Repository status and publish."""
+    pass
+
+
+@grp_repo.command("status")
+@click.option("--release-id", type=int, default=None)
+@click.pass_context
+def repo_status(ctx: click.Context, release_id: int | None) -> None:
+    token = get_token()
+    params = {}
+    if release_id is not None:
+        params["release_id"] = release_id
+    out = http_json("GET", get_api_url(), "/api/repos/status", token=token, params=params or None)
+    click.echo(json.dumps(out, indent=2, default=str))
+
+
+@grp_repo.command("publish")
+@click.option("--release-id", type=int, required=True)
+@click.option("--channel", required=True)
+@click.option("--architecture", required=True)
+@click.pass_context
+def repo_publish(ctx: click.Context, release_id: int, channel: str, architecture: str) -> None:
+    token = require_auth(get_token())
+    require_maintainer(token)
+    http_json(
+        "POST",
+        get_api_url(),
+        "/api/repos/publish",
+        token=token,
+        params={"release_id": release_id, "channel": channel, "architecture": architecture},
+    )
+    click.echo("publish requested")
+
+
+@grp_repo.command("regenerate-metadata")
+@click.pass_context
+def repo_regenerate_metadata(ctx: click.Context) -> None:
+    token = require_auth(get_token())
+    require_admin(token)
+    out = http_json("POST", get_api_url(), "/api/repos/regenerate-metadata", token=token)
+    click.echo(json.dumps(out, indent=2, default=str))
+
+
+@cli.group("audit")
+def grp_audit() -> None:
+    """Audit log (admin)."""
+    pass
+
+
+@grp_audit.command("list")
+@click.option("--limit", type=int, default=100)
+@click.pass_context
+def audit_list(ctx: click.Context, limit: int) -> None:
+    token = require_auth(get_token())
+    require_admin(token)
+    out = http_json("GET", get_api_url(), "/api/audit", token=token, params={"limit": limit})
+    for row in out:
+        click.echo("%s\t%s\t%s\t%s" % (row.get("id"), row.get("action"), row.get("resource_type"), row.get("details")))
+
+
+@cli.group("account")
+def grp_account() -> None:
+    """User accounts (admin)."""
+    pass
+
+
+@grp_account.command("list")
+@click.pass_context
+def account_list(ctx: click.Context) -> None:
+    token = require_auth(get_token())
+    require_admin(token)
+    out = http_json("GET", get_api_url(), "/api/accounts", token=token)
+    for a in out:
+        click.echo("%s\t%s\t%s\tactive=%s" % (a.get("id"), a.get("username"), a.get("role"), a.get("is_active")))
+
+
+@grp_account.command("create")
+@click.option("--username", required=True)
+@click.option("--password", envvar="ORBSCLI_NEW_ACCOUNT_PASSWORD", required=True)
+@click.option("--role", type=click.Choice(["admin", "maintainer"]), required=True)
+@click.pass_context
+def account_create(ctx: click.Context, username: str, password: str, role: str) -> None:
+    token = require_auth(get_token())
+    require_admin(token)
+    out = http_json(
+        "POST",
+        get_api_url(),
+        "/api/accounts",
+        token=token,
+        json_body={"username": username, "password": password, "role": role},
+    )
+    click.echo(json.dumps(out, indent=2, default=str))
+
+
+@grp_account.command("update")
+@click.argument("account_id", type=int)
+@click.option("--password", envvar="ORBSCLI_ACCOUNT_PASSWORD", default=None)
+@click.option("--role", type=click.Choice(["admin", "maintainer"]), default=None)
+@click.option("--active/--inactive", default=None)
+@click.pass_context
+def account_update(
+    ctx: click.Context,
+    account_id: int,
+    password: str | None,
+    role: str | None,
+    active: bool | None,
+) -> None:
+    token = require_auth(get_token())
+    require_admin(token)
+    patch: dict[str, Any] = {}
+    if password is not None:
+        patch["password"] = password
+    if role is not None:
+        patch["role"] = role
+    if active is not None:
+        patch["is_active"] = active
+    if not patch:
+        click.echo("Nothing to update", err=True)
+        sys.exit(2)
+    out = http_json("PATCH", get_api_url(), f"/api/accounts/{account_id}", token=token, json_body=patch)
+    click.echo(json.dumps(out, indent=2, default=str))
+
+
+@grp_account.command("delete")
+@click.argument("account_id", type=int)
+@click.pass_context
+def account_delete(ctx: click.Context, account_id: int) -> None:
+    token = require_auth(get_token())
+    require_admin(token)
+    http_json("DELETE", get_api_url(), f"/api/accounts/{account_id}", token=token)
+    click.echo("deleted account %s" % account_id)
+
+
+@cli.command("search")
+@click.argument("query")
+@click.pass_context
+def cmd_search(ctx: click.Context, query: str) -> None:
+    token = get_token()
+    out = http_json("GET", get_api_url(), "/api/search", token=token, params={"q": query})
+    click.echo(json.dumps(out, indent=2, default=str))
+
+
+@cli.group("advisory")
+def grp_advisory() -> None:
+    """Watchdog security advisories (same JWT as build API; uses ORBSCLI_WATCHDOG_URL)."""
+    pass
+
+
+@grp_advisory.command("list")
+@click.option("--release-id", type=int, default=None)
+@click.option("--limit", type=int, default=25)
+@click.pass_context
+def advisory_list(ctx: click.Context, release_id: int | None, limit: int) -> None:
+    token = get_token()
+    wd = get_watchdog_url()
+    params: dict[str, Any] = {"limit": limit, "offset": 0}
+    if release_id is not None:
+        params["release_id"] = release_id
+    out = http_json("GET", wd, "/api/security/advisories", token=token, params=params)
+    click.echo(json.dumps(out, indent=2, default=str)[:8000])
+
+
+@grp_advisory.command("scan")
+@click.pass_context
+def advisory_scan(ctx: click.Context) -> None:
+    token = require_auth(get_token())
+    require_admin(token)
+    wd = get_watchdog_url()
+    out = http_json("POST", wd, "/api/security/scan", token=token, json_body={})
+    click.echo(json.dumps(out, indent=2, default=str))
+
+
+@grp_advisory.command("create-custom")
+@click.option("--title", required=True)
+@click.option("--package-name", required=True)
+@click.option("--package-version", required=True)
+@click.option("--release-id", "release_ids", multiple=True, type=int, required=True)
+@click.option("--cve-id", default=None)
+@click.option("--severity", default=None)
+@click.option("--summary", default="")
+@click.option("--upstream-url", default=None)
+@click.option("--recommended-fix", default=None)
+@click.pass_context
+def advisory_create_custom(
+    ctx: click.Context,
+    title: str,
+    package_name: str,
+    package_version: str,
+    release_ids: tuple[int, ...],
+    cve_id: str | None,
+    severity: str | None,
+    summary: str,
+    upstream_url: str | None,
+    recommended_fix: str | None,
+) -> None:
+    token = require_auth(get_token())
+    require_admin(token)
+    wd = get_watchdog_url()
+    body = {
+        "title": title,
+        "cve_id": cve_id,
+        "package_name": package_name,
+        "package_version": package_version,
+        "severity": severity,
+        "upstream_url": upstream_url,
+        "summary": summary,
+        "recommended_fix": recommended_fix,
+        "affected_release_ids": list(release_ids),
+    }
+    out = http_json("POST", wd, "/api/security/advisories/custom", token=token, json_body=body)
+    click.echo(json.dumps(out, indent=2, default=str))
+
+
+@grp_advisory.command("resolve-cve")
+@click.argument("cve_match_id", type=int)
+@click.option("--reason", type=click.Choice(["backport", "upstream_bump", "false_positive", "mitigated", "accepted_risk", "other"]))
+@click.option("--notes", default=None)
+@click.pass_context
+def advisory_resolve_cve(
+    ctx: click.Context,
+    cve_match_id: int,
+    reason: str | None,
+    notes: str | None,
+) -> None:
+    token = require_auth(get_token())
+    require_admin(token)
+    wd = get_watchdog_url()
+    body = {}
+    if reason:
+        body["reason"] = reason
+    if notes:
+        body["notes"] = notes
+    out = http_json(
+        "POST",
+        wd,
+        f"/api/security/advisories/cve/{cve_match_id}/resolve",
+        token=token,
+        json_body=body or None,
+    )
+    click.echo(json.dumps(out, indent=2, default=str))
+
+
+@grp_advisory.command("resolve-custom")
+@click.argument("advisory_id", type=int)
+@click.pass_context
+def advisory_resolve_custom(ctx: click.Context, advisory_id: int) -> None:
+    token = require_auth(get_token())
+    require_admin(token)
+    wd = get_watchdog_url()
+    out = http_json("POST", wd, f"/api/security/advisories/custom/{advisory_id}/resolve", token=token)
+    click.echo(json.dumps(out, indent=2, default=str))
+
+
+def main() -> None:
+    cli.add_command(grp_builds)
+    cli.add_command(grp_logs)
+    cli.add_command(grp_promotions)
+    cli.add_command(grp_mockenv)
+    cli.add_command(grp_worker)
+    cli.add_command(grp_release)
+    cli.add_command(grp_package)
+    cli.add_command(grp_schedule)
+    cli.add_command(grp_repo)
+    cli.add_command(grp_audit)
+    cli.add_command(grp_account)
+    cli.add_command(grp_advisory)
+    cli()
+
+
+if __name__ == "__main__":
+    main()
