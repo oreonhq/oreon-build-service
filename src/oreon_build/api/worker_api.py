@@ -161,20 +161,58 @@ async def heartbeat(db: DbSession, worker: Annotated[Worker, Depends(_require_wo
 
 @router.get("/poll")
 async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_worker)]):
-    if worker.state == WorkerState.OFFLINE:
-        worker.state = WorkerState.IDLE
+    # Serialize poll/claim per worker row so duplicate processes sharing one token cannot
+    # over-claim jobs in parallel.
+    wr = await db.execute(select(Worker).where(Worker.id == worker.id).with_for_update())
+    locked_worker = wr.scalar_one_or_none()
+    if locked_worker is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Worker not found")
+
+    if locked_worker.state == WorkerState.OFFLINE:
+        locked_worker.state = WorkerState.IDLE
         await db.flush()
-    if worker.state not in (WorkerState.IDLE, WorkerState.BUSY):
+    if locked_worker.state not in (WorkerState.IDLE, WorkerState.BUSY):
         return {"job": None}
+    running_attempts = int(
+        (
+            await db.execute(
+                select(func.count(BuildAttempt.id)).where(
+                    BuildAttempt.worker_id == locked_worker.id,
+                    BuildAttempt.status == BuildStatus.RUNNING,
+                )
+            )
+        ).scalar()
+        or 0
+    )
+    # Readiness reconciliation only.
+    # Keep BUSY workers eligible to poll so one worker host can run parallel builds.
+    # If DB state says BUSY but no RUNNING attempts remain, heal back to IDLE.
+    if running_attempts == 0 and locked_worker.state == WorkerState.BUSY:
+        locked_worker.state = WorkerState.IDLE
+        locked_worker.current_build_attempt_id = None
+        await db.flush()
+    elif running_attempts > 0 and locked_worker.current_build_attempt_id is None:
+        newest_running_attempt_id = await db.scalar(
+            select(BuildAttempt.id)
+            .where(
+                BuildAttempt.worker_id == locked_worker.id,
+                BuildAttempt.status == BuildStatus.RUNNING,
+            )
+            .order_by(BuildAttempt.id.desc())
+            .limit(1)
+        )
+        locked_worker.state = WorkerState.BUSY
+        locked_worker.current_build_attempt_id = newest_running_attempt_id
+        await db.flush()
     # Only return jobs whose target architecture matches this worker (or job has no target for backward compat)
-    worker_arch = (worker.architecture or "").strip() or None
+    worker_arch = (locked_worker.architecture or "").strip() or None
     q = (
         select(BuildJob)
         .where(BuildJob.status.in_([BuildStatus.PENDING, BuildStatus.QUEUED]))
         .order_by(BuildJob.priority.desc(), BuildJob.created_at.asc())
     )
     if worker_arch:
-        arch_vals = sql_arch_match_values(worker.architecture)
+        arch_vals = sql_arch_match_values(locked_worker.architecture)
         if arch_vals:
             q = q.outerjoin(BuildTarget, BuildJob.target_id == BuildTarget.id).where(
                 (BuildJob.target_id.is_(None)) | (BuildTarget.architecture.in_(arch_vals))
@@ -193,15 +231,15 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
     attempt_number = (count_result.scalar() or 0) + 1
     attempt = BuildAttempt(
         build_job_id=job.id,
-        worker_id=worker.id,
+        worker_id=locked_worker.id,
         attempt_number=attempt_number,
         status=BuildStatus.RUNNING,
         started_at=datetime.now(timezone.utc),
     )
     db.add(attempt)
-    worker.state = WorkerState.BUSY
+    locked_worker.state = WorkerState.BUSY
     await db.flush()
-    worker.current_build_attempt_id = attempt.id
+    locked_worker.current_build_attempt_id = attempt.id
     await db.flush()
     await db.refresh(attempt)
 

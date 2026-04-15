@@ -126,7 +126,6 @@ class Settings(BaseSettings):
             "seconds (idle/busy in the DB are stale). Workers heartbeat about every 30s. 0 uses DB state only."
         ),
     )
-
     # Webhooks / integrations
     discord_webhook_url: Optional[str] = Field(default=None)
     security_discord_webhook_url: Optional[str] = Field(default=None)
