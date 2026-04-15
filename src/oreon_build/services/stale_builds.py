@@ -20,16 +20,117 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from oreon_build.config import Settings
 from oreon_build.core.audit import log_audit
-from oreon_build.models import BuildAttempt, BuildJob, BuildStatus, Worker
+from oreon_build.models import BuildAttempt, BuildJob, BuildStatus, Worker, WorkerState
 from oreon_build.services.worker_state_sync import sync_worker_state_after_attempt_finished
 
 logger = logging.getLogger(__name__)
+
+
+async def reconcile_queue_inconsistencies(db: AsyncSession) -> tuple[int, int]:
+    """
+    Repair controller-side drift that blocks the queue under load:
+
+    - **Worker BUSY** with no RUNNING attempts (missed ``sync_worker_state_after_attempt_finished``,
+      partial handler failure, or tooling edits). Those workers still *poll*, but UI and any future
+      logic that keys off ``current_build_attempt_id`` are wrong; we reset to IDLE.
+
+    - **BuildJob RUNNING** with no RUNNING attempts (job row out of sync with attempts). Align the
+    job to the latest attempt terminal status so pending work is not blocked by a ghost running job.
+
+    Returns ``(workers_fixed, jobs_fixed)``.
+    """
+    now = datetime.now(timezone.utc)
+    workers_fixed = 0
+    jobs_fixed = 0
+
+    busy_orphan = await db.execute(
+        select(Worker).where(
+            Worker.state == WorkerState.BUSY,
+            ~exists(
+                select(1).select_from(BuildAttempt).where(
+                    BuildAttempt.worker_id == Worker.id,
+                    BuildAttempt.status == BuildStatus.RUNNING,
+                )
+            ),
+        )
+    )
+    for w in busy_orphan.scalars().all():
+        w.state = WorkerState.IDLE
+        w.current_build_attempt_id = None
+        await db.flush()
+        workers_fixed += 1
+        logger.warning(
+            "Reconciled worker id=%s from BUSY to IDLE (no RUNNING attempts on controller)",
+            w.id,
+        )
+
+    job_orphan = await db.execute(
+        select(BuildJob).where(
+            BuildJob.status == BuildStatus.RUNNING,
+            ~exists(
+                select(1).select_from(BuildAttempt).where(
+                    BuildAttempt.build_job_id == BuildJob.id,
+                    BuildAttempt.status == BuildStatus.RUNNING,
+                )
+            ),
+        )
+    )
+    jobs = list(job_orphan.scalars().all())
+    for job in jobs:
+        last_id = await db.scalar(
+            select(func.max(BuildAttempt.id)).where(BuildAttempt.build_job_id == job.id)
+        )
+        latest: BuildAttempt | None = None
+        if last_id is not None:
+            latest = await db.get(BuildAttempt, last_id)
+        if latest is None:
+            job.status = BuildStatus.FAILED
+            job.completed_at = now
+            jobs_fixed += 1
+            logger.warning(
+                "Reconciled build_job id=%s from RUNNING to FAILED (no attempts row)",
+                job.id,
+            )
+            continue
+        if latest.status == BuildStatus.RUNNING:
+            continue
+        job.status = latest.status
+        job.completed_at = latest.finished_at or now
+        jobs_fixed += 1
+        logger.warning(
+            "Reconciled build_job id=%s from RUNNING to %s (latest attempt id=%s)",
+            job.id,
+            latest.status.value,
+            latest.id,
+        )
+        w2 = await db.get(Worker, latest.worker_id) if latest.worker_id else None
+        if w2 is not None:
+            await sync_worker_state_after_attempt_finished(db, w2)
+
+    if workers_fixed or jobs_fixed:
+        logger.warning(
+            "Queue reconcile: fixed %d worker row(s), %d build job row(s)",
+            workers_fixed,
+            jobs_fixed,
+        )
+        await log_audit(
+            db,
+            action="queue.reconcile",
+            account_id=None,
+            resource_type="controller",
+            resource_id="queue",
+            details=f"workers_fixed={workers_fixed} jobs_fixed={jobs_fixed}",
+            ip_address=None,
+            user_agent="controller",
+        )
+
+    return workers_fixed, jobs_fixed
 
 
 async def sweep_stale_running_builds(db: AsyncSession, settings: Settings) -> int:
@@ -74,17 +175,17 @@ async def sweep_stale_running_builds(db: AsyncSession, settings: Settings) -> in
             )
 
         w = att.worker
-        if (
-            cutoff_hb is not None
-            and att.worker_id is not None
-            and w is not None
-            and w.last_heartbeat is not None
-            and w.last_heartbeat < cutoff_hb
-        ):
-            reasons.append(
-                f"Worker last heartbeat older than {hb_min} minutes while build was still marked running "
-                "(worker process likely dead or cannot reach the controller)."
-            )
+        if cutoff_hb is not None and att.worker_id is not None and w is not None:
+            if w.last_heartbeat is None and ref < now - timedelta(minutes=hb_min):
+                reasons.append(
+                    f"No worker heartbeat ever recorded and attempt started more than {hb_min} minutes ago "
+                    "(controller/worker link may be broken)."
+                )
+            elif w.last_heartbeat is not None and w.last_heartbeat < cutoff_hb:
+                reasons.append(
+                    f"Worker last heartbeat older than {hb_min} minutes while build was still marked running "
+                    "(worker process likely dead or cannot reach the controller)."
+                )
 
         if not reasons:
             continue
