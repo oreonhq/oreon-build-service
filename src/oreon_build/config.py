@@ -37,6 +37,24 @@ class Settings(BaseSettings):
         default="postgresql+asyncpg://oreon:oreon@localhost:5432/oreon_build",
         description="PostgreSQL connection URL (async)",
     )
+    database_pool_size: int = Field(
+        default=20,
+        ge=5,
+        le=200,
+        description="SQLAlchemy async pool size (concurrent API + worker poll sessions).",
+    )
+    database_max_overflow: int = Field(
+        default=40,
+        ge=0,
+        le=200,
+        description="Extra connections beyond pool_size when the pool is exhausted.",
+    )
+    database_pool_timeout: int = Field(
+        default=60,
+        ge=5,
+        le=600,
+        description="Seconds to wait for a free connection before failing (avoids indefinite hangs).",
+    )
 
     # Auth
     secret_key: str = Field(default="change-me-to-a-secure-random-string-min-32-chars")
