@@ -440,30 +440,84 @@ def grp_builds() -> None:
     pass
 
 
+_BUILD_JOB_STATUSES = (
+    "pending",
+    "queued",
+    "running",
+    "success",
+    "failed",
+    "cancelled",
+    "skipped",
+)
+
+
 @grp_builds.command("list")
 @click.option("--release-id", type=int, default=None)
 @click.option("--package-id", type=int, default=None)
-@click.option("--status", default=None)
+@click.option(
+    "--status",
+    default=None,
+    help="Filter by job status: %s (case-insensitive)"
+    % ", ".join(_BUILD_JOB_STATUSES),
+)
+@click.option(
+    "--search",
+    default=None,
+    help="Substring match on job id, package name, release name, arch, or status (API search)",
+)
 @click.option("--limit", type=int, default=50)
-def builds_list(release_id: int | None, package_id: int | None, status: str | None, limit: int) -> None:
+@click.option("--offset", type=int, default=0)
+@click.option("--json", "as_json", is_flag=True, help="Print raw JSON (items + total)")
+def builds_list(
+    release_id: int | None,
+    package_id: int | None,
+    status: str | None,
+    search: str | None,
+    limit: int,
+    offset: int,
+    as_json: bool,
+) -> None:
+    """List build jobs, optionally filtered by status (same states as the web UI)."""
     token = get_token()
-    params: dict[str, Any] = {"limit": limit, "offset": 0}
+    params: dict[str, Any] = {"limit": limit, "offset": offset}
     if release_id is not None:
         params["release_id"] = release_id
     if package_id is not None:
         params["package_id"] = package_id
     if status:
-        params["status"] = status
+        st = status.strip().lower()
+        if st not in _BUILD_JOB_STATUSES:
+            click.echo(
+                "Unknown status %r. Use one of: %s"
+                % (status, ", ".join(_BUILD_JOB_STATUSES)),
+                err=True,
+            )
+            sys.exit(2)
+        params["status"] = st
+    if search:
+        params["search"] = search.strip()
     out = http_json("GET", get_api_url(), "/api/builds", token=token, params=params)
+    if as_json:
+        click.echo(json.dumps(out, indent=2, default=str))
+        return
+    total = out.get("total", "?")
+    click.echo("# total=%s (showing up to %s from offset %s)" % (total, limit, offset))
+    click.echo("id\tpkg_id\trel_id\tarch\tstatus\tdisplay\tsigning\tcreated")
     for j in out.get("items", []):
+        ca = j.get("created_at") or ""
+        if isinstance(ca, str) and len(ca) > 19:
+            ca = ca[:19]
         click.echo(
-            "%s\t%s\t%s\t%s\t%s"
+            "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s"
             % (
                 j.get("id"),
                 j.get("package_id"),
                 j.get("release_id"),
                 j.get("architecture") or "-",
                 j.get("status"),
+                (j.get("display_status") or "-")[:24],
+                (j.get("signing_status") or "-")[:12],
+                ca,
             )
         )
 
