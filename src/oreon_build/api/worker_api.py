@@ -313,7 +313,10 @@ async def cancel_check(
     job = job_result.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
-    return {"cancel_requested": job.status == BuildStatus.CANCELLED}
+    # Job may already be PENDING again after cancel+retry while this attempt row is still
+    # CANCELLED; workers must stop mock based on the attempt, not only job.status.
+    cancel_requested = job.status == BuildStatus.CANCELLED or attempt.status == BuildStatus.CANCELLED
+    return {"cancel_requested": cancel_requested}
 
 
 def _put_rpm_bytes_to_r2(key: str, raw: bytes) -> None:

@@ -124,20 +124,24 @@ async def lifespan(app: FastAPI):
 
     async def _stale_build_sweep_loop() -> None:
         from oreon_build.db.session import async_session_maker
-        from oreon_build.services.stale_builds import sweep_stale_running_builds
+        from oreon_build.services.stale_builds import (
+            reconcile_queue_inconsistencies,
+            sweep_stale_running_builds,
+        )
 
         while True:
             try:
                 s = get_settings()
                 interval = max(60, s.stale_build_sweep_interval_seconds)
-                if s.build_stale_running_minutes > 0 or s.build_stale_worker_heartbeat_minutes > 0:
-                    async with async_session_maker() as db:
-                        try:
+                async with async_session_maker() as db:
+                    try:
+                        await reconcile_queue_inconsistencies(db)
+                        if s.build_stale_running_minutes > 0 or s.build_stale_worker_heartbeat_minutes > 0:
                             await sweep_stale_running_builds(db, s)
-                            await db.commit()
-                        except Exception:
-                            await db.rollback()
-                            raise
+                        await db.commit()
+                    except Exception:
+                        await db.rollback()
+                        raise
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 break
