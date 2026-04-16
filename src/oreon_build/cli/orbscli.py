@@ -568,6 +568,167 @@ def builds_failures(release_id: int | None) -> None:
         )
 
 
+@grp_builds.command("fix-current")
+@click.option("--release-id", type=int, default=None, help="Same filter as builds failures (optional).")
+@click.option(
+    "--mode",
+    type=click.Choice(["retry", "rebuild"]),
+    default="retry",
+    help="retry POSTs each failing job id (default). rebuild queues one trigger per package+release with skip_complete_arches on (no duplicate work for already-green arches).",
+)
+@click.option("--dry-run", is_flag=True, help="Print actions only, no POSTs.")
+@click.option(
+    "--arch",
+    default="x86_64,aarch64",
+    help="Rebuild mode only, comma-separated arches passed to /api/builds/trigger.",
+)
+@click.option(
+    "--distgit-url",
+    envvar="ORBSCLI_DISTGIT_URL",
+    default="https://github.com/oreonhq/rpm-specfiles.git",
+)
+@click.option(
+    "--distgit-branch",
+    envvar="ORBSCLI_DISTGIT_BRANCH",
+    default="main",
+)
+def builds_fix_current(
+    release_id: int | None,
+    mode: str,
+    dry_run: bool,
+    arch: str,
+    distgit_url: str,
+    distgit_branch: str,
+) -> None:
+    """Act only on /api/builds/current-failures (not every historic failed job).
+
+    Default mode retries each listed job. Use rebuild to re-trigger distgit builds
+    while skipping arches that already succeeded (avoids cases like nano getting
+    extra jobs when both arches are already green).
+    """
+    token_read = get_token()
+    params: dict[str, Any] = {}
+    if release_id is not None:
+        params["release_id"] = release_id
+    out = http_json(
+        "GET",
+        get_api_url(),
+        "/api/builds/current-failures",
+        token=token_read,
+        params=params or None,
+    )
+    if not isinstance(out, list):
+        click.echo("Unexpected current-failures response", err=True)
+        sys.exit(1)
+    if not out:
+        click.echo("No current failures.")
+        return
+
+    api_base = get_api_url()
+
+    if mode == "retry":
+        if dry_run:
+            seen: set[int] = set()
+            for row in out:
+                jid = row.get("id")
+                if jid is None:
+                    continue
+                jid = int(jid)
+                if jid in seen:
+                    continue
+                seen.add(jid)
+                click.echo(
+                    "dry-run retry job %s package=%s arch=%s"
+                    % (jid, row.get("package_name") or "?", row.get("architecture") or "-")
+                )
+            return
+        token = require_auth(get_token())
+        require_maintainer(token)
+        seen_retry: set[int] = set()
+        for row in out:
+            jid = row.get("id")
+            if jid is None:
+                continue
+            jid = int(jid)
+            if jid in seen_retry:
+                continue
+            seen_retry.add(jid)
+            http_json("POST", api_base, f"/api/builds/jobs/{jid}/retry", token=token)
+            click.echo(
+                "retry ok job %s package=%s arch=%s"
+                % (jid, row.get("package_name") or "?", row.get("architecture") or "-")
+            )
+        return
+
+    # rebuild: one trigger per (release_id, package_name), always skip_complete_arches
+    arcs = [a.strip() for a in arch.split(",") if a.strip()]
+    if not arcs:
+        click.echo("No architectures after parsing --arch", err=True)
+        sys.exit(2)
+
+    keys: dict[tuple[int, str], dict[str, Any]] = {}
+    for row in out:
+        rid = row.get("release_id")
+        pkg = row.get("package_name")
+        if rid is None and row.get("release_name"):
+            try:
+                rid = resolve_release_id(api_base, token_read, str(row["release_name"]))
+            except SystemExit:
+                rid = None
+        if rid is None or not pkg:
+            click.echo("skip row missing release_id or package_name: %s" % (row,), err=True)
+            continue
+        rid = int(rid)
+        keys[(rid, str(pkg))] = row
+
+    if dry_run:
+        for rid, pkg in sorted(keys.keys(), key=lambda t: (t[0], t[1].lower())):
+            click.echo(
+                "dry-run rebuild release_id=%s package=%s skip_complete_arches=yes arches=%s"
+                % (rid, pkg, ",".join(arcs))
+            )
+        return
+
+    token = require_auth(get_token())
+    require_maintainer(token)
+    release_names: dict[int, str] = {}
+    for rid, pkg in sorted(keys.keys(), key=lambda t: (t[0], t[1].lower())):
+        if rid not in release_names:
+            rel = http_json("GET", api_base, f"/api/releases/{rid}", token=token)
+            rn = str(rel.get("releasename") or "").strip()
+            if not rn:
+                click.echo("Release %s has no releasename, skip package %s" % (rid, pkg), err=True)
+                continue
+            release_names[rid] = rn
+        releasename = release_names[rid]
+        existing = find_package_by_name(api_base, token, pkg)
+        if existing:
+            body: dict[str, Any] = {
+                "package_id": int(existing["id"]),
+                "release_id": rid,
+                "architectures": arcs,
+                "skip_complete_arches": True,
+            }
+        else:
+            body = {
+                "new_package": distgit_new_package_payload(
+                    pkg, releasename, distgit_url=distgit_url, distgit_branch=distgit_branch
+                ),
+                "release_id": rid,
+                "architectures": arcs,
+                "skip_complete_arches": True,
+            }
+        created = http_json("POST", api_base, "/api/builds/trigger", token=token, json_body=body, timeout=300.0)
+        if not isinstance(created, list):
+            click.echo("Unexpected trigger response for %s" % pkg, err=True)
+            sys.exit(1)
+        for job in created:
+            click.echo(
+                "queued build job %s package=%s arch=%s"
+                % (int(job["id"]), pkg, job.get("architecture") or "")
+            )
+
+
 @cli.group("logs")
 def grp_logs() -> None:
     """Fetch build logs."""
