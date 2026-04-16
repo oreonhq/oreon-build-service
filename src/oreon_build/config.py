@@ -250,7 +250,6 @@ class Settings(BaseSettings):
     build_stale_pending_minutes: int = Field(
         default=1440,
         ge=0,
-        le=43200,
         description=(
             "Fail PENDING/QUEUED jobs that have been waiting this many minutes without being claimed "
             "by a worker (0 = disable). Default 24h; jobs sitting longer usually mean no worker matches "
