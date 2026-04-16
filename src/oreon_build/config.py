@@ -247,6 +247,24 @@ class Settings(BaseSettings):
         le=1440,
         description="Fail RUNNING attempts whose worker last_heartbeat is older than this (0 = disable).",
     )
+    build_stale_pending_minutes: int = Field(
+        default=1440,
+        ge=0,
+        le=43200,
+        description=(
+            "Fail PENDING/QUEUED jobs that have been waiting this many minutes without being claimed "
+            "by a worker (0 = disable). Default 24h; jobs sitting longer usually mean no worker matches "
+            "the requested architecture or the worker pool is down."
+        ),
+    )
+    build_stale_pending_require_no_eligible_worker: bool = Field(
+        default=False,
+        description=(
+            "If true, only fail stuck PENDING/QUEUED jobs when no worker matching the job's "
+            "architecture has heartbeated within worker_offline_after_seconds. If false, fail "
+            "purely by age (safer for small pools where workers come and go)."
+        ),
+    )
     stale_build_sweep_interval_seconds: int = Field(
         default=300,
         ge=60,

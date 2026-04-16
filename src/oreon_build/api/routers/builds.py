@@ -946,10 +946,27 @@ async def cancel_build(
         )
     )
     now = datetime.now(timezone.utc)
+    affected_worker_ids: set[int] = set()
     for att in att_result.scalars().all():
         att.status = BuildStatus.CANCELLED
         att.finished_at = now
         att.error_message = "Cancelled by user"
+        if att.signing_status in ("not_started", "running", "uploading"):
+            att.signing_status = "failed"
+        if att.worker_id is not None:
+            affected_worker_ids.add(att.worker_id)
+    # Without this, the worker row stays BUSY with current_build_attempt_id pointing at a
+    # cancelled attempt until its next /poll heals itself, which blocks capacity accounting
+    # in the UI and any logic that keys off worker.state.
+    if affected_worker_ids:
+        await db.flush()
+        from oreon_build.services.worker_state_sync import (
+            sync_worker_state_after_attempt_finished,
+        )
+        for wid in affected_worker_ids:
+            w = await db.get(Worker, wid)
+            if w is not None:
+                await sync_worker_state_after_attempt_finished(db, w)
     await log_audit(
         db,
         "build.cancel",
