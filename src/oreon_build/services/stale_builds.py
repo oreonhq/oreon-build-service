@@ -390,6 +390,10 @@ async def sweep_stale_pending_builds(db: AsyncSession, settings: Settings) -> in
 
     Behavior:
     - If ``build_stale_pending_minutes`` is 0, the sweep is disabled.
+    - Queue age is measured from ``BuildJob.updated_at`` (last change to the job row), not
+      ``created_at``. That way a **retry** after a pending timeout (POST sets status back to
+      pending and clears ``completed_at``) starts a fresh wait window instead of failing again
+      immediately because ``created_at`` is still from the original trigger.
     - If ``build_stale_pending_require_no_eligible_worker`` is True, age alone is not enough: the
       job is only failed when **no** worker matching its architecture has heartbeated recently
       (uses ``worker_offline_after_seconds``). Jobs with no target (match-any-arch) are never
@@ -409,7 +413,7 @@ async def sweep_stale_pending_builds(db: AsyncSession, settings: Settings) -> in
     result = await db.execute(
         select(BuildJob).where(
             BuildJob.status.in_([BuildStatus.PENDING, BuildStatus.QUEUED]),
-            BuildJob.created_at < cutoff,
+            BuildJob.updated_at < cutoff,
         )
     )
     jobs = list(result.scalars().all())
