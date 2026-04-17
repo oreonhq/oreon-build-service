@@ -274,7 +274,9 @@ class BuildTrigger(BaseModel):
 class BuildJobResponse(BaseModel):
     id: int
     package_id: int
+    package_name: Optional[str] = None
     release_id: int
+    release_name: Optional[str] = None
     target_id: Optional[int] = None
     architecture: Optional[str] = None
     package_version_id: Optional[int] = None

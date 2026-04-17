@@ -1546,87 +1546,104 @@ async def report_result(
             )
         )
         await db.execute(stmt)
+    # Persist artifact rows immediately. The job/attempt success status was already committed
+    # above, so a later side-effect failure must not erase artifact metadata from the UI/API.
+    await db.commit()
 
     # On success: ensure RPMs are in dev/, then update repodata, create promotion
     # Worker may upload to builds/ or dev/. If builds/: copy to dev/ FIRST, then we delete builds/ later.
     if str(payload.status).lower() == "success":
-        pkg_result = await db.execute(select(Package).where(Package.id == job.package_id))
-        pkg = pkg_result.scalar_one_or_none()
-        rel_result = await db.execute(select(Release).where(Release.id == job.release_id))
-        release = rel_result.scalar_one()
-        target_result = await db.execute(select(BuildTarget).where(BuildTarget.id == job.target_id))
-        target = target_result.scalar_one_or_none()
-        arch = target.architecture if target else None
-        branch = r2_publish_branch(release)
-        job.branch = branch
-        if release and arch:
-            # Durable row for orphan recovery; immediate run via BackgroundTasks (same work, lock dedupes).
-            await _enqueue_repo_publish_task()
-            background_tasks.add_task(run_repo_publish_for_attempt, attempt_id)
-            # Copy package SRPM to releasename/branch/src/ (from uploads) if we have one
-            if job.package_version_id:
-                src_result = await db.execute(
-                    select(Source).where(
-                        Source.package_version_id == job.package_version_id,
-                        Source.r2_key.isnot(None),
-                        Source.r2_key != "",
-                    ).limit(1)
+        try:
+            pkg_result = await db.execute(select(Package).where(Package.id == job.package_id))
+            pkg = pkg_result.scalar_one_or_none()
+            rel_result = await db.execute(select(Release).where(Release.id == job.release_id))
+            release = rel_result.scalar_one()
+            target_result = await db.execute(select(BuildTarget).where(BuildTarget.id == job.target_id))
+            target = target_result.scalar_one_or_none()
+            arch = target.architecture if target else None
+            branch = r2_publish_branch(release)
+            job.branch = branch
+            if release and arch:
+                # Durable row for orphan recovery; immediate run via BackgroundTasks (same work, lock dedupes).
+                await _enqueue_repo_publish_task()
+                background_tasks.add_task(run_repo_publish_for_attempt, attempt_id)
+                # Copy package SRPM to releasename/branch/src/ (from uploads) if we have one
+                if job.package_version_id:
+                    src_result = await db.execute(
+                        select(Source).where(
+                            Source.package_version_id == job.package_version_id,
+                            Source.r2_key.isnot(None),
+                            Source.r2_key != "",
+                        ).limit(1)
+                    )
+                    src_row = src_result.scalar_one_or_none()
+                    if src_row and src_row.r2_key:
+                        try:
+                            r2 = get_r2_client()
+                            data = r2.get_object(src_row.r2_key)
+                            if data:
+                                filename = src_row.r2_key.split("/")[-1]
+                                if filename.endswith(".src.rpm"):
+                                    dest_key = src_r2_key(release.releasename, branch, filename)
+                                    r2.put_object(dest_key, data)
+                        except Exception:
+                            pass
+            # Create promotion candidate (pending), but don't duplicate it on retries.
+            promo_count = await db.scalar(
+                select(func.count(Promotion.id)).where(
+                    Promotion.build_job_id == job.id,
+                    Promotion.status == "pending",
+                    Promotion.to_channel.is_(None),
                 )
-                src_row = src_result.scalar_one_or_none()
-                if src_row and src_row.r2_key:
-                    try:
-                        r2 = get_r2_client()
-                        data = r2.get_object(src_row.r2_key)
-                        if data:
-                            filename = src_row.r2_key.split("/")[-1]
-                            if filename.endswith(".src.rpm"):
-                                dest_key = src_r2_key(release.releasename, branch, filename)
-                                r2.put_object(dest_key, data)
-                    except Exception:
-                        pass
-        # Create promotion candidate (pending), but don't duplicate it on retries.
-        promo_count = await db.scalar(
-            select(func.count(Promotion.id)).where(
-                Promotion.build_job_id == job.id,
-                Promotion.status == "pending",
-                Promotion.to_channel.is_(None),
             )
-        )
-        if (promo_count or 0) == 0:
-            promo = Promotion(
-                release_id=job.release_id,
-                from_channel="dev",
-                to_channel=None,
-                status="pending",
-                package_id=job.package_id,
-                package_name=pkg.name if pkg else None,
-                build_job_id=job.id,
+            if (promo_count or 0) == 0:
+                promo = Promotion(
+                    release_id=job.release_id,
+                    from_channel="dev",
+                    to_channel=None,
+                    status="pending",
+                    package_id=job.package_id,
+                    package_name=pkg.name if pkg else None,
+                    build_job_id=job.id,
+                )
+                db.add(promo)
+                await db.flush()
+            await db.commit()
+        except Exception:
+            logger.exception(
+                "post-result success side effects failed for attempt_id=%s job_id=%s",
+                attempt_id,
+                job.id,
             )
-            db.add(promo)
-            await db.flush()
+            await db.rollback()
 
     # Delete upload R2 objects after build (success or fail); uploads are not reused for retries.
     # ONLY delete keys under /uploads/ - never touch repo path (dev/arch/RPMS, dev/src).
     if job.package_version_id:
-        src_list_result = await db.execute(
-            select(Source).where(
-                Source.package_version_id == job.package_version_id,
-                Source.r2_key.isnot(None),
-                Source.r2_key != "",
-            )
-        )
         try:
-            r2 = get_r2_client()
-            for src in src_list_result.scalars().all():
-                if src.r2_key and "/uploads/" in src.r2_key:
-                    try:
-                        r2.delete_object(src.r2_key)
-                    except Exception:
-                        pass
-                src.r2_key = None
+            src_list_result = await db.execute(
+                select(Source).where(
+                    Source.package_version_id == job.package_version_id,
+                    Source.r2_key.isnot(None),
+                    Source.r2_key != "",
+                )
+            )
+            try:
+                r2 = get_r2_client()
+                for src in src_list_result.scalars().all():
+                    if src.r2_key and "/uploads/" in src.r2_key:
+                        try:
+                            r2.delete_object(src.r2_key)
+                        except Exception:
+                            pass
+                    src.r2_key = None
+            except Exception:
+                pass
+            await db.flush()
+            await db.commit()
         except Exception:
-            pass
-        await db.flush()
+            logger.exception("upload-source cleanup failed for attempt_id=%s", attempt_id)
+            await db.rollback()
 
     # Delete ONLY keys under releasename/builds/{attempt_id}/ - never touch dev/arch or repo path.
     rel_result = await db.execute(select(Release).where(Release.id == job.release_id))
