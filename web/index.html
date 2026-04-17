@@ -124,8 +124,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
               var rows = builds.slice(0, 10).map(function(b) {
                 var pkg = packages.find(function(p) { return p.id === b.package_id; });
                 var rel = releases.find(function(r) { return r.id === b.release_id; });
-                var pkgLabel = pkg && (pkg.name || '').trim() ? (pkg.name + ' (' + b.package_id + ')') : ('#' + b.package_id);
-                var relLabel = rel && (rel.releasename || '').trim() ? (rel.releasename + ' (' + b.release_id + ')') : ('#' + b.release_id);
+                var pkgName = (b.package_name || '').trim() || (pkg && (pkg.name || '').trim()) || '';
+                var relName = (b.release_name || '').trim() || (rel && (rel.releasename || '').trim()) || '';
+                var pkgLabel = pkgName ? (pkgName + ' (' + b.package_id + ')') : ('#' + b.package_id);
+                var relLabel = relName ? (relName + ' (' + b.release_id + ')') : ('#' + b.release_id);
                 var arch = b.architecture || '—';
                 var created = (b.created_at || '').slice(0, 19);
                 var sd = jobDisplayStatus(b);
