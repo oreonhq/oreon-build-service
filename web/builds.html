@@ -565,11 +565,15 @@
           var jobs = (data && data.items) ? data.items : [];
           buildsTotal = (data && typeof data.total === 'number') ? data.total : 0;
           function packageLabel(j) {
+            var fromJob = (j.package_name || '').trim();
+            if (fromJob) return escapeHtml(fromJob) + ' (' + j.package_id + ')';
             var pkg = packagesList.find(function(p) { return p.id === j.package_id; });
             var name = pkg ? (pkg.name || '').trim() : '';
             return name ? escapeHtml(name) + ' (' + j.package_id + ')' : ('#' + j.package_id);
           }
           function releaseLabel(j) {
+            var fromJob = (j.release_name || '').trim();
+            if (fromJob) return escapeHtml(fromJob) + ' (' + j.release_id + ')';
             var rel = releasesList.find(function(r) { return r.id === j.release_id; });
             var name = rel ? (rel.releasename || '').trim() : '';
             return name ? escapeHtml(name) + ' (' + j.release_id + ')' : ('#' + j.release_id);
