@@ -848,10 +848,14 @@ async def _job_to_response(
     if job.target_id:
         r = await db.execute(select(BuildTarget.architecture).where(BuildTarget.id == job.target_id))
         arch = r.scalars().one_or_none()
+    package_name = await db.scalar(select(Package.name).where(Package.id == job.package_id))
+    release_name = await db.scalar(select(Release.releasename).where(Release.id == job.release_id))
     return BuildJobResponse(
         id=job.id,
         package_id=job.package_id,
+        package_name=package_name,
         release_id=job.release_id,
+        release_name=release_name,
         target_id=job.target_id,
         architecture=arch,
         package_version_id=job.package_version_id,
