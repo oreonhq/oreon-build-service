@@ -175,6 +175,41 @@ class ArtifactPayload(BaseModel):
     signed: bool | None = None
 
 
+async def _upsert_attempt_artifact(
+    db: DbSession,
+    *,
+    attempt_id: int,
+    kind: str,
+    filename: str,
+    r2_key: str,
+    size_bytes: int | None,
+    checksum_sha256: str | None,
+    is_signed: bool,
+) -> None:
+    stmt = (
+        pg_insert(Artifact.__table__)
+        .values(
+            build_attempt_id=attempt_id,
+            kind=kind,
+            filename=filename,
+            r2_key=r2_key,
+            size_bytes=size_bytes,
+            checksum_sha256=checksum_sha256,
+            is_signed=is_signed,
+        )
+        .on_conflict_do_update(
+            index_elements=["build_attempt_id", "kind", "filename", "r2_key"],
+            set_={
+                "size_bytes": size_bytes,
+                "checksum_sha256": checksum_sha256,
+                "is_signed": is_signed,
+            },
+        )
+    )
+    await db.execute(stmt)
+    await db.flush()
+
+
 @router.post("/heartbeat")
 async def heartbeat(db: DbSession, worker: Annotated[Worker, Depends(_require_worker)]):
     worker.last_heartbeat = datetime.now(timezone.utc)
@@ -848,6 +883,16 @@ async def upload_worker_rpm_complete(
 
     digest = signed_sha
     fname = Path(body.filename.strip()).name
+    await _upsert_attempt_artifact(
+        db,
+        attempt_id=attempt_id,
+        kind="rpm",
+        filename=fname,
+        r2_key=rk,
+        size_bytes=signed_size,
+        checksum_sha256=digest,
+        is_signed=bool(signed),
+    )
     await log_audit(
         db,
         action="worker.rpm_upload_presigned_complete",
@@ -1319,6 +1364,16 @@ async def upload_worker_rpm(
         except OSError:
             pass
 
+    await _upsert_attempt_artifact(
+        db,
+        attempt_id=attempt_id,
+        kind="rpm",
+        filename=fname,
+        r2_key=r2_key,
+        size_bytes=len(raw),
+        checksum_sha256=digest,
+        is_signed=bool(signed),
+    )
     return {
         "filename": fname,
         "r2_key": r2_key,
