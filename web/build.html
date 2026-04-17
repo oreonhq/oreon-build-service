@@ -127,8 +127,10 @@
           document.getElementById('build-meta').style.display = 'block';
           var pkg = packages.find(function(p) { return p.id === job.package_id; });
           var rel = releases.find(function(r) { return r.id === job.release_id; });
-          var pkgLabel = pkg && (pkg.name || '').trim() ? escapeHtml(pkg.name) + ' (' + job.package_id + ')' : ('#' + (job.package_id || '—'));
-          var relLabel = rel && (rel.releasename || '').trim() ? escapeHtml(rel.releasename) + ' (' + job.release_id + ')' : ('#' + (job.release_id || '—'));
+          var pkgName = (job.package_name || '').trim() || ((pkg && pkg.name) ? String(pkg.name).trim() : '');
+          var relName = (job.release_name || '').trim() || ((rel && rel.releasename) ? String(rel.releasename).trim() : '');
+          var pkgLabel = pkgName ? escapeHtml(pkgName) + ' (' + job.package_id + ')' : ('#' + (job.package_id || '—'));
+          var relLabel = relName ? escapeHtml(relName) + ' (' + job.release_id + ')' : ('#' + (job.release_id || '—'));
           var jobDisp = window.oreonJobDisplayStatus ? window.oreonJobDisplayStatus(job) : String(job.status || '');
           var meta = document.getElementById('build-meta');
           var signingRow = window.oreonControllerKeyHtml
