@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Header, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Body, Depends, File, Header, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
@@ -63,7 +63,6 @@ from oreon_build.models import (
     Worker,
     WorkerState,
 )
-from oreon_build.services.repo_publish import run_repo_publish_for_attempt
 from oreon_build.services.r2 import get_r2_client, log_r2_key, repo_r2_prefix, repo_rpms_key, src_r2_key
 from oreon_build.services.signing import sign_rpm
 from oreon_build.services.worker_artifact_access import source_r2_keys_for_attempt
@@ -1416,7 +1415,6 @@ async def report_result(
     payload: ResultPayload,
     db: DbSession,
     worker: Annotated[Worker, Depends(_require_worker)],
-    background_tasks: BackgroundTasks,
 ):
     result = await db.execute(
         select(BuildAttempt)
@@ -1550,7 +1548,6 @@ async def report_result(
                 job.branch = branch
                 if release and arch:
                     await _enqueue_repo_publish_task()
-                    background_tasks.add_task(run_repo_publish_for_attempt, attempt_id)
 
                 await log_audit(
                     db,
@@ -1619,9 +1616,8 @@ async def report_result(
             branch = r2_publish_branch(release)
             job.branch = branch
             if release and arch:
-                # Durable row for orphan recovery; immediate run via BackgroundTasks (same work, lock dedupes).
+                # Durable PublishTask row; API lifespan poll loop runs repo publish under a global concurrency cap.
                 await _enqueue_repo_publish_task()
-                background_tasks.add_task(run_repo_publish_for_attempt, attempt_id)
                 # Copy package SRPM to releasename/branch/src/ (from uploads) if we have one
                 if job.package_version_id:
                     src_result = await db.execute(

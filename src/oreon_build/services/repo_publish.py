@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from datetime import datetime, timezone
 
 from sqlalchemy import select, update
 
+from oreon_build.config import get_settings
 from oreon_build.core.repo_branch import r2_publish_branch
 from oreon_build.db.session import async_session_maker
 from oreon_build.models import Artifact, BuildAttempt, BuildJob, BuildTarget, PublishTask, Release
@@ -21,6 +23,19 @@ from oreon_build.services.r2 import get_r2_client, repo_r2_prefix, repo_rpms_key
 logger = logging.getLogger(__name__)
 
 _publish_locks: dict[int, asyncio.Lock] = {}
+_publish_global_sem: asyncio.Semaphore | None = None
+_publish_global_sem_lock = threading.Lock()
+
+
+def _global_publish_semaphore() -> asyncio.Semaphore:
+    """One process-wide limit for heavy R2 + createrepo work so burst completions do not stall the API."""
+    global _publish_global_sem
+    with _publish_global_sem_lock:
+        if _publish_global_sem is None:
+            n = max(1, int(get_settings().repo_publish_max_concurrent))
+            _publish_global_sem = asyncio.Semaphore(n)
+            logger.info("repo publish global concurrency limit=%s", n)
+        return _publish_global_sem
 
 
 def _lock_for(attempt_id: int) -> asyncio.Lock:
@@ -85,13 +100,14 @@ async def run_repo_publish_for_attempt(
     Load artifacts for the attempt, run R2 copy/prune/repodata. Serialized per attempt_id.
     If publish_task_id is set (poll loop), claim that row; otherwise claim by attempt_id.
     """
-    async with _lock_for(attempt_id):
-        async with async_session_maker() as db:
-            pt_r = await db.execute(select(PublishTask).where(PublishTask.attempt_id == attempt_id))
-            pt = pt_r.scalar_one_or_none()
-            if pt and pt.status == "success":
-                logger.info("repo publish skip attempt_id=%s (already success)", attempt_id)
-                return
+    async with _global_publish_semaphore():
+        async with _lock_for(attempt_id):
+            async with async_session_maker() as db:
+                pt_r = await db.execute(select(PublishTask).where(PublishTask.attempt_id == attempt_id))
+                pt = pt_r.scalar_one_or_none()
+                if pt and pt.status == "success":
+                    logger.info("repo publish skip attempt_id=%s (already success)", attempt_id)
+                    return
 
         from oreon_build.api.worker_api import ArtifactPayload
 

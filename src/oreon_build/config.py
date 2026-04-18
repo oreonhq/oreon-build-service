@@ -100,6 +100,22 @@ class Settings(BaseSettings):
             "If unset, defaults to ~/.oreon/repo-tmp (not tmpfs /tmp). Same as env OREON_REPO_TMPDIR."
         ),
     )
+    repo_publish_max_concurrent: int = Field(
+        default=2,
+        ge=1,
+        le=32,
+        description=(
+            "Max concurrent repo-publish jobs (R2 sync + createrepo) per API process. "
+            "Build completions enqueue PublishTask rows; the background loop runs them under this cap "
+            "so many finished builds do not starve the event loop and default thread pool."
+        ),
+    )
+    repo_publish_poll_batch: int = Field(
+        default=1,
+        ge=1,
+        le=50,
+        description="How many pending PublishTask rows to dequeue per poll cycle (each still obeys repo_publish_max_concurrent).",
+    )
 
     # GitHub (API + webhooks)
     github_api_url: str = Field(default="https://api.github.com", description="GitHub REST API base URL")

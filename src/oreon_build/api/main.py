@@ -212,13 +212,14 @@ async def lifespan(app: FastAPI):
 
         while True:
             try:
+                s = get_settings()
                 raw_idle = (os.environ.get("OREON_PUBLISH_TASK_IDLE_POLL_SEC") or "2").strip()
                 try:
                     idle_interval_s = float(raw_idle)
                 except ValueError:
                     idle_interval_s = 2.0
                 idle_interval_s = max(0.5, min(idle_interval_s, 30.0))
-                batch = 5
+                batch = max(1, int(s.repo_publish_poll_batch))
                 async with async_session_maker() as db:
                     q = (
                         select(PublishTask)
