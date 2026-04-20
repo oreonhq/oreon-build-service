@@ -27,6 +27,7 @@ import subprocess
 import time
 import tarfile
 import tempfile
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated
@@ -70,6 +71,18 @@ from oreon_build.services.worker_state_sync import sync_worker_state_after_attem
 
 router = APIRouter(prefix="/worker", tags=["worker"])
 logger = logging.getLogger(__name__)
+_cancel_check_cache: dict[tuple[int, int], tuple[float, bool]] = {}
+_cancel_check_cache_lock = threading.Lock()
+
+
+def _cancel_cache_ttl_seconds() -> float:
+    # Keep tiny to preserve fast cancel semantics while reducing repeated DB reads.
+    raw = (os.environ.get("OREON_CANCEL_CHECK_CACHE_TTL_SEC") or "2.0").strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        v = 2.0
+    return max(0.2, min(v, 10.0))
 
 _MAX_BUILD_LOG_BYTES = 64 * 1024 * 1024
 
@@ -463,6 +476,14 @@ async def cancel_check(
     worker: Annotated[Worker, Depends(_require_worker)],
 ):
     """Worker polls this while a build runs; true when the user cancelled the job."""
+    key = (worker.id, attempt_id)
+    now_ts = time.monotonic()
+    ttl = _cancel_cache_ttl_seconds()
+    with _cancel_check_cache_lock:
+        cached = _cancel_check_cache.get(key)
+        if cached and cached[0] > now_ts:
+            return {"cancel_requested": cached[1]}
+
     result = await db.execute(
         select(BuildAttempt).where(
             BuildAttempt.id == attempt_id,
@@ -479,6 +500,11 @@ async def cancel_check(
     # Job may already be PENDING again after cancel+retry while this attempt row is still
     # CANCELLED; workers must stop mock based on the attempt, not only job.status.
     cancel_requested = job.status == BuildStatus.CANCELLED or attempt.status == BuildStatus.CANCELLED
+    with _cancel_check_cache_lock:
+        # Small bounded cache to avoid unbounded growth in long-lived API processes.
+        if len(_cancel_check_cache) > 4096:
+            _cancel_check_cache.clear()
+        _cancel_check_cache[key] = (now_ts + ttl, cancel_requested)
     return {"cancel_requested": cancel_requested}
 
 

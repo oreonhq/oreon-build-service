@@ -1948,7 +1948,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
             cancel_client = httpx.Client(timeout=20.0, headers=worker_headers)
             cancel_interval = _env_float(
                 "OREON_WORKER_CANCEL_CHECK_INTERVAL_SEC",
-                15.0,
+                20.0,
                 min_v=2.0,
                 max_v=120.0,
             )
@@ -2532,13 +2532,13 @@ def main() -> None:
     )
     poll_idle_interval = _env_float(
         "OREON_WORKER_POLL_IDLE_INTERVAL_SEC",
-        15.0,
+        20.0,
         min_v=2.0,
         max_v=180.0,
     )
     poll_busy_interval = _env_float(
         "OREON_WORKER_POLL_BUSY_INTERVAL_SEC",
-        5.0,
+        6.0,
         min_v=0.5,
         max_v=30.0,
     )
