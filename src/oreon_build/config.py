@@ -23,7 +23,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -259,6 +259,14 @@ class Settings(BaseSettings):
     signing_key_id: Optional[str] = Field(default=None)
     signing_key_grip: Optional[str] = Field(default=None)
     gpg_home: str = Field(default="/var/lib/oreon-build/gnupg")
+    signing_gpg_passphrase: Optional[SecretStr] = Field(
+        default=None,
+        description=(
+            "Subkey passphrase for headless GPG signing (API has no /dev/tty). Used for repomd detach-sign "
+            "and passed into rpm --addsign via _gpg_sign_cmd_extra_args. Your gpg-agent may need "
+            "allow-loopback-pinentry in GNUPGHOME. Env SIGNING_GPG_PASSPHRASE."
+        ),
+    )
 
     # Secure Boot / PE signing: controller holds NSS + rules; workers fetch a short-lived bundle
     # (GET /api/worker/pesign-bundle) and run pesign before upload. Controller only GPG-signs RPMs.

@@ -35,6 +35,14 @@ from oreon_build.config import Settings, get_settings
 logger = logging.getLogger(__name__)
 
 
+def _signing_passphrase_plain(settings: Settings) -> Optional[str]:
+    sec = settings.signing_gpg_passphrase
+    if sec is None:
+        return None
+    v = sec.get_secret_value().strip()
+    return v or None
+
+
 class PesignRepackError(RuntimeError):
     """Raised when pesign/repack was required (strict mode) but failed."""
 
@@ -504,9 +512,26 @@ def sign_rpm(rpm_path: Path, key_id: Optional[str] = None) -> bool:
     if settings.gpg_home:
         env["GNUPGHOME"] = settings.gpg_home
     env.setdefault("LC_ALL", "C.UTF-8")
+    phrase = _signing_passphrase_plain(settings)
+    pass_path: Optional[str] = None
     try:
+        extra = "--batch --no-tty"
+        if phrase:
+            fd, pass_path = tempfile.mkstemp(prefix="oreon-gpg-pass-", text=True)
+            with os.fdopen(fd, "w") as pf:
+                pf.write(phrase)
+            os.chmod(pass_path, 0o600)
+            extra += f" --pinentry-mode loopback --passphrase-file {shlex.quote(pass_path)}"
         result = subprocess.run(
-            ["rpm", "--define", f"_gpg_name {kid}", "--addsign", str(rpm_path)],
+            [
+                "rpm",
+                "--define",
+                f"_gpg_name {kid}",
+                "--define",
+                f"_gpg_sign_cmd_extra_args {extra}",
+                "--addsign",
+                str(rpm_path),
+            ],
             capture_output=True,
             env=env,
             text=True,
@@ -524,6 +549,12 @@ def sign_rpm(rpm_path: Path, key_id: Optional[str] = None) -> bool:
     except FileNotFoundError as e:
         logger.exception("rpm command not found: %s", e)
         return False
+    finally:
+        if pass_path:
+            try:
+                os.unlink(pass_path)
+            except OSError:
+                pass
 
 
 def sign_repomd(repomd_path: Path, key_id: Optional[str] = None) -> bool:
@@ -535,12 +566,20 @@ def sign_repomd(repomd_path: Path, key_id: Optional[str] = None) -> bool:
     env = os.environ.copy()
     if settings.gpg_home:
         env["GNUPGHOME"] = settings.gpg_home
+    env.setdefault("LC_ALL", "C.UTF-8")
+    phrase = _signing_passphrase_plain(settings)
+    cmd = ["gpg", "--batch", "--no-tty", "--detach-sign", "--armor", "-u", kid, str(repomd_path)]
+    stdin_input: Optional[str] = None
+    if phrase:
+        cmd[1:1] = ["--pinentry-mode", "loopback", "--passphrase-fd", "0"]
+        stdin_input = phrase + "\n"
     try:
         result = subprocess.run(
-            ["gpg", "--detach-sign", "--armor", "-u", kid, str(repomd_path)],
+            cmd,
             capture_output=True,
             env=env,
             text=True,
+            input=stdin_input,
         )
         if result.returncode != 0:
             err = (result.stderr or "").strip() or (result.stdout or "").strip()
