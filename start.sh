@@ -91,9 +91,43 @@ done
 
 source .venv/bin/activate
 
-# One-shot: reset publish_tasks stuck in ``running`` (crash mid-repodata) before workers connect.
-echo "Reclaiming stuck publish_tasks (if any)..."
-python -u "$ROOT/scripts/reclaim_stuck_publish_tasks.py"
+# One-shot: inspect DB pressure and terminate only safe idle sessions before services connect.
+echo "DB unclog preflight (safe idle session cleanup)..."
+set +e
+python -u "$ROOT/scripts/db_unclog_safe_idles.py"
+_db_unclog_rc=$?
+set -e
+if [ "$_db_unclog_rc" -eq 3 ]; then
+  # No slot available for app role at all. Hard-unclog fallback:
+  # restart local postgres service to clear stale client backends, then retry once.
+  echo "DB unclog: no connection slots available for app role; attempting PostgreSQL restart fallback..."
+  _pg_restarted=0
+  if command -v systemctl &>/dev/null; then
+    for svc in postgresql-16 postgresql-15 postgresql-14 postgresql; do
+      if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${svc}.service"; then
+        if systemctl restart "$svc" 2>/dev/null || sudo systemctl restart "$svc" 2>/dev/null; then
+          _pg_restarted=1
+          sleep 3
+        fi
+        break
+      fi
+    done
+  fi
+  if [ "$_pg_restarted" -eq 1 ]; then
+    set +e
+    python -u "$ROOT/scripts/db_unclog_safe_idles.py"
+    _db_unclog_rc=$?
+    set -e
+  fi
+fi
+
+if [ "$_db_unclog_rc" -ne 0 ]; then
+  if [ "${OREON_START_DB_UNCLOG_STRICT:-0}" = "1" ]; then
+    echo "DB unclog failed and OREON_START_DB_UNCLOG_STRICT=1, aborting start."
+    exit 1
+  fi
+  echo "WARNING: DB unclog failed; continuing startup. Set OREON_START_DB_UNCLOG_STRICT=1 to fail fast."
+fi
 
 if ! command -v createrepo_c &>/dev/null; then
   echo "WARNING: createrepo_c not on PATH. Install it for repodata refresh (e.g. dnf install createrepo_c)."
