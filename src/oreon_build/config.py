@@ -38,18 +38,18 @@ class Settings(BaseSettings):
         description="PostgreSQL connection URL (async)",
     )
     database_pool_size: int = Field(
-        default=16,
+        default=32,
         ge=1,
-        le=200,
+        le=500,
         description=(
             "Per-process SQLAlchemy async pool size. Keep conservative because API, scheduler, "
             "and watchdog each maintain their own pool."
         ),
     )
     database_max_overflow: int = Field(
-        default=8,
+        default=16,
         ge=0,
-        le=200,
+        le=500,
         description=(
             "Per-process burst connections beyond pool_size. Lower values prevent stampeding "
             "PostgreSQL under load."
