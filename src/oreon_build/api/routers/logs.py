@@ -34,15 +34,20 @@ async def get_build_log(attempt_id: int):
 
 
 @router.get("/attempts/{attempt_id}/tail")
-async def get_build_log_tail(attempt_id: int, db: DbSession, lines: int = 100):
-    result = await db.execute(select(BuildAttempt).where(BuildAttempt.id == attempt_id))
-    attempt = result.scalar_one_or_none()
-    if not attempt:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Build attempt not found")
-    if not attempt.log_r2_key:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Log not yet available")
+async def get_build_log_tail(attempt_id: int, lines: int = 100):
+    async with async_session_maker() as db:
+        result = await db.execute(select(BuildAttempt).where(BuildAttempt.id == attempt_id))
+        attempt = result.scalar_one_or_none()
+        if not attempt:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Build attempt not found")
+        if not attempt.log_r2_key:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Log not yet available")
+        log_r2_key = attempt.log_r2_key
+        if lines < 1:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="lines must be at least 1")
+
     r2 = get_r2_client()
-    data = r2.get_object(attempt.log_r2_key)
+    data = r2.get_object(log_r2_key)
     if data is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Log file not found in storage")
     text = data.decode("utf-8", errors="replace")

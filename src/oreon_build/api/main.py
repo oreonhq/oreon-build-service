@@ -72,8 +72,14 @@ from .worker_api import router as worker_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await init_db()
     settings = get_settings()
+    logger.info(
+        "API startup pool_config pool_size=%s max_overflow=%s pool_timeout=%s",
+        settings.database_pool_size,
+        settings.database_max_overflow,
+        settings.database_pool_timeout,
+    )
+    await init_db()
     _configure_oreon_logging(settings)
     logger.info(
         "API startup log_level=%s github_catchup_s=%s github_token=%s",
