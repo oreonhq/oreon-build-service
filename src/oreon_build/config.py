@@ -18,10 +18,12 @@
 from __future__ import annotations
 
 import os
+import warnings
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -37,8 +39,26 @@ class Settings(BaseSettings):
         default="postgresql+asyncpg://oreon:oreon@localhost:5432/oreon_build",
         description="PostgreSQL connection URL (async)",
     )
+    database_reclaim_url: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional async Postgres URL used only by scripts/reclaim_stuck_publish_tasks.py when "
+            "DATABASE_URL cannot connect because max_connections is saturated for that role. "
+            "Use the same database as postgresql+asyncpg://postgres:...@host:5432/oreon_build so reclaim "
+            "can use reserved superuser connection slots. Env DATABASE_RECLAIM_URL."
+        ),
+    )
+    database_use_null_pool: bool = Field(
+        default=True,
+        description=(
+            "If True, use SQLAlchemy NullPool (DATABASE_USE_NULL_POOL): open a real Postgres connection "
+            "for each checked-out session and close it on return. No idle client-side pool per process, "
+            "so multiple API/Watchdog/scheduler processes do not multiply reserved connections. "
+            "Set False and tune DATABASE_POOL_* when you have a large max_connections and want pooling."
+        ),
+    )
     database_pool_size: int = Field(
-        default=32,
+        default=14,
         ge=1,
         description="Per-process SQLAlchemy QueuePool pool_size (DATABASE_POOL_SIZE).",
     )
@@ -46,6 +66,15 @@ class Settings(BaseSettings):
         default=16,
         ge=0,
         description="Per-process QueuePool max_overflow beyond pool_size (DATABASE_MAX_OVERFLOW).",
+    )
+    database_pool_max_connections_per_process: int = Field(
+        default=30,
+        ge=0,
+        description=(
+            "Ceiling on pool_size+max_overflow for this OS process (DATABASE_POOL_MAX_CONNECTIONS_PER_PROCESS). "
+            "API and Watchdog each load oreon_build.db.session and each get a full pool, so two processes use twice this at peak. "
+            "0 disables clamping (you must keep Postgres max_connections above your own totals)."
+        ),
     )
     database_pool_timeout: int = Field(
         default=30,
@@ -69,6 +98,49 @@ class Settings(BaseSettings):
         max_length=128,
         description="PostgreSQL application_name tag used in pg_stat_activity.",
     )
+
+    @field_validator("database_use_null_pool", mode="before")
+    @classmethod
+    def _coerce_database_use_null_pool(cls, v: object) -> bool:
+        if v is None or v is Ellipsis:
+            return True
+        if isinstance(v, bool):
+            return v
+        s = str(v).strip().lower()
+        if s in ("0", "false", "no", "off"):
+            return False
+        if s in ("1", "true", "yes", "on"):
+            return True
+        return bool(v)
+
+    @model_validator(mode="after")
+    def _clamp_database_pool_to_postgres_safe_total(self) -> Settings:
+        if self.database_use_null_pool:
+            return self
+        cap = int(self.database_pool_max_connections_per_process)
+        if cap <= 0:
+            return self
+        ps = int(self.database_pool_size)
+        mo = int(self.database_max_overflow)
+        if ps + mo <= cap:
+            return self
+        if ps > cap:
+            new_ps, new_mo = cap, 0
+        else:
+            new_ps, new_mo = ps, cap - ps
+        warnings.warn(
+            f"Database pool clamped to pool_size={new_ps} max_overflow={new_mo} "
+            f"(was pool_size={ps} max_overflow={mo}) because "
+            f"database_pool_max_connections_per_process={cap}. "
+            "Each Oreon process that imports the DB engine holds its own pool. "
+            "Raise Postgres max_connections, lower other clients, or set "
+            "DATABASE_POOL_MAX_CONNECTIONS_PER_PROCESS=0 only if you sized Postgres yourself.",
+            UserWarning,
+            stacklevel=1,
+        )
+        self.database_pool_size = max(1, new_ps)
+        self.database_max_overflow = max(0, new_mo)
+        return self
 
     # Auth
     secret_key: str = Field(default="change-me-to-a-secure-random-string-min-32-chars")
@@ -108,6 +180,16 @@ class Settings(BaseSettings):
         ge=1,
         le=50,
         description="How many pending PublishTask rows to dequeue per poll cycle (each still obeys repo_publish_max_concurrent).",
+    )
+    publish_task_stale_running_minutes: int = Field(
+        default=240,
+        ge=0,
+        le=10080,
+        description=(
+            "If a PublishTask stays status=running longer than this (crash mid-repodata, hung createrepo), "
+            "the stale-build sweep resets it to pending so publish can retry. 0 disables. "
+            "PUBLISH_TASK_STALE_RUNNING_MINUTES."
+        ),
     )
 
     # GitHub (API + webhooks)
@@ -309,5 +391,7 @@ class Settings(BaseSettings):
         return self.database_url
 
 
+@lru_cache(maxsize=1)
 def get_settings() -> Settings:
+    """One cached instance per process (API, Watchdog, CLI each have their own cache)."""
     return Settings()
