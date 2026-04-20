@@ -91,6 +91,10 @@ done
 
 source .venv/bin/activate
 
+# One-shot: reset publish_tasks stuck in ``running`` (crash mid-repodata) before workers connect.
+echo "Reclaiming stuck publish_tasks (if any)..."
+python -u "$ROOT/scripts/reclaim_stuck_publish_tasks.py"
+
 if ! command -v createrepo_c &>/dev/null; then
   echo "WARNING: createrepo_c not on PATH. Install it for repodata refresh (e.g. dnf install createrepo_c)."
 fi
@@ -146,8 +150,8 @@ echo "Done. Run ./stop.sh to stop."
 
 # Background repodata refresh only when ./start.sh --regen (uses persistent ~/.oreon/repo-tmp stages + MIGRATE_PARALLEL).
 if [ "$DO_REGEN" -eq 1 ]; then
-  echo "Starting background repodata refresh (logs: $LOG_DIR/repodata-refresh.log, parallel=${MIGRATE_PARALLEL:-50})..."
-  nohup env MIGRATE_PARALLEL="${MIGRATE_PARALLEL:-50}" bash -c "cd \"$ROOT\" && exec bash ./scripts/migrate-rpmrepo-metadata.sh" \
+  echo "Starting background repodata refresh (logs: $LOG_DIR/repodata-refresh.log, parallel=${MIGRATE_PARALLEL:-4})..."
+  nohup env MIGRATE_PARALLEL="${MIGRATE_PARALLEL:-4}" bash -c "cd \"$ROOT\" && exec bash ./scripts/migrate-rpmrepo-metadata.sh" \
     >> "$LOG_DIR/repodata-refresh.log" 2>&1 &
   echo $! > "$ROOT/.oreon-repodata-refresh.pid"
   echo "Repodata refresh PID $(cat "$ROOT/.oreon-repodata-refresh.pid")"
