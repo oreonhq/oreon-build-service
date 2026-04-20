@@ -18,15 +18,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
+import asyncpg
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import OperationalError
 from oreon_build.db.session import async_session_maker
 from oreon_build.core.auth import require_admin, require_account
 from oreon_build.api.routers.auth import router as auth_router
@@ -49,6 +52,15 @@ from oreon_build.watchdog.package_names import (
 from .scanner import scan_cves_once
 
 logger = logging.getLogger(__name__)
+def _too_many_connections(exc: BaseException) -> bool:
+    if isinstance(exc, asyncpg.TooManyConnectionsError):
+        return True
+    if isinstance(exc, OperationalError):
+        c = exc.__cause__
+        return isinstance(c, asyncpg.TooManyConnectionsError)
+    return False
+
+
 
 
 CVE_RESOLVE_REASONS = frozenset(
@@ -104,6 +116,12 @@ async def lifespan(app: FastAPI):
 
     settings = get_settings()
     interval_s = max(60, int(getattr(settings, "cve_scan_interval_minutes", 30) * 60))
+    raw_delay = (os.environ.get("WATCHDOG_STARTUP_SCAN_DELAY_SEC") or "60").strip()
+    try:
+        start_delay_s = int(raw_delay)
+    except ValueError:
+        start_delay_s = 60
+    start_delay_s = max(10, min(300, start_delay_s))
     app.state.scan_lock = asyncio.Lock()
 
     async def _run_scan(reason: str) -> None:
@@ -112,11 +130,18 @@ async def lifespan(app: FastAPI):
                 logger.info("Watchdog inventory sync started reason=%s", reason)
                 await scan_cves_once()
                 logger.info("Watchdog inventory sync finished reason=%s", reason)
-        except Exception:
+        except Exception as e:
+            if _too_many_connections(e):
+                logger.warning(
+                    "Watchdog inventory sync skipped reason=%s (database too many connections)",
+                    reason,
+                )
+                return
             logger.exception("Watchdog inventory sync failed reason=%s", reason)
 
     async def _periodic_loop() -> None:
-        # Guaranteed startup scan followed by interval scans.
+        # Defer initial scan so API/publish startup can stabilize DB connection usage.
+        await asyncio.sleep(start_delay_s)
         await _run_scan("startup")
         while True:
             await asyncio.sleep(interval_s)
