@@ -2,6 +2,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from oreon_build.config import get_settings
 from oreon_build.db.base import Base
@@ -14,17 +15,31 @@ if _settings.database_idle_in_transaction_timeout_seconds > 0:
     _server_settings["idle_in_transaction_session_timeout"] = str(
         _settings.database_idle_in_transaction_timeout_seconds * 1000
     )
-_engine = create_async_engine(
-    _settings.database_url,
-    echo=False,
-    pool_pre_ping=True,
-    pool_use_lifo=True,
-    pool_recycle=1800,
-    pool_size=_settings.database_pool_size,
-    max_overflow=_settings.database_max_overflow,
-    pool_timeout=_settings.database_pool_timeout,
-    connect_args={"server_settings": _server_settings},
-)
+
+if _settings.database_use_null_pool:
+    # One real server connection per in-flight session, closed when the session returns to the pool.
+    # Avoids QueuePool times (pool_size + max_overflow) per OS process, which exhausts small Postgres
+    # max_connections when API, Watchdog, and scheduler all run on one host.
+    _engine = create_async_engine(
+        _settings.database_url,
+        echo=False,
+        poolclass=NullPool,
+        connect_args={"server_settings": _server_settings},
+    )
+else:
+    _engine_kwargs: dict = {
+        "echo": False,
+        "pool_pre_ping": True,
+        "pool_use_lifo": True,
+        "pool_recycle": 1800,
+        "pool_size": _settings.database_pool_size,
+        "max_overflow": _settings.database_max_overflow,
+        "connect_args": {"server_settings": _server_settings},
+    }
+    _pt = int(_settings.database_pool_timeout)
+    if _pt > 0:
+        _engine_kwargs["pool_timeout"] = _pt
+    _engine = create_async_engine(_settings.database_url, **_engine_kwargs)
 async_session_maker = async_sessionmaker(
     _engine,
     class_=AsyncSession,
