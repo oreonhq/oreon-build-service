@@ -22,7 +22,8 @@ if [ -f ".env" ]; then
 fi
 
 export PATH="${HOME}/.local/bin:${PATH}"
-export OREON_CREATEREPO_WORKERS="${OREON_CREATEREPO_WORKERS:-50}"
+# Default createrepo workers per prefix (not the same as MIGRATE_PARALLEL).
+export OREON_CREATEREPO_WORKERS="${OREON_CREATEREPO_WORKERS:-8}"
 CRE_TOOL="${OREON_CREATEREPO_BIN:-createrepo_c}"
 if ! command -v "$CRE_TOOL" &>/dev/null; then
   echo "createrepo_c not found (install e.g. dnf install createrepo_c, or set OREON_CREATEREPO_BIN)"
@@ -36,7 +37,8 @@ if [ ! -x "$PYTHON_BIN" ]; then
 fi
 
 ARCHES_RAW="${MIGRATE_ARCHES:-x86_64,aarch64}"
-PARALLEL_RAW="${MIGRATE_PARALLEL:-50}"
+# How many prefixes run at once. High values fork many Python processes and can overwhelm the host.
+PARALLEL_RAW="${MIGRATE_PARALLEL:-4}"
 DRY_RUN="${MIGRATE_DRY_RUN:-0}"
 
 case "$PARALLEL_RAW" in
@@ -49,6 +51,10 @@ case "$PARALLEL_RAW" in
 esac
 if [ "$PARALLEL" -lt 1 ]; then
   PARALLEL=1
+fi
+if [ "$PARALLEL" -gt 16 ]; then
+  echo "WARNING: MIGRATE_PARALLEL=$PARALLEL capped at 16 (set lower to avoid fork storms)."
+  PARALLEL=16
 fi
 
 PREFIX_FILE="$(mktemp)"
