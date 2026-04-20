@@ -277,27 +277,53 @@ def _cleanup_old_repodata(
 def _run_createrepo(repo_dir: Path) -> None:
     # Never use capture_output/PIPE here. createrepo_c can write a lot to stderr; a full pipe blocks the child
     # while the parent waits forever (looks like a hang with RPMs already on disk).
-    tmp_repodata = repo_dir / ".repodata"
-    if tmp_repodata.exists():
-        # Previous interrupted createrepo runs can leave this behind and every future run
-        # fails with "Temporary repodata directory ... already exists".
-        try:
-            shutil.rmtree(tmp_repodata)
-            logger.warning("Removed stale createrepo temp dir %s", tmp_repodata)
-        except OSError as e:
-            logger.warning("Could not remove stale createrepo temp dir %s: %s", tmp_repodata, e)
+    def _cleanup_tmp_repodata() -> None:
+        tmp_repodata = repo_dir / ".repodata"
+        if tmp_repodata.exists():
+            # Previous interrupted createrepo runs can leave this behind and every future run
+            # fails with "Temporary repodata directory ... already exists".
+            try:
+                shutil.rmtree(tmp_repodata)
+                logger.warning("Removed stale createrepo temp dir %s", tmp_repodata)
+            except OSError as e:
+                logger.warning("Could not remove stale createrepo temp dir %s: %s", tmp_repodata, e)
+
+    def _run_once(workers: int) -> None:
+        logger.info("createrepo_c starting repo_root=%s workers=%s", repo_dir, workers)
+        subprocess.run(
+            [
+                "createrepo_c",
+                str(repo_dir),
+                f"--workers={workers}",
+            ],
+            check=True,
+            stdin=subprocess.DEVNULL,
+        )
+        repomd = repo_dir / "repodata" / "repomd.xml"
+        if not repomd.exists():
+            raise RuntimeError(f"createrepo_c reported success but {repomd} is missing")
+        logger.info("createrepo_c finished repo_root=%s workers=%s", repo_dir, workers)
+
+    _cleanup_tmp_repodata()
     w = _createrepo_workers()
-    logger.info("createrepo_c starting repo_root=%s workers=%s", repo_dir, w)
-    subprocess.run(
-        [
-            "createrepo_c",
-            str(repo_dir),
-            f"--workers={w}",
-        ],
-        check=True,
-        stdin=subprocess.DEVNULL,
-    )
-    logger.info("createrepo_c finished repo_root=%s", repo_dir)
+    try:
+        _run_once(w)
+    except Exception:
+        fb_raw = (os.environ.get("OREON_CREATEREPO_FALLBACK_WORKERS") or "8").strip()
+        try:
+            fb = int(fb_raw)
+        except ValueError:
+            fb = 8
+        fb = max(1, min(fb, 32))
+        if fb == w:
+            raise
+        logger.exception(
+            "createrepo_c failed with workers=%s, retrying once with workers=%s after cleanup",
+            w,
+            fb,
+        )
+        _cleanup_tmp_repodata()
+        _run_once(fb)
 
 
 def _upload_repodata_dir_ordered(client: R2Client, r2_prefix: str, repodata_dir: Path) -> None:
