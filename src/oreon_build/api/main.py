@@ -18,14 +18,17 @@
 import asyncio
 import logging
 import os
+import random
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import asyncpg
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 
 from oreon_build.config import Settings, get_settings
 from oreon_build.db import get_db, init_db
@@ -35,6 +38,15 @@ from oreon_build.core.security import hash_password, verify_password
 logger = logging.getLogger(__name__)
 
 _github_catchup_misconfig_logged = False
+
+
+def _too_many_connections(exc: BaseException) -> bool:
+    if isinstance(exc, asyncpg.TooManyConnectionsError):
+        return True
+    if isinstance(exc, OperationalError):
+        c = exc.__cause__
+        return isinstance(c, asyncpg.TooManyConnectionsError)
+    return False
 
 
 def _configure_oreon_logging(settings: Settings) -> None:
@@ -73,6 +85,7 @@ from .worker_api import router as worker_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
+    _configure_oreon_logging(settings)
     logger.info(
         "API startup db_pool null_pool=%s pool_size=%s max_overflow=%s pool_timeout=%s",
         settings.database_use_null_pool,
@@ -80,8 +93,19 @@ async def lifespan(app: FastAPI):
         settings.database_max_overflow,
         settings.database_pool_timeout,
     )
-    await init_db()
-    _configure_oreon_logging(settings)
+    if settings.database_init_schema_on_startup:
+        try:
+            await init_db()
+        except Exception as e:
+            if settings.database_startup_bootstrap_strict:
+                raise
+            if _too_many_connections(e):
+                logger.warning(
+                    "Skipping init_db on startup due to database saturation (TooManyConnections). "
+                    "Set DATABASE_STARTUP_BOOTSTRAP_STRICT=true to fail startup instead."
+                )
+            else:
+                logger.exception("Skipping init_db on startup due to bootstrap error")
     logger.info(
         "API startup log_level=%s github_catchup_s=%s github_token=%s",
         settings.log_level,
@@ -89,42 +113,53 @@ async def lifespan(app: FastAPI):
         bool(settings.github_token),
     )
     from oreon_build.db.session import async_session_maker
-    async with async_session_maker() as db:
-        try:
-            result = await db.execute(select(Role))
-            roles = list(result.scalars().all())
-            if not roles:
-                for r in [RoleName.ADMIN, RoleName.MAINTAINER]:
-                    role = Role(name=r, description=r.value)
-                    db.add(role)
-                await db.flush()
-            result = await db.execute(select(Role).where(Role.name == RoleName.ADMIN))
-            admin_role = result.scalar_one_or_none()
-            if admin_role:
-                result = await db.execute(select(Account).where(Account.username == settings.admin_username))
-                admin = result.scalar_one_or_none()
-                if not admin:
-                    # First boot: create the default admin from env.
-                    admin = Account(
-                        username=settings.admin_username,
-                        password_hash=hash_password(settings.admin_password),
-                        role_id=admin_role.id,
-                        is_active=True,
-                    )
-                    db.add(admin)
-                else:
-                    # Subsequent boots: if the env password changed, update the stored
-                    # password hash (the "invalid password" symptom many users hit).
-                    try:
-                        if not verify_password(settings.admin_password, admin.password_hash):
-                            admin.password_hash = hash_password(settings.admin_password)
-                            db.add(admin)
-                    except Exception:
-                        logger.exception("Failed verifying/updating default admin password")
-            await db.commit()
-        except Exception:
-            await db.rollback()
+    try:
+        async with async_session_maker() as db:
+            try:
+                result = await db.execute(select(Role))
+                roles = list(result.scalars().all())
+                if not roles:
+                    for r in [RoleName.ADMIN, RoleName.MAINTAINER]:
+                        role = Role(name=r, description=r.value)
+                        db.add(role)
+                    await db.flush()
+                result = await db.execute(select(Role).where(Role.name == RoleName.ADMIN))
+                admin_role = result.scalar_one_or_none()
+                if admin_role:
+                    result = await db.execute(select(Account).where(Account.username == settings.admin_username))
+                    admin = result.scalar_one_or_none()
+                    if not admin:
+                        # First boot: create the default admin from env.
+                        admin = Account(
+                            username=settings.admin_username,
+                            password_hash=hash_password(settings.admin_password),
+                            role_id=admin_role.id,
+                            is_active=True,
+                        )
+                        db.add(admin)
+                    else:
+                        # Subsequent boots: if the env password changed, update the stored
+                        # password hash (the "invalid password" symptom many users hit).
+                        try:
+                            if not verify_password(settings.admin_password, admin.password_hash):
+                                admin.password_hash = hash_password(settings.admin_password)
+                                db.add(admin)
+                        except Exception:
+                            logger.exception("Failed verifying/updating default admin password")
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+    except Exception as e:
+        if settings.database_startup_bootstrap_strict:
             raise
+        if _too_many_connections(e):
+            logger.warning(
+                "Skipping role/admin startup bootstrap due to database saturation (TooManyConnections). "
+                "Service will continue and recover once DB pressure drops."
+            )
+        else:
+            logger.exception("Skipping role/admin startup bootstrap due to startup DB error")
 
     sweep_task: asyncio.Task[None] | None = None
     publish_task: asyncio.Task[None] | None = None
@@ -222,12 +257,12 @@ async def lifespan(app: FastAPI):
         while True:
             try:
                 s = get_settings()
-                raw_idle = (os.environ.get("OREON_PUBLISH_TASK_IDLE_POLL_SEC") or "2").strip()
+                raw_idle = (os.environ.get("OREON_PUBLISH_TASK_IDLE_POLL_SEC") or "15").strip()
                 try:
                     idle_interval_s = float(raw_idle)
                 except ValueError:
-                    idle_interval_s = 2.0
-                idle_interval_s = max(0.5, min(idle_interval_s, 30.0))
+                    idle_interval_s = 15.0
+                idle_interval_s = max(1.0, min(idle_interval_s, 60.0))
                 batch = max(1, int(s.repo_publish_poll_batch))
                 async with async_session_maker() as db:
                     q = (
@@ -240,7 +275,7 @@ async def lifespan(app: FastAPI):
                     result = await db.execute(q)
                     tasks = list(result.scalars().all())
                     if not tasks:
-                        await asyncio.sleep(idle_interval_s)
+                        await asyncio.sleep(random.uniform(idle_interval_s * 0.85, idle_interval_s * 1.15))
                         continue
                     await db.commit()
 

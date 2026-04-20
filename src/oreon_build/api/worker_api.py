@@ -27,7 +27,7 @@ import subprocess
 import time
 import tarfile
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated
 
@@ -35,7 +35,7 @@ from fastapi import APIRouter, Body, Depends, File, Header, HTTPException, Query
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
-from sqlalchemy import delete, select, func
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from oreon_build.api.deps import DbSession
@@ -137,9 +137,6 @@ async def get_worker(
     w = await resolve_worker_for_token(db, x_worker_token)
     if not w:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid worker token")
-    w.last_seen_at = datetime.now(timezone.utc)
-    w.last_heartbeat = datetime.now(timezone.utc)
-    await db.flush()
     return w
 
 
@@ -152,10 +149,55 @@ async def _require_worker(
     w = await resolve_worker_for_token(db, x_worker_token)
     if not w:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid worker token")
-    w.last_seen_at = datetime.now(timezone.utc)
-    w.last_heartbeat = datetime.now(timezone.utc)
-    await db.flush()
     return w
+
+
+def _presence_write_interval_seconds() -> int:
+    raw = (os.environ.get("OREON_WORKER_PRESENCE_WRITE_INTERVAL_SEC") or "15").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 15
+    return max(1, min(n, 300))
+
+
+async def _touch_worker_presence(
+    db: DbSession,
+    worker: Worker,
+    *,
+    include_heartbeat: bool,
+    revive_offline: bool,
+) -> None:
+    """
+    Throttle worker presence writes.
+
+    Poll/cancel/heartbeat can be very hot. Writing last_seen/last_heartbeat on every
+    request creates avoidable DB write pressure and lock churn under load.
+    """
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(seconds=_presence_write_interval_seconds())
+
+    if revive_offline:
+        rs = await db.execute(
+            update(Worker)
+            .where(Worker.id == worker.id, Worker.state == WorkerState.OFFLINE)
+            .values(state=WorkerState.IDLE)
+        )
+        if int(rs.rowcount or 0) > 0:
+            worker.state = WorkerState.IDLE
+
+    clauses = [Worker.last_seen_at.is_(None), Worker.last_seen_at < cutoff]
+    values: dict[str, object] = {"last_seen_at": now}
+    if include_heartbeat:
+        clauses.extend([Worker.last_heartbeat.is_(None), Worker.last_heartbeat < cutoff])
+        values["last_heartbeat"] = now
+
+    await db.execute(
+        update(Worker)
+        .where(Worker.id == worker.id)
+        .where(or_(*clauses))
+        .values(**values)
+    )
 
 
 class ResultPayload(BaseModel):
@@ -211,16 +253,23 @@ async def _upsert_attempt_artifact(
 
 @router.post("/heartbeat")
 async def heartbeat(db: DbSession, worker: Annotated[Worker, Depends(_require_worker)]):
-    worker.last_heartbeat = datetime.now(timezone.utc)
-    worker.last_seen_at = datetime.now(timezone.utc)
-    if worker.state == WorkerState.OFFLINE:
-        worker.state = WorkerState.IDLE
-    await db.flush()
+    await _touch_worker_presence(
+        db,
+        worker,
+        include_heartbeat=True,
+        revive_offline=True,
+    )
     return {"status": "ok", "state": worker.state.value}
 
 
 @router.get("/poll")
 async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_worker)]):
+    await _touch_worker_presence(
+        db,
+        worker,
+        include_heartbeat=False,
+        revive_offline=False,
+    )
     # Serialize poll/claim per worker row so duplicate processes sharing one token cannot
     # over-claim jobs in parallel.
     wr = await db.execute(select(Worker).where(Worker.id == worker.id).with_for_update())
@@ -858,6 +907,8 @@ async def upload_worker_rpm_complete(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="Timed out waiting for RPM finalize lock",
                 )
+            # Release transaction resources while waiting on another worker's finalize lock.
+            await db.rollback()
             await asyncio.sleep(2)
 
         try:
