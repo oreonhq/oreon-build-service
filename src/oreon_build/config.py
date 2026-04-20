@@ -98,6 +98,22 @@ class Settings(BaseSettings):
         max_length=128,
         description="PostgreSQL application_name tag used in pg_stat_activity.",
     )
+    database_init_schema_on_startup: bool = Field(
+        default=False,
+        description=(
+            "Run SQLAlchemy Base.metadata.create_all() during API startup. "
+            "Disable in production to avoid startup hard-fail when DB is temporarily saturated; "
+            "manage schema via Alembic/migrations instead. Env DATABASE_INIT_SCHEMA_ON_STARTUP."
+        ),
+    )
+    database_startup_bootstrap_strict: bool = Field(
+        default=False,
+        description=(
+            "If True, API startup fails when role/admin bootstrap cannot reach DB. "
+            "If False, logs warning and continues so service can recover once DB pressure drops. "
+            "Env DATABASE_STARTUP_BOOTSTRAP_STRICT."
+        ),
+    )
 
     @field_validator("database_use_null_pool", mode="before")
     @classmethod
