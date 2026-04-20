@@ -55,6 +55,7 @@ import io
 import json
 import logging
 import os
+import random
 import re
 import platform
 import secrets
@@ -79,6 +80,26 @@ from oreon_build.services.signing import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def _env_float(name: str, default: float, *, min_v: float, max_v: float) -> float:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        v = float(raw)
+    except ValueError:
+        return default
+    return max(min_v, min(max_v, v))
+
+
+def _sleep_with_jitter(base_seconds: float, jitter_ratio: float = 0.15) -> None:
+    # Spread requests across workers and avoid synchronized poll spikes.
+    j = max(0.0, min(0.9, jitter_ratio))
+    delta = base_seconds * j
+    low = max(0.0, base_seconds - delta)
+    high = max(low, base_seconds + delta)
+    time.sleep(random.uniform(low, high))
 
 # Ignore a second dispatch for the same build_attempt_id (duplicate poll / misbehaving client).
 _inflight_attempt_lock = threading.Lock()
@@ -1925,6 +1946,12 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
 
         def poll_cancel() -> None:
             cancel_client = httpx.Client(timeout=20.0, headers=worker_headers)
+            cancel_interval = _env_float(
+                "OREON_WORKER_CANCEL_CHECK_INTERVAL_SEC",
+                15.0,
+                min_v=2.0,
+                max_v=120.0,
+            )
             try:
                 while not done_event.is_set():
                     try:
@@ -1937,7 +1964,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                             return
                     except Exception:
                         pass
-                    time.sleep(5)
+                    _sleep_with_jitter(cancel_interval)
             finally:
                 cancel_client.close()
 
@@ -2497,6 +2524,24 @@ def main() -> None:
     active: list[threading.Thread] = []
     last_heartbeat = 0.0
     last_mock_prune = 0.0
+    heartbeat_interval = _env_float(
+        "OREON_WORKER_HEARTBEAT_INTERVAL_SEC",
+        60.0,
+        min_v=10.0,
+        max_v=300.0,
+    )
+    poll_idle_interval = _env_float(
+        "OREON_WORKER_POLL_IDLE_INTERVAL_SEC",
+        15.0,
+        min_v=2.0,
+        max_v=180.0,
+    )
+    poll_busy_interval = _env_float(
+        "OREON_WORKER_POLL_BUSY_INTERVAL_SEC",
+        5.0,
+        min_v=0.5,
+        max_v=30.0,
+    )
 
     while True:
         active = [t for t in active if t.is_alive()]
@@ -2506,7 +2551,7 @@ def main() -> None:
             threading.Thread(target=_prune_stale_var_lib_mock_dirs, daemon=True, name="oreon-mock-pruner").start()
             last_mock_prune = now
 
-        if now - last_heartbeat > 30:
+        if now - last_heartbeat > heartbeat_interval:
             try:
                 session.post(f"{controller_url}/api/worker/heartbeat", json={})
             except Exception:
@@ -2514,7 +2559,7 @@ def main() -> None:
             last_heartbeat = now
 
         if len(active) >= max_jobs:
-            time.sleep(2)
+            _sleep_with_jitter(poll_busy_interval)
             continue
 
         try:
@@ -2523,7 +2568,7 @@ def main() -> None:
             data = resp.json()
             job = data.get("job")
             if not job:
-                time.sleep(10)
+                _sleep_with_jitter(poll_idle_interval)
                 continue
             raw_aid = job.get("build_attempt_id")
             try:
@@ -2537,7 +2582,7 @@ def main() -> None:
                             "Ignoring duplicate poll job for build_attempt_id=%s (already running locally)",
                             aid,
                         )
-                        time.sleep(2)
+                        _sleep_with_jitter(poll_busy_interval)
                         continue
                     _inflight_attempt_ids.add(aid)
                 _mark_inflight_attempt_external(aid)
