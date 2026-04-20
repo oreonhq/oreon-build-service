@@ -28,6 +28,15 @@ _publish_global_sem_lock = threading.Lock()
 _publish_completed_attempts: set[int] = set()  # Track completed attempts for cleanup
 
 
+def _repo_publish_timeout_sec() -> int:
+    raw = (os.environ.get("OREON_REPO_PUBLISH_TIMEOUT_SEC") or "2400").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 2400
+    return max(120, min(n, 12 * 3600))
+
+
 def _global_publish_semaphore() -> asyncio.Semaphore:
     """One process-wide limit for heavy R2 + createrepo work so burst completions do not stall the API."""
     global _publish_global_sem
@@ -192,14 +201,17 @@ async def run_repo_publish_for_attempt(
                 len(payload_artifacts),
             )
 
-            await asyncio.to_thread(
-                process_repo_publish_sync,
-                releasename=release.releasename,
-                branch=branch,
-                arch=arch,
-                attempt_id=attempt_id,
-                payload_artifacts=payload_artifacts,
-                build_attempt_r2_keys=r2_keys,
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    process_repo_publish_sync,
+                    releasename=release.releasename,
+                    branch=branch,
+                    arch=arch,
+                    attempt_id=attempt_id,
+                    payload_artifacts=payload_artifacts,
+                    build_attempt_r2_keys=r2_keys,
+                ),
+                timeout=_repo_publish_timeout_sec(),
             )
 
             async with async_session_maker() as db:

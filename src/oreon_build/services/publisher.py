@@ -189,6 +189,15 @@ def _createrepo_workers() -> int:
     return max(1, min(w, 128))
 
 
+def _createrepo_timeout_sec() -> int:
+    raw = (os.environ.get("OREON_CREATEREPO_TIMEOUT_SEC") or "1800").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 1800
+    return max(60, min(n, 8 * 3600))
+
+
 def _sync_rpms_dir_from_r2(client: R2Client, rpms_prefix: str, rpms_dir: Path) -> int:
     """
     Ensure ``rpms_dir`` matches R2 under ``rpms_prefix``. Skip download if file exists with same size.
@@ -289,16 +298,23 @@ def _run_createrepo(repo_dir: Path) -> None:
                 logger.warning("Could not remove stale createrepo temp dir %s: %s", tmp_repodata, e)
 
     def _run_once(workers: int) -> None:
+        timeout_s = _createrepo_timeout_sec()
         logger.info("createrepo_c starting repo_root=%s workers=%s", repo_dir, workers)
-        subprocess.run(
-            [
-                "createrepo_c",
-                str(repo_dir),
-                f"--workers={workers}",
-            ],
-            check=True,
-            stdin=subprocess.DEVNULL,
-        )
+        try:
+            subprocess.run(
+                [
+                    "createrepo_c",
+                    str(repo_dir),
+                    f"--workers={workers}",
+                ],
+                check=True,
+                stdin=subprocess.DEVNULL,
+                timeout=timeout_s,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(
+                f"createrepo_c timed out after {timeout_s}s for repo_root={repo_dir} workers={workers}"
+            ) from e
         repomd = repo_dir / "repodata" / "repomd.xml"
         if not repomd.exists():
             raise RuntimeError(f"createrepo_c reported success but {repomd} is missing")
