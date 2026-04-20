@@ -568,7 +568,12 @@ def sign_repomd(repomd_path: Path, key_id: Optional[str] = None) -> bool:
         env["GNUPGHOME"] = settings.gpg_home
     env.setdefault("LC_ALL", "C.UTF-8")
     phrase = _signing_passphrase_plain(settings)
-    cmd = ["gpg", "--batch", "--no-tty", "--detach-sign", "--armor", "-u", kid, str(repomd_path)]
+    asc_path = repomd_path.parent / f"{repomd_path.name}.asc"
+    try:
+        asc_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    cmd = ["gpg", "--batch", "--no-tty", "--yes", "--detach-sign", "--armor", "-u", kid, str(repomd_path)]
     stdin_input: Optional[str] = None
     if phrase:
         cmd[1:1] = ["--pinentry-mode", "loopback", "--passphrase-fd", "0"]
