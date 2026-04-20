@@ -74,7 +74,8 @@ from .worker_api import router as worker_router
 async def lifespan(app: FastAPI):
     settings = get_settings()
     logger.info(
-        "API startup pool_config pool_size=%s max_overflow=%s pool_timeout=%s",
+        "API startup db_pool null_pool=%s pool_size=%s max_overflow=%s pool_timeout=%s",
+        settings.database_use_null_pool,
         settings.database_pool_size,
         settings.database_max_overflow,
         settings.database_pool_timeout,
@@ -135,6 +136,7 @@ async def lifespan(app: FastAPI):
             sweep_stale_pending_builds,
             sweep_stale_running_builds,
         )
+        from oreon_build.services.stale_publish_tasks import reclaim_publish_tasks_stuck_running
 
         while True:
             try:
@@ -143,6 +145,7 @@ async def lifespan(app: FastAPI):
                 async with async_session_maker() as db:
                     try:
                         await reconcile_queue_inconsistencies(db)
+                        await reclaim_publish_tasks_stuck_running(db, s)
                         if s.build_stale_running_minutes > 0 or s.build_stale_worker_heartbeat_minutes > 0:
                             await sweep_stale_running_builds(db, s)
                         if s.build_stale_pending_minutes > 0:
