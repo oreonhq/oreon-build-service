@@ -157,6 +157,29 @@ def _repo_stage_lock(container: Path) -> object:
         os.close(fd)
 
 
+@contextmanager
+def _global_repogen_lock() -> object:
+    """
+    Cross-process global lock for createrepo_c runs.
+
+    One repogen at a time prevents CPU/disk storms when many publish tasks
+    land together. Per-prefix stage locking still prevents same-prefix races.
+    """
+    parent = _repo_temp_dir_parent()
+    if not parent:
+        parent = str(Path.home() / ".oreon" / "repo-tmp")
+    lock_dir = Path(parent)
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / ".oreon-global-repogen.lock"
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 def _createrepo_workers() -> int:
     raw = (os.environ.get("OREON_CREATEREPO_WORKERS") or "50").strip()
     try:
@@ -323,7 +346,8 @@ def update_repodata_at_prefix(r2_prefix: str, r2_client: R2Client | None = None)
             _progress(f"{r2_prefix} syncing RPMs to local stage (may take a while)")
             n = _sync_rpms_dir_from_r2(client, rpms_prefix, rpms_dir)
             _progress(f"{r2_prefix} synced {n} RPMs, running createrepo_c")
-            _run_createrepo(repo_root)
+            with _global_repogen_lock():
+                _run_createrepo(repo_root)
             _progress(f"{r2_prefix} createrepo_c done, uploading repodata to R2")
             repodata_dir = repo_root / "repodata"
             if repodata_dir.exists():
