@@ -38,7 +38,7 @@ class Settings(BaseSettings):
         description="PostgreSQL connection URL (async)",
     )
     database_pool_size: int = Field(
-        default=8,
+        default=16,
         ge=1,
         le=200,
         description=(
@@ -47,7 +47,7 @@ class Settings(BaseSettings):
         ),
     )
     database_max_overflow: int = Field(
-        default=4,
+        default=8,
         ge=0,
         le=200,
         description=(

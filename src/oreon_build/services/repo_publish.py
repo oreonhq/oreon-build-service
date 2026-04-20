@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 _publish_locks: dict[int, asyncio.Lock] = {}
 _publish_global_sem: asyncio.Semaphore | None = None
 _publish_global_sem_lock = threading.Lock()
+_publish_completed_attempts: set[int] = set()  # Track completed attempts for cleanup
 
 
 def _global_publish_semaphore() -> asyncio.Semaphore:
@@ -44,6 +45,17 @@ def _lock_for(attempt_id: int) -> asyncio.Lock:
         lock = asyncio.Lock()
         _publish_locks[attempt_id] = lock
     return lock
+
+
+def _cleanup_old_locks() -> None:
+    """Remove locks for completed attempts to prevent unbounded memory growth."""
+    # Keep only recent completed attempts to avoid memory bloat
+    max_cache_size = 100
+    if len(_publish_completed_attempts) > max_cache_size:
+        oldest = sorted(list(_publish_completed_attempts))[: len(_publish_completed_attempts) - max_cache_size]
+        for attempt_id in oldest:
+            _publish_locks.pop(attempt_id, None)
+            _publish_completed_attempts.discard(attempt_id)
 
 
 def process_repo_publish_sync(
@@ -100,7 +112,10 @@ async def run_repo_publish_for_attempt(
     Load artifacts for the attempt, run R2 copy/prune/repodata. Serialized per attempt_id.
     If publish_task_id is set (poll loop), claim that row; otherwise claim by attempt_id.
     """
+    from oreon_build.api.worker_api import ArtifactPayload
+
     async with _global_publish_semaphore():
+        # Check if already complete - keep lock brief
         async with _lock_for(attempt_id):
             async with async_session_maker() as db:
                 pt_r = await db.execute(select(PublishTask).where(PublishTask.attempt_id == attempt_id))
@@ -108,8 +123,7 @@ async def run_repo_publish_for_attempt(
                 if pt and pt.status == "success":
                     logger.info("repo publish skip attempt_id=%s (already success)", attempt_id)
                     return
-
-        from oreon_build.api.worker_api import ArtifactPayload
+        # Lock released here - do heavy work outside lock to avoid starving DB pool
 
         try:
             async with async_session_maker() as db:
@@ -200,6 +214,8 @@ async def run_repo_publish_for_attempt(
                 )
                 await db.commit()
             logger.info("repo publish done attempt_id=%s", attempt_id)
+            _publish_completed_attempts.add(attempt_id)
+            _cleanup_old_locks()
         except Exception as e:
             logger.exception("repo publish failed attempt_id=%s", attempt_id)
             async with async_session_maker() as db:
@@ -213,4 +229,6 @@ async def run_repo_publish_for_attempt(
                     )
                 )
                 await db.commit()
+            _publish_completed_attempts.add(attempt_id)
+            _cleanup_old_locks()
             raise
