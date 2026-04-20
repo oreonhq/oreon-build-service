@@ -27,7 +27,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from pydantic import BaseModel, Field
-from oreon_build.db.session import init_db, async_session_maker
+from oreon_build.db.session import async_session_maker
 from oreon_build.core.auth import require_admin, require_account
 from oreon_build.api.routers.auth import router as auth_router
 from oreon_build.models import (
@@ -96,7 +96,8 @@ def _dt_to_iso(dt) -> str | None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await init_db()
+    # DDL is owned by the API process (see oreon_build.api.main lifespan init_db). This process
+    # only needs a working schema, so we avoid an extra create_all and an extra startup connection.
     _configure_watchdog_logging()
 
     from oreon_build.config import get_settings
