@@ -40,34 +40,27 @@ class Settings(BaseSettings):
     database_pool_size: int = Field(
         default=32,
         ge=1,
-        le=500,
-        description=(
-            "Per-process SQLAlchemy async pool size. Keep conservative because API, scheduler, "
-            "and watchdog each maintain their own pool."
-        ),
+        description="Per-process SQLAlchemy QueuePool pool_size (DATABASE_POOL_SIZE).",
     )
     database_max_overflow: int = Field(
         default=16,
         ge=0,
-        le=500,
-        description=(
-            "Per-process burst connections beyond pool_size. Lower values prevent stampeding "
-            "PostgreSQL under load."
-        ),
+        description="Per-process QueuePool max_overflow beyond pool_size (DATABASE_MAX_OVERFLOW).",
     )
     database_pool_timeout: int = Field(
         default=30,
-        ge=5,
-        le=600,
-        description="Seconds to wait for a free connection before failing (avoids indefinite hangs).",
+        ge=0,
+        description=(
+            "Seconds to wait when acquiring a pooled connection (DATABASE_POOL_TIMEOUT). "
+            "0 is passed through to SQLAlchemy as configured there."
+        ),
     )
     database_idle_in_transaction_timeout_seconds: int = Field(
         default=120,
         ge=0,
-        le=3600,
         description=(
-            "Server-side timeout for idle open transactions. 0 disables. Helps prevent leaked "
-            "sessions from exhausting PostgreSQL."
+            "Postgres idle_in_transaction_session_timeout in ms for new connections (0 disables). "
+            "DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_SECONDS."
         ),
     )
     database_application_name: str = Field(
