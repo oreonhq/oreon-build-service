@@ -742,6 +742,31 @@ def _upload_rpm_via_presigned_r2(
 
         saw_400 = False
         for ci in range(max_pass):
+            def _probe_complete_status(wait_s: float = 180.0) -> dict | None:
+                deadline = time.time() + wait_s
+                while time.time() < deadline:
+                    try:
+                        sr = session.get(
+                            f"{controller_url}/api/worker/upload-rpm/status/{attempt_id}",
+                            params={"filename": fname},
+                            timeout=httpx.Timeout(30.0, connect=10.0),
+                        )
+                        sr.raise_for_status()
+                        body = sr.json()
+                        if isinstance(body, dict) and body.get("finalized"):
+                            return {
+                                "filename": str(body.get("filename") or fname),
+                                "r2_key": str(body.get("r2_key") or ""),
+                                "signed": bool(body.get("signed")),
+                                "pesign_applied": bool(body.get("pesign_applied") or False),
+                                "size_bytes": int(body.get("size_bytes") or size_bytes),
+                                "checksum_sha256": str(body.get("checksum_sha256") or digest),
+                            }
+                    except Exception:
+                        pass
+                    time.sleep(5.0)
+                return None
+
             def _complete() -> dict:
                 r = session.post(
                     f"{controller_url}/api/worker/upload-rpm/complete/{attempt_id}",
@@ -763,6 +788,22 @@ def _upload_rpm_via_presigned_r2(
             except httpx.HTTPStatusError as e:
                 last_exc = e
                 detail = ""
+                sc = e.response.status_code if e.response is not None else None
+                if sc in (502, 503, 504, 522, 524):
+                    logger.warning(
+                        "rpm complete got HTTP %s for %s (attempt_id=%s), probing finalize status",
+                        sc,
+                        fname,
+                        attempt_id,
+                    )
+                    recovered = _probe_complete_status()
+                    if recovered is not None:
+                        logger.info(
+                            "rpm complete recovered by status probe for %s (attempt_id=%s)",
+                            fname,
+                            attempt_id,
+                        )
+                        return recovered
                 if e.response is not None and e.response.status_code == 400:
                     saw_400 = True
                     try:

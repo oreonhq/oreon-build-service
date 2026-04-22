@@ -987,6 +987,46 @@ async def upload_worker_rpm_complete(
     }
 
 
+@router.get("/upload-rpm/status/{attempt_id}")
+async def upload_worker_rpm_status(
+    attempt_id: int,
+    db: DbSession,
+    worker: Annotated[Worker, Depends(_require_worker)],
+    filename: str = Query(..., min_length=1, max_length=512),
+):
+    """
+    Lightweight probe for presigned upload completion.
+
+    Used by workers after transient 5xx/522/524 on /complete to verify whether the
+    controller finished finalize+sign asynchronously before Cloudflare timed out.
+    """
+    _, _, _, _, _, r2_key = await _resolve_worker_rpm_upload_context(
+        db, worker, attempt_id, filename
+    )
+    fname = Path(filename.strip()).name
+    row = (
+        await db.execute(
+            select(Artifact).where(
+                Artifact.build_attempt_id == attempt_id,
+                Artifact.kind == "rpm",
+                Artifact.filename == fname,
+                Artifact.r2_key == r2_key,
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        return {"finalized": False}
+    return {
+        "finalized": True,
+        "filename": fname,
+        "r2_key": row.r2_key,
+        "signed": bool(row.is_signed),
+        "pesign_applied": False,
+        "size_bytes": int(row.size_bytes or 0),
+        "checksum_sha256": (row.checksum_sha256 or "").strip(),
+    }
+
+
 def _rpm_name_from_bytes(data: bytes) -> str | None:
     """Extract RPM NAME from bytes using host rpm command."""
     if not data:
