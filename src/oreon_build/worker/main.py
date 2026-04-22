@@ -1347,7 +1347,7 @@ def _copy_local_spec_sources_listed_by_spectool(spec_path: Path, staging_dir: Pa
     staging_dir.mkdir(parents=True, exist_ok=True)
 
     rc, out = _run(
-        ["spectool", "-l", str(spec_path.name)],
+        _spectool_cmd(["-l", str(spec_path.name)], staging_dir),
         timeout_s=120,
         cwd=str(spec_dir),
     )
@@ -1435,6 +1435,26 @@ def _seed_sources_from_spec_tree(spec_path: Path, staging_dir: Path) -> str:
     return f"Pre-seeded local source tree: copied={copied} skipped={skipped}"
 
 
+def _spectool_cmd(args: list[str], sourcedir: Path) -> list[str]:
+    """
+    Build spectool command with explicit RPM macro dirs for parse-time source lookups.
+
+    Some specs reference %{_sourcedir} files while parsing (Lua/includes). Without
+    overriding these macros, worker-local ~/.rpmmacros can point to unrelated host
+    paths (e.g. /var/lib/oreon-build-worker/rpmbuild/SOURCES) and parse fails.
+    """
+    src = str(sourcedir.resolve())
+    top = str(sourcedir.resolve().parent)
+    return [
+        "spectool",
+        "--define",
+        f"_sourcedir {src}",
+        "--define",
+        f"_topdir {top}",
+        *args,
+    ]
+
+
 def _collect_url_source_basenames_from_spectool_list(spec_path: Path) -> list[str]:
     """
     Return basenames of every URL-based Source/Patch entry in the spec.
@@ -1444,8 +1464,11 @@ def _collect_url_source_basenames_from_spectool_list(spec_path: Path) -> list[st
     missing file only surfaces as a cryptic "Bad file" error inside mock.
     """
     spec_dir = spec_path.parent
+    # For specs that expect files in %{_sourcedir} during parse, use an explicit
+    # sourcedir/topdir so spectool sees the staged workspace, not host rpmbuild dirs.
+    staging_dir = spec_dir
     rc, out = _run(
-        ["spectool", "-l", str(spec_path.name)],
+        _spectool_cmd(["-l", str(spec_path.name)], staging_dir),
         timeout_s=120,
         cwd=str(spec_dir),
     )
@@ -1486,7 +1509,7 @@ def _prepare_mock_sources_with_spectool(spec_path: Path, staging_dir: Path) -> t
     expected_url_basenames = _collect_url_source_basenames_from_spectool_list(spec_path)
 
     rc, out = _run(
-        ["spectool", "-g", "-C", str(staging_dir), str(spec_path.name)],
+        _spectool_cmd(["-g", "-C", str(staging_dir), str(spec_path.name)], staging_dir),
         timeout_s=None,
         cwd=str(spec_dir),
     )
