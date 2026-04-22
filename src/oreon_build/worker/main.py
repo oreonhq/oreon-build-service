@@ -1404,6 +1404,37 @@ def _copy_local_spec_sources_listed_by_spectool(spec_path: Path, staging_dir: Pa
     return True, "\n".join(parts)
 
 
+def _seed_sources_from_spec_tree(spec_path: Path, staging_dir: Path) -> str:
+    """
+    Best-effort pre-seed for specs that need local side files *during* parse.
+
+    Some specs (lua/includes/conditionals) touch files under SOURCES while parsing,
+    before rpmbuild starts. If those files live in distgit next to the spec, stage
+    them first so spectool/rpm parse does not fail with "Unable to open .../SOURCES/...".
+    """
+    spec_dir = spec_path.parent
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    copied = 0
+    skipped = 0
+    for p in spec_dir.rglob("*"):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(spec_dir)
+        srel = rel.as_posix()
+        # Skip VCS internals and the spec file itself.
+        if srel.startswith(".git/") or p == spec_path:
+            continue
+        dst = staging_dir / rel
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(p, dst)
+            copied += 1
+        except OSError:
+            skipped += 1
+    return f"Pre-seeded local source tree: copied={copied} skipped={skipped}"
+
+
 def _collect_url_source_basenames_from_spectool_list(spec_path: Path) -> list[str]:
     """
     Return basenames of every URL-based Source/Patch entry in the spec.
@@ -1446,6 +1477,10 @@ def _prepare_mock_sources_with_spectool(spec_path: Path, staging_dir: Path) -> t
     """
     spec_dir = spec_path.parent
     staging_dir.mkdir(parents=True, exist_ok=True)
+    log_parts: list[str] = []
+
+    # Seed local files before spectool parse; required by some specs.
+    log_parts.append(_seed_sources_from_spec_tree(spec_path, staging_dir))
 
     # Collect expected URL source basenames BEFORE downloading so we can verify after.
     expected_url_basenames = _collect_url_source_basenames_from_spectool_list(spec_path)
@@ -1463,13 +1498,14 @@ def _prepare_mock_sources_with_spectool(spec_path: Path, staging_dir: Path) -> t
                 "spectool not found. Install rpmdevtools on the worker: sudo dnf install rpmdevtools. "
                 " spectool downloads Source URLs and copies local Patch files for mock --buildsrpm."
             )
-        return False, err
+        log_parts.append(err)
+        return False, "\n".join(log_parts)
 
     files = sorted(staging_dir.rglob("*")) if staging_dir.is_dir() else []
     names = {f.name for f in files if f.is_file()}
     head = ", ".join(sorted(names)[:6])
     more = f" (+{len(names) - 6} more)" if len(names) > 6 else ""
-    log_parts = [f"URL sources via spectool: {len(names)} file(s){(': ' + head + more) if names else ''}"]
+    log_parts.append(f"URL sources via spectool: {len(names)} file(s){(': ' + head + more) if names else ''}")
 
     # Verify every expected URL source was actually downloaded. spectool can return rc=0
     # even when a download fails (server 404, timeout, etc.), which causes a confusing
