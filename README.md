@@ -4,7 +4,7 @@ Super powerful, lightweight, and easy to deploy RPM build system with CVE tracki
 
 ## Why another build system?
 
-We were intially going to use Koji for our build system as we are planning to go independent from upstream repos starting in Oreon 11, but Koji is designed to run on large infrastructure, and deploying it is a huge pain, so we wanted to make the painless build system that can run on almost any server. We don't store repos or artifacts locally, everything goes straight to Cloudflare R2 and workers can run multiple tasks at once, making it perfect for smaller projects or cost sensitive setups.
+We wanted a small, easy to deploy RPM build stack for Oreon 11 and beyond, without running a giant farm of dedicated build hardware. Nothing is stored on local disk for repos or artifacts, everything goes to Cloudflare R2, and workers can take multiple jobs, which keeps costs and ops overhead down.
 
 ## Features
 
