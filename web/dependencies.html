@@ -6,6 +6,112 @@
   <title>Dependencies - Oreon Build Service</title>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" crossorigin="anonymous" referrerpolicy="no-referrer">
   <link rel="stylesheet" href="/static/style.css?v=3">
+  <style>
+    .deps-card {
+      border-radius: 10px;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+    }
+    .deps-lead {
+      color: var(--text-muted);
+      font-size: 0.92rem;
+      margin: 0.25rem 0 0.85rem;
+    }
+    .deps-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 0.85rem;
+      align-items: start;
+    }
+    .deps-filter-box {
+      background: #fafafa;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.65rem;
+    }
+    .deps-filter-box label {
+      display: block;
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      margin-bottom: 0.35rem;
+    }
+    .deps-filter-list {
+      max-height: 12rem;
+      overflow: auto;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: #fff;
+      padding: 0.35rem 0.45rem;
+      margin-top: 0.35rem;
+    }
+    .deps-actions {
+      margin-top: 0.75rem;
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }
+    .deps-status-row {
+      margin-top: 0.6rem;
+    }
+    .deps-status-text {
+      color: var(--text-muted);
+      font-size: 0.9rem;
+      margin-bottom: 0.45rem;
+    }
+    .deps-summary {
+      display: flex;
+      gap: 0.45rem;
+      flex-wrap: wrap;
+    }
+    .deps-chip {
+      display: inline-flex;
+      align-items: center;
+      padding: 0.18rem 0.5rem;
+      border-radius: 999px;
+      font-size: 0.8rem;
+      border: 1px solid #d4d4d8;
+      background: #fff;
+      color: #333;
+    }
+    .deps-chip.warn {
+      background: #fff5f5;
+      border-color: #fecaca;
+      color: #9f1239;
+    }
+    .deps-codebox {
+      width: 100%;
+      max-width: none;
+      min-height: 96px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      background: #fbfbfc;
+    }
+    .deps-toolbar {
+      display: flex;
+      gap: 0.5rem;
+      align-items: center;
+      margin-bottom: 0.55rem;
+      flex-wrap: wrap;
+      padding: 0.4rem 0.45rem;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #fafafa;
+    }
+    .deps-toolbar label {
+      color: var(--text-muted);
+      font-size: 0.86rem;
+    }
+    .deps-table-wrap {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: auto;
+      background: #fff;
+    }
+    .deps-table-wrap table th {
+      position: sticky;
+      top: 0;
+      background: #fafafa;
+      z-index: 1;
+    }
+  </style>
 </head>
 <body>
   <header class="header">
@@ -33,52 +139,55 @@
     </nav>
   </header>
   <main class="main">
-    <section class="card">
+    <section class="card deps-card">
       <h2>Dependencies</h2>
-      <p style="color:var(--text-muted); font-size:0.9rem;">
+      <p class="deps-lead">
         Scans all release and branch repos in R2, checks package dependency closure, and highlights missing requirements.
       </p>
-      <div style="display:flex; gap:1rem; flex-wrap:wrap; align-items:flex-start;">
-        <div style="min-width:16rem; flex:1;">
+      <div class="deps-grid">
+        <div class="deps-filter-box">
           <label>Filter releases</label>
           <input id="filter-release-search" class="form-control" placeholder="Search releases...">
-          <div id="filter-releases" style="max-height:11rem; overflow:auto; border:1px solid var(--border-color,#ddd); padding:0.4rem;"></div>
+          <div id="filter-releases" class="deps-filter-list"></div>
         </div>
-        <div style="min-width:16rem; flex:1;">
+        <div class="deps-filter-box">
           <label>Filter branches</label>
           <input id="filter-branch-search" class="form-control" placeholder="Search branches...">
-          <div id="filter-branches" style="max-height:11rem; overflow:auto; border:1px solid var(--border-color,#ddd); padding:0.4rem;"></div>
+          <div id="filter-branches" class="deps-filter-list"></div>
         </div>
-        <div style="min-width:16rem; flex:1;">
+        <div class="deps-filter-box">
           <label>Filter packages and dependency names</label>
           <input id="filter-package-search" class="form-control" placeholder="Search package or requirement...">
-          <div id="filter-packages" style="max-height:11rem; overflow:auto; border:1px solid var(--border-color,#ddd); padding:0.4rem;"></div>
+          <div id="filter-packages" class="deps-filter-list"></div>
         </div>
       </div>
-      <div style="margin-top:0.75rem; display:flex; gap:0.5rem; flex-wrap:wrap;">
+      <div class="deps-actions">
         <button type="button" class="btn" id="btn-deps-refresh">Refresh graph</button>
         <button type="button" class="btn" id="btn-select-all">Select all filters</button>
         <button type="button" class="btn" id="btn-select-none">Clear filters</button>
       </div>
-      <div id="deps-status" style="margin-top:0.5rem; color:var(--text-muted);"></div>
+      <div class="deps-status-row">
+        <div id="deps-status" class="deps-status-text"></div>
+        <div id="deps-summary" class="deps-summary"></div>
+      </div>
     </section>
 
-    <section class="card">
+    <section class="card deps-card">
       <h3 style="margin-top:0;">Generated chain-build</h3>
-      <p style="color:var(--text-muted); font-size:0.85rem;">
+      <p class="deps-lead" style="margin-top:0;">
         This is generated from the currently filtered missing dependencies.
       </p>
-      <textarea id="chain-output" class="form-control" rows="4" readonly></textarea>
+      <textarea id="chain-output" class="form-control deps-codebox" rows="4" readonly></textarea>
       <div style="margin-top:0.5rem;">
         <button type="button" class="btn primary" id="btn-copy-chain">Copy chain-build string</button>
       </div>
     </section>
 
-    <section class="card">
+    <section class="card deps-card">
       <h3 style="margin-top:0;">Missing dependencies</h3>
-      <div style="display:flex; gap:0.5rem; align-items:center; margin-bottom:0.5rem; flex-wrap:wrap;">
+      <div class="deps-toolbar">
         <button type="button" class="btn" id="missing-prev">Prev</button>
-        <span id="missing-page-info" style="color:var(--text-muted);">Page 1</span>
+        <span id="missing-page-info" class="deps-status-text" style="margin:0;">Page 1</span>
         <button type="button" class="btn" id="missing-next">Next</button>
         <label style="margin-left:0.5rem;">Per page</label>
         <select id="missing-page-size" class="form-control" style="width:6rem;">
@@ -87,14 +196,14 @@
           <option value="100">100</option>
         </select>
       </div>
-      <div id="missing-table"></div>
+      <div id="missing-table" class="deps-table-wrap"></div>
     </section>
 
-    <section class="card">
+    <section class="card deps-card">
       <h3 style="margin-top:0;">Dependency graph edges</h3>
-      <div style="display:flex; gap:0.5rem; align-items:center; margin-bottom:0.5rem; flex-wrap:wrap;">
+      <div class="deps-toolbar">
         <button type="button" class="btn" id="edges-prev">Prev</button>
-        <span id="edges-page-info" style="color:var(--text-muted);">Page 1</span>
+        <span id="edges-page-info" class="deps-status-text" style="margin:0;">Page 1</span>
         <button type="button" class="btn" id="edges-next">Next</button>
         <label style="margin-left:0.5rem;">Per page</label>
         <select id="edges-page-size" class="form-control" style="width:6rem;">
@@ -103,7 +212,7 @@
           <option value="250">250</option>
         </select>
       </div>
-      <div id="edges-table"></div>
+      <div id="edges-table" class="deps-table-wrap"></div>
     </section>
   </main>
 
@@ -116,6 +225,7 @@
       var branchSel = new Set();
       var packageSel = new Set();
       var packageUniverse = [];
+      var neededUniverse = [];
       var missingPage = 1;
       var edgesPage = 1;
 
@@ -150,9 +260,19 @@
 
       function renderFilterBoxes() {
         if (!graph) return;
+        var releaseText = (byId('filter-release-search').value || '').trim().toLowerCase();
+        var branchText = (byId('filter-branch-search').value || '').trim().toLowerCase();
+        var scopedMissing = (graph.missing || []).filter(function(m) {
+          return includedRelease(m.release) && includedBranch(m.branch)
+            && (!releaseText || textIncludes(m.release, releaseText))
+            && (!branchText || textIncludes(m.branch, branchText));
+        });
+        neededUniverse = Array.from(new Set(scopedMissing.map(function(m) { return m.package; }).filter(Boolean))).sort();
+        // Keep stale selected package values from poisoning filtering.
+        packageSel.forEach(function(v) { if (neededUniverse.indexOf(v) < 0) packageSel.delete(v); });
         renderOptions('filter-releases', graph.releases || [], releaseSel, byId('filter-release-search').value);
         renderOptions('filter-branches', graph.branches || [], branchSel, byId('filter-branch-search').value);
-        renderOptions('filter-packages', packageUniverse, packageSel, byId('filter-package-search').value);
+        renderOptions('filter-packages', neededUniverse, packageSel, byId('filter-package-search').value);
       }
 
       function includedRelease(v) { return releaseSel.size === 0 || releaseSel.has(v); }
@@ -160,38 +280,75 @@
       function includedPackage(v) { return packageSel.size === 0 || packageSel.has(v); }
       function textIncludes(hay, needle) { return String(hay || '').toLowerCase().indexOf(needle) >= 0; }
 
+      function mapReqToSource(req, candidates) {
+        var r = String(req || '').trim();
+        if (!r) return null;
+        if (candidates.has(r)) return r;
+        var best = null;
+        candidates.forEach(function(c) {
+          if (r.indexOf(c + '-') === 0 || r === c) {
+            if (!best || c.length > best.length) best = c;
+          }
+        });
+        return best;
+      }
+
       function buildChainFromFiltered(missing, edges) {
-        var pkgs = Array.from(new Set(missing.map(function(m) { return m.package; }))).filter(Boolean);
+        var allPkgs = new Set((graph && graph.packages) ? graph.packages : []);
+        var neededProviders = new Set();
+        missing.forEach(function(m) {
+          var mapped = mapReqToSource(m.requirement, allPkgs);
+          if (mapped) neededProviders.add(mapped);
+        });
+        var pkgs = Array.from(neededProviders).sort();
         if (!pkgs.length) return '';
         var missingSet = new Set(pkgs);
-        var deps = {};
+        // Graph direction for build ordering:
+        // if A requires B, we add B -> A so B is built before A.
+        var nextMap = {};
         var indeg = {};
-        pkgs.forEach(function(p) { deps[p] = new Set(); indeg[p] = 0; });
+        pkgs.forEach(function(p) { nextMap[p] = new Set(); indeg[p] = 0; });
+        var participates = new Set();
         edges.forEach(function(e) {
           if (e.missing) return;
-          if (!missingSet.has(e.from) || !missingSet.has(e.to)) return;
+          if (!missingSet.has(e.from) || !missingSet.has(e.to)) return; // only order inside needed provider set
           if (e.from === e.to) return;
-          if (!deps[e.from].has(e.to)) {
-            deps[e.from].add(e.to);
-            indeg[e.to] = (indeg[e.to] || 0) + 1;
+          var provider = e.to;
+          var dependent = e.from;
+          if (!nextMap[provider].has(dependent)) {
+            nextMap[provider].add(dependent);
+            indeg[dependent] = (indeg[dependent] || 0) + 1;
+            participates.add(provider);
+            participates.add(dependent);
           }
         });
 
+        var chainPkgs = pkgs.filter(function(p) { return participates.has(p); });
+        if (!chainPkgs.length) {
+          // If provider set has no internal relation edges, return providers sorted as a single stage.
+          return pkgs.join(' ');
+        }
+
         var done = new Set();
         var groups = [];
-        while (done.size < pkgs.length) {
-          var ready = pkgs.filter(function(p) { return !done.has(p) && (indeg[p] || 0) === 0; }).sort();
+        while (done.size < chainPkgs.length) {
+          var ready = chainPkgs.filter(function(p) { return !done.has(p) && (indeg[p] || 0) === 0; }).sort();
           if (!ready.length) {
             // Cycle fallback: emit remaining in one final group.
-            ready = pkgs.filter(function(p) { return !done.has(p); }).sort();
+            ready = chainPkgs.filter(function(p) { return !done.has(p); }).sort();
           }
           groups.push(ready);
           ready.forEach(function(p) {
             done.add(p);
-            deps[p].forEach(function(nxt) { indeg[nxt] = Math.max(0, (indeg[nxt] || 0) - 1); });
+            nextMap[p].forEach(function(nxt) { indeg[nxt] = Math.max(0, (indeg[nxt] || 0) - 1); });
           });
         }
         return groups.map(function(g) { return g.join(' '); }).join(' : ');
+      }
+
+      function packageFilterPass(pkg) {
+        if (packageSel.size === 0) return true;
+        return packageSel.has(pkg);
       }
 
       function applyFilters() {
@@ -201,23 +358,34 @@
         var pkgText = (byId('filter-package-search').value || '').trim().toLowerCase();
         var missing = (graph.missing || []).filter(function(m) {
           return includedRelease(m.release) && includedBranch(m.branch)
-            && (includedPackage(m.package) || includedPackage(m.requirement))
+            && packageFilterPass(m.package)
             && (!releaseText || textIncludes(m.release, releaseText))
             && (!branchText || textIncludes(m.branch, branchText))
-            && (!pkgText || textIncludes(m.package, pkgText) || textIncludes(m.requirement, pkgText));
+            && (!pkgText || textIncludes(m.package, pkgText));
         });
         var edges = (graph.edges || []).filter(function(e) {
           return includedRelease(e.release) && includedBranch(e.branch)
-            && (includedPackage(e.from) || includedPackage(e.to) || includedPackage(e.requirement))
+            && packageFilterPass(e.from)
             && (!releaseText || textIncludes(e.release, releaseText))
             && (!branchText || textIncludes(e.branch, branchText))
-            && (!pkgText || textIncludes(e.from, pkgText) || textIncludes(e.to, pkgText) || textIncludes(e.requirement, pkgText));
+            && (!pkgText || textIncludes(e.from, pkgText));
         });
         byId('chain-output').value = buildChainFromFiltered(missing, edges);
 
         byId('deps-status').textContent =
           'Showing ' + missing.length + ' missing requirements and ' + edges.length + ' dependency edges'
           + ' with current filters.';
+        var summary = byId('deps-summary');
+        if (summary) {
+          var s = graph.summary || {};
+          var errCount = Array.isArray(graph.repo_errors) ? graph.repo_errors.length : 0;
+          summary.innerHTML =
+            '<span class="deps-chip">repos scanned ' + esc(s.repositories_scanned || 0) + '</span>'
+            + '<span class="deps-chip">nodes ' + esc(s.nodes || 0) + '</span>'
+            + '<span class="deps-chip">edges ' + esc(edges.length) + '</span>'
+            + '<span class="deps-chip">missing ' + esc(missing.length) + '</span>'
+            + (errCount ? ('<span class="deps-chip warn">repo errors ' + esc(errCount) + '</span>') : '');
+        }
 
         var missingPageSize = parseInt(byId('missing-page-size').value || '25', 10);
         var missingPages = Math.max(1, Math.ceil(missing.length / missingPageSize));
@@ -269,9 +437,7 @@
         byId('deps-status').textContent = 'Loading dependency graph...';
         return api.get('/dependencies/graph').then(function(data) {
           graph = data || {};
-          var pkgs = Array.isArray(graph.packages) ? graph.packages : [];
-          var deps = Array.isArray(graph.dependency_terms) ? graph.dependency_terms : [];
-          packageUniverse = Array.from(new Set(pkgs.concat(deps))).sort();
+          packageUniverse = [];
           releaseSel = new Set(graph.releases || []);
           branchSel = new Set(graph.branches || []);
           packageSel = new Set();

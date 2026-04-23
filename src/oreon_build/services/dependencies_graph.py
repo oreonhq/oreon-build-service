@@ -5,10 +5,12 @@ import gzip
 import bz2
 import lzma
 import logging
+import re
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
 import subprocess
+from urllib.parse import urljoin
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,8 +20,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from oreon_build.core.repo_branch import r2_publish_branch
-from oreon_build.models import Release, Repository
+from oreon_build.models import Release, ReleaseRepo, Repository
 from oreon_build.services.r2 import get_r2_client
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -38,20 +41,39 @@ class RepoTarget:
         return f"{self.releasename}|{self.branch}|{self.arch}"
 
 
-def _parse_requirement_name(raw: str) -> str | None:
+_REQ_STOPWORDS = {"and", "or", "if", "else", "with", "without", "unless"}
+
+
+def _extract_requirement_names(raw: str) -> list[str]:
     s = (raw or "").strip()
     if not s:
-        return None
-    if s.startswith("rpmlib(") or s.startswith("config("):
-        return None
-    if s.startswith("/"):
-        return None
-    for sep in (" ", ">=", "<=", "=", ">", "<"):
-        if sep in s:
-            s = s.split(sep, 1)[0].strip()
-    if not s:
-        return None
-    return s
+        return []
+    # Split on boolean operators and comparison operators while keeping soname tokens intact.
+    chunks = re.split(r"[\s,|&<>==]+", s)
+    out: list[str] = []
+    seen: set[str] = set()
+    for c in chunks:
+        t = c.strip()
+        while t.startswith("("):
+            t = t[1:].strip()
+        while t.endswith(")") and "(" not in t:
+            t = t[:-1].strip()
+        if not t:
+            continue
+        low = t.lower()
+        if low in _REQ_STOPWORDS:
+            continue
+        if t.startswith("rpmlib(") or t.startswith("config("):
+            continue
+        if t.startswith("/"):
+            continue
+        if re.fullmatch(r"[0-9]+(\.[0-9]+)*", t):
+            continue
+        # Keep useful tokens like package names, virtual provides, and soname provides.
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
 
 
 def _import_hawkey_with_system_fallback():
@@ -88,6 +110,41 @@ def _package_name_from_href(href: str) -> str | None:
     if len(parts) != 3:
         return None
     return parts[0] or None
+
+
+def _source_name_from_sourcerpm(raw: str) -> str | None:
+    s = (raw or "").strip()
+    if not s.endswith(".src.rpm"):
+        return None
+    base = s[:-8]
+    parts = base.rsplit("-", 2)
+    if len(parts) != 3:
+        return None
+    return parts[0] or None
+
+
+def _source_name_from_srpm_filename(raw: str) -> str | None:
+    s = (raw or "").strip()
+    if s.endswith(".src.rpm"):
+        s = s[:-8]
+    parts = s.rsplit("-", 2)
+    if len(parts) != 3:
+        return None
+    return parts[0] or None
+
+
+def _map_binary_to_source_name(bin_name: str, source_name_candidates: set[str] | None) -> str:
+    b = (bin_name or "").strip()
+    if not b or not source_name_candidates:
+        return b
+    if b in source_name_candidates:
+        return b
+    matches = [s for s in source_name_candidates if b.startswith(s + "-")]
+    if matches:
+        # Longest prefix wins (e.g. python3-foo-bar-devel -> python3-foo-bar)
+        matches.sort(key=len, reverse=True)
+        return matches[0]
+    return b
 
 
 def _build_chain_from_missing(items: list[dict[str, Any]]) -> str:
@@ -161,6 +218,22 @@ def _resolve_primary_key(repo_prefix: str, repomd_bytes: bytes) -> str | None:
     return None
 
 
+def _resolve_primary_href(repomd_bytes: bytes) -> str | None:
+    try:
+        root = ET.fromstring(repomd_bytes)
+    except ET.ParseError:
+        return None
+    for data in root.findall(".//{*}data"):
+        if (data.attrib.get("type") or "").strip() != "primary":
+            continue
+        loc = data.find("{*}location")
+        href = (loc.attrib.get("href") if loc is not None else "") or ""
+        href = href.strip()
+        if href:
+            return href
+    return None
+
+
 def _decompress_if_needed(raw: bytes, key: str) -> bytes:
     k = key.lower()
     if k.endswith(".gz"):
@@ -189,15 +262,22 @@ def _decompress_if_needed(raw: bytes, key: str) -> bytes:
     return raw
 
 
-def _parse_primary_xml(primary_xml: bytes) -> tuple[dict[str, dict[str, Any]], dict[str, set[str]], dict[str, set[str]]]:
-    pkgs: dict[str, dict[str, Any]] = {}
+def _parse_primary_xml(
+    primary_xml: bytes, source_name_candidates: set[str] | None = None
+) -> tuple[dict[str, dict[str, Any]], dict[str, set[str]], dict[str, set[str]]]:
+    # Track only source packages while ingesting binary metadata.
+    src_pkgs: dict[str, dict[str, Any]] = {}
     provides_index: dict[str, set[str]] = {}
     requires_index: dict[str, set[str]] = {}
     root = ET.fromstring(primary_xml)
     for pkg in root.findall(".//{*}package"):
-        name = _safe_text(pkg.find("{*}name"))
-        if not name:
+        bin_name = _safe_text(pkg.find("{*}name"))
+        if not bin_name:
             continue
+        # sourcerpm is not under the rpm namespace in primary metadata, so use wildcard ns.
+        src_name = _source_name_from_sourcerpm(_safe_text(pkg.find("{*}sourcerpm")))
+        if not src_name:
+            src_name = _map_binary_to_source_name(bin_name, source_name_candidates)
         provides: set[str] = set()
         requires: set[str] = set()
 
@@ -206,32 +286,39 @@ def _parse_primary_xml(primary_xml: bytes) -> tuple[dict[str, dict[str, Any]], d
             if not prov_name:
                 continue
             provides.add(prov_name)
-            provides_index.setdefault(prov_name, set()).add(name)
+            provides_index.setdefault(prov_name, set()).add(src_name)
 
         for e in pkg.findall(f".//{RPM_NS}requires/{RPM_NS}entry"):
             req_name = (e.attrib.get("name") or "").strip()
-            parsed = _parse_requirement_name(req_name)
-            if not parsed:
-                continue
-            requires.add(parsed)
-            requires_index.setdefault(parsed, set()).add(name)
+            parsed_tokens = _extract_requirement_names(req_name)
+            for parsed in parsed_tokens:
+                requires.add(parsed)
+                requires_index.setdefault(parsed, set()).add(src_name)
 
         loc = pkg.find("{*}location")
         href = (loc.attrib.get("href") if loc is not None else "") or ""
         src_pkg = _package_name_from_href(href)
         if src_pkg:
             provides.add(src_pkg)
-            provides_index.setdefault(src_pkg, set()).add(name)
+            provides_index.setdefault(src_pkg, set()).add(src_name)
 
-        pkgs[name] = {
-            "name": name,
-            "provides": sorted(provides),
-            "requires": sorted(requires),
+        cur = src_pkgs.get(src_name)
+        if cur is None:
+            cur = {"name": src_name, "provides": set(), "requires": set()}
+            src_pkgs[src_name] = cur
+        cur["provides"].update(provides)
+        cur["requires"].update(requires)
+    normalized: dict[str, dict[str, Any]] = {}
+    for src_name, d in src_pkgs.items():
+        normalized[src_name] = {
+            "name": src_name,
+            "provides": sorted(d["provides"]),
+            "requires": sorted(d["requires"]),
         }
-    return pkgs, provides_index, requires_index
+    return normalized, provides_index, requires_index
 
 
-def _analyze_repo(target: RepoTarget, tmpdir: Path) -> dict[str, Any]:
+def _analyze_repo(target: RepoTarget, tmpdir: Path, external_provides: set[str] | None = None) -> dict[str, Any]:
     try:
         hawkey = _import_hawkey_with_system_fallback()
     except Exception as exc:  # pragma: no cover
@@ -253,8 +340,15 @@ def _analyze_repo(target: RepoTarget, tmpdir: Path) -> dict[str, Any]:
     if not primary_raw:
         return {"repo": target, "packages": {}, "missing": [], "edges": [], "error": "primary_blob_missing"}
     try:
+        src_prefix = f"{target.releasename}/{target.branch}/src/"
+        src_candidates: set[str] = set()
+        for k in r2.iter_keys_with_prefix(src_prefix):
+            fn = k.rsplit("/", 1)[-1]
+            sn = _source_name_from_srpm_filename(fn)
+            if sn:
+                src_candidates.add(sn)
         primary_xml = _decompress_if_needed(primary_raw, primary_key)
-        pkgs, provides_index, _requires_index = _parse_primary_xml(primary_xml)
+        pkgs, provides_index, _requires_index = _parse_primary_xml(primary_xml, src_candidates)
     except Exception as exc:
         return {
             "repo": target,
@@ -291,13 +385,21 @@ def _analyze_repo(target: RepoTarget, tmpdir: Path) -> dict[str, Any]:
                         }
                     )
             else:
+                if external_provides and req in external_provides:
+                    continue
+                # Only track actionable internal gaps. If a requirement does not map to a source
+                # package candidate in this release/branch src index, it is likely an external/base
+                # repo dep or a pure virtual token and cannot be fixed by chain-building this repo set.
+                req_src = _map_binary_to_source_name(req, src_candidates)
+                if req_src not in src_candidates:
+                    continue
                 missing.append(
                     {
                         "release": target.releasename,
                         "branch": target.branch,
                         "arch": target.arch,
                         "package": pkg_name,
-                        "requirement": req,
+                        "requirement": req_src,
                     }
                 )
                 edges.append(
@@ -306,8 +408,8 @@ def _analyze_repo(target: RepoTarget, tmpdir: Path) -> dict[str, Any]:
                         "branch": target.branch,
                         "arch": target.arch,
                         "from": pkg_name,
-                        "to": req,
-                        "requirement": req,
+                        "to": req_src,
+                        "requirement": req_src,
                         "missing": True,
                     }
                 )
@@ -315,13 +417,77 @@ def _analyze_repo(target: RepoTarget, tmpdir: Path) -> dict[str, Any]:
     return {"repo": target, "packages": pkgs, "missing": missing, "edges": edges, "error": None}
 
 
+async def _external_provides_for_release_arch(
+    baseurls: list[str],
+    arch: str,
+    timeout_s: float = 12.0,
+) -> set[str]:
+    out: set[str] = set()
+    async with httpx.AsyncClient(timeout=timeout_s, follow_redirects=True) as client:
+        for base in baseurls:
+            u = (base or "").strip()
+            if not u:
+                continue
+            u = u.replace("$basearch", arch)
+            repomd_url = u.rstrip("/") + "/repodata/repomd.xml"
+            try:
+                r = await client.get(repomd_url)
+                if r.status_code != 200:
+                    continue
+                repomd = r.content
+                href = _resolve_primary_href(repomd)
+                if not href:
+                    continue
+                if href.startswith("http://") or href.startswith("https://"):
+                    purl = href
+                else:
+                    purl = urljoin(repomd_url, href)
+                rp = await client.get(purl)
+                if rp.status_code != 200:
+                    continue
+                primary_xml = _decompress_if_needed(rp.content, purl)
+                pkgs, provides_index, _ = _parse_primary_xml(primary_xml)
+                out.update(pkgs.keys())
+                out.update(provides_index.keys())
+            except Exception:
+                logger.debug("skip external repo metadata url=%s arch=%s", repomd_url, arch, exc_info=True)
+                continue
+    return out
+
+
 async def build_dependencies_graph(db: AsyncSession) -> dict[str, Any]:
     targets = await _collect_repo_targets(db)
+    rel_rows = await db.execute(select(Release))
+    releases = rel_rows.scalars().all()
+    rel_by_name = {(r.releasename or "").strip(): r for r in releases if (r.releasename or "").strip()}
+    rr = await db.execute(select(ReleaseRepo).where(ReleaseRepo.enabled.is_(True)))
+    baseurl_by_release_name: dict[str, list[str]] = {}
+    for row in rr.scalars().all():
+        rel = rel_by_name.get((getattr(row.release, "releasename", None) or "").strip()) if getattr(row, "release", None) else None
+        if rel is None:
+            rel_obj = await db.get(Release, row.release_id)
+            rel_name = (rel_obj.releasename or "").strip() if rel_obj else ""
+        else:
+            rel_name = (rel.releasename or "").strip()
+        if not rel_name:
+            continue
+        baseurl_by_release_name.setdefault(rel_name, []).append((row.baseurl or "").strip())
+
+    ext_cache: dict[tuple[str, str], set[str]] = {}
+
     with tempfile.TemporaryDirectory(prefix="oreon-deps-") as td:
         _tmpdir = Path(td)
-        results = [_analyze_repo(t, _tmpdir) for t in targets]
+        results = []
+        for t in targets:
+            rk = (t.releasename, t.arch)
+            if rk not in ext_cache:
+                ext_cache[rk] = await _external_provides_for_release_arch(
+                    baseurl_by_release_name.get(t.releasename, []),
+                    t.arch,
+                )
+            results.append(_analyze_repo(t, _tmpdir, external_provides=ext_cache[rk]))
 
-    releases: set[str] = set()
+    releases_set: set[str] = set()
     branches: set[str] = set()
     package_names: set[str] = set()
     dependency_terms: set[str] = set()
@@ -332,7 +498,7 @@ async def build_dependencies_graph(db: AsyncSession) -> dict[str, Any]:
 
     for result in results:
         target: RepoTarget = result["repo"]
-        releases.add(target.releasename)
+        releases_set.add(target.releasename)
         branches.add(target.branch)
         if result.get("error"):
             repo_errors.append({"repo": target.key, "error": str(result["error"])})
@@ -380,7 +546,7 @@ async def build_dependencies_graph(db: AsyncSession) -> dict[str, Any]:
             "edges": len(all_edges),
             "missing_requirements": len(all_missing),
         },
-        "releases": sorted(releases),
+        "releases": sorted(releases_set),
         "branches": sorted(branches),
         "packages": sorted(package_names),
         "dependency_terms": sorted(dependency_terms),
