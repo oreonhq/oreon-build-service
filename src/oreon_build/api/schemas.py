@@ -271,6 +271,39 @@ class BuildTrigger(BaseModel):
         return self
 
 
+class ChainBuildTrigger(BaseModel):
+    """DistGit chain build (colon separates parallel groups; no colon means one package per stage)."""
+
+    chain_spec: str = Field(
+        ...,
+        min_length=1,
+        max_length=4096,
+        description=(
+            "Whitespace-separated NVRs or package names. Colon ``:`` separates groups that run in parallel; "
+            "groups run in order. With no colons, each package is its own group (strictly sequential)."
+        ),
+    )
+    release_id: int = Field(..., description="Release to build for")
+    architectures: List[str] = Field(
+        default=["x86_64", "aarch64"],
+        description="Architectures to build for (same as single trigger)",
+    )
+    skip_complete_arches: bool = Field(
+        default=True,
+        description="If true, skip arches that already have a successful build for that package and target.",
+    )
+    preferred_mock_environment_id: Optional[int] = Field(
+        None, description="Mock env for new distgit packages (must belong to the release)"
+    )
+    distgit_url: Optional[str] = Field(
+        None,
+        max_length=1024,
+        description="Git URL for distgit spec repo (default oreonhq/rpm-specfiles)",
+    )
+    distgit_branch: Optional[str] = Field(None, max_length=128, description="Branch fragment in distgit URL")
+    priority: int = 0
+
+
 class BuildJobResponse(BaseModel):
     id: int
     package_id: int
@@ -288,8 +321,18 @@ class BuildJobResponse(BaseModel):
     priority: int
     created_at: datetime
     completed_at: Optional[datetime] = None
+    chain_id: Optional[int] = None
+    chain_stage_index: Optional[int] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class ChainBuildTriggerResponse(BaseModel):
+    chain_id: int
+    chain_status: str
+    stages: List[List[str]]
+    chain_spec: str
+    jobs: List[BuildJobResponse]
 
 
 class CurrentFailureItem(BaseModel):

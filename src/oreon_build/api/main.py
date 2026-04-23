@@ -210,7 +210,11 @@ async def lifespan(app: FastAPI):
         while True:
             try:
                 s = get_settings()
-                if s.github_catchup_interval_seconds <= 0 or not s.github_token:
+                if (
+                    s.github_catchup_interval_seconds <= 0
+                    or not s.github_token
+                    or not s.github_push_auto_build_enabled
+                ):
                     if not _github_catchup_misconfig_logged:
                         _github_catchup_misconfig_logged = True
                         reasons: list[str] = []
@@ -221,6 +225,10 @@ async def lifespan(app: FastAPI):
                             )
                         if s.github_catchup_interval_seconds <= 0:
                             reasons.append("GITHUB_CATCHUP_INTERVAL_SECONDS is 0")
+                        if not s.github_push_auto_build_enabled:
+                            reasons.append(
+                                "GITHUB_PUSH_AUTO_BUILD_ENABLED is false (set true to enqueue distgit builds from webhooks and catch-up)"
+                            )
                         logger.warning(
                             "GitHub push catch-up disabled: %s",
                             " ".join(reasons),

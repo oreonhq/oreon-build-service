@@ -1698,6 +1698,13 @@ async def report_result(
     # Final status transitions must survive failures in artifact insert / repo publish enqueue /
     # promotion creation / R2 cleanup during large autobuild bursts.
     await db.commit()
+    if st_l in ("failed", "cancelled"):
+        try:
+            from oreon_build.services.build_chain import notify_chain_job_terminal_after_result
+
+            await notify_chain_job_terminal_after_result(job.id, st_l, payload.error_message)
+        except Exception:
+            logger.exception("chain notify after terminal job result job_id=%s", job.id)
     for a in payload.artifacts:
         stmt = (
             pg_insert(Artifact.__table__)
