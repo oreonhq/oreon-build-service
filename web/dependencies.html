@@ -262,14 +262,20 @@
         if (!graph) return;
         var releaseText = (byId('filter-release-search').value || '').trim().toLowerCase();
         var branchText = (byId('filter-branch-search').value || '').trim().toLowerCase();
-        var scopedMissing = (graph.missing || []).filter(function(m) {
-          return includedRelease(m.release) && includedBranch(m.branch)
-            && (!releaseText || textIncludes(m.release, releaseText))
-            && (!branchText || textIncludes(m.branch, branchText));
+        // Package filter universe: all source packages involved in missing build-dep edges.
+        var involvedPkgs = new Set();
+        (graph.edges || []).forEach(function(e) {
+          if (!e.missing) return;
+          if (!includedRelease(e.release) && releaseSel.size > 0) return;
+          if (!includedBranch(e.branch) && branchSel.size > 0) return;
+          if (releaseText && !textIncludes(e.release, releaseText)) return;
+          if (branchText && !textIncludes(e.branch, branchText)) return;
+          if (e.from) involvedPkgs.add(e.from);
+          if (e.to) involvedPkgs.add(e.to);
         });
-        neededUniverse = Array.from(new Set(scopedMissing.map(function(m) { return m.package; }).filter(Boolean))).sort();
-        // Keep stale selected package values from poisoning filtering.
-        packageSel.forEach(function(v) { if (neededUniverse.indexOf(v) < 0) packageSel.delete(v); });
+        neededUniverse = Array.from(involvedPkgs).sort();
+        // Drop stale selections.
+        packageSel.forEach(function(v) { if (!involvedPkgs.has(v)) packageSel.delete(v); });
         renderOptions('filter-releases', graph.releases || [], releaseSel, byId('filter-release-search').value);
         renderOptions('filter-branches', graph.branches || [], branchSel, byId('filter-branch-search').value);
         renderOptions('filter-packages', neededUniverse, packageSel, byId('filter-package-search').value);
@@ -277,110 +283,83 @@
 
       function includedRelease(v) { return releaseSel.size === 0 || releaseSel.has(v); }
       function includedBranch(v) { return branchSel.size === 0 || branchSel.has(v); }
-      function includedPackage(v) { return packageSel.size === 0 || packageSel.has(v); }
       function textIncludes(hay, needle) { return String(hay || '').toLowerCase().indexOf(needle) >= 0; }
 
-      function mapReqToSource(req, candidates) {
-        var r = String(req || '').trim();
-        if (!r) return null;
-        if (candidates.has(r)) return r;
-        return null;
-      }
+      /**
+       * Build a chain-build string from the filtered missing-dependency edges.
+       *
+       * Each edge {from: A, to: B, missing: true} means:
+       *   "source package A has a BuildRequires that should come from source B,
+       *    but B is not yet built / does not yet provide that binary."
+       *
+       * Build order: B must be built BEFORE A.
+       *
+       * Algorithm (Kahn's topological sort):
+       *   - deps[A] = set of sources A needs built first  (B for the above edge)
+       *   - dependents[B] = set of sources that need B
+       *   - Stage 0: packages with empty deps (nothing they need is still missing)
+       *   - Stage N: packages whose deps were satisfied in stages 0..N-1
+       */
+      function buildChainFromFiltered(missingEdges) {
+        // Collect all unique source packages involved in missing edges.
+        var allNodes = new Set();
+        var deps = {};       // node -> Set of nodes it depends on (must be built first)
+        var dependents = {}; // node -> Set of nodes that depend on it
 
-      function normalizeRequirementForChain(req) {
-        var r = String(req || '').trim();
-        if (!r) return '';
-        // strip richdep punctuation at edges
-        while (r.startsWith('(')) r = r.slice(1).trim();
-        while (r.endsWith(')')) r = r.slice(0, -1).trim();
-        // keep first token before comparison/version operators
-        r = r.split(/\s+/)[0] || '';
-        r = r.split(/[<>=]/)[0] || '';
-        return r.trim();
-      }
-
-      function looksLikePackageName(s) {
-        var t = String(s || '').trim();
-        if (!t) return false;
-        if (t.indexOf('/') >= 0) return false;
-        if (t.indexOf('(') >= 0) return false;
-        if (/^[0-9]+(\.[0-9]+)*$/.test(t)) return false;
-        return /^[A-Za-z0-9][A-Za-z0-9+._-]*$/.test(t);
-      }
-
-      function buildChainFromFiltered(missing, edges) {
-        var allPkgs = new Set((graph && graph.packages) ? graph.packages : []);
-        var neededProviders = new Set();
-        missing.forEach(function(m) {
-          var reqName = normalizeRequirementForChain(m.requirement);
-          if (!reqName) return;
-          var mapped = mapReqToSource(reqName, allPkgs);
-          if (mapped) {
-            neededProviders.add(mapped);
-            return;
-          }
-          // Keep unresolved package-like requirements too (e.g. *-srpm-macros, debugedit, binutils, ed).
-          if (looksLikePackageName(reqName)) neededProviders.add(reqName);
-        });
-        var pkgs = Array.from(neededProviders).sort();
-        if (!pkgs.length) return '';
-        var missingSet = new Set(pkgs);
-        // Graph direction for build ordering:
-        // if A requires B, we add B -> A so B is built before A.
-        var nextMap = {};
-        var indeg = {};
-        pkgs.forEach(function(p) { nextMap[p] = new Set(); indeg[p] = 0; });
-        var participates = new Set();
-        edges.forEach(function(e) {
-          if (e.missing) return;
-          if (!missingSet.has(e.from) || !missingSet.has(e.to)) return; // only order inside needed provider set
-          if (e.from === e.to) return;
-          var provider = e.to;
-          var dependent = e.from;
-          if (!nextMap[provider].has(dependent)) {
-            nextMap[provider].add(dependent);
-            indeg[dependent] = (indeg[dependent] || 0) + 1;
-            participates.add(provider);
-            participates.add(dependent);
-          }
+        missingEdges.forEach(function(e) {
+          var consumer = e.from;  // the package that needs something
+          var provider = e.to;    // the package that should provide it
+          if (!consumer || !provider || consumer === provider) return;
+          allNodes.add(consumer);
+          allNodes.add(provider);
+          if (!deps[consumer]) deps[consumer] = new Set();
+          if (!dependents[provider]) dependents[provider] = new Set();
+          deps[consumer].add(provider);
+          dependents[provider].add(consumer);
         });
 
-        var chainPkgs = pkgs.filter(function(p) { return participates.has(p); });
-        if (!chainPkgs.length) {
-          // If provider set has no internal relation edges, return providers sorted as a single stage.
-          return pkgs.join(' ');
-        }
+        if (!allNodes.size) return '';
 
-        // Higher out-degree means "needed by more packages", so build it earlier in stage ordering.
-        var score = {};
-        chainPkgs.forEach(function(p) { score[p] = (nextMap[p] && nextMap[p].size) ? nextMap[p].size : 0; });
+        // Initialize in-degree for Kahn's (# of unmet deps per node).
+        var inDeg = {};
+        allNodes.forEach(function(n) {
+          inDeg[n] = (deps[n] ? deps[n].size : 0);
+        });
+
+        // Score by number of dependents (more dependents = more critical = build earlier).
         function byPriority(a, b) {
-          var sa = score[a] || 0;
-          var sb = score[b] || 0;
-          if (sa !== sb) return sb - sa;
+          var sa = (dependents[a] ? dependents[a].size : 0);
+          var sb = (dependents[b] ? dependents[b].size : 0);
+          if (sb !== sa) return sb - sa;
           return a.localeCompare(b);
         }
 
+        var nodeList = Array.from(allNodes);
         var done = new Set();
         var groups = [];
-        while (done.size < chainPkgs.length) {
-          var ready = chainPkgs.filter(function(p) { return !done.has(p) && (indeg[p] || 0) === 0; }).sort(byPriority);
+
+        while (done.size < nodeList.length) {
+          var ready = nodeList
+            .filter(function(n) { return !done.has(n) && inDeg[n] === 0; })
+            .sort(byPriority);
+
           if (!ready.length) {
-            // Cycle fallback: emit remaining in one final group.
-            ready = chainPkgs.filter(function(p) { return !done.has(p); }).sort(byPriority);
+            // Cycle in the dependency graph - emit remaining as a single group.
+            ready = nodeList.filter(function(n) { return !done.has(n); }).sort(byPriority);
           }
+
           groups.push(ready);
-          ready.forEach(function(p) {
-            done.add(p);
-            nextMap[p].forEach(function(nxt) { indeg[nxt] = Math.max(0, (indeg[nxt] || 0) - 1); });
+          ready.forEach(function(n) {
+            done.add(n);
+            if (dependents[n]) {
+              dependents[n].forEach(function(dep) {
+                inDeg[dep] = Math.max(0, (inDeg[dep] || 0) - 1);
+              });
+            }
           });
         }
-        return groups.map(function(g) { return g.join(' '); }).join(' : ');
-      }
 
-      function packageFilterPass(pkg) {
-        if (packageSel.size === 0) return true;
-        return packageSel.has(pkg);
+        return groups.map(function(g) { return g.join(' '); }).join(' : ');
       }
 
       function applyFilters() {
@@ -388,64 +367,84 @@
         var releaseText = (byId('filter-release-search').value || '').trim().toLowerCase();
         var branchText = (byId('filter-branch-search').value || '').trim().toLowerCase();
         var pkgText = (byId('filter-package-search').value || '').trim().toLowerCase();
-        var missing = (graph.missing || []).filter(function(m) {
-          return includedRelease(m.release) && includedBranch(m.branch)
-            && packageFilterPass(m.package)
-            && (!releaseText || textIncludes(m.release, releaseText))
-            && (!branchText || textIncludes(m.branch, branchText))
-            && (!pkgText || textIncludes(m.package, pkgText));
-        });
-        var edges = (graph.edges || []).filter(function(e) {
+
+        function edgePass(e) {
+          var pkgMatch = packageSel.size === 0 || packageSel.has(e.from) || packageSel.has(e.to);
           return includedRelease(e.release) && includedBranch(e.branch)
-            && packageFilterPass(e.from)
+            && pkgMatch
             && (!releaseText || textIncludes(e.release, releaseText))
             && (!branchText || textIncludes(e.branch, branchText))
-            && (!pkgText || textIncludes(e.from, pkgText));
+            && (!pkgText || textIncludes(e.from, pkgText) || textIncludes(e.to, pkgText));
+        }
+
+        // Split edges into missing and ok.
+        var filteredEdges = (graph.edges || []).filter(edgePass);
+        var missingEdges = filteredEdges.filter(function(e) { return e.missing; });
+        var okEdges = filteredEdges.filter(function(e) { return !e.missing; });
+
+        // Deduplicate missing edges by (from, to) across arches.
+        var seenMissingKey = new Set();
+        var uniqueMissingEdges = [];
+        missingEdges.forEach(function(e) {
+          var k = e.release + '|' + e.branch + '|' + e.from + '|' + e.to;
+          if (!seenMissingKey.has(k)) {
+            seenMissingKey.add(k);
+            uniqueMissingEdges.push(e);
+          }
         });
-        byId('chain-output').value = buildChainFromFiltered(missing, edges);
+
+        byId('chain-output').value = buildChainFromFiltered(uniqueMissingEdges);
 
         byId('deps-status').textContent =
-          'Showing ' + missing.length + ' missing requirements and ' + edges.length + ' dependency edges'
-          + ' with current filters.';
+          'Showing ' + uniqueMissingEdges.length + ' missing build dependencies and '
+          + okEdges.length + ' satisfied dependencies with current filters.';
+
         var summary = byId('deps-summary');
         if (summary) {
           var s = graph.summary || {};
           var errCount = Array.isArray(graph.repo_errors) ? graph.repo_errors.length : 0;
           summary.innerHTML =
             '<span class="deps-chip">repos scanned ' + esc(s.repositories_scanned || 0) + '</span>'
-            + '<span class="deps-chip">nodes ' + esc(s.nodes || 0) + '</span>'
-            + '<span class="deps-chip">edges ' + esc(edges.length) + '</span>'
-            + '<span class="deps-chip">missing ' + esc(missing.length) + '</span>'
+            + '<span class="deps-chip">source packages ' + esc(s.nodes || 0) + '</span>'
+            + '<span class="deps-chip">missing build deps ' + esc(uniqueMissingEdges.length) + '</span>'
+            + '<span class="deps-chip">satisfied deps ' + esc(okEdges.length) + '</span>'
             + (errCount ? ('<span class="deps-chip warn">repo errors ' + esc(errCount) + '</span>') : '');
         }
 
+        // Missing build-dependency table (deduplicated, per release+branch).
         var missingPageSize = parseInt(byId('missing-page-size').value || '25', 10);
-        var missingPages = Math.max(1, Math.ceil(missing.length / missingPageSize));
+        var missingPages = Math.max(1, Math.ceil(uniqueMissingEdges.length / missingPageSize));
         if (missingPage > missingPages) missingPage = missingPages;
         if (missingPage < 1) missingPage = 1;
         var missingStart = (missingPage - 1) * missingPageSize;
-        var missingRows = missing.slice(missingStart, missingStart + missingPageSize).map(function(m) {
+        var missingRows = uniqueMissingEdges.slice(missingStart, missingStart + missingPageSize).map(function(e) {
           return '<tr>'
-            + '<td>' + esc(m.release) + '</td>'
-            + '<td>' + esc(m.branch) + '</td>'
-            + '<td>' + esc(m.arch) + '</td>'
-            + '<td>' + esc(m.package) + '</td>'
-            + '<td>' + esc(m.requirement) + '</td>'
+            + '<td>' + esc(e.release) + '</td>'
+            + '<td>' + esc(e.branch) + '</td>'
+            + '<td>' + esc(e.from) + '</td>'
+            + '<td>' + esc(e.requirement) + '</td>'
+            + '<td style="color:#c0392b;">' + esc(e.to) + '</td>'
             + '</tr>';
         }).join('');
         byId('missing-table').innerHTML =
-          '<table class="table-list"><thead><tr><th>Release</th><th>Branch</th><th>Arch</th><th>Package</th><th>Missing requirement</th></tr></thead>'
-          + '<tbody>' + (missingRows || '<tr><td colspan="5">No missing dependencies in this filter view.</td></tr>') + '</tbody></table>';
-        byId('missing-page-info').textContent = 'Page ' + missingPage + ' of ' + missingPages + ' (' + missing.length + ' rows)';
+          '<table class="table-list"><thead><tr>'
+          + '<th>Release</th><th>Branch</th>'
+          + '<th>Package (needs rebuild)</th>'
+          + '<th>BuildRequires</th>'
+          + '<th>Unbuilt provider</th>'
+          + '</tr></thead>'
+          + '<tbody>' + (missingRows || '<tr><td colspan="5">No missing build dependencies in this filter view.</td></tr>') + '</tbody></table>';
+        byId('missing-page-info').textContent = 'Page ' + missingPage + ' of ' + missingPages + ' (' + uniqueMissingEdges.length + ' rows)';
         byId('missing-prev').disabled = missingPage <= 1;
         byId('missing-next').disabled = missingPage >= missingPages;
 
+        // All edges table (both satisfied and missing).
         var edgesPageSize = parseInt(byId('edges-page-size').value || '50', 10);
-        var edgesPages = Math.max(1, Math.ceil(edges.length / edgesPageSize));
+        var edgesPages = Math.max(1, Math.ceil(filteredEdges.length / edgesPageSize));
         if (edgesPage > edgesPages) edgesPage = edgesPages;
         if (edgesPage < 1) edgesPage = 1;
         var edgesStart = (edgesPage - 1) * edgesPageSize;
-        var edgeRows = edges.slice(edgesStart, edgesStart + edgesPageSize).map(function(e) {
+        var edgeRows = filteredEdges.slice(edgesStart, edgesStart + edgesPageSize).map(function(e) {
           var to = e.missing ? ('<span style="color:#c0392b;">' + esc(e.to) + '</span>') : esc(e.to);
           return '<tr>'
             + '<td>' + esc(e.release) + '</td>'
@@ -454,13 +453,16 @@
             + '<td>' + esc(e.from) + '</td>'
             + '<td>' + esc(e.requirement) + '</td>'
             + '<td>' + to + '</td>'
-            + '<td>' + (e.missing ? 'missing' : 'ok') + '</td>'
+            + '<td>' + (e.missing ? '<span style="color:#c0392b;">missing</span>' : 'ok') + '</td>'
             + '</tr>';
         }).join('');
         byId('edges-table').innerHTML =
-          '<table class="table-list"><thead><tr><th>Release</th><th>Branch</th><th>Arch</th><th>From package</th><th>Requirement</th><th>Provider</th><th>Status</th></tr></thead>'
-          + '<tbody>' + (edgeRows || '<tr><td colspan="7">No edges in this filter view.</td></tr>') + '</tbody></table>';
-        byId('edges-page-info').textContent = 'Page ' + edgesPage + ' of ' + edgesPages + ' (' + edges.length + ' rows)';
+          '<table class="table-list"><thead><tr>'
+          + '<th>Release</th><th>Branch</th><th>Arch</th>'
+          + '<th>Source (needs)</th><th>BuildRequires</th><th>Provider source</th><th>Status</th>'
+          + '</tr></thead>'
+          + '<tbody>' + (edgeRows || '<tr><td colspan="7">No dependency edges in this filter view.</td></tr>') + '</tbody></table>';
+        byId('edges-page-info').textContent = 'Page ' + edgesPage + ' of ' + edgesPages + ' (' + filteredEdges.length + ' rows)';
         byId('edges-prev').disabled = edgesPage <= 1;
         byId('edges-next').disabled = edgesPage >= edgesPages;
       }
