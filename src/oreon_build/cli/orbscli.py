@@ -58,7 +58,7 @@ def get_api_url() -> str:
     if env:
         return env.rstrip("/")
     cfg = _load_json(CONFIG_PATH)
-    return str(cfg.get("api_url", "http://localhost:8000")).rstrip("/")
+    return str(cfg.get("api_url", "https://build.oreonhq.com")).rstrip("/")
 
 
 def get_watchdog_url() -> str:
@@ -168,6 +168,39 @@ def parse_package_names(args: tuple[str, ...]) -> list[str]:
         return []
     parts = re.split(r"[\s,]+", joined)
     return [p for p in parts if p]
+
+
+def _nevra_to_name(nevra: str) -> str:
+    """Best-effort RPM name from a NEVRA string (strip arch, epoch, version-release)."""
+    s = nevra.strip()
+    for arch in (".x86_64", ".aarch64", ".ppc64le", ".s390x", ".noarch", ".i686"):
+        if s.endswith(arch):
+            s = s[: -len(arch)]
+            break
+    m = re.match(r"^(?:([^:]+):)?(.+)-([^-]+-[^-]+)$", s)
+    if m:
+        return m.group(2)
+    if s.count("-") >= 2:
+        return s.rsplit("-", 2)[0]
+    return s
+
+
+def _spec_dir_for_rpm(spec_root: Path, rpm_name: str) -> str | None:
+    """Return dist-git style directory name under spec_root if a spec file exists."""
+    if (spec_root / rpm_name).is_dir():
+        p = spec_root / rpm_name
+        if (p / f"{rpm_name}.spec").is_file():
+            return rpm_name
+        specs = list(p.glob("*.spec"))
+        if len(specs) == 1:
+            return rpm_name
+    if rpm_name.startswith("python3-"):
+        alt = "python-" + rpm_name[len("python3-") :]
+        if (spec_root / alt).is_dir() and (
+            (spec_root / alt / f"{alt}.spec").is_file() or len(list((spec_root / alt).glob("*.spec"))) == 1
+        ):
+            return alt
+    return None
 
 
 def resolve_release_id(api_base: str, token: str | None, release: str) -> int:
@@ -304,6 +337,76 @@ def cmd_whoami() -> None:
     click.echo("user: %s\nrole: %s" % (p.get("sub", "?"), p.get("role", "?")))
 
 
+@cli.command("iso-dnf-log")
+@click.argument(
+    "log_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--spec-root",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Package trees root (default: fedora-rpms/oreon-11-rp1 under the rpm-specfiles repo).",
+)
+@click.option(
+    "--release",
+    "release_ref",
+    default="oreon-11-rp1",
+    help="Printed in the suggested orbscli build line.",
+)
+@click.option(
+    "--print-providers",
+    is_flag=True,
+    help="List unique 'nothing provides …' strings from the log.",
+)
+def cmd_iso_dnf_log(
+    log_path: Path,
+    spec_root: Path | None,
+    release_ref: str,
+    print_providers: bool,
+) -> None:
+    """Parse anaconda/dnf problem lines and suggest orbscli build for local specs."""
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    names: set[str] = set()
+    for m in re.finditer(r"\bneeded by (\S+) from\b", text):
+        names.add(_nevra_to_name(m.group(1)))
+    if print_providers:
+        provs: set[str] = set()
+        for m in re.finditer(r"\bnothing provides ([^\n]+?) needed by\b", text):
+            provs.add(m.group(1).strip())
+        if provs:
+            click.echo("Missing providers (%d):" % len(provs))
+            for p in sorted(provs):
+                click.echo("  %s" % p)
+            click.echo("")
+    root = (
+        spec_root.resolve()
+        if spec_root is not None
+        else (Path(__file__).resolve().parent.parent / "fedora-rpms" / "oreon-11-rp1")
+    )
+    have: list[str] = []
+    seen: set[str] = set()
+    for n in sorted(names):
+        d = _spec_dir_for_rpm(root, n)
+        if d and d not in seen:
+            seen.add(d)
+            have.append(d)
+    click.echo("RPM names referenced in log: %d" % len(names))
+    if have:
+        click.echo("Local spec dirs (%d): %s" % (len(have), " ".join(have)))
+        click.echo("orbscli build --release %s %s" % (release_ref, " ".join(have)))
+    else:
+        click.echo("No matching package dirs under %s" % root)
+    uncovered = sorted(n for n in names if _spec_dir_for_rpm(root, n) is None)
+    if uncovered:
+        lim = 100
+        tail = uncovered[lim:]
+        head = uncovered[:lim]
+        click.echo("No local spec dir for (%d): %s" % (len(uncovered), " ".join(head)))
+        if tail:
+            click.echo("  … (%d more)" % len(tail))
+
+
 @cli.command("build")
 @click.argument("packages", nargs=-1, required=True)
 @click.option("--release", "release_ref", required=True, help="Release id or releasename (e.g. oreon-11-rp1)")
@@ -400,6 +503,102 @@ def cmd_build(
             jid = int(job["id"])
             click.echo("queued build job %s package=%s arch=%s" % (jid, pkg, job.get("architecture") or ""))
             jobs_out.append(job)
+
+    need_poll = wait or log_path is not None
+    if need_poll and jobs_out:
+        for job in jobs_out:
+            _wait_job_and_maybe_log(api_base, token, int(job["id"]), log_path)
+
+
+@cli.command("chain-build")
+@click.argument("spec_parts", nargs=-1, required=True)
+@click.option("--release", "release_ref", required=True, help="Release id or releasename (e.g. oreon-11-rp1)")
+@click.option(
+    "--arch",
+    default="x86_64,aarch64",
+    help="Comma-separated arches (default x86_64,aarch64)",
+)
+@click.option(
+    "--log",
+    "log_dir",
+    type=click.Path(),
+    default=None,
+    help="Directory for per-job logs for first-stage jobs only",
+)
+@click.option(
+    "--wait/--no-wait",
+    default=False,
+    help="Poll until each first-stage job reaches a terminal state",
+)
+@click.option(
+    "--skip-complete/--no-skip-complete",
+    "skip_complete",
+    default=True,
+    help="Skip arches that already have a successful build (API default)",
+)
+@click.option(
+    "--distgit-url",
+    envvar="ORBSCLI_DISTGIT_URL",
+    default="https://github.com/oreonhq/rpm-specfiles.git",
+    help="Git URL for distgit sources",
+)
+@click.option(
+    "--distgit-branch",
+    envvar="ORBSCLI_DISTGIT_BRANCH",
+    default="main",
+    help="Branch fragment in distgit URL",
+)
+def cmd_chain_build(
+    spec_parts: tuple[str, ...],
+    release_ref: str,
+    arch: str,
+    log_dir: str | None,
+    wait: bool,
+    skip_complete: bool,
+    distgit_url: str,
+    distgit_branch: str,
+) -> None:
+    """Queue a distgit chain build (colon separates parallel groups; no colon means sequential)."""
+    token = require_auth(get_token())
+    require_maintainer(token)
+    api_base = get_api_url()
+    rid = resolve_release_id(api_base, token, release_ref)
+    chain_spec = " ".join(spec_parts).strip()
+    if not chain_spec:
+        click.echo("Empty chain spec.", err=True)
+        sys.exit(2)
+    arches = [a.strip() for a in arch.split(",") if a.strip()]
+    log_path = Path(log_dir) if log_dir else None
+    if log_path:
+        log_path.mkdir(parents=True, exist_ok=True)
+
+    body: dict[str, Any] = {
+        "chain_spec": chain_spec,
+        "release_id": rid,
+        "architectures": arches,
+        "skip_complete_arches": skip_complete,
+        "distgit_url": distgit_url,
+        "distgit_branch": distgit_branch,
+    }
+    data = http_json("POST", api_base, "/api/builds/chain-trigger", token=token, json_body=body, timeout=300.0)
+    if not isinstance(data, dict):
+        click.echo("Unexpected chain-trigger response", err=True)
+        sys.exit(1)
+    cid = data.get("chain_id")
+    click.echo("chain_id=%s status=%s" % (cid, data.get("chain_status") or ""))
+    jobs = data.get("jobs") or []
+    if not isinstance(jobs, list):
+        jobs = []
+    jobs_out: list[dict[str, Any]] = []
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        jid = int(job["id"])
+        click.echo(
+            "queued build job %s arch=%s chain_stage=%s"
+            % (jid, job.get("architecture") or "", job.get("chain_stage_index") if job.get("chain_stage_index") is not None else "")
+        )
+        jobs_out.append(job)
 
     need_poll = wait or log_path is not None
     if need_poll and jobs_out:
@@ -579,8 +778,8 @@ def builds_failures(release_id: int | None) -> None:
 @click.option("--dry-run", is_flag=True, help="Print actions only, no POSTs.")
 @click.option(
     "--arch",
-    default="x86_64,aarch64",
-    help="Rebuild mode only, comma-separated arches passed to /api/builds/trigger.",
+    default="",
+    help="Rebuild mode only. If set, comma-separated arches passed to /api/builds/trigger. If omitted, reuse the failing arch(es) from current-failures rows per package.",
 )
 @click.option(
     "--distgit-url",
@@ -661,15 +860,13 @@ def builds_fix_current(
         return
 
     # rebuild: one trigger per (release_id, package_name), always skip_complete_arches
-    arcs = [a.strip() for a in arch.split(",") if a.strip()]
-    if not arcs:
-        click.echo("No architectures after parsing --arch", err=True)
-        sys.exit(2)
-
+    explicit_arches = [a.strip() for a in arch.split(",") if a.strip()]
     keys: dict[tuple[int, str], dict[str, Any]] = {}
+    arches_for_key: dict[tuple[int, str], set[str]] = {}
     for row in out:
         rid = row.get("release_id")
         pkg = row.get("package_name")
+        row_arch = str(row.get("architecture") or "").strip()
         if rid is None and row.get("release_name"):
             try:
                 rid = resolve_release_id(api_base, token_read, str(row["release_name"]))
@@ -679,10 +876,17 @@ def builds_fix_current(
             click.echo("skip row missing release_id or package_name: %s" % (row,), err=True)
             continue
         rid = int(rid)
-        keys[(rid, str(pkg))] = row
+        key = (rid, str(pkg))
+        keys[key] = row
+        if row_arch:
+            arches_for_key.setdefault(key, set()).add(row_arch)
 
     if dry_run:
         for rid, pkg in sorted(keys.keys(), key=lambda t: (t[0], t[1].lower())):
+            key = (rid, pkg)
+            arcs = explicit_arches or sorted(arches_for_key.get(key, set()))
+            if not arcs:
+                arcs = ["x86_64", "aarch64"]
             click.echo(
                 "dry-run rebuild release_id=%s package=%s skip_complete_arches=yes arches=%s"
                 % (rid, pkg, ",".join(arcs))
@@ -693,6 +897,11 @@ def builds_fix_current(
     require_maintainer(token)
     release_names: dict[int, str] = {}
     for rid, pkg in sorted(keys.keys(), key=lambda t: (t[0], t[1].lower())):
+        key = (rid, pkg)
+        arcs = explicit_arches or sorted(arches_for_key.get(key, set()))
+        if not arcs:
+            click.echo("skip package %s release %s, no inferred failing arches (set --arch to override)" % (pkg, rid), err=True)
+            continue
         if rid not in release_names:
             rel = http_json("GET", api_base, f"/api/releases/{rid}", token=token)
             rn = str(rel.get("releasename") or "").strip()
@@ -731,8 +940,35 @@ def builds_fix_current(
 
 @cli.group("logs")
 def grp_logs() -> None:
-    """Fetch build logs."""
+    """Fetch build logs.
+
+    Typical flow: ``orbscli builds list --status failed --limit 20`` then
+    ``orbscli builds show <job_id>`` for package name, then
+    ``orbscli logs job <job_id> --tail 400`` (or omit --tail for full log via attempts API).
+    """
     pass
+
+
+@grp_logs.command("job")
+@click.argument("job_id", type=int)
+@click.option("--tail", type=int, default=120, help="Last N log lines (default 120)")
+@click.option("--attempt", type=int, default=None, help="Use this attempt id instead of latest for the job")
+def logs_job(job_id: int, tail: int, attempt: int | None) -> None:
+    """Resolve latest build attempt for a job id, then print the log tail (build job id from UI)."""
+    token = get_token()
+    base = get_api_url()
+    if attempt is not None:
+        aid = attempt
+        click.echo("job %s attempt %s (explicit)" % (job_id, aid), err=True)
+    else:
+        att = http_json("GET", base, f"/api/builds/jobs/{job_id}/attempts", token=token)
+        if not att:
+            click.echo("No attempts for job %s" % job_id, err=True)
+            sys.exit(1)
+        aid = int(att[0]["id"])
+        click.echo("job %s latest_attempt %s" % (job_id, aid), err=True)
+    ctx = click.get_current_context()
+    ctx.invoke(logs_view, attempt_id=aid, out=None, tail=tail)
 
 
 @grp_logs.command("view")
