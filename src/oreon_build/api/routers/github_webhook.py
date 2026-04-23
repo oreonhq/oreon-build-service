@@ -90,7 +90,19 @@ async def github_push_webhook(request: Request, db: DbSession) -> dict[str, Any]
     repo_id = int(repo_id)
     push_branch = _push_ref_branch(body)
     changed_paths = await resolve_github_webhook_changed_paths(body, repository)
-    result = await apply_github_push(db, repository, repo_id, push_branch, changed_paths, kind="webhook")
+    if not settings.github_push_auto_build_enabled:
+        logger.info(
+            "GitHub webhook push skipped auto-build (GITHUB_PUSH_AUTO_BUILD_ENABLED is false) repo_id=%s",
+            repo_id,
+        )
+        result: dict[str, Any] = {
+            "status": "ignored",
+            "reason": "github_push_auto_build_disabled",
+            "jobs": [],
+            "skipped": [],
+        }
+    else:
+        result = await apply_github_push(db, repository, repo_id, push_branch, changed_paths, kind="webhook")
 
     after_sha = body.get("after")
     branch_for_cursor = push_branch or (repository.get("default_branch") or "").strip()
