@@ -284,21 +284,43 @@
         var r = String(req || '').trim();
         if (!r) return null;
         if (candidates.has(r)) return r;
-        var best = null;
-        candidates.forEach(function(c) {
-          if (r.indexOf(c + '-') === 0 || r === c) {
-            if (!best || c.length > best.length) best = c;
-          }
-        });
-        return best;
+        return null;
+      }
+
+      function normalizeRequirementForChain(req) {
+        var r = String(req || '').trim();
+        if (!r) return '';
+        // strip richdep punctuation at edges
+        while (r.startsWith('(')) r = r.slice(1).trim();
+        while (r.endsWith(')')) r = r.slice(0, -1).trim();
+        // keep first token before comparison/version operators
+        r = r.split(/\s+/)[0] || '';
+        r = r.split(/[<>=]/)[0] || '';
+        return r.trim();
+      }
+
+      function looksLikePackageName(s) {
+        var t = String(s || '').trim();
+        if (!t) return false;
+        if (t.indexOf('/') >= 0) return false;
+        if (t.indexOf('(') >= 0) return false;
+        if (/^[0-9]+(\.[0-9]+)*$/.test(t)) return false;
+        return /^[A-Za-z0-9][A-Za-z0-9+._-]*$/.test(t);
       }
 
       function buildChainFromFiltered(missing, edges) {
         var allPkgs = new Set((graph && graph.packages) ? graph.packages : []);
         var neededProviders = new Set();
         missing.forEach(function(m) {
-          var mapped = mapReqToSource(m.requirement, allPkgs);
-          if (mapped) neededProviders.add(mapped);
+          var reqName = normalizeRequirementForChain(m.requirement);
+          if (!reqName) return;
+          var mapped = mapReqToSource(reqName, allPkgs);
+          if (mapped) {
+            neededProviders.add(mapped);
+            return;
+          }
+          // Keep unresolved package-like requirements too (e.g. *-srpm-macros, debugedit, binutils, ed).
+          if (looksLikePackageName(reqName)) neededProviders.add(reqName);
         });
         var pkgs = Array.from(neededProviders).sort();
         if (!pkgs.length) return '';
@@ -329,13 +351,23 @@
           return pkgs.join(' ');
         }
 
+        // Higher out-degree means "needed by more packages", so build it earlier in stage ordering.
+        var score = {};
+        chainPkgs.forEach(function(p) { score[p] = (nextMap[p] && nextMap[p].size) ? nextMap[p].size : 0; });
+        function byPriority(a, b) {
+          var sa = score[a] || 0;
+          var sb = score[b] || 0;
+          if (sa !== sb) return sb - sa;
+          return a.localeCompare(b);
+        }
+
         var done = new Set();
         var groups = [];
         while (done.size < chainPkgs.length) {
-          var ready = chainPkgs.filter(function(p) { return !done.has(p) && (indeg[p] || 0) === 0; }).sort();
+          var ready = chainPkgs.filter(function(p) { return !done.has(p) && (indeg[p] || 0) === 0; }).sort(byPriority);
           if (!ready.length) {
             // Cycle fallback: emit remaining in one final group.
-            ready = chainPkgs.filter(function(p) { return !done.has(p); }).sort();
+            ready = chainPkgs.filter(function(p) { return !done.has(p); }).sort(byPriority);
           }
           groups.push(ready);
           ready.forEach(function(p) {

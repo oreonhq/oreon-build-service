@@ -147,6 +147,21 @@ def _map_binary_to_source_name(bin_name: str, source_name_candidates: set[str] |
     return b
 
 
+def _is_actionable_unmapped_requirement(req: str) -> bool:
+    r = (req or "").strip()
+    if not r:
+        return False
+    # Generic macro marker used by buildroot stacks.
+    if r.endswith("-srpm-macros"):
+        return True
+    # Generic package-like token (no rich/soname/file syntax). This avoids hardcoding names.
+    # Examples matched: debugedit, binutils, dwz, ed, python-srpm-macros
+    # Examples not matched: libfoo.so.1()(64bit), filesystem(aarch64), /path/file
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9+._-]*", r):
+        return True
+    return False
+
+
 def _build_chain_from_missing(items: list[dict[str, Any]]) -> str:
     names = sorted({str(x.get("package") or "").strip() for x in items if (x.get("package") or "").strip()})
     if not names:
@@ -391,15 +406,22 @@ def _analyze_repo(target: RepoTarget, tmpdir: Path, external_provides: set[str] 
                 # package candidate in this release/branch src index, it is likely an external/base
                 # repo dep or a pure virtual token and cannot be fixed by chain-building this repo set.
                 req_src = _map_binary_to_source_name(req, src_candidates)
+                keep_nonrepo_buildroot_req = False
                 if req_src not in src_candidates:
-                    continue
+                    # Keep unresolved buildroot/toolchain requirements visible. These are frequently
+                    # the actual blockers when mock installs buildsys-build.
+                    if _is_actionable_unmapped_requirement(req):
+                        keep_nonrepo_buildroot_req = True
+                    else:
+                        continue
+                target_req = req if keep_nonrepo_buildroot_req else req_src
                 missing.append(
                     {
                         "release": target.releasename,
                         "branch": target.branch,
                         "arch": target.arch,
                         "package": pkg_name,
-                        "requirement": req_src,
+                        "requirement": target_req,
                     }
                 )
                 edges.append(
@@ -408,8 +430,8 @@ def _analyze_repo(target: RepoTarget, tmpdir: Path, external_provides: set[str] 
                         "branch": target.branch,
                         "arch": target.arch,
                         "from": pkg_name,
-                        "to": req_src,
-                        "requirement": req_src,
+                        "to": target_req,
+                        "requirement": target_req,
                         "missing": True,
                     }
                 )
