@@ -216,6 +216,14 @@ class Settings(BaseSettings):
         default=None,
         description="Secret for X-Hub-Signature-256 on POST /api/github/webhook",
     )
+    github_push_auto_build_enabled: bool = Field(
+        default=False,
+        description=(
+            "When true, GitHub push webhooks and catch-up enqueue distgit auto-builds. "
+            "When false (default), webhooks still verify and update cursors but do not queue jobs; "
+            "catch-up skips enqueueing. GITHUB_PUSH_AUTO_BUILD_ENABLED."
+        ),
+    )
     github_catchup_interval_seconds: int = Field(
         default=600,
         ge=0,
