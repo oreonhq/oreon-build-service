@@ -65,10 +65,111 @@ class RepoTarget:
         return f"{self.releasename}|{self.branch}|{self.arch}"
 
 
+_SIMPLE_PKG_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+._-]*$")
+
+
 def _safe_text(node: ET.Element | None, default: str = "") -> str:
     if node is None or node.text is None:
         return default
     return node.text.strip()
+
+
+def _parse_comps_buildsys_members(comps_xml: bytes) -> set[str]:
+    """Return the package names in the 'buildsys-build' comps group."""
+    try:
+        root = ET.fromstring(comps_xml)
+    except ET.ParseError:
+        return set()
+    for grp in root.findall(".//group"):
+        id_el = grp.find("id")
+        if id_el is not None and _safe_text(id_el) == "buildsys-build":
+            members: set[str] = set()
+            for pkg_el in grp.findall(".//packagereq"):
+                name = _safe_text(pkg_el)
+                if name:
+                    members.add(name)
+            return members
+    return set()
+
+
+def _buildroot_missing(
+    comps_xml: bytes,
+    primary_xml: bytes,
+    external_provides: set[str] | None,
+) -> set[str]:
+    """Check if all runtime deps of the buildsys-build group are in the repo.
+
+    Returns the set of simple package-name requirements that are missing —
+    i.e. not provided by any binary package in the repo and not in external
+    provides. These must be imported and built before any other build can
+    succeed.
+    """
+    buildsys_members = _parse_comps_buildsys_members(comps_xml)
+    if not buildsys_members:
+        return set()
+
+    # Build a provides index and a per-binary-package runtime-requires map.
+    try:
+        root = ET.fromstring(primary_xml)
+    except ET.ParseError:
+        return set()
+
+    provides_index: set[str] = set()
+    pkg_requires: dict[str, set[str]] = {}
+
+    for pkg in root.findall(".//{*}package"):
+        name_el = pkg.find("{*}name")
+        arch_el = pkg.find("{*}arch")
+        if name_el is None or arch_el is None:
+            continue
+        bin_name = _safe_text(name_el)
+        if not bin_name:
+            continue
+
+        # Every binary package implicitly provides its own name.
+        provides_index.add(bin_name)
+
+        for e in pkg.findall(f".//{RPM_NS}provides/{RPM_NS}entry"):
+            pname = (e.attrib.get("name") or "").strip()
+            if pname:
+                provides_index.add(pname)
+
+        if arch_el.text == "src":
+            continue
+
+        reqs: set[str] = set()
+        for e in pkg.findall(f".//{RPM_NS}requires/{RPM_NS}entry"):
+            req = (e.attrib.get("name") or "").strip()
+            if (
+                _SIMPLE_PKG_NAME.match(req)
+                and not req.startswith("rpmlib(")
+                and not req.startswith("config(")
+            ):
+                reqs.add(req)
+        if reqs:
+            pkg_requires[bin_name] = reqs
+
+    missing: set[str] = set()
+    # Check direct runtime deps of each buildsys-build group member.
+    for member in buildsys_members:
+        for req in pkg_requires.get(member, set()):
+            if req in provides_index:
+                continue
+            if external_provides and req in external_provides:
+                continue
+            missing.add(req)
+        # One level of transitivity: also check deps of the member's direct deps.
+        for req in pkg_requires.get(member, set()):
+            if req not in provides_index:
+                continue
+            for req2 in pkg_requires.get(req, set()):
+                if req2 in provides_index:
+                    continue
+                if external_provides and req2 in external_provides:
+                    continue
+                missing.add(req2)
+
+    return missing
 
 
 def _source_name_from_srpm_filename(raw: str) -> str | None:
@@ -118,13 +219,13 @@ def _decompress_if_needed(raw: bytes, key: str) -> bytes:
     return raw
 
 
-def _resolve_primary_key(repo_prefix: str, repomd_bytes: bytes) -> str | None:
+def _resolve_repodata_key(repo_prefix: str, repomd_bytes: bytes, data_type: str) -> str | None:
     try:
         root = ET.fromstring(repomd_bytes)
     except ET.ParseError:
         return None
     for data in root.findall(".//{*}data"):
-        if (data.attrib.get("type") or "").strip() != "primary":
+        if (data.attrib.get("type") or "").strip() != data_type:
             continue
         loc = data.find("{*}location")
         href = (loc.attrib.get("href") if loc is not None else "") or ""
@@ -135,6 +236,10 @@ def _resolve_primary_key(repo_prefix: str, repomd_bytes: bytes) -> str | None:
             return href
         return f"{repo_prefix}/{href.lstrip('/')}"
     return None
+
+
+def _resolve_primary_key(repo_prefix: str, repomd_bytes: bytes) -> str | None:
+    return _resolve_repodata_key(repo_prefix, repomd_bytes, "primary")
 
 
 def _resolve_primary_href(repomd_bytes: bytes) -> str | None:
@@ -383,18 +488,20 @@ def _analyze_repo(
     r2 = get_r2_client()
 
     # 1. Fetch and parse repomd + primary.xml to build the provides index.
+    _empty = {"repo": target, "packages": {}, "missing": [], "edges": [], "buildroot_missing": set()}
+
     repomd_key = f"{target.prefix}/repodata/repomd.xml"
     repomd = r2.get_object(repomd_key)
     if not repomd:
-        return {"repo": target, "packages": {}, "missing": [], "edges": [], "error": "repomd_missing"}
+        return {**_empty, "error": "repomd_missing"}
 
     primary_key = _resolve_primary_key(target.prefix, repomd)
     if not primary_key:
-        return {"repo": target, "packages": {}, "missing": [], "edges": [], "error": "primary_missing_in_repomd"}
+        return {**_empty, "error": "primary_missing_in_repomd"}
 
     primary_raw = r2.get_object(primary_key)
     if not primary_raw:
-        return {"repo": target, "packages": {}, "missing": [], "edges": [], "error": "primary_blob_missing"}
+        return {**_empty, "error": "primary_blob_missing"}
 
     try:
         primary_xml = _decompress_if_needed(primary_raw, primary_key)
@@ -405,8 +512,22 @@ def _analyze_repo(
             "packages": {},
             "missing": [],
             "edges": [],
+            "buildroot_missing": set(),
             "error": f"primary_parse_failed:{type(exc).__name__}:{exc}",
         }
+
+    # Load comps to check buildroot health.
+    comps_xml: bytes = b""
+    comps_key = _resolve_repodata_key(target.prefix, repomd, "group")
+    if comps_key:
+        comps_raw = r2.get_object(comps_key)
+        if comps_raw:
+            try:
+                comps_xml = _decompress_if_needed(comps_raw, comps_key)
+            except Exception:
+                comps_xml = b""
+
+    br_missing_this_arch = _buildroot_missing(comps_xml, primary_xml, external_provides)
 
     # 2. List SRPMs from the src/ directory for this release+branch.
     src_prefix = f"{target.releasename}/{target.branch}/src/"
@@ -498,6 +619,7 @@ def _analyze_repo(
         "packages": packages,
         "missing": missing,
         "edges": edges,
+        "buildroot_missing": br_missing_this_arch,
         "error": None,
     }
 
@@ -616,6 +738,11 @@ async def build_dependencies_graph(db: AsyncSession) -> dict[str, Any]:
     all_missing: list[dict[str, Any]] = []
     repo_errors: list[dict[str, str]] = []
 
+    # Collect buildroot_missing per (release, branch) per arch, then intersect
+    # across arches so we only report packages missing from ALL arches
+    # (truly absent from the repo, not just a partial aarch64/x86_64 gap).
+    br_missing_by_rb: dict[tuple[str, str], dict[str, set[str]]] = {}
+
     for result in results:
         target: RepoTarget = result["repo"]
         releases_set.add(target.releasename)
@@ -650,6 +777,22 @@ async def build_dependencies_graph(db: AsyncSession) -> dict[str, Any]:
 
         all_edges.extend(result["edges"])
 
+        # Accumulate buildroot_missing per arch.
+        rb_key = (target.releasename, target.branch)
+        bm = result.get("buildroot_missing") or set()
+        if bm:
+            by_arch = br_missing_by_rb.setdefault(rb_key, {})
+            by_arch[target.arch] = bm
+
+    # Intersect across arches: only keep packages missing from ALL arches.
+    all_buildroot_missing: list[dict[str, str]] = []
+    for (rel, branch), by_arch in br_missing_by_rb.items():
+        if not by_arch:
+            continue
+        intersection = set.intersection(*by_arch.values())
+        for pkg in sorted(intersection):
+            all_buildroot_missing.append({"release": rel, "branch": branch, "package": pkg})
+
     all_missing.sort(key=lambda x: (x["release"], x["branch"], x["package"], x["requirement"], x["arch"]))
     nodes = sorted(nodes_map.values(), key=lambda x: (x["release"], x["branch"], x["name"]))
     for n in nodes:
@@ -663,6 +806,7 @@ async def build_dependencies_graph(db: AsyncSession) -> dict[str, Any]:
             "nodes": len(nodes),
             "edges": len(all_edges),
             "missing_requirements": len(all_missing),
+            "buildroot_blockers": len(all_buildroot_missing),
         },
         "releases": sorted(releases_set),
         "branches": sorted(branches),
@@ -670,5 +814,6 @@ async def build_dependencies_graph(db: AsyncSession) -> dict[str, Any]:
         "nodes": nodes,
         "edges": all_edges,
         "missing": all_missing,
+        "buildroot_missing": all_buildroot_missing,
         "repo_errors": repo_errors,
     }

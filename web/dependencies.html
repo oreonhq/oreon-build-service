@@ -172,10 +172,20 @@
       </div>
     </section>
 
+    <section class="card deps-card" id="buildroot-health-card" style="display:none;">
+      <h3 style="margin-top:0; color:#9f1239;">Buildroot blockers</h3>
+      <p class="deps-lead" style="margin-top:0;">
+        These packages are required by the <code>buildsys-build</code> group at build time but are
+        missing from the repo entirely. No build can succeed until they are imported and built.
+        They appear as stage 0 in the chain-build string below.
+      </p>
+      <div id="buildroot-missing-list"></div>
+    </section>
+
     <section class="card deps-card">
       <h3 style="margin-top:0;">Generated chain-build</h3>
       <p class="deps-lead" style="margin-top:0;">
-        This is generated from the currently filtered missing dependencies.
+        Packages that need to be built, in dependency order. Buildroot blockers (if any) appear first.
       </p>
       <textarea id="chain-output" class="form-control deps-codebox" rows="4" readonly></textarea>
       <div style="margin-top:0.5rem;">
@@ -184,7 +194,7 @@
     </section>
 
     <section class="card deps-card">
-      <h3 style="margin-top:0;">Missing dependencies</h3>
+      <h3 style="margin-top:0;">Missing build dependencies</h3>
       <div class="deps-toolbar">
         <button type="button" class="btn" id="missing-prev">Prev</button>
         <span id="missing-page-info" class="deps-status-text" style="margin:0;">Page 1</span>
@@ -363,6 +373,7 @@
 
       function applyFilters() {
         if (!graph) return;
+        renderBuildootMissing();
         var releaseText = (byId('filter-release-search').value || '').trim().toLowerCase();
         var branchText = (byId('filter-branch-search').value || '').trim().toLowerCase();
         var pkgText = (byId('filter-package-search').value || '').trim().toLowerCase();
@@ -392,10 +403,30 @@
           }
         });
 
-        byId('chain-output').value = buildChainFromFiltered(filteredEdges, uniqueMissingEdges);
+        // Prepend buildroot blockers (filtered by release/branch) as stage 0.
+        var brMissing = (graph.buildroot_missing || []).filter(function(m) {
+          return includedRelease(m.release) && includedBranch(m.branch);
+        });
+        var brPkgs = [];
+        var brSeen = new Set();
+        brMissing.forEach(function(m) {
+          if (!brSeen.has(m.package)) {
+            brSeen.add(m.package);
+            brPkgs.push(m.package);
+          }
+        });
+        brPkgs.sort();
 
+        var mainChain = buildChainFromFiltered(filteredEdges, uniqueMissingEdges);
+        var parts = [];
+        if (brPkgs.length) parts.push(brPkgs.join(' '));
+        if (mainChain) parts.push(mainChain);
+        byId('chain-output').value = parts.join(' : ');
+
+        var brCount = brPkgs.length;
         byId('deps-status').textContent =
-          'Showing ' + uniqueMissingEdges.length + ' missing build dependencies and '
+          (brCount ? brCount + ' buildroot blocker(s), ' : '')
+          + uniqueMissingEdges.length + ' missing build dependencies, '
           + okEdges.length + ' satisfied dependencies with current filters.';
 
         var summary = byId('deps-summary');
@@ -466,6 +497,32 @@
         byId('edges-next').disabled = edgesPage >= edgesPages;
       }
 
+      function renderBuildootMissing() {
+        if (!graph) return;
+        var bm = (graph.buildroot_missing || []).filter(function(m) {
+          return includedRelease(m.release) && includedBranch(m.branch);
+        });
+        var card = byId('buildroot-health-card');
+        var list = byId('buildroot-missing-list');
+        if (!bm.length) {
+          card.style.display = 'none';
+          return;
+        }
+        card.style.display = '';
+        var byRB = {};
+        bm.forEach(function(m) {
+          var k = m.release + ' / ' + m.branch;
+          (byRB[k] = byRB[k] || []).push(m.package);
+        });
+        list.innerHTML = Object.keys(byRB).sort().map(function(k) {
+          return '<div style="margin-bottom:0.5rem;"><strong>' + esc(k) + ':</strong> '
+            + byRB[k].map(function(p) {
+              return '<code style="background:#fee2e2;padding:0.1rem 0.3rem;border-radius:4px;margin:0.1rem;">' + esc(p) + '</code>';
+            }).join(' ')
+            + '</div>';
+        }).join('');
+      }
+
       function loadGraph() {
         byId('deps-status').textContent = 'Loading dependency graph...';
         return api.get('/dependencies/graph').then(function(data) {
@@ -476,6 +533,7 @@
           packageSel = new Set();
           missingPage = 1;
           edgesPage = 1;
+          renderBuildootMissing();
           renderFilterBoxes();
           applyFilters();
         }).catch(function(e) {
