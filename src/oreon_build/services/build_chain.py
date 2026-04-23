@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+import os
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from fastapi import HTTPException, Request, status
@@ -34,6 +35,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_ARCH = ["x86_64", "aarch64"]
+
+
+def _chain_stage_settle_sec() -> int:
+    """Seconds to wait after all stage publishes complete before advancing.
+
+    Gives workers time to see fresh repodata before the next stage's jobs
+    start. Configurable via OREON_CHAIN_STAGE_SETTLE_SEC (default 30).
+    Set to 0 to advance immediately (old behavior).
+    """
+    raw = (os.environ.get("OREON_CHAIN_STAGE_SETTLE_SEC") or "30").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 30
+    return max(0, min(n, 600))
 
 
 def distgit_new_package_dict(
@@ -188,7 +204,21 @@ async def on_repo_publish_success_for_chain(attempt_id: int) -> None:
         chain.stage_publish_done += 1
 
         if chain.stage_publish_done >= chain.stage_expected_jobs:
-            await _advance_chain_after_stage_complete(db, chain)
+            settle = _chain_stage_settle_sec()
+            if settle > 0:
+                # Persist the advance-after timestamp so the background loop picks it
+                # up even if this process restarts during the settle window.
+                chain.stage_advance_after = datetime.now(timezone.utc) + timedelta(seconds=settle)
+                logger.info(
+                    "chain_id=%s stage=%s all publishes done; advancing in %ss at %s",
+                    chain.id,
+                    chain.active_stage_index,
+                    settle,
+                    chain.stage_advance_after.isoformat(),
+                )
+            else:
+                # Settle disabled: advance immediately (old behavior).
+                await _advance_chain_after_stage_complete(db, chain)
 
         await db.commit()
 
@@ -228,12 +258,14 @@ async def _advance_chain_after_stage_complete(db: Any, chain: BuildChain) -> Non
         chain.stage_expected_jobs = 0
         chain.stage_skip_slots = 0
         chain.stage_publish_done = 0
+        chain.stage_advance_after = None
         return
 
     chain.active_stage_index = nxt
     chain.stage_expected_jobs = 0
     chain.stage_skip_slots = 0
     chain.stage_publish_done = 0
+    chain.stage_advance_after = None
     await db.flush()
 
     opt = _options_dict(chain)
@@ -515,6 +547,46 @@ async def trigger_chain_build(
         )
 
     return chain, jobs
+
+
+async def advance_settled_chains() -> None:
+    """Advance any chains whose settle window has passed.
+
+    Called by a background loop in main.py. Handles the case where
+    OREON_CHAIN_STAGE_SETTLE_SEC > 0 and the settle period has elapsed.
+    Also recovers chains whose advance was deferred across an API restart.
+    """
+    from oreon_build.db.session import async_session_maker
+
+    now = datetime.now(timezone.utc)
+    async with async_session_maker() as db:
+        result = await db.execute(
+            select(BuildChain)
+            .where(
+                BuildChain.status.in_([BuildChainStatus.PENDING, BuildChainStatus.RUNNING]),
+                BuildChain.stage_advance_after.isnot(None),
+                BuildChain.stage_advance_after <= now,
+            )
+            .with_for_update(skip_locked=True)
+        )
+        chains = list(result.scalars().all())
+        if not chains:
+            return
+        for chain in chains:
+            if chain.stage_publish_done < chain.stage_expected_jobs:
+                # Shouldn't happen, but guard against stale advance_after.
+                chain.stage_advance_after = None
+                continue
+            logger.info(
+                "chain_id=%s stage=%s settle elapsed, advancing to next stage",
+                chain.id,
+                chain.active_stage_index,
+            )
+            try:
+                await _advance_chain_after_stage_complete(db, chain)
+            except Exception:
+                logger.exception("chain_id=%s advance failed", chain.id)
+        await db.commit()
 
 
 async def notify_chain_job_terminal_after_result(

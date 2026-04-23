@@ -314,15 +314,40 @@ async def lifespan(app: FastAPI):
 
     publish_task = asyncio.create_task(_publish_tasks_loop(), name="publish-tasks")
 
+    async def _chain_settle_loop() -> None:
+        from oreon_build.services.build_chain import advance_settled_chains
+
+        while True:
+            try:
+                await advance_settled_chains()
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Chain settle advance loop error")
+                try:
+                    await asyncio.sleep(30)
+                except asyncio.CancelledError:
+                    break
+
+    chain_settle_task = asyncio.create_task(_chain_settle_loop(), name="chain-settle")
+
     yield
 
-    for t, label in [(sweep_task, "stale-build-sweep"), (catchup_task, "github-push-catchup"), (publish_task, "publish-tasks")]:
+    for t, label in [
+        (sweep_task, "stale-build-sweep"),
+        (catchup_task, "github-push-catchup"),
+        (publish_task, "publish-tasks"),
+        (chain_settle_task, "chain-settle"),
+    ]:
         if t is not None:
             t.cancel()
             try:
-                await t
-            except asyncio.CancelledError:
+                await asyncio.wait_for(t, timeout=5)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
+            except Exception:
+                logger.exception("Error stopping background task %s", label)
     # shutdown
 
 

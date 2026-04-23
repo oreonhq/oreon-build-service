@@ -4,7 +4,7 @@ import enum
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, List, Optional
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Integer, JSON, String, Text, func
+from sqlalchemy import DateTime, Enum, ForeignKey, Integer, JSON, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from oreon_build.db.base import Base
@@ -47,6 +47,9 @@ class BuildChain(Base):
     #: Slots satisfied by skip_complete (already successful for that package or arch).
     stage_skip_slots: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     stage_publish_done: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    #: When set, the chain waits until this timestamp before advancing to the next stage.
+    #: Allows a settle period after all stage publishes finish so workers see fresh repodata.
+    stage_advance_after: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
