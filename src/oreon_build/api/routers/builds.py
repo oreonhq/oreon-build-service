@@ -7,7 +7,6 @@ from fastapi.responses import JSONResponse
 
 from oreon_build.utils.spec import name_from_srpm_filename, parse_spec_content
 from sqlalchemy import String, cast, func, or_, select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from oreon_build.api.deps import CurrentUser, DbSession
@@ -16,6 +15,8 @@ from oreon_build.api.schemas import (
     BuildAttemptResponse,
     BuildJobResponse,
     BuildTrigger,
+    ChainBuildTrigger,
+    ChainBuildTriggerResponse,
     CurrentFailureItem,
     PaginatedResponse,
 )
@@ -23,6 +24,7 @@ from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
 from oreon_build.core.machine_arch import normalize_machine_arch
 from oreon_build.core.repo_branch import r2_publish_branch
 from oreon_build.models import BuildAttempt, BuildJob, BuildStatus, BuildTarget, Package, Release, Worker
+from oreon_build.services.build_target_util import get_or_create_build_target, has_successful_build_for_target
 from oreon_build.services.r2 import get_r2_client, upload_r2_key
 
 router = APIRouter(prefix="/builds", tags=["builds"])
@@ -117,83 +119,6 @@ def _attempt_to_response(a: BuildAttempt) -> BuildAttemptResponse:
         worker_name=w.name if w else None,
         worker_last_heartbeat=w.last_heartbeat if w else None,
     )
-
-
-async def _has_successful_build_for_target(
-    db: DbSession,
-    package_id: int,
-    release_id: int,
-    target_id: int,
-    package_version_id: int | None,
-) -> bool:
-    """True if there is already a successful job for this package, release, and build target."""
-    q = (
-        select(BuildJob.id)
-        .where(
-            BuildJob.package_id == package_id,
-            BuildJob.release_id == release_id,
-            BuildJob.target_id == target_id,
-            BuildJob.status == BuildStatus.SUCCESS,
-        )
-        .limit(1)
-    )
-    if package_version_id is not None:
-        q = q.where(BuildJob.package_version_id == package_version_id)
-    r = await db.execute(q)
-    return r.scalar_one_or_none() is not None
-
-
-async def _get_or_create_build_target(db: DbSession, release_id: int, architecture: str, mock_environment_id: int | None) -> BuildTarget:
-    """Get or create a BuildTarget for (release_id, architecture, mock_environment_id)."""
-    from oreon_build.models import MockEnvironment
-
-    # Resolve default mock *before* lookup. If we only queried mock_environment_id == None here and
-    # then fell back to mock id 1, we would miss an existing (release, arch, mock=1) row and hit
-    # uq_build_targets_release_arch_mock_nonnull on insert.
-    mock_env_id = mock_environment_id
-    if mock_env_id is None:
-        fb = await db.execute(
-            select(MockEnvironment)
-            .where(MockEnvironment.release_id == release_id)
-            .order_by(MockEnvironment.id.asc())
-            .limit(1)
-        )
-        me = fb.scalar_one_or_none()
-        if me:
-            mock_env_id = me.id
-
-    q = (
-        select(BuildTarget)
-        .where(
-            BuildTarget.release_id == release_id,
-            BuildTarget.architecture == architecture,
-            BuildTarget.mock_environment_id == mock_env_id,
-        )
-        .order_by(BuildTarget.id.asc())
-        .limit(1)
-    )
-    result = await db.execute(q)
-    target = result.scalars().first()
-    if target:
-        return target
-
-    created = BuildTarget(
-        release_id=release_id,
-        architecture=architecture,
-        mock_environment_id=mock_env_id,
-    )
-    db.add(created)
-    try:
-        async with db.begin_nested():
-            await db.flush()
-    except IntegrityError:
-        db.expunge(created)
-        again = await db.execute(q)
-        found = again.scalars().first()
-        if found:
-            return found
-        raise
-    return created
 
 
 def _build_job_search_clause(search_trim: str):
@@ -609,8 +534,8 @@ async def trigger_build(
         if not has_worker:
             continue  # Skip arch with no worker; only create jobs that can run
         saw_worker_for_requested = True
-        target = await _get_or_create_build_target(db, data.release_id, canon, preferred_mock_environment_id)
-        if data.skip_complete_arches and await _has_successful_build_for_target(
+        target = await get_or_create_build_target(db, data.release_id, canon, preferred_mock_environment_id)
+        if data.skip_complete_arches and await has_successful_build_for_target(
             db, package_id, data.release_id, target.id, package_version_id
         ):
             continue
@@ -661,6 +586,41 @@ async def trigger_build(
         )
     att_map = await _latest_attempt_by_job_ids(db, [j.id for j in jobs_created])
     return [await _job_to_response(db, j, att_map.get(j.id)) for j in jobs_created]
+
+
+@router.post("/chain-trigger", response_model=ChainBuildTriggerResponse, status_code=status.HTTP_201_CREATED)
+async def trigger_chain_build_endpoint(
+    data: ChainBuildTrigger,
+    request: Request,
+    db: DbSession,
+    user: CurrentUser,
+):
+    from oreon_build.services.build_chain import trigger_chain_build as run_chain_build
+
+    chain, jobs = await run_chain_build(
+        db,
+        request,
+        user,
+        chain_spec=data.chain_spec,
+        release_id=data.release_id,
+        architectures=data.architectures,
+        skip_complete_arches=data.skip_complete_arches,
+        preferred_mock_environment_id=data.preferred_mock_environment_id,
+        distgit_url=data.distgit_url,
+        distgit_branch=data.distgit_branch,
+        priority=data.priority,
+    )
+    att_map = await _latest_attempt_by_job_ids(db, [j.id for j in jobs])
+    job_responses = [await _job_to_response(db, j, att_map.get(j.id)) for j in jobs]
+    stages_raw = chain.stages_json if isinstance(chain.stages_json, list) else []
+    stages: list[list[str]] = [[str(n) for n in grp] for grp in stages_raw if isinstance(grp, list)]
+    return ChainBuildTriggerResponse(
+        chain_id=chain.id,
+        chain_status=chain.status.value,
+        stages=stages,
+        chain_spec=chain.chain_spec,
+        jobs=job_responses,
+    )
 
 
 ALLOWED_UPLOAD_EXTENSIONS = (".src.rpm", ".spec")
@@ -789,7 +749,7 @@ async def upload_and_trigger(
         has_worker = workers_by_arch.get(canon, False)
         if not has_worker:
             continue  # Skip arch with no worker; only create jobs that can run
-        target = await _get_or_create_build_target(db, release_id, canon, mock_env_id)
+        target = await get_or_create_build_target(db, release_id, canon, mock_env_id)
         job = BuildJob(
             package_id=pkg.id,
             release_id=release_id,
@@ -865,6 +825,8 @@ async def _job_to_response(
         priority=job.priority,
         created_at=job.created_at,
         completed_at=job.completed_at,
+        chain_id=getattr(job, "chain_id", None),
+        chain_stage_index=getattr(job, "chain_stage_index", None),
     )
 
 
@@ -903,7 +865,7 @@ async def retry_build(
                 )
                 if me_result.scalar_one_or_none() is None:
                     preferred_env_id = None
-            target = await _get_or_create_build_target(
+            target = await get_or_create_build_target(
                 db,
                 job.release_id,
                 normalize_machine_arch(target_arch),
@@ -980,5 +942,11 @@ async def cancel_build(
         ip_address=get_client_ip(request),
         user_agent=get_user_agent(request),
     )
+    from oreon_build.services.build_chain import on_user_cancelled_chain_job
+
+    try:
+        await on_user_cancelled_chain_job(db, job)
+    except Exception:
+        logger.exception("chain cancel side effect job_id=%s", job_id)
     payload = await _job_to_response(db, job)
     return JSONResponse(status_code=200, content=payload.model_dump(mode="json"))
