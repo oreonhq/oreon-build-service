@@ -113,4 +113,4 @@ rm -rf %{_prefix}/lib/oreon-build-worker/pydantic_core-*
 - pip prefer-binary plus no-binary cryptography,cffi,psycopg2-binary for system SSL/LDAP/KRB linkage
 
 * Thu Mar 26 2026 Oreon HQ <packages@oreonhq.com> - 1.0.0-24
-- pip install use --prefer-binary to avoid transitive sdist build failure in Koji/mock
+- pip install use --prefer-binary to avoid transitive sdist build failure in mock/install roots
