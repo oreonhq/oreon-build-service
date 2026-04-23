@@ -83,6 +83,7 @@
               <button type="button" class="source-type-tab" data-type="upload">Upload</button>
               <button type="button" class="source-type-tab" data-type="scm">SCM</button>
               <button type="button" class="source-type-tab" data-type="distgit">DistGit</button>
+              <button type="button" class="source-type-tab" data-type="chainbuild">Chain build</button>
               <button type="button" class="source-type-tab" data-type="checklist">Checklist</button>
             </div>
             <div id="source-url-panel" class="source-panel">
@@ -114,6 +115,15 @@
                   Enter one or more package names (one per line or separated by spaces). A build will be triggered for each.
                 </p>
               </div>
+            </div>
+            <div id="source-chainbuild-panel" class="source-panel" style="display:none;">
+              <label>DistGit chain build</label>
+              <p style="color:var(--text-muted); font-size:0.85rem; margin-bottom:0.5rem;">
+                Uses <code>oreonhq/rpm-specfiles</code> and <code>&lt;release&gt;/&lt;package&gt;/&lt;package&gt;.spec</code> like DistGit.
+                A colon <code>:</code> separates groups. Packages in one group build in parallel. The next group starts after RPMs from the previous group are published.
+                If you omit colons, each package name is its own stage (strictly sequential).
+              </p>
+              <textarea id="chainbuild-spec" class="form-control" rows="4" placeholder="Example (parallel then next):&#10;libwidget libaselib : libgizmo&#10;&#10;Sequential only:&#10;bash grep coreutils"></textarea>
             </div>
             <div id="source-checklist-panel" class="source-panel" style="display:none;">
               <p style="color:var(--text-muted); font-size:0.85rem; margin-bottom:0.5rem;">
@@ -809,6 +819,29 @@
                 alert(parts.length ? parts.join('. ') + '.' : 'Trigger requested for ' + pkgNames.length + ' DistGit package(s).');
               }
             });
+          });
+          return;
+        } else if (currentSourceType === 'chainbuild') {
+          if (!selectedReleaseIdNew) { alert('Select a release.'); return; }
+          var chainRaw = (document.getElementById('chainbuild-spec') && document.getElementById('chainbuild-spec').value || '').trim();
+          if (!chainRaw) { alert('Enter a chain-build line (package names, spaces, and colons for groups).'); return; }
+          var chainBody = {
+            chain_spec: chainRaw,
+            release_id: selectedReleaseIdNew,
+            architectures: arches,
+            skip_complete_arches: true
+          };
+          var mockChain = (document.getElementById('new-package-mock-env') && document.getElementById('new-package-mock-env').value || '').trim();
+          if (mockChain) chainBody.preferred_mock_environment_id = parseInt(mockChain, 10);
+          oreonWithLoading(_btn, function() {
+            return api.post('/builds/chain-trigger', chainBody)
+              .then(function(data) {
+                render();
+                var n = (data && data.jobs && data.jobs.length) ? data.jobs.length : 0;
+                var cid = data && data.chain_id;
+                alert('Chain ' + cid + ' started. Queued ' + n + ' job(s) for the first stage (later stages run after repo publish completes).');
+              })
+              .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
           });
           return;
         }
