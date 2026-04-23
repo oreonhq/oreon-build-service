@@ -150,6 +150,9 @@ async def upsert_github_push_cursor(db: AsyncSession, repository_id: int, branch
 
 async def run_github_push_catchup(db: AsyncSession) -> dict[str, Any]:
     settings = get_settings()
+    if not settings.github_push_auto_build_enabled:
+        logger.info("GitHub catch-up skipped (GITHUB_PUSH_AUTO_BUILD_ENABLED is false)")
+        return {"status": "skipped", "reason": "github_push_auto_build_disabled"}
     if not settings.github_token:
         logger.info("GitHub catch-up skipped (no GITHUB_TOKEN)")
         return {"status": "skipped", "reason": "no_github_token"}

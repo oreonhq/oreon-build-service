@@ -229,6 +229,12 @@ async def run_repo_publish_for_attempt(
             logger.info("repo publish done attempt_id=%s", attempt_id)
             _publish_completed_attempts.add(attempt_id)
             _cleanup_old_locks()
+            try:
+                from oreon_build.services.build_chain import on_repo_publish_success_for_chain
+
+                await on_repo_publish_success_for_chain(attempt_id)
+            except Exception:
+                logger.exception("build chain advance after publish attempt_id=%s", attempt_id)
         except Exception as e:
             logger.exception("repo publish failed attempt_id=%s", attempt_id)
             async with async_session_maker() as db:
@@ -244,4 +250,10 @@ async def run_repo_publish_for_attempt(
                 await db.commit()
             _publish_completed_attempts.add(attempt_id)
             _cleanup_old_locks()
+            try:
+                from oreon_build.services.build_chain import on_repo_publish_failed_for_chain
+
+                await on_repo_publish_failed_for_chain(attempt_id, str(e))
+            except Exception:
+                logger.exception("build chain notify publish failure attempt_id=%s", attempt_id)
             raise

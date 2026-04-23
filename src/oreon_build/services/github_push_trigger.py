@@ -26,7 +26,7 @@ from sqlalchemy import exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from oreon_build.api.routers.builds import _get_or_create_build_target
+from oreon_build.services.build_target_util import get_or_create_build_target
 from oreon_build.config import get_settings
 from oreon_build.core.audit import log_audit
 from oreon_build.core.repo_branch import r2_publish_branch
@@ -470,7 +470,7 @@ async def apply_github_push(
                 skipped.append({"package_id": pkg.id, "release_id": release_id, "reason": "release_not_found"})
                 continue
             publish_branch = r2_publish_branch(rel_obj)
-            target = await _get_or_create_build_target(db, release_id, arch, pkg.preferred_mock_environment_id)
+            target = await get_or_create_build_target(db, release_id, arch, pkg.preferred_mock_environment_id)
             job = BuildJob(
                 package_id=pkg.id,
                 release_id=release_id,
