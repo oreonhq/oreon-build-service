@@ -30,6 +30,7 @@ import fcntl
 import hashlib
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -42,6 +43,177 @@ from oreon_build.services.r2 import R2Client, get_r2_client
 from oreon_build.services.signing import sign_repomd
 
 logger = logging.getLogger(__name__)
+
+
+_BUILDSYS_GROUP_PREFER: list[str] = [
+    "bash",
+    "coreutils",
+    "cpio",
+    "diffutils",
+    "findutils",
+    "gawk",
+    "gcc",
+    "gcc-c++",
+    "grep",
+    "gzip",
+    "make",
+    "patch",
+    "redhat-rpm-config",
+    "rpm-build",
+    "sed",
+    "tar",
+    "unzip",
+    "util-linux",
+    "which",
+    "xz",
+]
+
+
+def _rpm_name_from_filename(filename: str) -> str | None:
+    base = filename.strip()
+    if not base.endswith(".rpm") or base.endswith(".src.rpm"):
+        return None
+    base = base[:-4]
+    parts = base.rsplit("-", 2)
+    if len(parts) != 3:
+        return None
+    return parts[0] or None
+
+
+def _discover_available_binary_names(rpms_dir: Path) -> list[str]:
+    out: set[str] = set()
+    for f in rpms_dir.iterdir():
+        if not f.is_file():
+            continue
+        n = _rpm_name_from_filename(f.name)
+        if n:
+            out.add(n)
+    return sorted(out)
+
+
+def _fedora_comps_repo_path() -> Path:
+    """
+    Local clone path for Fedora comps templates.
+
+    Defaults to `<repo>/vendor/fedora-comps` and can be overridden with
+    `OREON_FEDORA_COMPS_REPO_PATH`.
+    """
+    raw = (os.environ.get("OREON_FEDORA_COMPS_REPO_PATH") or "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    repo_root = Path(__file__).resolve().parents[3]
+    return repo_root / "vendor" / "fedora-comps"
+
+
+def _select_local_fedora_comps_template(repo_path: Path) -> Path | None:
+    """
+    Pick a Fedora comps template from the local clone.
+
+    Priority:
+    - `OREON_FEDORA_COMPS_TEMPLATE_FILE` if set
+    - highest `f/comps-f<NN>.xml.in` in the local clone
+    """
+    explicit = (os.environ.get("OREON_FEDORA_COMPS_TEMPLATE_FILE") or "").strip()
+    if explicit:
+        p = Path(explicit).expanduser()
+        if p.is_file():
+            return p
+        logger.warning("OREON_FEDORA_COMPS_TEMPLATE_FILE does not exist: %s", p)
+    best_num = -1
+    best_path: Path | None = None
+    for base in (repo_path, repo_path / "f"):
+        if not base.is_dir():
+            continue
+        for p in base.iterdir():
+            if not p.is_file():
+                continue
+            m = re.fullmatch(r"comps-f(\d+)\.xml\.in", p.name)
+            if not m:
+                continue
+            n = int(m.group(1))
+            if n > best_num:
+                best_num = n
+                best_path = p
+    return best_path
+
+
+def _load_fedora_comps_template_text() -> str | None:
+    repo_path = _fedora_comps_repo_path()
+    template_path = _select_local_fedora_comps_template(repo_path)
+    if not template_path:
+        logger.warning(
+            "Fedora comps local clone not found or missing templates. Expected clone at: %s",
+            repo_path,
+        )
+        return None
+    try:
+        body = template_path.read_text(encoding="utf-8")
+        if "<comps" not in body:
+            raise RuntimeError("local comps template is not valid XML")
+        return body
+    except Exception as exc:
+        logger.warning("Could not read local Fedora comps template path=%s: %s", template_path, exc)
+        return None
+
+
+def _buildsys_group_xml(selected: list[str]) -> str:
+    lines: list[str] = [
+        "  <group>",
+        "    <id>buildsys-build</id>",
+        "    <name>buildsys-build</name>",
+        "    <description>Buildroot package set for mock SRPM/RPM builds</description>",
+        "    <default>false</default>",
+        "    <uservisible>false</uservisible>",
+        "    <packagelist>",
+    ]
+    for pkg in selected:
+        safe = re.sub(r"[^A-Za-z0-9+_.-]", "", pkg)
+        if not safe:
+            continue
+        lines.append(f'      <packagereq type="mandatory">{safe}</packagereq>')
+    lines += [
+        "    </packagelist>",
+        "  </group>",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _write_buildsys_comps(repo_dir: Path) -> Path | None:
+    rpms_dir = repo_dir / "RPMS"
+    if not rpms_dir.is_dir():
+        return None
+    available = _discover_available_binary_names(rpms_dir)
+    if not available:
+        return None
+
+    selected = [n for n in _BUILDSYS_GROUP_PREFER if n in set(available)]
+    # Ensure group is not empty. If preferred set is absent, seed a tiny fallback from repo content.
+    if not selected:
+        selected = available[: min(8, len(available))]
+
+    # Start from Fedora comps template when available.
+    template = _load_fedora_comps_template_text()
+    if template and "<comps" in template:
+        lines = [template.rstrip(), ""]
+        if "<id>buildsys-build</id>" not in template:
+            group = _buildsys_group_xml(selected)
+            if "</comps>" in template:
+                lines = [template.replace("</comps>", group + "</comps>").rstrip(), ""]
+            else:
+                lines = [template.rstrip(), "<comps>", group, "</comps>", ""]
+    else:
+        # Fallback minimal comps (still provides buildsys-build).
+        lines = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            "<comps>",
+            _buildsys_group_xml(selected).rstrip(),
+            "</comps>",
+            "",
+        ]
+    out = repo_dir / ".oreon-comps.xml"
+    out.write_text("\n".join(lines), encoding="utf-8")
+    return out
 
 
 def _progress_stdout_enabled() -> bool:
@@ -299,14 +471,18 @@ def _run_createrepo(repo_dir: Path) -> None:
 
     def _run_once(workers: int) -> None:
         timeout_s = _createrepo_timeout_sec()
+        comps_file = _write_buildsys_comps(repo_dir)
         logger.info("createrepo_c starting repo_root=%s workers=%s", repo_dir, workers)
+        cmd = [
+            "createrepo_c",
+            str(repo_dir),
+            f"--workers={workers}",
+        ]
+        if comps_file is not None and comps_file.exists():
+            cmd += ["--groupfile", str(comps_file)]
         try:
             subprocess.run(
-                [
-                    "createrepo_c",
-                    str(repo_dir),
-                    f"--workers={workers}",
-                ],
+                cmd,
                 check=True,
                 stdin=subprocess.DEVNULL,
                 timeout=timeout_s,
