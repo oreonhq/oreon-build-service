@@ -288,74 +288,73 @@
       /**
        * Build a chain-build string from the filtered missing-dependency edges.
        *
-       * Each edge {from: A, to: B, missing: true} means:
-       *   "source package A has a BuildRequires that should come from source B,
-       *    but B is not yet built / does not yet provide that binary."
+       * Each missing edge {from: A, to: B} means:
+       *   "A has a BuildRequires from B, but B is not yet built/published."
        *
-       * Build order: B must be built BEFORE A.
+       * The chain contains ONLY the PROVIDERS (the `to` packages) — i.e. the
+       * packages that actually need to be built to satisfy missing deps.
+       * Consumers (the `from` packages) that are already in the repo are NOT
+       * included, because they don't need to be rebuilt just because their
+       * provider is missing for one arch.
        *
-       * Algorithm (Kahn's topological sort):
-       *   - deps[A] = set of sources A needs built first  (B for the above edge)
-       *   - dependents[B] = set of sources that need B
-       *   - Stage 0: packages with empty deps (nothing they need is still missing)
-       *   - Stage N: packages whose deps were satisfied in stages 0..N-1
+       * Inter-provider ordering uses ALL edges (missing + satisfied) so that if
+       * two providers have a dependency on each other, they appear in the right
+       * stage.
        */
-      function buildChainFromFiltered(missingEdges) {
-        // Collect all unique source packages involved in missing edges.
-        var allNodes = new Set();
-        var deps = {};       // node -> Set of nodes it depends on (must be built first)
-        var dependents = {}; // node -> Set of nodes that depend on it
-
+      function buildChainFromFiltered(allEdges, missingEdges) {
+        // The packages that need to be built: appear as `to` in any missing edge.
+        var providers = new Set();
         missingEdges.forEach(function(e) {
-          var consumer = e.from;  // the package that needs something
-          var provider = e.to;    // the package that should provide it
-          if (!consumer || !provider || consumer === provider) return;
-          allNodes.add(consumer);
-          allNodes.add(provider);
-          if (!deps[consumer]) deps[consumer] = new Set();
-          if (!dependents[provider]) dependents[provider] = new Set();
-          deps[consumer].add(provider);
-          dependents[provider].add(consumer);
+          if (e.to) providers.add(e.to);
         });
 
-        if (!allNodes.size) return '';
+        if (!providers.size) return '';
 
-        // Initialize in-degree for Kahn's (# of unmet deps per node).
+        var providerList = Array.from(providers);
+
+        // Build a dependency graph ONLY AMONG providers.
+        // If both A and B are providers and A has any edge to B (A needs B),
+        // then B must be built first.
+        var deps = {};     // provider -> Set of providers it depends on
+        var rdeps = {};    // provider -> Set of providers that depend on it
+        providerList.forEach(function(p) { deps[p] = new Set(); rdeps[p] = new Set(); });
+
+        allEdges.forEach(function(e) {
+          if (!providers.has(e.from) || !providers.has(e.to)) return;
+          if (e.from === e.to) return;
+          deps[e.from].add(e.to);
+          rdeps[e.to].add(e.from);
+        });
+
+        // Kahn's topological sort.
         var inDeg = {};
-        allNodes.forEach(function(n) {
-          inDeg[n] = (deps[n] ? deps[n].size : 0);
-        });
+        providerList.forEach(function(n) { inDeg[n] = deps[n].size; });
 
-        // Score by number of dependents (more dependents = more critical = build earlier).
+        // Sort stage members: more dependents first (more critical = build earlier),
+        // then alphabetically for stability.
         function byPriority(a, b) {
-          var sa = (dependents[a] ? dependents[a].size : 0);
-          var sb = (dependents[b] ? dependents[b].size : 0);
+          var sa = rdeps[a] ? rdeps[a].size : 0;
+          var sb = rdeps[b] ? rdeps[b].size : 0;
           if (sb !== sa) return sb - sa;
           return a.localeCompare(b);
         }
 
-        var nodeList = Array.from(allNodes);
         var done = new Set();
         var groups = [];
-
-        while (done.size < nodeList.length) {
-          var ready = nodeList
+        while (done.size < providerList.length) {
+          var ready = providerList
             .filter(function(n) { return !done.has(n) && inDeg[n] === 0; })
             .sort(byPriority);
-
           if (!ready.length) {
-            // Cycle in the dependency graph - emit remaining as a single group.
-            ready = nodeList.filter(function(n) { return !done.has(n); }).sort(byPriority);
+            // Cycle: emit remaining as one group.
+            ready = providerList.filter(function(n) { return !done.has(n); }).sort(byPriority);
           }
-
           groups.push(ready);
           ready.forEach(function(n) {
             done.add(n);
-            if (dependents[n]) {
-              dependents[n].forEach(function(dep) {
-                inDeg[dep] = Math.max(0, (inDeg[dep] || 0) - 1);
-              });
-            }
+            if (rdeps[n]) rdeps[n].forEach(function(d) {
+              inDeg[d] = Math.max(0, (inDeg[d] || 0) - 1);
+            });
           });
         }
 
@@ -393,7 +392,7 @@
           }
         });
 
-        byId('chain-output').value = buildChainFromFiltered(uniqueMissingEdges);
+        byId('chain-output').value = buildChainFromFiltered(filteredEdges, uniqueMissingEdges);
 
         byId('deps-status').textContent =
           'Showing ' + uniqueMissingEdges.length + ' missing build dependencies and '
