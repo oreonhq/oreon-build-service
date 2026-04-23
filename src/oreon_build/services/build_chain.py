@@ -341,7 +341,8 @@ async def _enqueue_chain_stage_jobs(
         if existing_pkg:
             package_id = existing_pkg.id
             package_version_id = None
-            pref_mock = existing_pkg.preferred_mock_environment_id or preferred_mock_environment_id
+            # Chain-specified mock takes priority; fall back to package's stored preference.
+            pref_mock = preferred_mock_environment_id or existing_pkg.preferred_mock_environment_id
         else:
             npd = distgit_new_package_dict(
                 pkg_name,
