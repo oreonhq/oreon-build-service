@@ -78,6 +78,7 @@ from .routers import (
     audit,
     search as search_router,
     github_webhook,
+    dependencies,
 )
 from .worker_api import router as worker_router
 
@@ -353,6 +354,7 @@ def create_app() -> FastAPI:
     app.include_router(audit.router, prefix="/api")
     app.include_router(search_router.router, prefix="/api")
     app.include_router(github_webhook.router, prefix="/api")
+    app.include_router(dependencies.router, prefix="/api")
     app.include_router(worker_router, prefix="/api")
     # api/main.py -> oreon_build -> src -> repo root
     web_dir = Path(__file__).resolve().parent.parent.parent.parent / "web"
@@ -394,6 +396,9 @@ def create_app() -> FastAPI:
         @app.get("/search.html")
         def _search():
             return FileResponse(web_dir / "search.html")
+        @app.get("/dependencies.html")
+        def _dependencies():
+            return FileResponse(web_dir / "dependencies.html")
     return app
 
 
