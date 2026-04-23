@@ -76,11 +76,33 @@
 
     <section class="card">
       <h3 style="margin-top:0;">Missing dependencies</h3>
+      <div style="display:flex; gap:0.5rem; align-items:center; margin-bottom:0.5rem; flex-wrap:wrap;">
+        <button type="button" class="btn" id="missing-prev">Prev</button>
+        <span id="missing-page-info" style="color:var(--text-muted);">Page 1</span>
+        <button type="button" class="btn" id="missing-next">Next</button>
+        <label style="margin-left:0.5rem;">Per page</label>
+        <select id="missing-page-size" class="form-control" style="width:6rem;">
+          <option value="25" selected>25</option>
+          <option value="50">50</option>
+          <option value="100">100</option>
+        </select>
+      </div>
       <div id="missing-table"></div>
     </section>
 
     <section class="card">
       <h3 style="margin-top:0;">Dependency graph edges</h3>
+      <div style="display:flex; gap:0.5rem; align-items:center; margin-bottom:0.5rem; flex-wrap:wrap;">
+        <button type="button" class="btn" id="edges-prev">Prev</button>
+        <span id="edges-page-info" style="color:var(--text-muted);">Page 1</span>
+        <button type="button" class="btn" id="edges-next">Next</button>
+        <label style="margin-left:0.5rem;">Per page</label>
+        <select id="edges-page-size" class="form-control" style="width:6rem;">
+          <option value="50" selected>50</option>
+          <option value="100">100</option>
+          <option value="250">250</option>
+        </select>
+      </div>
       <div id="edges-table"></div>
     </section>
   </main>
@@ -94,6 +116,8 @@
       var branchSel = new Set();
       var packageSel = new Set();
       var packageUniverse = [];
+      var missingPage = 1;
+      var edgesPage = 1;
 
       function byId(id) { return document.getElementById(id); }
       function esc(s) {
@@ -134,6 +158,7 @@
       function includedRelease(v) { return releaseSel.size === 0 || releaseSel.has(v); }
       function includedBranch(v) { return branchSel.size === 0 || branchSel.has(v); }
       function includedPackage(v) { return packageSel.size === 0 || packageSel.has(v); }
+      function textIncludes(hay, needle) { return String(hay || '').toLowerCase().indexOf(needle) >= 0; }
 
       function buildChainFromFiltered(missing, edges) {
         var pkgs = Array.from(new Set(missing.map(function(m) { return m.package; }))).filter(Boolean);
@@ -171,13 +196,22 @@
 
       function applyFilters() {
         if (!graph) return;
+        var releaseText = (byId('filter-release-search').value || '').trim().toLowerCase();
+        var branchText = (byId('filter-branch-search').value || '').trim().toLowerCase();
+        var pkgText = (byId('filter-package-search').value || '').trim().toLowerCase();
         var missing = (graph.missing || []).filter(function(m) {
           return includedRelease(m.release) && includedBranch(m.branch)
-            && (includedPackage(m.package) || includedPackage(m.requirement));
+            && (includedPackage(m.package) || includedPackage(m.requirement))
+            && (!releaseText || textIncludes(m.release, releaseText))
+            && (!branchText || textIncludes(m.branch, branchText))
+            && (!pkgText || textIncludes(m.package, pkgText) || textIncludes(m.requirement, pkgText));
         });
         var edges = (graph.edges || []).filter(function(e) {
           return includedRelease(e.release) && includedBranch(e.branch)
-            && (includedPackage(e.from) || includedPackage(e.to) || includedPackage(e.requirement));
+            && (includedPackage(e.from) || includedPackage(e.to) || includedPackage(e.requirement))
+            && (!releaseText || textIncludes(e.release, releaseText))
+            && (!branchText || textIncludes(e.branch, branchText))
+            && (!pkgText || textIncludes(e.from, pkgText) || textIncludes(e.to, pkgText) || textIncludes(e.requirement, pkgText));
         });
         byId('chain-output').value = buildChainFromFiltered(missing, edges);
 
@@ -185,7 +219,12 @@
           'Showing ' + missing.length + ' missing requirements and ' + edges.length + ' dependency edges'
           + ' with current filters.';
 
-        var missingRows = missing.slice(0, 500).map(function(m) {
+        var missingPageSize = parseInt(byId('missing-page-size').value || '25', 10);
+        var missingPages = Math.max(1, Math.ceil(missing.length / missingPageSize));
+        if (missingPage > missingPages) missingPage = missingPages;
+        if (missingPage < 1) missingPage = 1;
+        var missingStart = (missingPage - 1) * missingPageSize;
+        var missingRows = missing.slice(missingStart, missingStart + missingPageSize).map(function(m) {
           return '<tr>'
             + '<td>' + esc(m.release) + '</td>'
             + '<td>' + esc(m.branch) + '</td>'
@@ -197,8 +236,16 @@
         byId('missing-table').innerHTML =
           '<table class="table-list"><thead><tr><th>Release</th><th>Branch</th><th>Arch</th><th>Package</th><th>Missing requirement</th></tr></thead>'
           + '<tbody>' + (missingRows || '<tr><td colspan="5">No missing dependencies in this filter view.</td></tr>') + '</tbody></table>';
+        byId('missing-page-info').textContent = 'Page ' + missingPage + ' of ' + missingPages + ' (' + missing.length + ' rows)';
+        byId('missing-prev').disabled = missingPage <= 1;
+        byId('missing-next').disabled = missingPage >= missingPages;
 
-        var edgeRows = edges.slice(0, 1000).map(function(e) {
+        var edgesPageSize = parseInt(byId('edges-page-size').value || '50', 10);
+        var edgesPages = Math.max(1, Math.ceil(edges.length / edgesPageSize));
+        if (edgesPage > edgesPages) edgesPage = edgesPages;
+        if (edgesPage < 1) edgesPage = 1;
+        var edgesStart = (edgesPage - 1) * edgesPageSize;
+        var edgeRows = edges.slice(edgesStart, edgesStart + edgesPageSize).map(function(e) {
           var to = e.missing ? ('<span style="color:#c0392b;">' + esc(e.to) + '</span>') : esc(e.to);
           return '<tr>'
             + '<td>' + esc(e.release) + '</td>'
@@ -213,6 +260,9 @@
         byId('edges-table').innerHTML =
           '<table class="table-list"><thead><tr><th>Release</th><th>Branch</th><th>Arch</th><th>From package</th><th>Requirement</th><th>Provider</th><th>Status</th></tr></thead>'
           + '<tbody>' + (edgeRows || '<tr><td colspan="7">No edges in this filter view.</td></tr>') + '</tbody></table>';
+        byId('edges-page-info').textContent = 'Page ' + edgesPage + ' of ' + edgesPages + ' (' + edges.length + ' rows)';
+        byId('edges-prev').disabled = edgesPage <= 1;
+        byId('edges-next').disabled = edgesPage >= edgesPages;
       }
 
       function loadGraph() {
@@ -225,6 +275,8 @@
           releaseSel = new Set(graph.releases || []);
           branchSel = new Set(graph.branches || []);
           packageSel = new Set();
+          missingPage = 1;
+          edgesPage = 1;
           renderFilterBoxes();
           applyFilters();
         }).catch(function(e) {
@@ -262,6 +314,15 @@
       byId('filter-release-search').addEventListener('input', renderFilterBoxes);
       byId('filter-branch-search').addEventListener('input', renderFilterBoxes);
       byId('filter-package-search').addEventListener('input', renderFilterBoxes);
+      byId('filter-release-search').addEventListener('input', function() { missingPage = 1; edgesPage = 1; applyFilters(); });
+      byId('filter-branch-search').addEventListener('input', function() { missingPage = 1; edgesPage = 1; applyFilters(); });
+      byId('filter-package-search').addEventListener('input', function() { missingPage = 1; edgesPage = 1; applyFilters(); });
+      byId('missing-prev').addEventListener('click', function() { missingPage -= 1; applyFilters(); });
+      byId('missing-next').addEventListener('click', function() { missingPage += 1; applyFilters(); });
+      byId('edges-prev').addEventListener('click', function() { edgesPage -= 1; applyFilters(); });
+      byId('edges-next').addEventListener('click', function() { edgesPage += 1; applyFilters(); });
+      byId('missing-page-size').addEventListener('change', function() { missingPage = 1; applyFilters(); });
+      byId('edges-page-size').addEventListener('change', function() { edgesPage = 1; applyFilters(); });
 
       loadGraph();
     })();

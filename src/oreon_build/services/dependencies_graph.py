@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import gzip
+import bz2
+import lzma
 import logging
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -162,6 +165,27 @@ def _decompress_if_needed(raw: bytes, key: str) -> bytes:
     k = key.lower()
     if k.endswith(".gz"):
         return gzip.decompress(raw)
+    if k.endswith(".bz2"):
+        return bz2.decompress(raw)
+    if k.endswith(".xz"):
+        return lzma.decompress(raw)
+    if k.endswith(".zst") or k.endswith(".zstd"):
+        # Try python zstandard first, then shell zstd fallback.
+        try:
+            import zstandard as zstd  # type: ignore
+
+            return zstd.ZstdDecompressor().decompress(raw)
+        except Exception:
+            p = subprocess.run(
+                ["zstd", "-d", "-c", "--no-progress"],
+                input=raw,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            if p.returncode == 0 and p.stdout:
+                return p.stdout
+            raise RuntimeError("Failed to decompress zstd primary metadata")
     return raw
 
 
@@ -228,8 +252,17 @@ def _analyze_repo(target: RepoTarget, tmpdir: Path) -> dict[str, Any]:
     primary_raw = r2.get_object(primary_key)
     if not primary_raw:
         return {"repo": target, "packages": {}, "missing": [], "edges": [], "error": "primary_blob_missing"}
-    primary_xml = _decompress_if_needed(primary_raw, primary_key)
-    pkgs, provides_index, _requires_index = _parse_primary_xml(primary_xml)
+    try:
+        primary_xml = _decompress_if_needed(primary_raw, primary_key)
+        pkgs, provides_index, _requires_index = _parse_primary_xml(primary_xml)
+    except Exception as exc:
+        return {
+            "repo": target,
+            "packages": {},
+            "missing": [],
+            "edges": [],
+            "error": f"primary_parse_failed:{type(exc).__name__}",
+        }
 
     # Use hawkey to parse dependency relations in the same format that dnf/hawkey understands.
     # We keep XML parsing for metadata ingestion from R2, then use hawkey as the dependency matcher.
