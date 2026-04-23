@@ -35,6 +35,10 @@ Stale legacy ``oreon-worker-*`` dirs are pruned by age (see deploy docs).
 DistGit: Source(kind="distgit", url="<repo>.git#branch:spec_relpath") — mock --buildsrpm then mock --rebuild.
 
 Poll may include ``mock_additional_repos`` (base URLs) from the job mock environment. Each becomes ``mock --addrepo``.
+Mock already tags those with ``cost=1`` (higher DNF priority than the default ~1000). Fedora templates still set ``best=1`` in ``[main]``,
+so DNF5 can try to take the "best" NEVR from different repos and mix an impossible gcc stack. When at least one addrepo is present, the
+worker uses a short generated config that includes the real root cfg, sets ``[main] best=0`` and appends ``--setopt=best=0`` to
+``dnf4_common_opts`` and ``dnf5_common_opts`` unless ``OREON_WORKER_MOCK_SKIP_MIXED_REPOS_OPTS=1`` disables that.
 Optional ``OREON_WORKER_EXTRA_MOCK_ADDREPO`` appends comma-separated URLs on the worker.
 During long ``mock`` runs, optional ``OREON_WORKER_LIVE_LOG_INTERVAL_SEC`` (default 60, 0 disables)
 uploads a tail of ``build.log`` so the web UI can show progress before the build finishes.
@@ -904,6 +908,82 @@ def _mock_addrepo_baseurls(job: dict) -> list[str]:
     return out
 
 
+def _resolve_mock_config_file(name: str) -> str | None:
+    """
+    Return an absolute path to a mock ``.cfg`` on the worker so we can ``include(...)`` it from
+    a generated wrapper. ``MOCK_CONFDIR`` (default ``/etc/mock``) is used for short names.
+    """
+    s = (name or "").strip()
+    if not s:
+        return None
+    if os.path.isabs(s) and os.path.isfile(s):
+        return os.path.realpath(s)
+    if os.path.isfile(s):
+        return os.path.realpath(s)
+    confd = (os.environ.get("MOCK_CONFDIR") or "/etc/mock").rstrip("/")
+    stem = s[: -4] if s.endswith(".cfg") else s
+    c = os.path.join(confd, f"{stem}.cfg")
+    if os.path.isfile(c):
+        return os.path.realpath(c)
+    return None
+
+
+def _write_oreon_mock_mixed_repos_wrapper_cfg(
+    include_path: str, parent: Path, attempt_id: int
+) -> Path:
+    """
+    Generate a mock config that includes the real root config, then relaxes dnf "best" so
+    ``--addrepo`` (already ``cost=1`` in mock) and base repos do not form impossible mixed stacks
+    (typical: gcc N from the extra repo vs gcc N-1 from fedora/updates in one transaction).
+    """
+    parent.mkdir(parents=True, exist_ok=True)
+    out = parent / f"oreon-mock-mixed-repos-{attempt_id}.cfg"
+    lines: list[str] = [
+        "# Oreon worker: mixed mock --addrepo dnf5 solver (auto-generated, do not edit)",
+        f"include({repr(include_path)})",
+        "# addrepo repos get cost=1 in mock; below relaxes [main] best=1 and dnf --setopt=best=0",
+        "",
+        '_oreon_d4 = " ".join(str(x) for x in (config_opts.get("dnf4_common_opts") or []))',
+        'if "best=0" not in _oreon_d4.lower() and "best=false" not in _oreon_d4.lower():',
+        '    config_opts["dnf4_common_opts"] = list(config_opts.get("dnf4_common_opts") or []) + ["--setopt=best=0"]',
+        "",
+        '_oreon_d5 = " ".join(str(x) for x in (config_opts.get("dnf5_common_opts") or []))',
+        'if "best=0" not in _oreon_d5.lower() and "best=false" not in _oreon_d5.lower():',
+        '    config_opts["dnf5_common_opts"] = list(config_opts.get("dnf5_common_opts") or []) + ["--setopt=best=0"]',
+        "",
+        '_oreon_dcf = config_opts.get("dnf.conf")',
+        '_oreon_pat = "\\nbest=1\\n"',
+        "if isinstance(_oreon_dcf, str) and _oreon_pat in _oreon_dcf:",
+        '    config_opts["dnf.conf"] = _oreon_dcf.replace(_oreon_pat, "\\nbest=0\\n", 1)',
+        "",
+    ]
+    out.write_text("\n".join(lines), encoding="utf-8")
+    return out
+
+
+def _mock_config_for_mixed_addrepos(
+    base_cfg: str,
+    addrepo_baseurls: list[str] | None,
+    result_parent: Path,
+    attempt_id: int | None,
+) -> str:
+    if not addrepo_baseurls or _truthy_env("OREON_WORKER_MOCK_SKIP_MIXED_REPOS_OPTS"):
+        return base_cfg
+    inc = _resolve_mock_config_file(base_cfg)
+    if not inc:
+        logger.warning(
+            "Could not find mock base config for %r (MOCK_CONFDIR=%s), using -r as-is; "
+            "addrepo dnf5 mixing may still fail. Install mock configs on this host.",
+            base_cfg,
+            os.environ.get("MOCK_CONFDIR") or "/etc/mock",
+        )
+        return base_cfg
+    wid = int(attempt_id) if attempt_id is not None else 0
+    wpath = _write_oreon_mock_mixed_repos_wrapper_cfg(inc, result_parent, wid)
+    logger.info("mock -r %s (mixed addrepo, include %s)", wpath, inc)
+    return str(wpath)
+
+
 def _rpm_dist_macro_value(releasename: str | None) -> str | None:
     """
     Return the value for rpmbuild ``dist`` (e.g. ``.or11``) so ``Release`` and filenames use ``orN``
@@ -1616,8 +1696,11 @@ def _mock_build_srpm_from_spec(
     ``OREON_WORKER_MOCK_SHARED_CACHE`` is set). Otherwise dnf metadata and tmpdirs are shared
     across all jobs using the same ``-r`` and dnf5 can fail when builds overlap.
     """
+    eff_mock_config = _mock_config_for_mixed_addrepos(
+        mock_config, addrepo_baseurls or [], result_dir.parent, attempt_id
+    )
     cmd = _mock_cmd_base(
-        mock_config,
+        eff_mock_config,
         mock_unique_ext,
         addrepo_baseurls or [],
         rpm_dist=rpm_dist,
@@ -1659,8 +1742,11 @@ def _mock_rebuild_srpm(
     attempt_id: int | None = None,
 ) -> tuple[bool, str, bool]:
     """Returns (ok, output, cancelled). See :func:`_mock_build_srpm_from_spec` for isolation knobs."""
+    eff_mock_config = _mock_config_for_mixed_addrepos(
+        mock_config, addrepo_baseurls or [], result_dir.parent, attempt_id
+    )
     cmd = _mock_cmd_base(
-        mock_config,
+        eff_mock_config,
         mock_unique_ext,
         addrepo_baseurls or [],
         rpm_dist=rpm_dist,
