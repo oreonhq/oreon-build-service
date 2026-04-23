@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import gzip
 import logging
+import sys
 import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -48,6 +49,26 @@ def _parse_requirement_name(raw: str) -> str | None:
     if not s:
         return None
     return s
+
+
+def _import_hawkey_with_system_fallback():
+    try:
+        import hawkey  # type: ignore
+
+        return hawkey
+    except Exception:
+        # Common deployment layout here is API in .venv but hawkey installed from OS RPM
+        # into system site-packages. Try those paths before failing.
+        candidates = (
+            "/usr/lib64/python3.14/site-packages",
+            "/usr/lib/python3.14/site-packages",
+        )
+        for p in candidates:
+            if p not in sys.path:
+                sys.path.append(p)
+        import hawkey  # type: ignore
+
+        return hawkey
 
 
 def _safe_text(node: ET.Element | None, default: str = "") -> str:
@@ -188,7 +209,7 @@ def _parse_primary_xml(primary_xml: bytes) -> tuple[dict[str, dict[str, Any]], d
 
 def _analyze_repo(target: RepoTarget, tmpdir: Path) -> dict[str, Any]:
     try:
-        import hawkey  # type: ignore
+        hawkey = _import_hawkey_with_system_fallback()
     except Exception as exc:  # pragma: no cover
         raise RuntimeError(
             "hawkey is not available on this API host. Install python3-hawkey (or python-hawkey) to use the Dependencies page."
