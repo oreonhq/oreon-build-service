@@ -346,14 +346,6 @@ class ChainBuildTrigger(BaseModel):
     )
     distgit_branch: Optional[str] = Field(None, max_length=128, description="Branch fragment in distgit URL")
     priority: int = 0
-    fail_fast: bool = Field(
-        False,
-        description=(
-            "If true, cancel the rest of the current stage when one job fails. "
-            "If false (default), other jobs in the stage keep running; use POST .../retry on failed jobs, "
-            "then the stage can still complete when all jobs succeed and publish."
-        ),
-    )
 
 
 class ChainResumeRequest(BaseModel):
