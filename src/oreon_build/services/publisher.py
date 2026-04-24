@@ -370,15 +370,48 @@ def _createrepo_timeout_sec() -> int:
     return max(60, min(n, 8 * 3600))
 
 
+def _r2_etag_strong_content_md5(etag: str) -> bool:
+    """
+    S3 / R2 single-part object ETag is the MD5 hex. Multipart and other forms are not; do not
+    use those for a local file comparison.
+    """
+    t = (etag or "").strip()
+    if not t or "-" in t:
+        return False
+    if len(t) != 32:
+        return False
+    t = t.lower()
+    for c in t:
+        if c not in "0123456789abcdef":
+            return False
+    return True
+
+
+def _local_rpm_bytes_match_r2_etag(path: Path, etag: str) -> bool:
+    """True if the file's MD5 matches a strong (single-part) S3 ETag."""
+    if not _r2_etag_strong_content_md5(etag) or not path.is_file() or path.stat().st_size == 0:
+        return False
+    m = hashlib.md5()
+    m.update(path.read_bytes())
+    return m.hexdigest() == etag.lower()
+
+
 def _sync_rpms_dir_from_r2(client: R2Client, rpms_prefix: str, rpms_dir: Path) -> int:
     """
-    Ensure ``rpms_dir`` matches R2 under ``rpms_prefix``. Skip download if file exists with same size.
-    Remove local ``*.rpm`` files that no longer exist in R2.
-    Returns number of RPM objects listed in R2.
+    Ensure ``rpms_dir`` matches R2 under ``rpms_prefix``.
+
+    R2 is the source of truth. A prior implementation skipped re-download when the local
+    file size matched the listing, which breaks if the object was replaced in R2 with new
+    content and the size stayed the same: createrepo would see stale bytes while clients
+    fetch fresh objects, producing "checksum does not match" in dnf.
+
+    We also compare MD5 to the object ETag when the ETag is a single-part content MD5. If
+    the ETag is absent or multipart (``-`` in the tag), we fall back to size only when the
+    tag is missing, otherwise re-download when size matches but the tag is non-md5.
     """
     rpms_dir.mkdir(parents=True, exist_ok=True)
     objs = client.list_objects(rpms_prefix)
-    wanted: dict[str, tuple[str, int]] = {}
+    wanted: dict[str, tuple[str, int, str]] = {}
     for o in objs:
         key = o.get("key")
         if not key:
@@ -387,13 +420,16 @@ def _sync_rpms_dir_from_r2(client: R2Client, rpms_prefix: str, rpms_dir: Path) -
         if not base.endswith(".rpm"):
             continue
         sz = int(o.get("size") or 0)
+        etag = (o.get("etag") or "").strip()
         if base in wanted:
+            prev_key, _, _ = wanted[base]
             logger.warning(
-                "Duplicate RPM basename in R2 listing, using last key base=%s key=%s",
+                "Duplicate RPM basename in R2 listing, last wins: base=%s was_key=%s now_key=%s",
                 base,
+                prev_key,
                 key,
             )
-        wanted[base] = (key, sz)
+        wanted[base] = (key, sz, etag)
 
     for f in list(rpms_dir.iterdir()):
         if f.is_file() and f.suffix == ".rpm" and f.name not in wanted:
@@ -402,9 +438,17 @@ def _sync_rpms_dir_from_r2(client: R2Client, rpms_prefix: str, rpms_dir: Path) -
             except OSError as e:
                 logger.warning("Could not remove stale local RPM %s: %s", f, e)
 
-    for fname, (key, sz) in wanted.items():
+    for fname, (key, sz, etag) in wanted.items():
         dest = rpms_dir / fname
+        need_fetch = True
         if sz > 0 and dest.is_file() and dest.stat().st_size == sz:
+            if _local_rpm_bytes_match_r2_etag(dest, etag):
+                need_fetch = False
+            elif not etag:
+                # Listing had no ETag: keep size-only skip (R2 should always send ETag)
+                need_fetch = False
+            # same size + non-matching or multipart ETag: must refresh from R2
+        if not need_fetch:
             continue
         data = client.get_object(key)
         if not data:
@@ -604,7 +648,10 @@ def publish_rpms_to_r2(
 ) -> None:
     """
     Given a list of R2 keys where RPMs already live, create repodata and upload to R2.
-    Flow: download RPMs to temp dir, run createrepo_c, upload repodata + RPMs (or just repodata if RPMs already at prefix).
+
+    Puts each object at ``<r2_prefix>/RPMS/<name>`` (when it is not already there) *before* running
+    createrepo or uploading repodata, so a client can never see new primary/repomd checksums that
+    still point at stale bytes in ``RPMS/``.
     """
     client = r2_client or get_r2_client()
     tmp_parent = _repo_temp_dir_parent()
@@ -613,6 +660,7 @@ def publish_rpms_to_r2(
             repo_root = Path(tmp) / "repo"
             rpms_dir = repo_root / "RPMS"
             rpms_dir.mkdir(parents=True)
+            prefix = r2_prefix.rstrip("/")
             for key in rpm_keys:
                 data = client.get_object(key)
                 if not data:
@@ -626,6 +674,9 @@ def publish_rpms_to_r2(
                         key,
                     )
                 dest.write_bytes(data)
+                canonical = f"{prefix}/RPMS/{fname}"
+                if key != canonical:
+                    client.put_object(canonical, data)
             _run_createrepo(repo_root)
             repodata_dir = repo_root / "repodata"
             if repodata_dir.exists():
@@ -633,13 +684,6 @@ def publish_rpms_to_r2(
                 _upload_repodata_dir_ordered(client, r2_prefix, repodata_dir)
 
                 _cleanup_old_repodata(client, r2_prefix, new_filenames)
-            for key in rpm_keys:
-                data = client.get_object(key)
-                if not data:
-                    raise RuntimeError(f"missing or empty RPM object at {key!r} during RPMS upload")
-                fname = key.split("/")[-1]
-                r2_key = f"{r2_prefix}/RPMS/{fname}"
-                client.put_object(r2_key, data)
     except OSError as e:
         if _is_disk_quota_or_no_space(e):
             label = _repo_temp_dir_label(tmp_parent)

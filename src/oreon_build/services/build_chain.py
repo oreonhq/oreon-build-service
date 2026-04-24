@@ -127,6 +127,7 @@ async def fail_chain(
     *,
     terminal: BuildChainStatus = BuildChainStatus.FAILED,
 ) -> None:
+    """Mark the chain terminal and cancel every still-active job in the chain (any stage)."""
     if chain.status in (
         BuildChainStatus.SUCCESS,
         BuildChainStatus.FAILED,
@@ -138,7 +139,6 @@ async def fail_chain(
     jres = await db.execute(
         select(BuildJob).where(
             BuildJob.chain_id == chain.id,
-            BuildJob.chain_stage_index == chain.active_stage_index,
             BuildJob.status.in_(
                 (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.RUNNING),
             ),
@@ -156,17 +156,6 @@ async def on_build_job_failed_for_chain(db: Any, job: BuildJob, reason: str) -> 
     if not chain or chain.status not in (BuildChainStatus.PENDING, BuildChainStatus.RUNNING):
         return
     if job.chain_stage_index is not None and job.chain_stage_index != chain.active_stage_index:
-        return
-    opt = _options_dict(chain)
-    # When fail_fast is false, other stage jobs keep running; retry failed job later.
-    if not bool(opt.get("fail_fast", False)):
-        logger.info(
-            "chain_id=%s stage=%s job_id=%s failed; fail_fast=false, not aborting other jobs: %s",
-            chain.id,
-            chain.active_stage_index,
-            job.id,
-            reason[:200],
-        )
         return
     await fail_chain(db, chain, reason, terminal=BuildChainStatus.FAILED)
 
@@ -462,7 +451,6 @@ async def trigger_chain_build(
     distgit_url: str | None,
     distgit_branch: str | None,
     priority: int,
-    fail_fast: bool = False,
 ) -> tuple[BuildChain, list[BuildJob]]:
     stages = parse_chain_build_spec(chain_spec)
     rr = await db.execute(select(Release).where(Release.id == release_id))
@@ -514,7 +502,6 @@ async def trigger_chain_build(
         "distgit_branch": dg_branch,
         "preferred_mock_environment_id": preferred_mock_environment_id,
         "priority": priority,
-        "fail_fast": bool(fail_fast),
     }
     chain = BuildChain(
         release_id=release_id,
@@ -643,7 +630,6 @@ async def resume_chain_from_previous(
         distgit_url=opt.get("distgit_url"),  # type: ignore[arg-type]
         distgit_branch=opt.get("distgit_branch"),  # type: ignore[arg-type]
         priority=int(opt.get("priority") or 0),
-        fail_fast=bool(opt.get("fail_fast", False)),
     )
 
 

@@ -87,7 +87,7 @@ class R2Client:
         self._client.delete_object(Bucket=self.bucket, Key=key)
 
     def list_objects(self, prefix: str, max_keys: int = 1000) -> list[dict]:
-        """List objects under prefix."""
+        """List objects under prefix. Includes ``etag`` (quote-stripped) for change detection."""
         paginator = self._client.get_paginator("list_objects_v2")
         out = []
         for page in paginator.paginate(
@@ -96,7 +96,19 @@ class R2Client:
             PaginationConfig={"PageSize": min(max_keys, 1000)},
         ):
             for obj in page.get("Contents", []):
-                out.append({"key": obj["Key"], "size": obj.get("Size", 0)})
+                raw_etag = obj.get("ETag") or ""
+                if isinstance(raw_etag, str):
+                    etag = raw_etag.strip().strip('"')
+                else:
+                    etag = str(raw_etag)
+                out.append(
+                    {
+                        "key": obj["Key"],
+                        "size": obj.get("Size", 0),
+                        "etag": etag,
+                        "last_modified": obj.get("LastModified"),
+                    }
+                )
         return out
 
     def iter_keys_with_prefix(self, prefix: str, *, page_size: int = 1000) -> Iterator[str]:
