@@ -75,6 +75,7 @@ async def create_mock_environment(
         config_content=data.config_content,
         additional_repo_urls=list(data.additional_repo_urls),
         lookaside_repo_urls=list(data.lookaside_repo_urls),
+        lookaside_gpg_key_url=data.lookaside_gpg_key_url,
         is_available=data.is_available,
         priority=data.priority,
     )
@@ -119,6 +120,8 @@ async def update_mock_environment(
         env.additional_repo_urls = list(data.additional_repo_urls)
     if data.lookaside_repo_urls is not None:
         env.lookaside_repo_urls = list(data.lookaside_repo_urls)
+    if "lookaside_gpg_key_url" in data.model_fields_set:
+        env.lookaside_gpg_key_url = data.lookaside_gpg_key_url
     a = list(env.additional_repo_urls or [])
     b = list(env.lookaside_repo_urls or [])
     if len(a) + len(b) > 32:
