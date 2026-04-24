@@ -74,6 +74,7 @@ async def create_mock_environment(
         architecture=None,
         config_content=data.config_content,
         additional_repo_urls=list(data.additional_repo_urls),
+        lookaside_repo_urls=list(data.lookaside_repo_urls),
         is_available=data.is_available,
         priority=data.priority,
     )
@@ -116,6 +117,15 @@ async def update_mock_environment(
         env.priority = data.priority
     if data.additional_repo_urls is not None:
         env.additional_repo_urls = list(data.additional_repo_urls)
+    if data.lookaside_repo_urls is not None:
+        env.lookaside_repo_urls = list(data.lookaside_repo_urls)
+    a = list(env.additional_repo_urls or [])
+    b = list(env.lookaside_repo_urls or [])
+    if len(a) + len(b) > 32:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="additional_repo_urls and lookaside_repo_urls combined may have at most 32 entries",
+        )
     await log_audit(
         db,
         "mock_env.update",
