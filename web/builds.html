@@ -125,6 +125,20 @@
                 If you omit colons, each package name is its own stage (strictly sequential).
               </p>
               <textarea id="chainbuild-spec" class="form-control" rows="4" placeholder="Example (parallel then next):&#10;libwidget libaselib : libgizmo&#10;&#10;Sequential only:&#10;bash grep coreutils"></textarea>
+              <p style="color:var(--text-muted); font-size:0.85rem; margin:0.55rem 0 0.25rem;">
+                <label style="display:inline-flex; align-items:center; gap:0.4rem; cursor:pointer; max-width:100%; flex-wrap:wrap;">
+                  <input type="checkbox" id="chainbuild-fail-fast" style="margin:0;">
+                  <span>Stop the rest of the current stage when one job fails (fail-fast). Leave off to keep other jobs in that stage running, fix the failure, then retry the failed job.</span>
+                </label>
+              </p>
+              <div style="margin-top:0.75rem; padding-top:0.75rem; border-top:1px solid var(--border-color,#e5e5e5);">
+                <span style="font-size:0.9rem; font-weight:500;">Resume from a previous chain</span>
+                <p style="color:var(--text-muted); font-size:0.82rem; margin:0.3rem 0 0.45rem 0;">Starts a new chain with the same spec and options as the old one, skipping arches that already have a successful build. Use after a failed or cancelled chain once specs are fixed.</p>
+                <div style="display:flex; flex-wrap:wrap; gap:0.5rem; align-items:center;">
+                  <input type="number" id="chain-resume-from-id" class="form-control" style="width:7rem; min-width:0;" min="1" step="1" placeholder="chain id">
+                  <button type="button" class="btn" id="btn-chain-resume">Resume as new chain</button>
+                </div>
+              </div>
             </div>
             <div id="source-checklist-panel" class="source-panel" style="display:none;">
               <p style="color:var(--text-muted); font-size:0.85rem; margin-bottom:0.5rem;">
@@ -195,7 +209,7 @@
       </div>
       <table class="table-list">
         <thead>
-          <tr><th class="col-checkbox"><input type="checkbox" id="builds-select-all" title="Select all on this page"></th><th>ID</th><th>Package</th><th>Release</th><th>Arch</th><th>Status</th><th>Controller</th><th>Created</th><th>Actions</th></tr>
+          <tr><th class="col-checkbox"><input type="checkbox" id="builds-select-all" title="Select all on this page"></th><th>ID</th><th>Package</th><th>Release</th><th>Arch</th><th>Status</th><th>Controller</th><th>Chain</th><th>Created</th><th>Actions</th></tr>
         </thead>
         <tbody id="builds-tbody"></tbody>
       </table>
@@ -224,6 +238,22 @@
       // (helper makeSearchableSelect was removed; selects are wired manually below)
       function escapeHtml(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; }
       function escapeAttr(s) { return escapeHtml(s).replace(/"/g, '&quot;'); }
+      function copyTextToClipboard(text) {
+        var t = String(text);
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          return navigator.clipboard.writeText(t).then(function() { return true; });
+        }
+        var ta = document.createElement('textarea');
+        ta.value = t;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.left = '-9999px';
+        document.body.appendChild(ta);
+        ta.select();
+        try { document.execCommand('copy'); } catch (e) {}
+        document.body.removeChild(ta);
+        return Promise.resolve(true);
+      }
       function findPackageIdByName(name) {
         var want = (name || '').trim().toLowerCase();
         if (!want) return null;
@@ -605,8 +635,20 @@
             var arch = (j.architecture != null && j.architecture !== '') ? j.architecture : '—';
             var sd = window.oreonJobDisplayStatus ? window.oreonJobDisplayStatus(j) : String(j.status || '');
             var signCell = window.oreonControllerKeyHtml ? window.oreonControllerKeyHtml(j.signing_status) : '—';
-            return '<tr data-id="' + j.id + '" data-status="' + escapeAttr(j.status || '') + '"><td class="col-checkbox"><input type="checkbox" class="build-row-cb" data-id="' + j.id + '"></td><td>' + j.id + '</td><td>' + packageLabel(j) + '</td><td>' + releaseLabel(j) + '</td><td>' + arch + '</td><td><span class="' + statusClass(sd) + '">' + escapeHtml(sd) + '</span></td><td>' + signCell + '</td><td>' + (j.created_at || '').slice(0,19) + '</td><td><a href="/build.html?job_id=' + j.id + '">View</a>' + retryBtn + cancelBtn + '</td></tr>';
-          }).join('') || '<tr><td colspan="9">No builds</td></tr>';
+            var chainPart = '—';
+            if (j.chain_id != null && j.chain_id !== undefined) {
+              var chainIdStr = String(j.chain_id);
+              var stgNote = (j.chain_stage_index != null && j.chain_stage_index !== undefined)
+                ? ' <span style="color:var(--text-muted); font-size:0.85em" title="Chain stage index">(S' + j.chain_stage_index + ')</span>'
+                : '';
+              var copyChainBtn = '<button type="button" class="btn copy-chain-id" data-chain-id="' + escapeAttr(chainIdStr) + '" title="Copy chain id" style="padding:0.2rem 0.45rem; font-size:0.8rem; margin-left:0.3rem; vertical-align:middle;">Copy</button>';
+              var resumeChainBtn = canAct
+                ? '<button type="button" class="btn chain-resume-row" data-chain-id="' + escapeAttr(chainIdStr) + '" title="New chain, same spec, skip arches already built" style="padding:0.2rem 0.5rem; font-size:0.8rem; margin-left:0.2rem; vertical-align:middle;">Resume chain</button>'
+                : '';
+              chainPart = chainIdStr + stgNote + copyChainBtn + resumeChainBtn;
+            }
+            return '<tr data-id="' + j.id + '" data-status="' + escapeAttr(j.status || '') + '"><td class="col-checkbox"><input type="checkbox" class="build-row-cb" data-id="' + j.id + '"></td><td>' + j.id + '</td><td>' + packageLabel(j) + '</td><td>' + releaseLabel(j) + '</td><td>' + arch + '</td><td><span class="' + statusClass(sd) + '">' + escapeHtml(sd) + '</span></td><td>' + signCell + '</td><td style="white-space:normal; max-width:16rem;">' + chainPart + '</td><td>' + (j.created_at || '').slice(0,19) + '</td><td><a href="/build.html?job_id=' + j.id + '">View</a>' + retryBtn + cancelBtn + '</td></tr>';
+          }).join('') || '<tr><td colspan="10">No builds</td></tr>';
           tbody.querySelectorAll('.retry:not([disabled])').forEach(function(btn) {
             btn.addEventListener('click', function() {
               var jid = String(btn.dataset.id);
@@ -628,6 +670,39 @@
               });
             });
           });
+          tbody.querySelectorAll('.copy-chain-id').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+              var raw = btn.getAttribute('data-chain-id');
+              if (raw == null || raw === '') return;
+              copyTextToClipboard(raw).then(function() {
+                var prev = btn.textContent;
+                btn.textContent = 'Copied';
+                btn.disabled = true;
+                setTimeout(function() {
+                  btn.textContent = prev;
+                  btn.disabled = false;
+                }, 1200);
+              }).catch(function() { alert('Could not copy. Chain id: ' + raw); });
+            });
+          });
+          tbody.querySelectorAll('.chain-resume-row').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+              if (!api.token) { alert('Log in to resume a chain.'); return; }
+              var raw = btn.getAttribute('data-chain-id');
+              var fromId = parseInt(raw, 10);
+              if (!fromId || fromId < 1) { return; }
+              oreonWithLoading(btn, function() {
+                return api.post('/builds/chain-resume', { from_chain_id: fromId })
+                  .then(function(data) {
+                    render();
+                    var n = (data && data.jobs && data.jobs.length) ? data.jobs.length : 0;
+                    var newCid = data && data.chain_id;
+                    alert('New chain ' + newCid + ' from chain ' + fromId + '. Queued ' + n + ' new job(s) (slots already built are skipped).');
+                  })
+                  .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
+              });
+            });
+          });
           var numPages = buildsTotal ? Math.ceil(buildsTotal / buildsPageSize) : 1;
           document.getElementById('builds-page-info').textContent = 'Page ' + (buildsPage + 1) + ' of ' + numPages;
           document.getElementById('builds-prev').disabled = buildsPage <= 0;
@@ -635,7 +710,7 @@
           buildsTableSel.refresh();
         }).catch(function() {
           const tbody = document.getElementById('builds-tbody');
-          if (tbody) tbody.innerHTML = '<tr><td colspan="9">Failed to load</td></tr>';
+          if (tbody) tbody.innerHTML = '<tr><td colspan="10">Failed to load</td></tr>';
         });
       }
       (function initBuildsPagination() {
@@ -834,18 +909,38 @@
           };
           var mockChain = (document.getElementById('new-package-mock-env') && document.getElementById('new-package-mock-env').value || '').trim();
           if (mockChain) chainBody.preferred_mock_environment_id = parseInt(mockChain, 10);
+          var ff = document.getElementById('chainbuild-fail-fast');
+          chainBody.fail_fast = !!(ff && ff.checked);
           oreonWithLoading(_btn, function() {
             return api.post('/builds/chain-trigger', chainBody)
               .then(function(data) {
                 render();
                 var n = (data && data.jobs && data.jobs.length) ? data.jobs.length : 0;
                 var cid = data && data.chain_id;
-                alert('Chain ' + cid + ' started. Queued ' + n + ' job(s) for the first stage (later stages run after repo publish completes).');
+                var tip = n ? 'Queued ' + n + ' job(s) for the first stage. Later stages start after the repo repodata updates.' : 'No new jobs in stage 0 (arches may already be built, or there are no workers).';
+                alert('Chain ' + cid + ' started. ' + tip + ' If something fails with fail-fast off, retry the failed job then the stage can still finish, or use Resume with from_chain_id=' + cid + '.');
               })
               .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
           });
           return;
         }
+      });
+      document.getElementById('btn-chain-resume').addEventListener('click', function() {
+        if (!api.token) { alert('Log in to resume a chain.'); return; }
+        var raw = (document.getElementById('chain-resume-from-id') && document.getElementById('chain-resume-from-id').value || '').trim();
+        var fromId = parseInt(raw, 10);
+        if (!fromId || fromId < 1) { alert('Enter a valid previous chain id (positive integer).'); return; }
+        var btn = this;
+        oreonWithLoading(btn, function() {
+          return api.post('/builds/chain-resume', { from_chain_id: fromId })
+            .then(function(data) {
+              render();
+              var n = (data && data.jobs && data.jobs.length) ? data.jobs.length : 0;
+              var cid = data && data.chain_id;
+              alert('New chain ' + cid + ' from chain ' + fromId + '. Queued ' + n + ' new job(s) (already-built slots skipped per options).');
+            })
+            .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
+        });
       });
       render();
     })();
