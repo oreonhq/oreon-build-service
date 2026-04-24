@@ -985,8 +985,9 @@ def _write_oreon_mock_mixed_repos_wrapper_cfg(
         '    config_opts["dnf.conf"] = _oreon_dcf.replace(_oreon_pat, "\\nbest=0\\n", 1)',
         "",
     ]
-    # If API provided a lookaside key URL, fetch once on host and inject into chroot for addrepo
-    # repos. This is distro-agnostic and does not depend on host files.
+    # If API provided a lookaside key URL, fetch once on host and inject into chroot.
+    # Do not write repo sections here. mock --addrepo generates them with baseurl/cost and we
+    # must not shadow those stanzas (shadowing can drop baseurl and break metadata loading).
     lk = (lookaside_gpg_key_url or "").strip()
     if lk:
         lines += [
@@ -1026,19 +1027,6 @@ def _write_oreon_mock_mixed_repos_wrapper_cfg(
             "    config_opts['files'] = _oreon_files",
             "except Exception:",
             "    pass",
-            "_oreon_key_file_for_repo = (_oreon_lookaside_chroot_key if '_oreon_lookaside_chroot_key' in globals() else _oreon_fedora_chroot_key)",
-            "_oreon_repo_snip = (",
-            "    '\\n[' + _oreon_fedora_repoid + ']\\n'"
-            " + 'gpgcheck=1\\n'"
-            " + 'repo_gpgcheck=0\\n'"
-            " + 'gpgkey=file://' + _oreon_key_file_for_repo + '\\n'"
-            ")",
-            "_oreon_dcf = str(config_opts.get('dnf.conf') or '')",
-            "if ('\\n[' + _oreon_fedora_repoid + ']\\n') not in _oreon_dcf:",
-            "    config_opts['dnf.conf'] = _oreon_dcf + _oreon_repo_snip",
-            "_oreon_ycf = str(config_opts.get('yum.conf') or '')",
-            "if ('\\n[' + _oreon_fedora_repoid + ']\\n') not in _oreon_ycf:",
-            "    config_opts['yum.conf'] = _oreon_ycf + _oreon_repo_snip",
             "",
         ]
     out.write_text("\n".join(lines), encoding="utf-8")
