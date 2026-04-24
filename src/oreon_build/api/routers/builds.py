@@ -9,7 +9,7 @@ from oreon_build.utils.spec import name_from_srpm_filename, parse_spec_content
 from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.orm import selectinload
 
-from oreon_build.api.deps import CurrentUser, DbSession
+from oreon_build.api.deps import CurrentAdmin, CurrentUser, DbSession
 from oreon_build.api.schemas import (
     ArtifactResponse,
     BuildAttemptResponse,
@@ -17,6 +17,7 @@ from oreon_build.api.schemas import (
     BuildTrigger,
     ChainBuildTrigger,
     ChainBuildTriggerResponse,
+    ChainResumeRequest,
     CurrentFailureItem,
     PaginatedResponse,
 )
@@ -609,6 +610,7 @@ async def trigger_chain_build_endpoint(
         distgit_url=data.distgit_url,
         distgit_branch=data.distgit_branch,
         priority=data.priority,
+        fail_fast=data.fail_fast,
     )
     att_map = await _latest_attempt_by_job_ids(db, [j.id for j in jobs])
     job_responses = [await _job_to_response(db, j, att_map.get(j.id)) for j in jobs]
@@ -621,6 +623,41 @@ async def trigger_chain_build_endpoint(
         chain_spec=chain.chain_spec,
         jobs=job_responses,
     )
+
+
+@router.post("/chain-resume", response_model=ChainBuildTriggerResponse, status_code=status.HTTP_201_CREATED)
+async def resume_chain_build_endpoint(
+    data: ChainResumeRequest,
+    request: Request,
+    db: DbSession,
+    user: CurrentUser,
+):
+    from oreon_build.services.build_chain import resume_chain_from_previous
+
+    chain, jobs = await resume_chain_from_previous(
+        db, request, user, from_chain_id=data.from_chain_id
+    )
+    att_map = await _latest_attempt_by_job_ids(db, [j.id for j in jobs])
+    job_responses = [await _job_to_response(db, j, att_map.get(j.id)) for j in jobs]
+    stages_raw = chain.stages_json if isinstance(chain.stages_json, list) else []
+    stages: list[list[str]] = [[str(n) for n in grp] for grp in stages_raw if isinstance(grp, list)]
+    return ChainBuildTriggerResponse(
+        chain_id=chain.id,
+        chain_status=chain.status.value,
+        stages=stages,
+        chain_spec=chain.chain_spec,
+        jobs=job_responses,
+    )
+
+
+@router.post("/mass-rebuild/run", response_model=dict)
+async def mass_rebuild_run_once(
+    db: DbSession,
+    admin: CurrentAdmin,
+):
+    from oreon_build.services.mass_rebuild import run_mass_rebuild_pass
+
+    return await run_mass_rebuild_pass(db)
 
 
 ALLOWED_UPLOAD_EXTENSIONS = (".src.rpm", ".spec")
