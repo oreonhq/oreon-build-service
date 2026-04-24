@@ -157,6 +157,17 @@ async def on_build_job_failed_for_chain(db: Any, job: BuildJob, reason: str) -> 
         return
     if job.chain_stage_index is not None and job.chain_stage_index != chain.active_stage_index:
         return
+    opt = _options_dict(chain)
+    # When fail_fast is false, other stage jobs keep running; retry failed job later.
+    if not bool(opt.get("fail_fast", False)):
+        logger.info(
+            "chain_id=%s stage=%s job_id=%s failed; fail_fast=false, not aborting other jobs: %s",
+            chain.id,
+            chain.active_stage_index,
+            job.id,
+            reason[:200],
+        )
+        return
     await fail_chain(db, chain, reason, terminal=BuildChainStatus.FAILED)
 
 
@@ -451,6 +462,7 @@ async def trigger_chain_build(
     distgit_url: str | None,
     distgit_branch: str | None,
     priority: int,
+    fail_fast: bool = False,
 ) -> tuple[BuildChain, list[BuildJob]]:
     stages = parse_chain_build_spec(chain_spec)
     rr = await db.execute(select(Release).where(Release.id == release_id))
@@ -502,6 +514,7 @@ async def trigger_chain_build(
         "distgit_branch": dg_branch,
         "preferred_mock_environment_id": preferred_mock_environment_id,
         "priority": priority,
+        "fail_fast": bool(fail_fast),
     }
     chain = BuildChain(
         release_id=release_id,
@@ -588,6 +601,50 @@ async def advance_settled_chains() -> None:
             except Exception:
                 logger.exception("chain_id=%s advance failed", chain.id)
         await db.commit()
+
+
+async def resume_chain_from_previous(
+    db: Any,
+    request: Request,
+    user: "Account",
+    *,
+    from_chain_id: int,
+) -> tuple[BuildChain, list[BuildJob]]:
+    """Start a new chain with the same spec and options as a previous (failed or finished) chain.
+
+    Uses ``skip_complete_arches`` from the previous options so already-built packages are skipped.
+    """
+    old_r = await db.execute(select(BuildChain).where(BuildChain.id == from_chain_id))
+    old = old_r.scalar_one_or_none()
+    if not old:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chain not found")
+    spec = (old.chain_spec or "").strip()
+    if not spec:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Source chain has no chain_spec")
+    opt = _options_dict(old)
+    opt.setdefault("skip_complete_arches", True)
+    _pm = opt.get("preferred_mock_environment_id")
+    if _pm is not None and _pm != "":
+        try:
+            _pm = int(_pm)  # JSON may have stored a string
+        except (TypeError, ValueError):
+            _pm = None
+    else:
+        _pm = None
+    return await trigger_chain_build(
+        db,
+        request,
+        user,
+        chain_spec=spec,
+        release_id=old.release_id,
+        architectures=list(opt.get("architectures") or DEFAULT_ARCH),
+        skip_complete_arches=bool(opt.get("skip_complete_arches", True)),
+        preferred_mock_environment_id=_pm,
+        distgit_url=opt.get("distgit_url"),  # type: ignore[arg-type]
+        distgit_branch=opt.get("distgit_branch"),  # type: ignore[arg-type]
+        priority=int(opt.get("priority") or 0),
+        fail_fast=bool(opt.get("fail_fast", False)),
+    )
 
 
 async def notify_chain_job_terminal_after_result(
