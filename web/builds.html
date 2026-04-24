@@ -123,14 +123,9 @@
                 Uses <code>oreonhq/rpm-specfiles</code> and <code>&lt;release&gt;/&lt;package&gt;/&lt;package&gt;.spec</code> like DistGit.
                 A colon <code>:</code> separates groups. Packages in one group build in parallel. The next group starts after RPMs from the previous group are published.
                 If you omit colons, each package name is its own stage (strictly sequential).
+                If any job in the current stage fails or is cancelled, other pending, queued, or running jobs in that chain are cancelled so you can fix and use Resume with the chain id.
               </p>
               <textarea id="chainbuild-spec" class="form-control" rows="4" placeholder="Example (parallel then next):&#10;libwidget libaselib : libgizmo&#10;&#10;Sequential only:&#10;bash grep coreutils"></textarea>
-              <p style="color:var(--text-muted); font-size:0.85rem; margin:0.55rem 0 0.25rem;">
-                <label style="display:inline-flex; align-items:center; gap:0.4rem; cursor:pointer; max-width:100%; flex-wrap:wrap;">
-                  <input type="checkbox" id="chainbuild-fail-fast" style="margin:0;">
-                  <span>Stop the rest of the current stage when one job fails (fail-fast). Leave off to keep other jobs in that stage running, fix the failure, then retry the failed job.</span>
-                </label>
-              </p>
               <div style="margin-top:0.75rem; padding-top:0.75rem; border-top:1px solid var(--border-color,#e5e5e5);">
                 <span style="font-size:0.9rem; font-weight:500;">Resume from a previous chain</span>
                 <p style="color:var(--text-muted); font-size:0.82rem; margin:0.3rem 0 0.45rem 0;">Starts a new chain with the same spec and options as the old one, skipping arches that already have a successful build. Use after a failed or cancelled chain once specs are fixed.</p>
@@ -909,8 +904,6 @@
           };
           var mockChain = (document.getElementById('new-package-mock-env') && document.getElementById('new-package-mock-env').value || '').trim();
           if (mockChain) chainBody.preferred_mock_environment_id = parseInt(mockChain, 10);
-          var ff = document.getElementById('chainbuild-fail-fast');
-          chainBody.fail_fast = !!(ff && ff.checked);
           oreonWithLoading(_btn, function() {
             return api.post('/builds/chain-trigger', chainBody)
               .then(function(data) {
@@ -918,7 +911,7 @@
                 var n = (data && data.jobs && data.jobs.length) ? data.jobs.length : 0;
                 var cid = data && data.chain_id;
                 var tip = n ? 'Queued ' + n + ' job(s) for the first stage. Later stages start after the repo repodata updates.' : 'No new jobs in stage 0 (arches may already be built, or there are no workers).';
-                alert('Chain ' + cid + ' started. ' + tip + ' If something fails with fail-fast off, retry the failed job then the stage can still finish, or use Resume with from_chain_id=' + cid + '.');
+                alert('Chain ' + cid + ' started. ' + tip + ' On failure other chain jobs are cancelled, then fix and use Resume with from_chain_id=' + cid + ' if you need a new chain.');
               })
               .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
           });
