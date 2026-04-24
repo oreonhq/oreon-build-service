@@ -908,6 +908,19 @@ def _mock_addrepo_baseurls(job: dict) -> list[str]:
     return out
 
 
+def _mock_lookaside_gpg_key_url(job: dict) -> str | None:
+    raw = job.get("mock_lookaside_gpg_key_url")
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    if not s.startswith(("http://", "https://")):
+        logger.warning("Ignoring non-http(s) mock_lookaside_gpg_key_url value")
+        return None
+    return s
+
+
 def _resolve_mock_config_file(name: str) -> str | None:
     """
     Return an absolute path to a mock ``.cfg`` on the worker so we can ``include(...)`` it from
@@ -928,8 +941,23 @@ def _resolve_mock_config_file(name: str) -> str | None:
     return None
 
 
+def _mock_addrepo_repoid(url: str) -> str:
+    raw = (url or "").strip().lower()
+    raw = re.sub(r"^[a-z]+://", "", raw)
+    return re.sub(r"[^a-z0-9]+", "_", raw) or "addrepo"
+
+
+def _fedora_releasever_from_url(url: str) -> str | None:
+    m = re.search(r"/releases/(\d+)/", (url or "").lower())
+    return m.group(1) if m else None
+
+
 def _write_oreon_mock_mixed_repos_wrapper_cfg(
-    include_path: str, parent: Path, attempt_id: int
+    include_path: str,
+    parent: Path,
+    attempt_id: int,
+    addrepo_baseurls: list[str] | None = None,
+    lookaside_gpg_key_url: str | None = None,
 ) -> Path:
     """
     Generate a mock config that includes the real root config, then relaxes dnf "best" so
@@ -957,6 +985,62 @@ def _write_oreon_mock_mixed_repos_wrapper_cfg(
         '    config_opts["dnf.conf"] = _oreon_dcf.replace(_oreon_pat, "\\nbest=0\\n", 1)',
         "",
     ]
+    # If API provided a lookaside key URL, fetch once on host and inject into chroot for addrepo
+    # repos. This is distro-agnostic and does not depend on host files.
+    lk = (lookaside_gpg_key_url or "").strip()
+    if lk:
+        lines += [
+            f"_oreon_lookaside_key_url = {lk!r}",
+            "_oreon_lookaside_chroot_key = '/etc/pki/rpm-gpg/RPM-GPG-KEY-lookaside-auto'",
+            "try:",
+            "    import urllib.request",
+            "    _oreon_key_text = urllib.request.urlopen(_oreon_lookaside_key_url, timeout=20).read().decode('utf-8', 'replace')",
+            "    _oreon_files = dict(config_opts.get('files') or {})",
+            "    _oreon_files[_oreon_lookaside_chroot_key.lstrip('/')] = _oreon_key_text",
+            "    config_opts['files'] = _oreon_files",
+            "except Exception:",
+            "    pass",
+            "",
+        ]
+    # If URL not provided, keep best-effort Fedora autodetection.
+    for url in addrepo_baseurls or []:
+        u = (url or "").strip()
+        if not u:
+            continue
+        if "dl.fedoraproject.org/pub/fedora/linux/releases/" not in u.lower():
+            continue
+        rel = _fedora_releasever_from_url(u)
+        if not rel:
+            continue
+        repoid = _mock_addrepo_repoid(u)
+        key_name = f"RPM-GPG-KEY-fedora-{rel}-primary"
+        host_key = f"/usr/share/distribution-gpg-keys/fedora/{key_name}"
+        chroot_key = f"/etc/pki/rpm-gpg/{key_name}"
+        lines += [
+            f"_oreon_fedora_repoid = {repoid!r}",
+            f"_oreon_fedora_chroot_key = {chroot_key!r}",
+            "try:",
+            f"    _oreon_key_text = open({host_key!r}, 'r', encoding='utf-8').read()",
+            "    _oreon_files = dict(config_opts.get('files') or {})",
+            "    _oreon_files[_oreon_fedora_chroot_key.lstrip('/')] = _oreon_key_text",
+            "    config_opts['files'] = _oreon_files",
+            "except Exception:",
+            "    pass",
+            "_oreon_key_file_for_repo = (_oreon_lookaside_chroot_key if '_oreon_lookaside_chroot_key' in globals() else _oreon_fedora_chroot_key)",
+            "_oreon_repo_snip = (",
+            "    '\\n[' + _oreon_fedora_repoid + ']\\n'"
+            " + 'gpgcheck=1\\n'"
+            " + 'repo_gpgcheck=0\\n'"
+            " + 'gpgkey=file://' + _oreon_key_file_for_repo + '\\n'"
+            ")",
+            "_oreon_dcf = str(config_opts.get('dnf.conf') or '')",
+            "if ('\\n[' + _oreon_fedora_repoid + ']\\n') not in _oreon_dcf:",
+            "    config_opts['dnf.conf'] = _oreon_dcf + _oreon_repo_snip",
+            "_oreon_ycf = str(config_opts.get('yum.conf') or '')",
+            "if ('\\n[' + _oreon_fedora_repoid + ']\\n') not in _oreon_ycf:",
+            "    config_opts['yum.conf'] = _oreon_ycf + _oreon_repo_snip",
+            "",
+        ]
     out.write_text("\n".join(lines), encoding="utf-8")
     return out
 
@@ -964,6 +1048,7 @@ def _write_oreon_mock_mixed_repos_wrapper_cfg(
 def _mock_config_for_mixed_addrepos(
     base_cfg: str,
     addrepo_baseurls: list[str] | None,
+    lookaside_gpg_key_url: str | None,
     result_parent: Path,
     attempt_id: int | None,
 ) -> str:
@@ -979,7 +1064,9 @@ def _mock_config_for_mixed_addrepos(
         )
         return base_cfg
     wid = int(attempt_id) if attempt_id is not None else 0
-    wpath = _write_oreon_mock_mixed_repos_wrapper_cfg(inc, result_parent, wid)
+    wpath = _write_oreon_mock_mixed_repos_wrapper_cfg(
+        inc, result_parent, wid, addrepo_baseurls, lookaside_gpg_key_url
+    )
     logger.info("mock -r %s (mixed addrepo, include %s)", wpath, inc)
     return str(wpath)
 
@@ -997,90 +1084,54 @@ def _write_oreon_mock_nogpg_wrapper_cfg(include_path: str, parent: Path, attempt
         "# Oreon worker: fallback for missing rpm GPG trust in mock bootstrap (auto-generated)",
         f"include({repr(include_path)})",
         "",
-        "_oreon_nogpg = [",
+        "_oreon_flags = [",
         '    "--nogpgcheck",',
         '    "--setopt=gpgcheck=0",',
-        '    "--setopt=localpkg_gpgcheck=0",',
         '    "--setopt=repo_gpgcheck=0",',
+        '    "--setopt=localpkg_gpgcheck=0",',
         "]",
         "",
-        'def _oreon_extend_opts(_key: str) -> None:',
-        '    _opts = list(config_opts.get(_key) or [])',
-        "    for _flag in _oreon_nogpg:",
-        "        if _flag not in _opts:",
-        "            _opts.append(_flag)",
-        "    config_opts[_key] = _opts",
+        '_oreon_opts = list(config_opts.get("dnf_common_opts") or [])',
+        "for _f in _oreon_flags:",
+        "    if _f not in _oreon_opts:",
+        "        _oreon_opts.append(_f)",
+        'config_opts["dnf_common_opts"] = _oreon_opts',
         "",
-        '# dnf4/dnf5/yum paths differ by mock version and runtime package manager selection.',
-        '_oreon_extend_opts("dnf_common_opts")',
-        '_oreon_extend_opts("dnf4_common_opts")',
-        '_oreon_extend_opts("dnf5_common_opts")',
-        '_oreon_extend_opts("yum_common_opts")',
+        '_oreon_opts = list(config_opts.get("dnf4_common_opts") or [])',
+        "for _f in _oreon_flags:",
+        "    if _f not in _oreon_opts:",
+        "        _oreon_opts.append(_f)",
+        'config_opts["dnf4_common_opts"] = _oreon_opts',
         "",
-        '_oreon_d4 = " ".join(str(x) for x in (config_opts.get("dnf4_common_opts") or []))',
-        'if "--nogpgcheck" not in _oreon_d4:',
-        '    config_opts["dnf4_common_opts"] = list(config_opts.get("dnf4_common_opts") or []) + ["--nogpgcheck"]',
+        '_oreon_opts = list(config_opts.get("dnf5_common_opts") or [])',
+        "for _f in _oreon_flags:",
+        "    if _f not in _oreon_opts:",
+        "        _oreon_opts.append(_f)",
+        'config_opts["dnf5_common_opts"] = _oreon_opts',
         "",
-        '_oreon_d5 = " ".join(str(x) for x in (config_opts.get("dnf5_common_opts") or []))',
-        'if "--nogpgcheck" not in _oreon_d5:',
-        '    config_opts["dnf5_common_opts"] = list(config_opts.get("dnf5_common_opts") or []) + ["--nogpgcheck"]',
+        '_oreon_opts = list(config_opts.get("yum_common_opts") or [])',
+        "for _f in _oreon_flags:",
+        "    if _f not in _oreon_opts:",
+        "        _oreon_opts.append(_f)",
+        'config_opts["yum_common_opts"] = _oreon_opts',
         "",
-        '_oreon_dcf = config_opts.get("dnf.conf")',
-        "if isinstance(_oreon_dcf, str):",
-        '    _oreon_lines = _oreon_dcf.splitlines()',
-        "    _out = []",
-        "    _seen = set()",
-        "    for _line in _oreon_lines:",
-        "        _s = _line.strip().lower()",
-        '        if _s.startswith("gpgcheck="):',
-        '            _out.append("gpgcheck=0")',
-        '            _seen.add("gpgcheck")',
-        "            continue",
-        '        if _s.startswith("repo_gpgcheck="):',
-        '            _out.append("repo_gpgcheck=0")',
-        '            _seen.add("repo_gpgcheck")',
-        "            continue",
-        '        if _s.startswith("localpkg_gpgcheck="):',
-        '            _out.append("localpkg_gpgcheck=0")',
-        '            _seen.add("localpkg_gpgcheck")',
-        "            continue",
-        "        _out.append(_line)",
-        '    if "gpgcheck" not in _seen:',
-        '        _out.append("gpgcheck=0")',
-        '    if "repo_gpgcheck" not in _seen:',
-        '        _out.append("repo_gpgcheck=0")',
-        '    if "localpkg_gpgcheck" not in _seen:',
-        '        _out.append("localpkg_gpgcheck=0")',
-        '    config_opts["dnf.conf"] = "\\n".join(_out) + "\\n"',
+        '_oreon_dcf = str(config_opts.get("dnf.conf") or "")',
+        'if "gpgcheck=0" not in _oreon_dcf:',
+        '    _oreon_dcf += "\\ngpgcheck=0"',
+        'if "repo_gpgcheck=0" not in _oreon_dcf:',
+        '    _oreon_dcf += "\\nrepo_gpgcheck=0"',
+        'if "localpkg_gpgcheck=0" not in _oreon_dcf:',
+        '    _oreon_dcf += "\\nlocalpkg_gpgcheck=0"',
+        'config_opts["dnf.conf"] = _oreon_dcf + "\\n"',
         "",
-        '# Some hosts read yum.conf when dnf4 runs in compatibility mode.',
-        '_oreon_ycf = config_opts.get("yum.conf")',
-        "if isinstance(_oreon_ycf, str):",
-        '    _oreon_y_lines = _oreon_ycf.splitlines()',
-        "    _y_out = []",
-        "    _y_seen = set()",
-        "    for _line in _oreon_y_lines:",
-        "        _s = _line.strip().lower()",
-        '        if _s.startswith("gpgcheck="):',
-        '            _y_out.append("gpgcheck=0")',
-        '            _y_seen.add("gpgcheck")',
-        "            continue",
-        '        if _s.startswith("repo_gpgcheck="):',
-        '            _y_out.append("repo_gpgcheck=0")',
-        '            _y_seen.add("repo_gpgcheck")',
-        "            continue",
-        '        if _s.startswith("localpkg_gpgcheck="):',
-        '            _y_out.append("localpkg_gpgcheck=0")',
-        '            _y_seen.add("localpkg_gpgcheck")',
-        "            continue",
-        "        _y_out.append(_line)",
-        '    if "gpgcheck" not in _y_seen:',
-        '        _y_out.append("gpgcheck=0")',
-        '    if "repo_gpgcheck" not in _y_seen:',
-        '        _y_out.append("repo_gpgcheck=0")',
-        '    if "localpkg_gpgcheck" not in _y_seen:',
-        '        _y_out.append("localpkg_gpgcheck=0")',
-        '    config_opts["yum.conf"] = "\\n".join(_y_out) + "\\n"',
+        '_oreon_ycf = str(config_opts.get("yum.conf") or "")',
+        'if "gpgcheck=0" not in _oreon_ycf:',
+        '    _oreon_ycf += "\\ngpgcheck=0"',
+        'if "repo_gpgcheck=0" not in _oreon_ycf:',
+        '    _oreon_ycf += "\\nrepo_gpgcheck=0"',
+        'if "localpkg_gpgcheck=0" not in _oreon_ycf:',
+        '    _oreon_ycf += "\\nlocalpkg_gpgcheck=0"',
+        'config_opts["yum.conf"] = _oreon_ycf + "\\n"',
         "",
     ]
     out.write_text("\n".join(lines), encoding="utf-8")
@@ -1823,6 +1874,7 @@ def _mock_build_srpm_from_spec(
     abort_event: threading.Event | None = None,
     mock_unique_ext: str | None = None,
     addrepo_baseurls: list[str] | None = None,
+    lookaside_gpg_key_url: str | None = None,
     rpm_dist: str | None = None,
     attempt_id: int | None = None,
 ) -> tuple[bool, Path | None, str, bool]:
@@ -1840,7 +1892,11 @@ def _mock_build_srpm_from_spec(
     across all jobs using the same ``-r`` and dnf5 can fail when builds overlap.
     """
     eff_mock_config = _mock_config_for_mixed_addrepos(
-        mock_config, addrepo_baseurls or [], result_dir.parent, attempt_id
+        mock_config,
+        addrepo_baseurls or [],
+        lookaside_gpg_key_url,
+        result_dir.parent,
+        attempt_id,
     )
     if _force_mock_nogpgcheck():
         eff_mock_config = _mock_config_with_nogpg_fallback(
@@ -1917,12 +1973,17 @@ def _mock_rebuild_srpm(
     abort_event: threading.Event | None = None,
     mock_unique_ext: str | None = None,
     addrepo_baseurls: list[str] | None = None,
+    lookaside_gpg_key_url: str | None = None,
     rpm_dist: str | None = None,
     attempt_id: int | None = None,
 ) -> tuple[bool, str, bool]:
     """Returns (ok, output, cancelled). See :func:`_mock_build_srpm_from_spec` for isolation knobs."""
     eff_mock_config = _mock_config_for_mixed_addrepos(
-        mock_config, addrepo_baseurls or [], result_dir.parent, attempt_id
+        mock_config,
+        addrepo_baseurls or [],
+        lookaside_gpg_key_url,
+        result_dir.parent,
+        attempt_id,
     )
     if _force_mock_nogpgcheck():
         eff_mock_config = _mock_config_with_nogpg_fallback(
@@ -2394,8 +2455,11 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
         scrub_mock_cfg = mock_config
         scrub_mock_ext = mock_unique_ext
         mock_addrepos = _mock_addrepo_baseurls(job)
+        lookaside_gpg_key_url = _mock_lookaside_gpg_key_url(job)
         if mock_addrepos:
             logger.info("mock --addrepo for attempt %s: %s", attempt_id, mock_addrepos)
+        if lookaside_gpg_key_url:
+            logger.info("mock lookaside GPG key URL for attempt %s: %s", attempt_id, lookaside_gpg_key_url)
 
         rpm_dist = _rpm_dist_macro_value(job.get("releasename"))
         if rpm_dist:
@@ -2536,6 +2600,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                         abort_event=abort_event,
                         mock_unique_ext=mock_unique_ext,
                         addrepo_baseurls=mock_addrepos,
+                        lookaside_gpg_key_url=lookaside_gpg_key_url,
                         rpm_dist=rpm_dist,
                         attempt_id=attempt_id,
                     )
@@ -2602,6 +2667,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                     abort_event=abort_event,
                     mock_unique_ext=mock_unique_ext,
                     addrepo_baseurls=mock_addrepos,
+                    lookaside_gpg_key_url=lookaside_gpg_key_url,
                     rpm_dist=rpm_dist,
                     attempt_id=attempt_id,
                 )
