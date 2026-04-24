@@ -105,11 +105,17 @@ class ReleaseResponse(BaseModel):
 
 
 # --- Mock environment ---
-def _validate_mock_additional_repo_urls(v: object, *, allow_none: bool) -> Optional[List[str]]:
+# Mock ``--addrepo`` lines: additional (misc) + lookaside (bootstrap) combined cap.
+_MOCK_REPO_MAX_COMBINED = 32
+
+
+def _validate_mock_repo_url_list(
+    v: object, *, allow_none: bool, per_field_cap: int
+) -> Optional[List[str]]:
     if v is None:
         return None if allow_none else []
     if not isinstance(v, list):
-        raise ValueError("additional_repo_urls must be a list of strings")
+        raise ValueError("repo URL list must be a list of strings")
     out: List[str] = []
     for item in v:
         s = str(item).strip()
@@ -117,12 +123,18 @@ def _validate_mock_additional_repo_urls(v: object, *, allow_none: bool) -> Optio
             continue
         if len(s) > 2048:
             raise ValueError("repo URL exceeds 2048 characters")
-        if len(out) >= 32:
-            raise ValueError("at most 32 additional repo URLs")
+        if len(out) >= per_field_cap:
+            raise ValueError(f"at most {per_field_cap} URLs in this field")
         if not s.startswith(("http://", "https://")):
-            raise ValueError("each additional repo URL must start with http:// or https://")
+            raise ValueError("each repo URL must start with http:// or https://")
         out.append(s)
     return out
+
+
+def _validate_mock_additional_repo_urls(v: object, *, allow_none: bool) -> Optional[List[str]]:
+    return _validate_mock_repo_url_list(
+        v, allow_none=allow_none, per_field_cap=_MOCK_REPO_MAX_COMBINED
+    )
 
 
 class MockEnvironmentCreate(BaseModel):
@@ -130,15 +142,36 @@ class MockEnvironmentCreate(BaseModel):
     name: str = Field(..., max_length=128)
     config_name: str = Field(..., max_length=128, description="Base config name; at build time worker uses <config_name>-<arch>")
     config_content: Optional[str] = None
-    additional_repo_urls: List[str] = Field(default_factory=list)
+    additional_repo_urls: List[str] = Field(default_factory=list, description="Extra mock --addrepo URLs (before lookaside).")
+    lookaside_repo_urls: List[str] = Field(
+        default_factory=list,
+        description="Bootstrap / Fedora lookaside; appended after additional_repo_urls for mock --addrepo.",
+    )
     is_available: bool = True
     priority: int = 0
 
     @field_validator("additional_repo_urls", mode="before")
     @classmethod
-    def _repos_create(cls, v: object) -> List[str]:
+    def _repos_create_additional(cls, v: object) -> List[str]:
         out = _validate_mock_additional_repo_urls(v, allow_none=False)
         return list(out) if out is not None else []
+
+    @field_validator("lookaside_repo_urls", mode="before")
+    @classmethod
+    def _repos_create_lookaside(cls, v: object) -> List[str]:
+        out = _validate_mock_repo_url_list(
+            v, allow_none=False, per_field_cap=_MOCK_REPO_MAX_COMBINED
+        )
+        return list(out) if out is not None else []
+
+    @model_validator(mode="after")
+    def _combined_addrepo_limit(self) -> "MockEnvironmentCreate":
+        a, b = self.additional_repo_urls, self.lookaside_repo_urls
+        if len(a) + len(b) > _MOCK_REPO_MAX_COMBINED:
+            raise ValueError(
+                f"additional_repo_urls and lookaside_repo_urls combined may have at most {_MOCK_REPO_MAX_COMBINED} entries"
+            )
+        return self
 
 
 class MockEnvironmentUpdate(BaseModel):
@@ -146,15 +179,25 @@ class MockEnvironmentUpdate(BaseModel):
     config_name: Optional[str] = None
     config_content: Optional[str] = None
     additional_repo_urls: Optional[List[str]] = None
+    lookaside_repo_urls: Optional[List[str]] = None
     is_available: Optional[bool] = None
     priority: Optional[int] = None
 
     @field_validator("additional_repo_urls", mode="before")
     @classmethod
-    def _repos_update(cls, v: object) -> Optional[List[str]]:
+    def _repos_update_add(cls, v: object) -> Optional[List[str]]:
         if v is None:
             return None
         return _validate_mock_additional_repo_urls(v, allow_none=False)
+
+    @field_validator("lookaside_repo_urls", mode="before")
+    @classmethod
+    def _repos_update_lookaside(cls, v: object) -> Optional[List[str]]:
+        if v is None:
+            return None
+        return _validate_mock_repo_url_list(
+            v, allow_none=False, per_field_cap=_MOCK_REPO_MAX_COMBINED
+        )
 
 
 class MockEnvironmentResponse(BaseModel):
@@ -164,6 +207,7 @@ class MockEnvironmentResponse(BaseModel):
     config_name: str
     architecture: Optional[str] = None
     additional_repo_urls: List[str] = Field(default_factory=list)
+    lookaside_repo_urls: List[str] = Field(default_factory=list)
     is_available: bool
     priority: int
     created_at: datetime
@@ -302,6 +346,20 @@ class ChainBuildTrigger(BaseModel):
     )
     distgit_branch: Optional[str] = Field(None, max_length=128, description="Branch fragment in distgit URL")
     priority: int = 0
+    fail_fast: bool = Field(
+        False,
+        description=(
+            "If true, cancel the rest of the current stage when one job fails. "
+            "If false (default), other jobs in the stage keep running; use POST .../retry on failed jobs, "
+            "then the stage can still complete when all jobs succeed and publish."
+        ),
+    )
+
+
+class ChainResumeRequest(BaseModel):
+    """Re-submit the same chain as a new chain, skipping packages that already built successfully."""
+
+    from_chain_id: int = Field(..., ge=1, description="Previous build chain id (failed, cancelled, or success)")
 
 
 class BuildJobResponse(BaseModel):

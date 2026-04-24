@@ -449,8 +449,11 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
         mock_config = base + "-" + build_arch
 
     mock_additional_repos: list[str] = []
-    if selected_mock_env and selected_mock_env.additional_repo_urls:
-        mock_additional_repos = [str(u).strip() for u in selected_mock_env.additional_repo_urls if str(u).strip()]
+    if selected_mock_env:
+        extra = [str(u).strip() for u in (selected_mock_env.additional_repo_urls or []) if str(u).strip()]
+        look = [str(u).strip() for u in (selected_mock_env.lookaside_repo_urls or []) if str(u).strip()]
+        # Oreon/primary in mock main config; addrepo: misc first, then lookaside (e.g. Fedora).
+        mock_additional_repos = extra + look
 
     return {
         "job": {

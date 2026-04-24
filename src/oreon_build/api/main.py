@@ -332,6 +332,39 @@ async def lifespan(app: FastAPI):
 
     chain_settle_task = asyncio.create_task(_chain_settle_loop(), name="chain-settle")
 
+    async def _mass_rebuild_loop() -> None:
+        from oreon_build.db.session import async_session_maker
+        from oreon_build.services.mass_rebuild import run_mass_rebuild_pass
+
+        while True:
+            try:
+                s = get_settings()
+                if not getattr(s, "mass_rebuild_enabled", False):
+                    await asyncio.sleep(30)
+                    continue
+                raw_i = int(getattr(s, "mass_rebuild_interval_seconds", 300) or 300)
+                raw_i = max(60, min(raw_i, 86400))
+                async with async_session_maker() as db:
+                    await run_mass_rebuild_pass(db)
+                    await db.commit()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Mass rebuild pass error")
+                try:
+                    await asyncio.sleep(120)
+                except asyncio.CancelledError:
+                    break
+                continue
+            try:
+                s2 = get_settings()
+                raw_i = int(getattr(s2, "mass_rebuild_interval_seconds", 300) or 300)
+                await asyncio.sleep(max(60, min(raw_i, 86400)))
+            except asyncio.CancelledError:
+                break
+
+    mass_rebuild_task = asyncio.create_task(_mass_rebuild_loop(), name="mass-rebuild")
+
     yield
 
     for t, label in [
@@ -339,6 +372,7 @@ async def lifespan(app: FastAPI):
         (catchup_task, "github-push-catchup"),
         (publish_task, "publish-tasks"),
         (chain_settle_task, "chain-settle"),
+        (mass_rebuild_task, "mass-rebuild"),
     ]:
         if t is not None:
             t.cancel()
