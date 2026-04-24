@@ -6,7 +6,10 @@ from fastapi import APIRouter, HTTPException, Query, status
 from oreon_build.api.deps import DbSession
 from oreon_build.models import Release
 from oreon_build.services.dependencies_graph import build_dependencies_graph
-from oreon_build.services.distgit_order import compute_distgit_build_order
+from oreon_build.services.distgit_order import (
+    compute_distgit_build_order,
+    compute_spec_tree_dependency_plan,
+)
 
 router = APIRouter(prefix="/dependencies", tags=["dependencies"])
 
@@ -51,6 +54,60 @@ async def distgit_build_order(
         "package_names": out.package_names,
         "edges": out.edges,
         "layers": out.layers,
+        "errors": out.errors,
+        "cycle_warning": out.cycle_warning,
+    }
+
+
+@router.get("/spec-tree-resolve", response_model=dict)
+async def spec_tree_resolve(
+    releasename: str = Query(..., min_length=1, max_length=128, description="Release name folder in rpm-specfiles and R2"),
+    repo_branch: str = Query("dev", min_length=1, max_length=64, description="R2 repo branch to compare source RPMs against (dev/testing/stable)"),
+    existing_only: bool = Query(
+        False,
+        description=(
+            "If false, chain all never-built sources from spec tree. "
+            "If true, only include missing sources required by packages already built in repo_branch."
+        ),
+    ),
+    distgit_url: str | None = Query(
+        None,
+        max_length=1024,
+        description="Override distgit Git URL (default from settings or oreonhq/rpm-specfiles)",
+    ),
+    distgit_branch: str | None = Query(None, max_length=128, description="Git branch (default main)"),
+) -> dict:
+    from oreon_build.config import get_settings
+
+    s = get_settings()
+    u = (distgit_url or getattr(s, "mass_rebuild_distgit_url", None) or "https://github.com/oreonhq/rpm-specfiles.git").strip()
+    b = (distgit_branch or getattr(s, "mass_rebuild_distgit_branch", None) or "main").strip()
+    out = await compute_spec_tree_dependency_plan(
+        releasename=releasename.strip(),
+        repo_branch=repo_branch.strip(),
+        existing_only=bool(existing_only),
+        distgit_url=u,
+        distgit_branch=b,
+    )
+    return {
+        "releasename": out.releasename,
+        "repo_branch": out.repo_branch,
+        "mode": out.mode,
+        "distgit_url": out.distgit_url,
+        "distgit_branch": out.distgit_branch,
+        "total_spec_packages": out.total_spec_packages,
+        "built_sources_count": len(out.built_sources),
+        "never_built_count": len(out.never_built_sources),
+        "selected_count": len(out.selected_for_chain),
+        "needed_missing_count": len(out.required_missing_sources),
+        "built_sources": out.built_sources,
+        "never_built_sources": out.never_built_sources,
+        "selected_for_chain": out.selected_for_chain,
+        "required_missing_sources": out.required_missing_sources,
+        "edges": out.edges,
+        "layers": out.layers,
+        "chain_string": out.chain_string,
+        "unresolved_requirements": out.unresolved_requirements,
         "errors": out.errors,
         "cycle_warning": out.cycle_warning,
     }
