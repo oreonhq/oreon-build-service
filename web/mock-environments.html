@@ -65,11 +65,6 @@
           <div id="create-mock-lookaside-repos"></div>
           <button type="button" class="btn" id="btn-create-mock-add-lookaside" style="margin-top:0.35rem;">Add lookaside row</button>
         </div>
-        <div class="form-group">
-          <label>Lookaside GPG key URL (optional)</label>
-          <p style="color:var(--text-muted); font-size:0.85rem; margin:0 0 0.5rem 0;">URL to ASCII-armored RPM signing key used by lookaside packages. Worker injects this into mock chroot.</p>
-          <input type="url" id="create-mock-lookaside-gpg-key-url" placeholder="https://example.org/RPM-GPG-KEY-foo" maxlength="2048">
-        </div>
         <button type="button" class="btn primary" id="btn-create-mock">Create mock environment</button>
       </div>
       <div class="list-toolbar">
@@ -125,10 +120,6 @@
           <label>Lookaside (bootstrap) repository URLs</label>
           <div id="edit-mock-lookaside-repos"></div>
           <button type="button" class="btn" id="btn-edit-mock-add-lookaside" style="margin-top:0.35rem;">Add lookaside row</button>
-        </div>
-        <div class="form-group">
-          <label>Lookaside GPG key URL (optional)</label>
-          <input type="url" id="edit-mock-lookaside-gpg-key-url" placeholder="https://example.org/RPM-GPG-KEY-foo" maxlength="2048">
         </div>
         <div class="modal-actions">
           <button type="button" class="btn" id="edit-mock-cancel">Cancel</button>
@@ -236,7 +227,6 @@
                 document.getElementById('edit-mock-priority').value = String(m.priority != null ? m.priority : 0);
                 fillMockRepoRows(document.getElementById('edit-mock-extra-repos'), m.additional_repo_urls || []);
                 fillMockRepoRows(document.getElementById('edit-mock-lookaside-repos'), m.lookaside_repo_urls || []);
-                document.getElementById('edit-mock-lookaside-gpg-key-url').value = m.lookaside_gpg_key_url || '';
                 document.getElementById('edit-mock-modal').classList.add('open');
               }).catch(function(e) { alert('Failed to load mock environment: ' + e.message); });
             });
@@ -307,7 +297,6 @@
             config_content: document.getElementById('edit-mock-config-content').value.trim() || null,
             additional_repo_urls: collectMockRepoUrls(document.getElementById('edit-mock-extra-repos')),
             lookaside_repo_urls: collectMockRepoUrls(document.getElementById('edit-mock-lookaside-repos')),
-            lookaside_gpg_key_url: document.getElementById('edit-mock-lookaside-gpg-key-url').value.trim() || null,
             is_available: document.getElementById('edit-mock-available').checked,
             priority: parseInt(document.getElementById('edit-mock-priority').value, 10) || 0
           }).then(function() { document.getElementById('edit-mock-modal').classList.remove('open'); load(); }).catch(function(e) { alert('Failed: ' + e.message); });
@@ -326,7 +315,6 @@
             config_name: config,
             additional_repo_urls: collectMockRepoUrls(document.getElementById('create-mock-extra-repos')),
             lookaside_repo_urls: collectMockRepoUrls(document.getElementById('create-mock-lookaside-repos')),
-            lookaside_gpg_key_url: document.getElementById('create-mock-lookaside-gpg-key-url').value.trim() || null,
             is_available: true,
             priority: 0
           })
@@ -334,7 +322,6 @@
               load();
               document.getElementById('create-mock-name').value = '';
               document.getElementById('create-mock-config').value = '';
-              document.getElementById('create-mock-lookaside-gpg-key-url').value = '';
               fillMockRepoRows(document.getElementById('create-mock-extra-repos'), []);
               fillMockRepoRows(document.getElementById('create-mock-lookaside-repos'), []);
               alert('Mock environment created.');
