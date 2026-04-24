@@ -984,6 +984,67 @@ def _mock_config_for_mixed_addrepos(
     return str(wpath)
 
 
+def _write_oreon_mock_nogpg_wrapper_cfg(include_path: str, parent: Path, attempt_id: int) -> Path:
+    """
+    Generate a mock config wrapper that keeps the base config but disables package GPG checks.
+
+    This is a controlled fallback for environments where the repo signing key is not imported in
+    the bootstrap chroot yet. It is only used after we detect explicit GPG key validation failures.
+    """
+    parent.mkdir(parents=True, exist_ok=True)
+    out = parent / f"oreon-mock-nogpg-{attempt_id}.cfg"
+    lines: list[str] = [
+        "# Oreon worker: fallback for missing rpm GPG trust in mock bootstrap (auto-generated)",
+        f"include({repr(include_path)})",
+        "",
+        '_oreon_d4 = " ".join(str(x) for x in (config_opts.get("dnf4_common_opts") or []))',
+        'if "--nogpgcheck" not in _oreon_d4:',
+        '    config_opts["dnf4_common_opts"] = list(config_opts.get("dnf4_common_opts") or []) + ["--nogpgcheck"]',
+        "",
+        '_oreon_d5 = " ".join(str(x) for x in (config_opts.get("dnf5_common_opts") or []))',
+        'if "--nogpgcheck" not in _oreon_d5:',
+        '    config_opts["dnf5_common_opts"] = list(config_opts.get("dnf5_common_opts") or []) + ["--nogpgcheck"]',
+        "",
+        '_oreon_dcf = config_opts.get("dnf.conf")',
+        "if isinstance(_oreon_dcf, str):",
+        '    _oreon_dcf = _oreon_dcf.replace("\\ngpgcheck=1\\n", "\\ngpgcheck=0\\n")',
+        '    _oreon_dcf = _oreon_dcf.replace("\\nrepo_gpgcheck=1\\n", "\\nrepo_gpgcheck=0\\n")',
+        '    config_opts["dnf.conf"] = _oreon_dcf',
+        "",
+    ]
+    out.write_text("\n".join(lines), encoding="utf-8")
+    return out
+
+
+def _looks_like_mock_gpg_key_failure(output: str) -> bool:
+    s = (output or "").lower()
+    return (
+        "gpg check failed" in s
+        or "public key for" in s
+        or "signature verification failed" in s
+        or "failed to validate gpg signature" in s
+    )
+
+
+def _allow_mock_gpg_fallback() -> bool:
+    """
+    Default on for resilience during bootstrap key distribution drift.
+    Set OREON_WORKER_MOCK_GPG_FALLBACK=0 to disable.
+    """
+    raw = (os.environ.get("OREON_WORKER_MOCK_GPG_FALLBACK") or "1").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _mock_config_with_nogpg_fallback(base_cfg: str, result_parent: Path, attempt_id: int | None) -> str:
+    inc = _resolve_mock_config_file(base_cfg)
+    if not inc:
+        return base_cfg
+    wid = int(attempt_id) if attempt_id is not None else 0
+    wpath = _write_oreon_mock_nogpg_wrapper_cfg(inc, result_parent, wid)
+    logger.warning("mock GPG trust fallback active: -r %s (include %s)", wpath, inc)
+    return str(wpath)
+
+
 def _rpm_dist_macro_value(releasename: str | None) -> str | None:
     """
     Return the value for rpmbuild ``dist`` (e.g. ``.or11``) so ``Release`` and filenames use ``orN``
@@ -1718,6 +1779,38 @@ def _mock_build_srpm_from_spec(
     rc, out = _run_with_abort(
         cmd, timeout_s=_mock_buildsrpm_timeout_sec(), abort_event=abort_event
     )
+    if (
+        rc != 0
+        and not (abort_event and abort_event.is_set())
+        and _allow_mock_gpg_fallback()
+        and _looks_like_mock_gpg_key_failure(out)
+    ):
+        fb_cfg = _mock_config_with_nogpg_fallback(eff_mock_config, result_dir.parent, attempt_id)
+        fb_cmd = _mock_cmd_base(
+            fb_cfg,
+            mock_unique_ext,
+            addrepo_baseurls or [],
+            rpm_dist=rpm_dist,
+            attempt_id=attempt_id,
+        )
+        fb_cmd += [
+            "--buildsrpm",
+            "--spec",
+            str(spec_path),
+            "--sources",
+            str(sources_dir),
+            "--resultdir",
+            str(result_dir),
+        ]
+        rc2, out2 = _run_with_abort(
+            fb_cmd, timeout_s=_mock_buildsrpm_timeout_sec(), abort_event=abort_event
+        )
+        out = (
+            out
+            + "\n\n== Oreon automatic mock GPG fallback retry (--nogpgcheck) ==\n"
+            + out2
+        )
+        rc = rc2
     if rc == _RC_MOCK_CANCELLED:
         return False, None, out, True
     if rc != 0:
@@ -1754,6 +1847,30 @@ def _mock_rebuild_srpm(
     )
     cmd += ["--rebuild", str(srpm_path), "--resultdir", str(result_dir)]
     rc, out = _run_with_abort(cmd, timeout_s=_mock_rebuild_timeout_sec(), abort_event=abort_event)
+    if (
+        rc != 0
+        and not (abort_event and abort_event.is_set())
+        and _allow_mock_gpg_fallback()
+        and _looks_like_mock_gpg_key_failure(out)
+    ):
+        fb_cfg = _mock_config_with_nogpg_fallback(eff_mock_config, result_dir.parent, attempt_id)
+        fb_cmd = _mock_cmd_base(
+            fb_cfg,
+            mock_unique_ext,
+            addrepo_baseurls or [],
+            rpm_dist=rpm_dist,
+            attempt_id=attempt_id,
+        )
+        fb_cmd += ["--rebuild", str(srpm_path), "--resultdir", str(result_dir)]
+        rc2, out2 = _run_with_abort(
+            fb_cmd, timeout_s=_mock_rebuild_timeout_sec(), abort_event=abort_event
+        )
+        out = (
+            out
+            + "\n\n== Oreon automatic mock GPG fallback retry (--nogpgcheck) ==\n"
+            + out2
+        )
+        rc = rc2
     if rc == _RC_MOCK_CANCELLED:
         return False, out, True
     return rc == 0, out, False
