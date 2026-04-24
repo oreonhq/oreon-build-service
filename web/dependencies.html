@@ -183,6 +183,21 @@
     </section>
 
     <section class="card deps-card">
+      <h3 style="margin-top:0;">DistGit spec build order (from specs)</h3>
+      <p class="deps-lead" style="margin-top:0;">
+        Lists every package under <code>releasename/*/</code> in the distgit tree and orders them by <code>BuildRequires</code> (parallel waves in <code>layers</code>). Handy for mass-rebuild or copying a chain line.
+      </p>
+      <div style="display:flex; flex-wrap:wrap; gap:0.5rem; align-items:center; margin-bottom:0.45rem;">
+        <label style="font-size:0.9rem;">Release id <input type="number" id="distgit-order-release" class="form-control" style="width:6.5rem; display:inline-block; vertical-align:middle; margin-left:0.25rem;" min="1" step="1" placeholder="e.g. 1"></label>
+        <input type="text" id="distgit-order-url" class="form-control" style="min-width:12rem; flex:1; max-width:32rem;" placeholder="DistGit URL (optional, server default if empty)">
+        <input type="text" id="distgit-order-branch" class="form-control" style="width:7.5rem;" placeholder="branch">
+        <button type="button" class="btn" id="btn-distgit-order">Load build order</button>
+      </div>
+      <div id="distgit-order-status" class="deps-status-text" style="margin-bottom:0.35rem;"></div>
+      <textarea id="distgit-order-output" class="form-control deps-codebox" rows="8" readonly placeholder="Layers, warnings, and a chain-style string appear here…"></textarea>
+    </section>
+
+    <section class="card deps-card">
       <h3 style="margin-top:0;">Generated chain-build</h3>
       <p class="deps-lead" style="margin-top:0;">
         Packages that need to be built, in dependency order. Buildroot dependencies (if any) appear first.
@@ -559,6 +574,40 @@
         renderFilterBoxes();
         applyFilters();
       });
+      byId('btn-distgit-order').addEventListener('click', function() {
+        var rid = parseInt((byId('distgit-order-release').value || '').trim(), 10);
+        if (!rid || rid < 1) { alert('Enter a valid release id (positive integer).'); return; }
+        var u = (byId('distgit-order-url').value || '').trim();
+        var b = (byId('distgit-order-branch').value || '').trim();
+        var q = 'release_id=' + encodeURIComponent(rid);
+        if (u) q += '&distgit_url=' + encodeURIComponent(u);
+        if (b) q += '&distgit_branch=' + encodeURIComponent(b);
+        byId('distgit-order-status').textContent = 'Loading…';
+        byId('distgit-order-output').value = '';
+        api.get('/dependencies/distgit-build-order?' + q).then(function(d) {
+          var lines = [];
+          lines.push('releasename: ' + (d.releasename || ''));
+          var pc = d.package_count;
+          if (pc == null && d.package_names) pc = d.package_names.length;
+          lines.push('packages: ' + (pc != null ? pc : '?'));
+          if (d.cycle_warning) lines.push('cycle warning: ' + d.cycle_warning);
+          if (d.errors && d.errors.length) lines.push('parse/network errors: ' + JSON.stringify(d.errors, null, 0));
+          lines.push('');
+          lines.push('layers (each wave can build in parallel):');
+          (d.layers || []).forEach(function(wave, i) {
+            lines.push('  wave ' + (i + 1) + ': ' + (Array.isArray(wave) ? wave.join(' ') : String(wave)));
+          });
+          lines.push('');
+          var chainStyle = (d.layers || []).map(function(w) { return (w || []).join(' '); }).filter(function(s) { return s && s.trim(); }).join(' : ');
+          lines.push('chain-style (colon between waves):');
+          lines.push(chainStyle);
+          byId('distgit-order-output').value = lines.join('\n');
+          byId('distgit-order-status').textContent = 'OK ' + (d.distgit_url ? '· ' + d.distgit_url : '') + (d.distgit_branch ? ' @ ' + d.distgit_branch : '');
+        }).catch(function(e) {
+          byId('distgit-order-status').textContent = 'Error: ' + (e && e.message ? e.message : String(e));
+        });
+      });
+
       byId('btn-copy-chain').addEventListener('click', function() {
         var txt = byId('chain-output').value || '';
         navigator.clipboard.writeText(txt).then(function() {
