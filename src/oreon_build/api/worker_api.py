@@ -449,11 +449,14 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
         mock_config = base + "-" + build_arch
 
     mock_additional_repos: list[str] = []
+    mock_lookaside_gpg_key_url: str | None = None
     if selected_mock_env:
         extra = [str(u).strip() for u in (selected_mock_env.additional_repo_urls or []) if str(u).strip()]
         look = [str(u).strip() for u in (selected_mock_env.lookaside_repo_urls or []) if str(u).strip()]
         # Oreon/primary in mock main config; addrepo: misc first, then lookaside (e.g. Fedora).
         mock_additional_repos = extra + look
+        k = (selected_mock_env.lookaside_gpg_key_url or "").strip()
+        mock_lookaside_gpg_key_url = k or None
 
     return {
         "job": {
@@ -468,6 +471,7 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
             "sources": sources,
             "mock_config": mock_config,
             "mock_additional_repos": mock_additional_repos,
+            "mock_lookaside_gpg_key_url": mock_lookaside_gpg_key_url,
         },
     }
 

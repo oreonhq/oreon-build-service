@@ -137,6 +137,19 @@ def _validate_mock_additional_repo_urls(v: object, *, allow_none: bool) -> Optio
     )
 
 
+def _validate_optional_http_url(v: object, *, field_name: str) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    if len(s) > 2048:
+        raise ValueError(f"{field_name} exceeds 2048 characters")
+    if not s.startswith(("http://", "https://")):
+        raise ValueError(f"{field_name} must start with http:// or https://")
+    return s
+
+
 class MockEnvironmentCreate(BaseModel):
     release_id: int
     name: str = Field(..., max_length=128)
@@ -146,6 +159,11 @@ class MockEnvironmentCreate(BaseModel):
     lookaside_repo_urls: List[str] = Field(
         default_factory=list,
         description="Bootstrap / Fedora lookaside; appended after additional_repo_urls for mock --addrepo.",
+    )
+    lookaside_gpg_key_url: Optional[str] = Field(
+        None,
+        max_length=2048,
+        description="Optional URL to ASCII-armored RPM GPG key used by lookaside repo packages.",
     )
     is_available: bool = True
     priority: int = 0
@@ -164,6 +182,11 @@ class MockEnvironmentCreate(BaseModel):
         )
         return list(out) if out is not None else []
 
+    @field_validator("lookaside_gpg_key_url", mode="before")
+    @classmethod
+    def _lookaside_key_url_create(cls, v: object) -> Optional[str]:
+        return _validate_optional_http_url(v, field_name="lookaside_gpg_key_url")
+
     @model_validator(mode="after")
     def _combined_addrepo_limit(self) -> "MockEnvironmentCreate":
         a, b = self.additional_repo_urls, self.lookaside_repo_urls
@@ -180,6 +203,7 @@ class MockEnvironmentUpdate(BaseModel):
     config_content: Optional[str] = None
     additional_repo_urls: Optional[List[str]] = None
     lookaside_repo_urls: Optional[List[str]] = None
+    lookaside_gpg_key_url: Optional[str] = None
     is_available: Optional[bool] = None
     priority: Optional[int] = None
 
@@ -199,6 +223,11 @@ class MockEnvironmentUpdate(BaseModel):
             v, allow_none=False, per_field_cap=_MOCK_REPO_MAX_COMBINED
         )
 
+    @field_validator("lookaside_gpg_key_url", mode="before")
+    @classmethod
+    def _lookaside_key_url_update(cls, v: object) -> Optional[str]:
+        return _validate_optional_http_url(v, field_name="lookaside_gpg_key_url")
+
 
 class MockEnvironmentResponse(BaseModel):
     id: int
@@ -208,6 +237,7 @@ class MockEnvironmentResponse(BaseModel):
     architecture: Optional[str] = None
     additional_repo_urls: List[str] = Field(default_factory=list)
     lookaside_repo_urls: List[str] = Field(default_factory=list)
+    lookaside_gpg_key_url: Optional[str] = None
     is_available: bool
     priority: int
     created_at: datetime
