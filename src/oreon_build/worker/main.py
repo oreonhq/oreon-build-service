@@ -908,19 +908,6 @@ def _mock_addrepo_baseurls(job: dict) -> list[str]:
     return out
 
 
-def _mock_lookaside_gpg_key_url(job: dict) -> str | None:
-    raw = job.get("mock_lookaside_gpg_key_url")
-    if raw is None:
-        return None
-    s = str(raw).strip()
-    if not s:
-        return None
-    if not s.startswith(("http://", "https://")):
-        logger.warning("Ignoring non-http(s) mock_lookaside_gpg_key_url value")
-        return None
-    return s
-
-
 def _resolve_mock_config_file(name: str) -> str | None:
     """
     Return an absolute path to a mock ``.cfg`` on the worker so we can ``include(...)`` it from
@@ -941,23 +928,10 @@ def _resolve_mock_config_file(name: str) -> str | None:
     return None
 
 
-def _mock_addrepo_repoid(url: str) -> str:
-    raw = (url or "").strip().lower()
-    raw = re.sub(r"^[a-z]+://", "", raw)
-    return re.sub(r"[^a-z0-9]+", "_", raw) or "addrepo"
-
-
-def _fedora_releasever_from_url(url: str) -> str | None:
-    m = re.search(r"/releases/(\d+)/", (url or "").lower())
-    return m.group(1) if m else None
-
-
 def _write_oreon_mock_mixed_repos_wrapper_cfg(
     include_path: str,
     parent: Path,
     attempt_id: int,
-    addrepo_baseurls: list[str] | None = None,
-    lookaside_gpg_key_url: str | None = None,
 ) -> Path:
     """
     Generate a mock config that includes the real root config, then relaxes dnf "best" so
@@ -985,50 +959,6 @@ def _write_oreon_mock_mixed_repos_wrapper_cfg(
         '    config_opts["dnf.conf"] = _oreon_dcf.replace(_oreon_pat, "\\nbest=0\\n", 1)',
         "",
     ]
-    # If API provided a lookaside key URL, fetch once on host and inject into chroot.
-    # Do not write repo sections here. mock --addrepo generates them with baseurl/cost and we
-    # must not shadow those stanzas (shadowing can drop baseurl and break metadata loading).
-    lk = (lookaside_gpg_key_url or "").strip()
-    if lk:
-        lines += [
-            f"_oreon_lookaside_key_url = {lk!r}",
-            "_oreon_lookaside_chroot_key = '/etc/pki/rpm-gpg/RPM-GPG-KEY-lookaside-auto'",
-            "try:",
-            "    import urllib.request",
-            "    _oreon_key_text = urllib.request.urlopen(_oreon_lookaside_key_url, timeout=20).read().decode('utf-8', 'replace')",
-            "    _oreon_files = dict(config_opts.get('files') or {})",
-            "    _oreon_files[_oreon_lookaside_chroot_key.lstrip('/')] = _oreon_key_text",
-            "    config_opts['files'] = _oreon_files",
-            "except Exception:",
-            "    pass",
-            "",
-        ]
-    # If URL not provided, keep best-effort Fedora autodetection.
-    for url in addrepo_baseurls or []:
-        u = (url or "").strip()
-        if not u:
-            continue
-        if "dl.fedoraproject.org/pub/fedora/linux/releases/" not in u.lower():
-            continue
-        rel = _fedora_releasever_from_url(u)
-        if not rel:
-            continue
-        repoid = _mock_addrepo_repoid(u)
-        key_name = f"RPM-GPG-KEY-fedora-{rel}-primary"
-        host_key = f"/usr/share/distribution-gpg-keys/fedora/{key_name}"
-        chroot_key = f"/etc/pki/rpm-gpg/{key_name}"
-        lines += [
-            f"_oreon_fedora_repoid = {repoid!r}",
-            f"_oreon_fedora_chroot_key = {chroot_key!r}",
-            "try:",
-            f"    _oreon_key_text = open({host_key!r}, 'r', encoding='utf-8').read()",
-            "    _oreon_files = dict(config_opts.get('files') or {})",
-            "    _oreon_files[_oreon_fedora_chroot_key.lstrip('/')] = _oreon_key_text",
-            "    config_opts['files'] = _oreon_files",
-            "except Exception:",
-            "    pass",
-            "",
-        ]
     out.write_text("\n".join(lines), encoding="utf-8")
     return out
 
@@ -1036,7 +966,6 @@ def _write_oreon_mock_mixed_repos_wrapper_cfg(
 def _mock_config_for_mixed_addrepos(
     base_cfg: str,
     addrepo_baseurls: list[str] | None,
-    lookaside_gpg_key_url: str | None,
     result_parent: Path,
     attempt_id: int | None,
 ) -> str:
@@ -1052,117 +981,8 @@ def _mock_config_for_mixed_addrepos(
         )
         return base_cfg
     wid = int(attempt_id) if attempt_id is not None else 0
-    wpath = _write_oreon_mock_mixed_repos_wrapper_cfg(
-        inc, result_parent, wid, addrepo_baseurls, lookaside_gpg_key_url
-    )
+    wpath = _write_oreon_mock_mixed_repos_wrapper_cfg(inc, result_parent, wid)
     logger.info("mock -r %s (mixed addrepo, include %s)", wpath, inc)
-    return str(wpath)
-
-
-def _write_oreon_mock_nogpg_wrapper_cfg(include_path: str, parent: Path, attempt_id: int) -> Path:
-    """
-    Generate a mock config wrapper that keeps the base config but disables package GPG checks.
-
-    This is a controlled fallback for environments where the repo signing key is not imported in
-    the bootstrap chroot yet. It is only used after we detect explicit GPG key validation failures.
-    """
-    parent.mkdir(parents=True, exist_ok=True)
-    out = parent / f"oreon-mock-nogpg-{attempt_id}.cfg"
-    lines: list[str] = [
-        "# Oreon worker: fallback for missing rpm GPG trust in mock bootstrap (auto-generated)",
-        f"include({repr(include_path)})",
-        "",
-        "_oreon_flags = [",
-        '    "--nogpgcheck",',
-        '    "--setopt=gpgcheck=0",',
-        '    "--setopt=repo_gpgcheck=0",',
-        '    "--setopt=localpkg_gpgcheck=0",',
-        "]",
-        "",
-        '_oreon_opts = list(config_opts.get("dnf_common_opts") or [])',
-        "for _f in _oreon_flags:",
-        "    if _f not in _oreon_opts:",
-        "        _oreon_opts.append(_f)",
-        'config_opts["dnf_common_opts"] = _oreon_opts',
-        "",
-        '_oreon_opts = list(config_opts.get("dnf4_common_opts") or [])',
-        "for _f in _oreon_flags:",
-        "    if _f not in _oreon_opts:",
-        "        _oreon_opts.append(_f)",
-        'config_opts["dnf4_common_opts"] = _oreon_opts',
-        "",
-        '_oreon_opts = list(config_opts.get("dnf5_common_opts") or [])',
-        "for _f in _oreon_flags:",
-        "    if _f not in _oreon_opts:",
-        "        _oreon_opts.append(_f)",
-        'config_opts["dnf5_common_opts"] = _oreon_opts',
-        "",
-        '_oreon_opts = list(config_opts.get("yum_common_opts") or [])',
-        "for _f in _oreon_flags:",
-        "    if _f not in _oreon_opts:",
-        "        _oreon_opts.append(_f)",
-        'config_opts["yum_common_opts"] = _oreon_opts',
-        "",
-        '_oreon_dcf = str(config_opts.get("dnf.conf") or "")',
-        'if "gpgcheck=0" not in _oreon_dcf:',
-        '    _oreon_dcf += "\\ngpgcheck=0"',
-        'if "repo_gpgcheck=0" not in _oreon_dcf:',
-        '    _oreon_dcf += "\\nrepo_gpgcheck=0"',
-        'if "localpkg_gpgcheck=0" not in _oreon_dcf:',
-        '    _oreon_dcf += "\\nlocalpkg_gpgcheck=0"',
-        'config_opts["dnf.conf"] = _oreon_dcf + "\\n"',
-        "",
-        '_oreon_ycf = str(config_opts.get("yum.conf") or "")',
-        'if "gpgcheck=0" not in _oreon_ycf:',
-        '    _oreon_ycf += "\\ngpgcheck=0"',
-        'if "repo_gpgcheck=0" not in _oreon_ycf:',
-        '    _oreon_ycf += "\\nrepo_gpgcheck=0"',
-        'if "localpkg_gpgcheck=0" not in _oreon_ycf:',
-        '    _oreon_ycf += "\\nlocalpkg_gpgcheck=0"',
-        'config_opts["yum.conf"] = _oreon_ycf + "\\n"',
-        "",
-    ]
-    out.write_text("\n".join(lines), encoding="utf-8")
-    return out
-
-
-def _looks_like_mock_gpg_key_failure(output: str) -> bool:
-    s = (output or "").lower()
-    return (
-        "gpg check failed" in s
-        or "public key for" in s
-        or "signature verification failed" in s
-        or "failed to validate gpg signature" in s
-    )
-
-
-def _allow_mock_gpg_fallback() -> bool:
-    """
-    Default on for resilience during bootstrap key distribution drift.
-    Set OREON_WORKER_MOCK_GPG_FALLBACK=0 to disable.
-    """
-    raw = (os.environ.get("OREON_WORKER_MOCK_GPG_FALLBACK") or "1").strip().lower()
-    return raw in ("1", "true", "yes", "on")
-
-
-def _force_mock_nogpgcheck() -> bool:
-    """
-    Force-disable package signature checks in mock from the first run.
-
-    Use for emergency recovery when bootstrap key trust is broken and repeated GPG-check failures
-    block the queue. Set OREON_WORKER_MOCK_FORCE_NOGPGCHECK=1.
-    """
-    raw = (os.environ.get("OREON_WORKER_MOCK_FORCE_NOGPGCHECK") or "0").strip().lower()
-    return raw in ("1", "true", "yes", "on")
-
-
-def _mock_config_with_nogpg_fallback(base_cfg: str, result_parent: Path, attempt_id: int | None) -> str:
-    inc = _resolve_mock_config_file(base_cfg)
-    if not inc:
-        return base_cfg
-    wid = int(attempt_id) if attempt_id is not None else 0
-    wpath = _write_oreon_mock_nogpg_wrapper_cfg(inc, result_parent, wid)
-    logger.warning("mock no-gpgcheck wrapper active: -r %s (include %s)", wpath, inc)
     return str(wpath)
 
 
@@ -1862,7 +1682,6 @@ def _mock_build_srpm_from_spec(
     abort_event: threading.Event | None = None,
     mock_unique_ext: str | None = None,
     addrepo_baseurls: list[str] | None = None,
-    lookaside_gpg_key_url: str | None = None,
     rpm_dist: str | None = None,
     attempt_id: int | None = None,
 ) -> tuple[bool, Path | None, str, bool]:
@@ -1882,14 +1701,9 @@ def _mock_build_srpm_from_spec(
     eff_mock_config = _mock_config_for_mixed_addrepos(
         mock_config,
         addrepo_baseurls or [],
-        lookaside_gpg_key_url,
         result_dir.parent,
         attempt_id,
     )
-    if _force_mock_nogpgcheck():
-        eff_mock_config = _mock_config_with_nogpg_fallback(
-            eff_mock_config, result_dir.parent, attempt_id
-        )
     cmd = _mock_cmd_base(
         eff_mock_config,
         mock_unique_ext,
@@ -1909,38 +1723,6 @@ def _mock_build_srpm_from_spec(
     rc, out = _run_with_abort(
         cmd, timeout_s=_mock_buildsrpm_timeout_sec(), abort_event=abort_event
     )
-    if (
-        rc != 0
-        and not (abort_event and abort_event.is_set())
-        and _allow_mock_gpg_fallback()
-        and _looks_like_mock_gpg_key_failure(out)
-    ):
-        fb_cfg = _mock_config_with_nogpg_fallback(eff_mock_config, result_dir.parent, attempt_id)
-        fb_cmd = _mock_cmd_base(
-            fb_cfg,
-            mock_unique_ext,
-            addrepo_baseurls or [],
-            rpm_dist=rpm_dist,
-            attempt_id=attempt_id,
-        )
-        fb_cmd += [
-            "--buildsrpm",
-            "--spec",
-            str(spec_path),
-            "--sources",
-            str(sources_dir),
-            "--resultdir",
-            str(result_dir),
-        ]
-        rc2, out2 = _run_with_abort(
-            fb_cmd, timeout_s=_mock_buildsrpm_timeout_sec(), abort_event=abort_event
-        )
-        out = (
-            out
-            + "\n\n== Oreon automatic mock GPG fallback retry (--nogpgcheck) ==\n"
-            + out2
-        )
-        rc = rc2
     if rc == _RC_MOCK_CANCELLED:
         return False, None, out, True
     if rc != 0:
@@ -1961,7 +1743,6 @@ def _mock_rebuild_srpm(
     abort_event: threading.Event | None = None,
     mock_unique_ext: str | None = None,
     addrepo_baseurls: list[str] | None = None,
-    lookaside_gpg_key_url: str | None = None,
     rpm_dist: str | None = None,
     attempt_id: int | None = None,
 ) -> tuple[bool, str, bool]:
@@ -1969,14 +1750,9 @@ def _mock_rebuild_srpm(
     eff_mock_config = _mock_config_for_mixed_addrepos(
         mock_config,
         addrepo_baseurls or [],
-        lookaside_gpg_key_url,
         result_dir.parent,
         attempt_id,
     )
-    if _force_mock_nogpgcheck():
-        eff_mock_config = _mock_config_with_nogpg_fallback(
-            eff_mock_config, result_dir.parent, attempt_id
-        )
     cmd = _mock_cmd_base(
         eff_mock_config,
         mock_unique_ext,
@@ -1986,30 +1762,6 @@ def _mock_rebuild_srpm(
     )
     cmd += ["--rebuild", str(srpm_path), "--resultdir", str(result_dir)]
     rc, out = _run_with_abort(cmd, timeout_s=_mock_rebuild_timeout_sec(), abort_event=abort_event)
-    if (
-        rc != 0
-        and not (abort_event and abort_event.is_set())
-        and _allow_mock_gpg_fallback()
-        and _looks_like_mock_gpg_key_failure(out)
-    ):
-        fb_cfg = _mock_config_with_nogpg_fallback(eff_mock_config, result_dir.parent, attempt_id)
-        fb_cmd = _mock_cmd_base(
-            fb_cfg,
-            mock_unique_ext,
-            addrepo_baseurls or [],
-            rpm_dist=rpm_dist,
-            attempt_id=attempt_id,
-        )
-        fb_cmd += ["--rebuild", str(srpm_path), "--resultdir", str(result_dir)]
-        rc2, out2 = _run_with_abort(
-            fb_cmd, timeout_s=_mock_rebuild_timeout_sec(), abort_event=abort_event
-        )
-        out = (
-            out
-            + "\n\n== Oreon automatic mock GPG fallback retry (--nogpgcheck) ==\n"
-            + out2
-        )
-        rc = rc2
     if rc == _RC_MOCK_CANCELLED:
         return False, out, True
     return rc == 0, out, False
@@ -2443,11 +2195,8 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
         scrub_mock_cfg = mock_config
         scrub_mock_ext = mock_unique_ext
         mock_addrepos = _mock_addrepo_baseurls(job)
-        lookaside_gpg_key_url = _mock_lookaside_gpg_key_url(job)
         if mock_addrepos:
             logger.info("mock --addrepo for attempt %s: %s", attempt_id, mock_addrepos)
-        if lookaside_gpg_key_url:
-            logger.info("mock lookaside GPG key URL for attempt %s: %s", attempt_id, lookaside_gpg_key_url)
 
         rpm_dist = _rpm_dist_macro_value(job.get("releasename"))
         if rpm_dist:
@@ -2588,7 +2337,6 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                         abort_event=abort_event,
                         mock_unique_ext=mock_unique_ext,
                         addrepo_baseurls=mock_addrepos,
-                        lookaside_gpg_key_url=lookaside_gpg_key_url,
                         rpm_dist=rpm_dist,
                         attempt_id=attempt_id,
                     )
@@ -2655,7 +2403,6 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                     abort_event=abort_event,
                     mock_unique_ext=mock_unique_ext,
                     addrepo_baseurls=mock_addrepos,
-                    lookaside_gpg_key_url=lookaside_gpg_key_url,
                     rpm_dist=rpm_dist,
                     attempt_id=attempt_id,
                 )
