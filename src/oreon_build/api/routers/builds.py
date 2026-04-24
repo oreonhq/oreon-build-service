@@ -610,7 +610,6 @@ async def trigger_chain_build_endpoint(
         distgit_url=data.distgit_url,
         distgit_branch=data.distgit_branch,
         priority=data.priority,
-        fail_fast=data.fail_fast,
     )
     att_map = await _latest_attempt_by_job_ids(db, [j.id for j in jobs])
     job_responses = [await _job_to_response(db, j, att_map.get(j.id)) for j in jobs]
