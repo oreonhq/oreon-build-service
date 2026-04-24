@@ -41,6 +41,8 @@ class MockEnvironment(Base):
     additional_repo_urls: Mapped[list[str]] = mapped_column(JSON, nullable=False)
     # Secondary lookaside (e.g. Fedora) for bootstrap; merged after additional_repo_urls for --addrepo.
     lookaside_repo_urls: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    # Optional URL for a lookaside repo RPM signing key (ASCII-armored).
+    lookaside_gpg_key_url: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
     is_available: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     priority: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
