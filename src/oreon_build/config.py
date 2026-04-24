@@ -394,6 +394,50 @@ class Settings(BaseSettings):
         description="How often the API runs the stale-build sweeper in the background.",
     )
 
+    # Mass auto-queue: distgit packages whose in-tree BRs are satisfied (OREON_MASS_REBUILD_ENABLED).
+    mass_rebuild_enabled: bool = Field(
+        default=False,
+        description="Background loop queues distgit builds when deps are met. OREON_MASS_REBUILD_ENABLED.",
+    )
+    mass_rebuild_interval_seconds: int = Field(
+        default=300,
+        ge=60,
+        le=86400,
+        description="How often to run a mass-rebuild pass. OREON_MASS_REBUILD_INTERVAL_SECONDS.",
+    )
+    mass_rebuild_max_jobs_per_pass: int = Field(
+        default=20,
+        ge=1,
+        le=500,
+        description="Cap jobs enqueued per pass (across all releases). OREON_MASS_REBUILD_MAX_JOBS_PER_PASS.",
+    )
+    mass_rebuild_distgit_url: str = Field(
+        default="https://github.com/oreonhq/rpm-specfiles.git",
+        description="Distgit Git URL for ``compute_distgit_build_order``. OREON_MASS_REBUILD_DISTGIT_URL.",
+    )
+    mass_rebuild_distgit_branch: str = Field(
+        default="main",
+        description="Branch for distgit order. OREON_MASS_REBUILD_DISTGIT_BRANCH.",
+    )
+    mass_rebuild_architectures: str = Field(
+        default="x86_64,aarch64",
+        description="Comma-separated arches to consider. OREON_MASS_REBUILD_ARCHITECTURES.",
+    )
+    mass_rebuild_mock_environment_id: Optional[int] = Field(
+        default=None,
+        description="If set, use this mock env for queued jobs (when valid for the release). OREON_MASS_REBUILD_MOCK_ENVIRONMENT_ID.",
+    )
+    mass_rebuild_release_ids: Optional[str] = Field(
+        default=None,
+        description="Comma-separated release id whitelist; empty = all active. OREON_MASS_REBUILD_RELEASE_IDS.",
+    )
+    mass_rebuild_priority: int = Field(
+        default=0,
+        ge=-1000,
+        le=1000,
+        description="Priority for mass-rebuild jobs. OREON_MASS_REBUILD_PRIORITY.",
+    )
+
     # Logging
     log_level: str = Field(default="INFO")
 
