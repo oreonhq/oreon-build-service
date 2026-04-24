@@ -548,12 +548,6 @@ def cmd_build(
     default="main",
     help="Branch fragment in distgit URL",
 )
-@click.option(
-    "--fail-fast/--no-fail-fast",
-    "fail_fast",
-    default=False,
-    help="If set, cancel other jobs in the current stage on first failure. Default: off (retry failed jobs, stage can still complete).",
-)
 def cmd_chain_build(
     spec_parts: tuple[str, ...],
     release_ref: str,
@@ -563,7 +557,6 @@ def cmd_chain_build(
     skip_complete: bool,
     distgit_url: str,
     distgit_branch: str,
-    fail_fast: bool,
 ) -> None:
     """Queue a distgit chain build (colon separates parallel groups; no colon means sequential)."""
     token = require_auth(get_token())
@@ -586,7 +579,6 @@ def cmd_chain_build(
         "skip_complete_arches": skip_complete,
         "distgit_url": distgit_url,
         "distgit_branch": distgit_branch,
-        "fail_fast": bool(fail_fast),
     }
     data = http_json("POST", api_base, "/api/builds/chain-trigger", token=token, json_body=body, timeout=300.0)
     if not isinstance(data, dict):
