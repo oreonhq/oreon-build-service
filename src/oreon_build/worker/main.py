@@ -1035,13 +1035,24 @@ def _allow_mock_gpg_fallback() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def _force_mock_nogpgcheck() -> bool:
+    """
+    Force-disable package signature checks in mock from the first run.
+
+    Use for emergency recovery when bootstrap key trust is broken and repeated GPG-check failures
+    block the queue. Set OREON_WORKER_MOCK_FORCE_NOGPGCHECK=1.
+    """
+    raw = (os.environ.get("OREON_WORKER_MOCK_FORCE_NOGPGCHECK") or "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def _mock_config_with_nogpg_fallback(base_cfg: str, result_parent: Path, attempt_id: int | None) -> str:
     inc = _resolve_mock_config_file(base_cfg)
     if not inc:
         return base_cfg
     wid = int(attempt_id) if attempt_id is not None else 0
     wpath = _write_oreon_mock_nogpg_wrapper_cfg(inc, result_parent, wid)
-    logger.warning("mock GPG trust fallback active: -r %s (include %s)", wpath, inc)
+    logger.warning("mock no-gpgcheck wrapper active: -r %s (include %s)", wpath, inc)
     return str(wpath)
 
 
@@ -1760,6 +1771,10 @@ def _mock_build_srpm_from_spec(
     eff_mock_config = _mock_config_for_mixed_addrepos(
         mock_config, addrepo_baseurls or [], result_dir.parent, attempt_id
     )
+    if _force_mock_nogpgcheck():
+        eff_mock_config = _mock_config_with_nogpg_fallback(
+            eff_mock_config, result_dir.parent, attempt_id
+        )
     cmd = _mock_cmd_base(
         eff_mock_config,
         mock_unique_ext,
@@ -1838,6 +1853,10 @@ def _mock_rebuild_srpm(
     eff_mock_config = _mock_config_for_mixed_addrepos(
         mock_config, addrepo_baseurls or [], result_dir.parent, attempt_id
     )
+    if _force_mock_nogpgcheck():
+        eff_mock_config = _mock_config_with_nogpg_fallback(
+            eff_mock_config, result_dir.parent, attempt_id
+        )
     cmd = _mock_cmd_base(
         eff_mock_config,
         mock_unique_ext,
