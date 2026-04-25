@@ -437,6 +437,26 @@ class Settings(BaseSettings):
         le=1000,
         description="Priority for mass-rebuild jobs. OREON_MASS_REBUILD_PRIORITY.",
     )
+    rpmbuild_layers_enabled: bool = Field(
+        default=True,
+        description="Enable rpmbuild-order plans, APIs, and layer metadata. OREON_RPMBUILD_LAYERS_ENABLED.",
+    )
+    rpmbuild_strict_gate_enabled: bool = Field(
+        default=True,
+        description="Enforce strict worker poll layer gating for rpmbuild plans. OREON_RPMBUILD_STRICT_GATE_ENABLED.",
+    )
+    rpmbuild_settle_timeout_seconds: int = Field(
+        default=900,
+        ge=30,
+        le=7200,
+        description="Max wait for repodata visibility before failing the active layer. OREON_RPMBUILD_SETTLE_TIMEOUT_SECONDS.",
+    )
+    rpmbuild_settle_poll_seconds: int = Field(
+        default=20,
+        ge=5,
+        le=300,
+        description="Settle loop poll interval for rpmbuild plans. OREON_RPMBUILD_SETTLE_POLL_SECONDS.",
+    )
 
     # Logging
     log_level: str = Field(default="INFO")
