@@ -58,6 +58,17 @@ class SpecTreeResolveResult:
 
 
 @dataclass
+class UnbuiltSpecListResult:
+    releasename: str
+    distgit_url: str
+    distgit_branch: str
+    total_spec_packages: int
+    total_db_packages: int
+    unbuilt_packages: list[str]
+    errors: list[str]
+
+
+@dataclass
 class _SpecParseResult:
     source_name: str
     build_requires: list[str]
@@ -514,4 +525,54 @@ async def compute_spec_tree_dependency_plan(
         unresolved_requirements=sorted(unresolved, key=lambda x: (x["package"], x["requirement"])),
         errors=errors,
         cycle_warning=cyc,
+    )
+
+
+async def compute_unbuilt_spec_list(
+    *,
+    releasename: str,
+    db_package_names: set[str],
+    distgit_url: str = "https://github.com/oreonhq/rpm-specfiles.git",
+    distgit_branch: str = "main",
+) -> UnbuiltSpecListResult:
+    """Return all dist-git packages under release that are not present in DB."""
+    errors: list[str] = []
+    gr = _github_owner_repo_from_git_url(distgit_url)
+    if not gr:
+        return UnbuiltSpecListResult(
+            releasename=releasename,
+            distgit_url=distgit_url,
+            distgit_branch=distgit_branch,
+            total_spec_packages=0,
+            total_db_packages=len(db_package_names),
+            unbuilt_packages=[],
+            errors=[f"distgit_url is not a supported github.com URL: {distgit_url!r}"],
+        )
+
+    owner, repo = gr
+    settings = get_settings()
+    token = (getattr(settings, "github_token", None) or os.environ.get("GITHUB_TOKEN") or "").strip() or None
+    headers: dict[str, str] = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    specs_by_pkg, tar_err = await _fetch_specs_by_tarball(
+        owner=owner,
+        repo=repo,
+        releasename=releasename,
+        distgit_branch=distgit_branch,
+        headers=headers,
+    )
+    errors.extend(tar_err)
+    spec_names = set(specs_by_pkg.keys())
+    unbuilt = sorted(name for name in spec_names if name not in db_package_names)
+
+    return UnbuiltSpecListResult(
+        releasename=releasename,
+        distgit_url=distgit_url,
+        distgit_branch=distgit_branch,
+        total_spec_packages=len(spec_names),
+        total_db_packages=len(db_package_names),
+        unbuilt_packages=unbuilt,
+        errors=errors,
     )

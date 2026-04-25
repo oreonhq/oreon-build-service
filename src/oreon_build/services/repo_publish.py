@@ -235,6 +235,12 @@ async def run_repo_publish_for_attempt(
                 await on_repo_publish_success_for_chain(attempt_id)
             except Exception:
                 logger.exception("build chain advance after publish attempt_id=%s", attempt_id)
+            try:
+                from oreon_build.services.rpmbuild_settle import on_repo_publish_event_for_rpmbuild
+
+                await on_repo_publish_event_for_rpmbuild(attempt_id)
+            except Exception:
+                logger.exception("rpmbuild settle notify after publish attempt_id=%s", attempt_id)
         except Exception as e:
             logger.exception("repo publish failed attempt_id=%s", attempt_id)
             async with async_session_maker() as db:

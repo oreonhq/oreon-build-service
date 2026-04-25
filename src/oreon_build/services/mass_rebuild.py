@@ -144,10 +144,13 @@ async def run_mass_rebuild_pass(db: Any) -> dict[str, Any]:
             continue
 
         flat: list[str] = []
-        for layer in order.layers:
+        layer_idx_by_name: dict[str, int] = {}
+        for idx, layer in enumerate(order.layers):
             for n in layer:
                 if n in by_name and n not in flat:
                     flat.append(n)
+                if n in by_name and n not in layer_idx_by_name:
+                    layer_idx_by_name[n] = idx
 
         for name in flat:
             if total_queued >= max_n:
@@ -186,6 +189,7 @@ async def run_mass_rebuild_pass(db: Any) -> dict[str, Any]:
                     priority=pr,
                     triggered_by_id=None,
                     branch=r2_publish_branch(release),
+                    rpmbuild_layer_index=layer_idx_by_name.get(name),
                 )
                 db.add(job)
                 await db.flush()

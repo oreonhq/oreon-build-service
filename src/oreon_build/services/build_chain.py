@@ -404,6 +404,7 @@ async def _enqueue_chain_stage_jobs(
                 branch=publish_branch,
                 chain_id=chain.id,
                 chain_stage_index=stage_index,
+                rpmbuild_layer_index=stage_index,
             )
             db.add(job)
             await db.flush()
