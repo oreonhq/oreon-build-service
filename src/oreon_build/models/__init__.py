@@ -18,6 +18,7 @@ from .account import Account, Role, RoleName
 from .audit import AuditLog
 from .build import BuildAttempt, BuildJob, BuildStatus, BuildTarget
 from .build_chain import BuildChain, BuildChainPublishReceipt, BuildChainStatus
+from .rpmbuild_plan import RpmbuildPlan, RpmbuildPlanStatus
 from .artifact import Artifact
 from .build_attempt_finalization import BuildAttemptFinalization
 from .package import Package, PackageVersion, Source
@@ -46,6 +47,8 @@ __all__ = [
     "BuildChain",
     "BuildChainPublishReceipt",
     "BuildChainStatus",
+    "RpmbuildPlan",
+    "RpmbuildPlanStatus",
     "Artifact",
     "BuildAttemptFinalization",
     "Package",

@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from .build_chain import BuildChain
     from .package import Package, PackageVersion
     from .release import Release
+    from .rpmbuild_plan import RpmbuildPlan
 
 
 class BuildStatus(str, enum.Enum):
@@ -71,6 +72,11 @@ class BuildJob(Base):
     branch: Mapped[str] = mapped_column(String(32), default="dev", nullable=False)
     chain_id: Mapped[Optional[int]] = mapped_column(ForeignKey("build_chains.id"), nullable=True, index=True)
     chain_stage_index: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    rpmbuild_plan_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("rpmbuild_plans.id"), nullable=True, index=True
+    )
+    rpmbuild_layer_index: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    rpmbuild_wave_index: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     package: Mapped["Package"] = relationship("Package", back_populates="build_jobs")
     release: Mapped["Release"] = relationship("Release", back_populates="build_jobs")
@@ -84,6 +90,7 @@ class BuildJob(Base):
         "BuildAttempt", back_populates="build_job", order_by="BuildAttempt.started_at.desc()"
     )
     build_chain: Mapped[Optional["BuildChain"]] = relationship("BuildChain", back_populates="jobs")
+    rpmbuild_plan: Mapped[Optional["RpmbuildPlan"]] = relationship("RpmbuildPlan", back_populates="jobs")
 
     @property
     def architecture(self) -> Optional[str]:
