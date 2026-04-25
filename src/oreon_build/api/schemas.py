@@ -373,6 +373,8 @@ class BuildJobResponse(BaseModel):
     completed_at: Optional[datetime] = None
     chain_id: Optional[int] = None
     chain_stage_index: Optional[int] = None
+    rpmbuild_plan_id: Optional[int] = None
+    rpmbuild_layer_index: Optional[int] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -383,6 +385,33 @@ class ChainBuildTriggerResponse(BaseModel):
     stages: List[List[str]]
     chain_spec: str
     jobs: List[BuildJobResponse]
+
+
+class RpmbuildPlanCreate(BaseModel):
+    release_id: int = Field(..., ge=1)
+    repo_branch: str = Field(default="dev", min_length=1, max_length=64)
+    seed_packages: List[str] = Field(default_factory=list)
+    architectures: List[str] = Field(default=["x86_64", "aarch64"])
+    priority: int = 0
+    distgit_url: Optional[str] = Field(None, max_length=1024)
+    distgit_branch: Optional[str] = Field(None, max_length=128)
+
+
+class RpmbuildPlanResponse(BaseModel):
+    id: int
+    release_id: int
+    releasename: str
+    repo_branch: str
+    distgit_url: str
+    distgit_branch: str
+    seed_mode: str
+    seed_packages: List[str]
+    status: str
+    current_open_layer: int
+    total_layers: int
+    queued_jobs: int
+    created_at: datetime
+    updated_at: datetime
 
 
 class CurrentFailureItem(BaseModel):

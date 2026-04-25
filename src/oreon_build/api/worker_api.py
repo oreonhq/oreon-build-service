@@ -60,6 +60,8 @@ from oreon_build.models import (
     Package,
     Promotion,
     Release,
+    RpmbuildPlan,
+    RpmbuildPlanStatus,
     Source,
     Worker,
     WorkerState,
@@ -349,6 +351,17 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
         .where(BuildJob.status.in_([BuildStatus.PENDING, BuildStatus.QUEUED]))
         .order_by(BuildJob.priority.desc(), BuildJob.created_at.asc())
     )
+    if get_settings().rpmbuild_strict_gate_enabled:
+        q = q.outerjoin(RpmbuildPlan, BuildJob.rpmbuild_plan_id == RpmbuildPlan.id).where(
+            (BuildJob.rpmbuild_plan_id.is_(None))
+            | (
+                RpmbuildPlan.status.in_((RpmbuildPlanStatus.RUNNING, RpmbuildPlanStatus.WAITING_SETTLE))
+                & (
+                    (BuildJob.rpmbuild_layer_index.is_(None))
+                    | (BuildJob.rpmbuild_layer_index <= RpmbuildPlan.current_open_layer)
+                )
+            )
+        )
     if worker_arch:
         arch_vals = sql_arch_match_values(locked_worker.architecture)
         if arch_vals:

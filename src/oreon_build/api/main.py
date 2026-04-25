@@ -365,6 +365,31 @@ async def lifespan(app: FastAPI):
 
     mass_rebuild_task = asyncio.create_task(_mass_rebuild_loop(), name="mass-rebuild")
 
+    async def _rpmbuild_settle_loop() -> None:
+        from oreon_build.db.session import async_session_maker
+        from oreon_build.services.rpmbuild_settle import advance_rpmbuild_plans_once
+
+        while True:
+            try:
+                s = get_settings()
+                if not s.rpmbuild_layers_enabled:
+                    await asyncio.sleep(30)
+                    continue
+                async with async_session_maker() as db:
+                    await advance_rpmbuild_plans_once(db)
+                    await db.commit()
+                await asyncio.sleep(max(5, int(s.rpmbuild_settle_poll_seconds)))
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("rpmbuild settle loop error")
+                try:
+                    await asyncio.sleep(30)
+                except asyncio.CancelledError:
+                    break
+
+    rpmbuild_settle_task = asyncio.create_task(_rpmbuild_settle_loop(), name="rpmbuild-settle")
+
     yield
 
     for t, label in [
@@ -373,6 +398,7 @@ async def lifespan(app: FastAPI):
         (publish_task, "publish-tasks"),
         (chain_settle_task, "chain-settle"),
         (mass_rebuild_task, "mass-rebuild"),
+        (rpmbuild_settle_task, "rpmbuild-settle"),
     ]:
         if t is not None:
             t.cancel()
