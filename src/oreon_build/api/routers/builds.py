@@ -20,11 +20,13 @@ from oreon_build.api.schemas import (
     ChainResumeRequest,
     CurrentFailureItem,
     PaginatedResponse,
+    RpmbuildPlanCreate,
+    RpmbuildPlanResponse,
 )
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
 from oreon_build.core.machine_arch import normalize_machine_arch
 from oreon_build.core.repo_branch import r2_publish_branch
-from oreon_build.models import BuildAttempt, BuildJob, BuildStatus, BuildTarget, Package, Release, Worker
+from oreon_build.models import BuildAttempt, BuildJob, BuildStatus, BuildTarget, Package, Release, RpmbuildPlan, Worker
 from oreon_build.services.build_target_util import get_or_create_build_target, has_successful_build_for_target
 from oreon_build.services.r2 import get_r2_client, upload_r2_key
 
@@ -401,6 +403,84 @@ async def distgit_checklist(
     }
 
 
+@router.get("/layers-checklist")
+async def layers_checklist(
+    release_id: int,
+    db: DbSession,
+    user: CurrentUser,
+    distgit_url: str | None = Query(None, max_length=1024),
+    distgit_branch: str | None = Query(None, max_length=128),
+) -> dict:
+    """Return rpmbuild-order layers from distgit specs with per-package ``finished`` (any successful build for this release).
+
+    Used by the Builds page Layers tab. ``finished`` matches distgit-checklist semantics (at least one
+    SUCCESS job for that package name and release, any architecture).
+    """
+    from oreon_build.config import get_settings
+    from oreon_build.services.distgit_order import compute_distgit_build_order
+
+    rel_res = await db.execute(select(Release).where(Release.id == release_id))
+    rel = rel_res.scalar_one_or_none()
+    if not rel:
+        raise HTTPException(status_code=404, detail="Release not found")
+    releasename = (rel.releasename or "").strip()
+    if not releasename:
+        raise HTTPException(status_code=400, detail="Release has no releasename configured")
+
+    s = get_settings()
+    dg = (distgit_url or getattr(s, "mass_rebuild_distgit_url", None) or "https://github.com/oreonhq/rpm-specfiles.git").strip()
+    br = (distgit_branch or getattr(s, "mass_rebuild_distgit_branch", None) or "main").strip()
+
+    order = await compute_distgit_build_order(releasename=releasename, distgit_url=dg, distgit_branch=br)
+    flat_names: list[str] = []
+    for wave in order.layers:
+        for n in wave:
+            n = str(n).strip()
+            if n and n not in flat_names:
+                flat_names.append(n)
+
+    already_built: set[str] = set()
+    if flat_names:
+        success_q = (
+            select(Package.name)
+            .join(BuildJob, BuildJob.package_id == Package.id)
+            .where(
+                BuildJob.release_id == release_id,
+                BuildJob.status == BuildStatus.SUCCESS,
+                Package.name.in_(flat_names),
+            )
+            .distinct()
+        )
+        already_res = await db.execute(success_q)
+        already_built = {str(row[0]) for row in already_res.all() if row[0]}
+
+    layers_out: list[list[dict[str, object]]] = []
+    for wave in order.layers:
+        row: list[dict[str, object]] = []
+        for name in wave:
+            name = str(name).strip()
+            if not name:
+                continue
+            row.append(
+                {
+                    "name": name,
+                    "finished": name in already_built,
+                    "spec_path": f"{releasename}/{name}/{name}.spec",
+                }
+            )
+        if row:
+            layers_out.append(row)
+
+    return {
+        "releasename": releasename,
+        "distgit_url": dg,
+        "distgit_branch": br,
+        "layers": layers_out,
+        "errors": order.errors,
+        "cycle_warning": order.cycle_warning,
+    }
+
+
 def _source_url_from_new_package(np) -> str | None:
     """Primary URL for Source record from NewPackageForBuild."""
     if np.source_url:
@@ -659,6 +739,79 @@ async def mass_rebuild_run_once(
     return await run_mass_rebuild_pass(db)
 
 
+@router.post("/rpmbuild-plan", response_model=RpmbuildPlanResponse, status_code=status.HTTP_201_CREATED)
+async def create_rpmbuild_plan_endpoint(
+    data: RpmbuildPlanCreate,
+    request: Request,
+    db: DbSession,
+    user: CurrentUser,
+):
+    from oreon_build.config import get_settings
+    from oreon_build.services.rpmbuild_order import create_rpmbuild_plan
+
+    s = get_settings()
+    if not s.rpmbuild_layers_enabled:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="rpmbuild layers are disabled")
+    out = await create_rpmbuild_plan(
+        db,
+        request,
+        release_id=data.release_id,
+        repo_branch=data.repo_branch,
+        seed_packages=data.seed_packages,
+        architectures=data.architectures,
+        priority=data.priority,
+        distgit_url=data.distgit_url,
+        distgit_branch=data.distgit_branch,
+        triggered_by_id=user.id,
+    )
+    qjobs = await db.scalar(select(func.count(BuildJob.id)).where(BuildJob.rpmbuild_plan_id == out.plan.id))
+    return RpmbuildPlanResponse(
+        id=out.plan.id,
+        release_id=out.plan.release_id,
+        releasename=out.plan.releasename,
+        repo_branch=out.plan.repo_branch,
+        distgit_url=out.plan.distgit_url,
+        distgit_branch=out.plan.distgit_branch,
+        seed_mode=out.plan.seed_mode,
+        seed_packages=list(out.plan.seed_packages_json or []),
+        status=out.plan.status.value if hasattr(out.plan.status, "value") else str(out.plan.status),
+        current_open_layer=int(out.plan.current_open_layer or 0),
+        total_layers=len(out.layers),
+        queued_jobs=int(qjobs or 0),
+        created_at=out.plan.created_at,
+        updated_at=out.plan.updated_at,
+    )
+
+
+@router.get("/rpmbuild-plans", response_model=list[RpmbuildPlanResponse])
+async def list_rpmbuild_plans(db: DbSession):
+    rows = await db.execute(select(RpmbuildPlan).order_by(RpmbuildPlan.created_at.desc()).limit(200))
+    plans = list(rows.scalars().all())
+    out: list[RpmbuildPlanResponse] = []
+    for p in plans:
+        qjobs = await db.scalar(select(func.count(BuildJob.id)).where(BuildJob.rpmbuild_plan_id == p.id))
+        total_layers = len(p.layers_json or []) if isinstance(p.layers_json, list) else 0
+        out.append(
+            RpmbuildPlanResponse(
+                id=p.id,
+                release_id=p.release_id,
+                releasename=p.releasename,
+                repo_branch=p.repo_branch,
+                distgit_url=p.distgit_url,
+                distgit_branch=p.distgit_branch,
+                seed_mode=p.seed_mode,
+                seed_packages=list(p.seed_packages_json or []),
+                status=p.status.value if hasattr(p.status, "value") else str(p.status),
+                current_open_layer=int(p.current_open_layer or 0),
+                total_layers=total_layers,
+                queued_jobs=int(qjobs or 0),
+                created_at=p.created_at,
+                updated_at=p.updated_at,
+            )
+        )
+    return out
+
+
 ALLOWED_UPLOAD_EXTENSIONS = (".src.rpm", ".spec")
 MAX_UPLOAD_MB = 100
 
@@ -863,6 +1016,8 @@ async def _job_to_response(
         completed_at=job.completed_at,
         chain_id=getattr(job, "chain_id", None),
         chain_stage_index=getattr(job, "chain_stage_index", None),
+        rpmbuild_plan_id=getattr(job, "rpmbuild_plan_id", None),
+        rpmbuild_layer_index=getattr(job, "rpmbuild_layer_index", None),
     )
 
 
