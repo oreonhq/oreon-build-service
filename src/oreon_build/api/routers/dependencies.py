@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query, status
+from sqlalchemy import select
 
 from oreon_build.api.deps import DbSession
-from oreon_build.models import Release
+from oreon_build.models import Package, Release
 from oreon_build.services.dependencies_graph import build_dependencies_graph
 from oreon_build.services.distgit_order import (
+    compute_unbuilt_spec_list,
     compute_distgit_build_order,
     compute_spec_tree_dependency_plan,
 )
@@ -110,4 +112,41 @@ async def spec_tree_resolve(
         "unresolved_requirements": out.unresolved_requirements,
         "errors": out.errors,
         "cycle_warning": out.cycle_warning,
+    }
+
+
+@router.get("/unbuilt-list", response_model=dict)
+async def unbuilt_list(
+    db: DbSession,
+    releasename: str = Query(..., min_length=1, max_length=128, description="Release name folder in rpm-specfiles"),
+    distgit_url: str | None = Query(
+        None,
+        max_length=1024,
+        description="Override distgit Git URL (default from settings or oreonhq/rpm-specfiles)",
+    ),
+    distgit_branch: str | None = Query(None, max_length=128, description="Git branch (default main)"),
+) -> dict:
+    from oreon_build.config import get_settings
+
+    rows = await db.execute(select(Package.name))
+    db_package_names = {(n or "").strip() for n in rows.scalars().all() if (n or "").strip()}
+
+    s = get_settings()
+    u = (distgit_url or getattr(s, "mass_rebuild_distgit_url", None) or "https://github.com/oreonhq/rpm-specfiles.git").strip()
+    b = (distgit_branch or getattr(s, "mass_rebuild_distgit_branch", None) or "main").strip()
+    out = await compute_unbuilt_spec_list(
+        releasename=releasename.strip(),
+        db_package_names=db_package_names,
+        distgit_url=u,
+        distgit_branch=b,
+    )
+    return {
+        "releasename": out.releasename,
+        "distgit_url": out.distgit_url,
+        "distgit_branch": out.distgit_branch,
+        "total_spec_packages": out.total_spec_packages,
+        "total_db_packages": out.total_db_packages,
+        "unbuilt_count": len(out.unbuilt_packages),
+        "unbuilt_packages": out.unbuilt_packages,
+        "errors": out.errors,
     }
