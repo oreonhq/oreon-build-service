@@ -173,24 +173,19 @@
     </section>
 
     <section class="card deps-card">
-      <h3 style="margin-top:0;">Spec tree resolver (fast + source-only)</h3>
+      <h3 style="margin-top:0;">Unbuilt list</h3>
       <p class="deps-lead" style="margin-top:0;">
-        Parses all specs under <code>rpm-specfiles/&lt;releasename&gt;/</code> in parallel and compares only against
-        <code>R2 &lt;releasename&gt;/&lt;repo_branch&gt;/src/*.src.rpm</code>. No DB package-state comparison.
+        Full dump of packages present in <code>rpm-specfiles/&lt;releasename&gt;/</code> but missing from the DB package list.
+        Output is dist-git format, one package per line.
       </p>
       <div style="display:flex; flex-wrap:wrap; gap:0.5rem; align-items:center; margin-bottom:0.45rem;">
-        <input type="text" id="spec-resolve-releasename" class="form-control" style="width:10rem;" placeholder="releasename">
-        <input type="text" id="spec-resolve-repo-branch" class="form-control" style="width:7.5rem;" value="dev" placeholder="repo branch">
-        <input type="text" id="distgit-order-url" class="form-control" style="min-width:12rem; flex:1; max-width:32rem;" placeholder="DistGit URL (optional, server default if empty)">
-        <input type="text" id="distgit-order-branch" class="form-control" style="width:7.5rem;" placeholder="distgit branch">
-        <label style="display:inline-flex; align-items:center; gap:0.35rem; color:var(--text-muted); font-size:0.9rem;">
-          <input type="checkbox" id="spec-resolve-existing-only">
-          existing packages only
-        </label>
-        <button type="button" class="btn" id="btn-distgit-order">Resolve chain</button>
+        <input type="text" id="unbuilt-releasename" class="form-control" style="width:10rem;" placeholder="releasename">
+        <input type="text" id="unbuilt-distgit-url" class="form-control" style="min-width:12rem; flex:1; max-width:32rem;" placeholder="DistGit URL (optional, server default if empty)">
+        <input type="text" id="unbuilt-distgit-branch" class="form-control" style="width:7.5rem;" placeholder="distgit branch">
+        <button type="button" class="btn" id="btn-unbuilt-list">Dump unbuilt list</button>
       </div>
-      <div id="distgit-order-status" class="deps-status-text" style="margin-bottom:0.35rem;"></div>
-      <textarea id="distgit-order-output" class="form-control deps-codebox" rows="10" readonly placeholder="Counts, layers, chain string, unresolved requirements…"></textarea>
+      <div id="unbuilt-list-status" class="deps-status-text" style="margin-bottom:0.35rem;"></div>
+      <textarea id="unbuilt-list-output" class="form-control deps-codebox" rows="10" readonly placeholder="package1&#10;package2&#10;package3"></textarea>
     </section>
 
     <section class="card deps-card">
@@ -509,7 +504,7 @@
 
       function inferDefaultReleasename() {
         if (!graph || !graph.releases || !graph.releases.length) return;
-        var inp = byId('spec-resolve-releasename');
+        var inp = byId('unbuilt-releasename');
         if (!inp) return;
         if (String(inp.value || '').trim()) return;
         inp.value = String(graph.releases[0] || '');
@@ -531,53 +526,26 @@
         renderFilterBoxes();
         applyFilters();
       });
-      byId('btn-distgit-order').addEventListener('click', function() {
-        var reln = String((byId('spec-resolve-releasename').value || '')).trim();
+      byId('btn-unbuilt-list').addEventListener('click', function() {
+        var reln = String((byId('unbuilt-releasename').value || '')).trim();
         if (!reln) { alert('Enter releasename (folder in rpm-specfiles and R2 path).'); return; }
-        var repoBranch = String((byId('spec-resolve-repo-branch').value || 'dev')).trim() || 'dev';
-        var existingOnly = !!(byId('spec-resolve-existing-only') && byId('spec-resolve-existing-only').checked);
-        var u = (byId('distgit-order-url').value || '').trim();
-        var b = (byId('distgit-order-branch').value || '').trim();
-        var q = 'releasename=' + encodeURIComponent(reln) + '&repo_branch=' + encodeURIComponent(repoBranch);
-        if (existingOnly) q += '&existing_only=true';
+        var u = (byId('unbuilt-distgit-url').value || '').trim();
+        var b = (byId('unbuilt-distgit-branch').value || '').trim();
+        var q = 'releasename=' + encodeURIComponent(reln);
         if (u) q += '&distgit_url=' + encodeURIComponent(u);
         if (b) q += '&distgit_branch=' + encodeURIComponent(b);
-        byId('distgit-order-status').textContent = 'Loading…';
-        byId('distgit-order-output').value = '';
-        api.get('/dependencies/spec-tree-resolve?' + q).then(function(d) {
-          var lines = [];
-          lines.push('releasename: ' + (d.releasename || ''));
-          lines.push('repo branch: ' + (d.repo_branch || ''));
-          lines.push('mode: ' + (d.mode || ''));
-          lines.push('total specs: ' + (d.total_spec_packages || 0));
-          lines.push('built source RPMs: ' + (d.built_sources_count || 0));
-          lines.push('never-built sources: ' + (d.never_built_count || 0));
-          lines.push('selected for chain: ' + (d.selected_count || 0));
-          lines.push('required missing sources: ' + (d.needed_missing_count || 0));
-          if (d.cycle_warning) lines.push('cycle warning: ' + d.cycle_warning);
-          if (d.errors && d.errors.length) lines.push('errors: ' + JSON.stringify(d.errors, null, 0));
-          lines.push('');
-          lines.push('layers (parallel waves):');
-          (d.layers || []).forEach(function(wave, i) {
-            lines.push('  wave ' + (i + 1) + ': ' + (Array.isArray(wave) ? wave.join(' ') : String(wave)));
-          });
-          lines.push('');
-          lines.push('chain-build string:');
-          lines.push(d.chain_string || '');
-          lines.push('');
-          lines.push('top unresolved requirements (not source package names in spec tree):');
-          (d.unresolved_requirements || []).slice(0, 80).forEach(function(x) {
-            lines.push('  ' + (x.package || '?') + ' -> ' + (x.requirement || '?'));
-          });
-          if ((d.unresolved_requirements || []).length > 80) {
-            lines.push('  ... (' + ((d.unresolved_requirements || []).length - 80) + ' more)');
-          }
-          byId('distgit-order-output').value = lines.join('\n');
-          byId('chain-output').value = d.chain_string || '';
-          byId('distgit-order-status').textContent =
-            'OK ' + (d.distgit_url ? '· ' + d.distgit_url : '') + (d.distgit_branch ? ' @ ' + d.distgit_branch : '');
+        byId('unbuilt-list-status').textContent = 'Loading...';
+        byId('unbuilt-list-output').value = '';
+        api.get('/dependencies/unbuilt-list?' + q).then(function(d) {
+          byId('unbuilt-list-output').value = (d.unbuilt_packages || []).join('\n');
+          var errCount = (d.errors || []).length;
+          byId('unbuilt-list-status').textContent =
+            'Loaded ' + (d.unbuilt_count || 0)
+            + ' unbuilt packages out of ' + (d.total_spec_packages || 0)
+            + ' dist-git specs and ' + (d.total_db_packages || 0) + ' DB packages'
+            + (errCount ? (' (' + errCount + ' warnings)') : '');
         }).catch(function(e) {
-          byId('distgit-order-status').textContent = 'Error: ' + (e && e.message ? e.message : String(e));
+          byId('unbuilt-list-status').textContent = 'Error: ' + (e && e.message ? e.message : String(e));
         });
       });
 
