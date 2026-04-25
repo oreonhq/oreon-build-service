@@ -26,6 +26,8 @@ def test_openapi(client):
     data = r.json()
     assert "openapi" in data
     assert "paths" in data
+    assert "/api/builds/rpmbuild-plan" in data["paths"]
+    assert "/api/builds/rpmbuild-plans" in data["paths"]
 
 
 @needs_db
