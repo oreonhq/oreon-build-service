@@ -371,11 +371,11 @@ class Settings(BaseSettings):
         description="Fail RUNNING attempts whose worker last_heartbeat is older than this (0 = disable).",
     )
     build_stale_pending_minutes: int = Field(
-        default=1440,
+        default=10080,
         ge=0,
         description=(
             "Fail PENDING/QUEUED jobs that have been waiting this many minutes without being claimed "
-            "by a worker (0 = disable). Default 24h; jobs sitting longer usually mean no worker matches "
+            "by a worker (0 = disable). Default 1 week; jobs sitting longer usually mean no worker matches "
             "the requested architecture or the worker pool is down."
         ),
     )
