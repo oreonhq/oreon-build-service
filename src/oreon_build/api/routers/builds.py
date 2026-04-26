@@ -371,7 +371,8 @@ async def distgit_checklist(
 
     valid_names = sorted(has_spec - is_dead)
 
-    # Find which of those already have at least one successful build job for this release.
+    # "Already built" means has SUCCESS and no FAILED/CANCELLED jobs for this release.
+    # Failed or cancelled packages stay visible in the checklist for retry.
     if valid_names:
         success_q = (
             select(Package.name)
@@ -384,7 +385,20 @@ async def distgit_checklist(
             .distinct()
         )
         already_res = await db.execute(success_q)
-        already_built: set[str] = {row[0] for row in already_res.all()}
+        success_names: set[str] = {str(row[0]) for row in already_res.all() if row[0]}
+        failed_or_cancelled_q = (
+            select(Package.name)
+            .join(BuildJob, BuildJob.package_id == Package.id)
+            .where(
+                BuildJob.release_id == release_id,
+                BuildJob.status.in_((BuildStatus.FAILED, BuildStatus.CANCELLED)),
+                Package.name.in_(valid_names),
+            )
+            .distinct()
+        )
+        failed_or_cancelled_res = await db.execute(failed_or_cancelled_q)
+        failed_or_cancelled_names: set[str] = {str(row[0]) for row in failed_or_cancelled_res.all() if row[0]}
+        already_built: set[str] = success_names - failed_or_cancelled_names
     else:
         already_built = set()
 
@@ -411,10 +425,11 @@ async def layers_checklist(
     distgit_url: str | None = Query(None, max_length=1024),
     distgit_branch: str | None = Query(None, max_length=128),
 ) -> dict:
-    """Return rpmbuild-order layers from distgit specs with per-package ``finished`` (any successful build for this release).
+    """Return rpmbuild-order layers from distgit specs with per-package ``finished``.
 
-    Used by the Builds page Layers tab. ``finished`` matches distgit-checklist semantics (at least one
-    SUCCESS job for that package name and release, any architecture).
+    Used by the Builds page Layers tab. ``finished`` matches distgit-checklist semantics:
+    at least one SUCCESS job for that package and release, but NOT when the package also has
+    FAILED/CANCELLED jobs for that release (so failed/cancelled packages remain actionable).
     """
     from oreon_build.config import get_settings
     from oreon_build.services.distgit_order import compute_distgit_build_order
@@ -452,7 +467,20 @@ async def layers_checklist(
             .distinct()
         )
         already_res = await db.execute(success_q)
-        already_built = {str(row[0]) for row in already_res.all() if row[0]}
+        success_names: set[str] = {str(row[0]) for row in already_res.all() if row[0]}
+        failed_or_cancelled_q = (
+            select(Package.name)
+            .join(BuildJob, BuildJob.package_id == Package.id)
+            .where(
+                BuildJob.release_id == release_id,
+                BuildJob.status.in_((BuildStatus.FAILED, BuildStatus.CANCELLED)),
+                Package.name.in_(flat_names),
+            )
+            .distinct()
+        )
+        failed_or_cancelled_res = await db.execute(failed_or_cancelled_q)
+        failed_or_cancelled_names: set[str] = {str(row[0]) for row in failed_or_cancelled_res.all() if row[0]}
+        already_built = success_names - failed_or_cancelled_names
 
     layers_out: list[list[dict[str, object]]] = []
     for wave in order.layers:
