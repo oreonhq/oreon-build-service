@@ -427,9 +427,9 @@ async def layers_checklist(
 ) -> dict:
     """Return rpmbuild-order layers from distgit specs with per-package ``finished``.
 
-    Used by the Builds page Layers tab. ``finished`` matches distgit-checklist semantics:
-    at least one SUCCESS job for that package and release, but NOT when the package also has
-    FAILED/CANCELLED jobs for that release (so failed/cancelled packages remain actionable).
+    Used by the Builds page Layers tab. A package is finished only when its latest attempt
+    status for this release is SUCCESS. If latest attempt is FAILED/CANCELLED (or not success),
+    it stays actionable so hide-finished remains accurate after retries.
     """
     from oreon_build.config import get_settings
     from oreon_build.services.distgit_order import compute_distgit_build_order
@@ -456,31 +456,45 @@ async def layers_checklist(
 
     already_built: set[str] = set()
     if flat_names:
-        success_q = (
-            select(Package.name)
+        latest_attempt_rows = await db.execute(
+            select(Package.name, BuildAttempt.status, BuildAttempt.id)
+            .join(BuildJob, BuildAttempt.build_job_id == BuildJob.id)
+            .join(Package, BuildJob.package_id == Package.id)
+            .where(
+                BuildJob.release_id == release_id,
+                Package.name.in_(flat_names),
+            )
+            .order_by(Package.name.asc(), BuildAttempt.id.desc())
+        )
+        latest_attempt_by_pkg: dict[str, BuildStatus] = {}
+        for pkg_name, attempt_status, _attempt_id in latest_attempt_rows.all():
+            n = str(pkg_name or "").strip()
+            if not n or n in latest_attempt_by_pkg:
+                continue
+            latest_attempt_by_pkg[n] = attempt_status
+
+        latest_job_rows = await db.execute(
+            select(Package.name, BuildJob.status, BuildJob.id)
             .join(BuildJob, BuildJob.package_id == Package.id)
             .where(
                 BuildJob.release_id == release_id,
-                BuildJob.status == BuildStatus.SUCCESS,
                 Package.name.in_(flat_names),
             )
-            .distinct()
+            .order_by(Package.name.asc(), BuildJob.id.desc())
         )
-        already_res = await db.execute(success_q)
-        success_names: set[str] = {str(row[0]) for row in already_res.all() if row[0]}
-        failed_or_cancelled_q = (
-            select(Package.name)
-            .join(BuildJob, BuildJob.package_id == Package.id)
-            .where(
-                BuildJob.release_id == release_id,
-                BuildJob.status.in_((BuildStatus.FAILED, BuildStatus.CANCELLED)),
-                Package.name.in_(flat_names),
-            )
-            .distinct()
-        )
-        failed_or_cancelled_res = await db.execute(failed_or_cancelled_q)
-        failed_or_cancelled_names: set[str] = {str(row[0]) for row in failed_or_cancelled_res.all() if row[0]}
-        already_built = success_names - failed_or_cancelled_names
+        latest_job_by_pkg: dict[str, BuildStatus] = {}
+        for pkg_name, job_status, _job_id in latest_job_rows.all():
+            n = str(pkg_name or "").strip()
+            if not n or n in latest_job_by_pkg:
+                continue
+            latest_job_by_pkg[n] = job_status
+
+        for n in flat_names:
+            st = latest_attempt_by_pkg.get(n)
+            if st is None:
+                st = latest_job_by_pkg.get(n)
+            if st == BuildStatus.SUCCESS:
+                already_built.add(n)
 
     layers_out: list[list[dict[str, object]]] = []
     for wave in order.layers:
