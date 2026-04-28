@@ -1073,6 +1073,32 @@ def _rpm_name_from_bytes(data: bytes) -> str | None:
                 pass
 
 
+def _rpm_name_from_filename(filename: str) -> str | None:
+    """
+    Best-effort NAME parser from RPM basename.
+
+    RPM filenames are typically NAME-VERSION-RELEASE.ARCH.rpm (or .src.rpm).
+    NAME may contain dashes, so split from the right.
+    """
+    fn = (filename or "").strip()
+    if not fn.endswith(".rpm"):
+        return None
+    stem = fn[:-4]
+    if stem.endswith(".src"):
+        stem = stem[:-4]
+    else:
+        dot = stem.rfind(".")
+        if dot <= 0:
+            return None
+        stem = stem[:dot]
+    # Now stem should be NAME-VERSION-RELEASE
+    parts = stem.rsplit("-", 2)
+    if len(parts) != 3:
+        return None
+    name = parts[0].strip()
+    return name or None
+
+
 def _prune_superseded_repo_objects(
     *,
     releasename: str,
@@ -1088,15 +1114,18 @@ def _prune_superseded_repo_objects(
     r2 = get_r2_client()
 
     # Resolve package NAMEs from newly produced payload artifacts.
+    # Prefer filename parse (cheap + reliable across R2/client differences), then fallback to RPM metadata.
     binary_names: set[str] = set()
     src_names: set[str] = set()
     for a in payload_artifacts:
         fn = (a.filename or "").strip()
         if not fn.endswith(".rpm"):
             continue
-        key = src_r2_key(releasename, branch, fn) if fn.endswith(".src.rpm") else repo_rpms_key(releasename, branch, arch, fn)
-        data = r2.get_object(key)
-        name = _rpm_name_from_bytes(data) if data else None
+        name = _rpm_name_from_filename(fn)
+        if not name:
+            key = src_r2_key(releasename, branch, fn) if fn.endswith(".src.rpm") else repo_rpms_key(releasename, branch, arch, fn)
+            data = r2.get_object(key)
+            name = _rpm_name_from_bytes(data) if data else None
         if not name:
             continue
         if fn.endswith(".src.rpm"):
@@ -1115,10 +1144,12 @@ def _prune_superseded_repo_objects(
             continue
         if base in keep_artifact_filenames:
             continue
-        if not any(base.startswith(n + "-") for n in binary_names):
+        old_name = _rpm_name_from_filename(base)
+        if not old_name and not any(base.startswith(n + "-") for n in binary_names):
             continue
-        data = r2.get_object(key)
-        old_name = _rpm_name_from_bytes(data) if data else None
+        if not old_name:
+            data = r2.get_object(key)
+            old_name = _rpm_name_from_bytes(data) if data else None
         if old_name and old_name in binary_names:
             r2.delete_object(key)
             logger.info("Pruned superseded binary RPM %s", key)
@@ -1134,10 +1165,12 @@ def _prune_superseded_repo_objects(
             continue
         if base in keep_artifact_filenames:
             continue
-        if not any(base.startswith(n + "-") for n in src_names):
+        old_name = _rpm_name_from_filename(base)
+        if not old_name and not any(base.startswith(n + "-") for n in src_names):
             continue
-        data = r2.get_object(key)
-        old_name = _rpm_name_from_bytes(data) if data else None
+        if not old_name:
+            data = r2.get_object(key)
+            old_name = _rpm_name_from_bytes(data) if data else None
         if old_name and old_name in src_names:
             r2.delete_object(key)
             logger.info("Pruned superseded SRPM %s", key)
