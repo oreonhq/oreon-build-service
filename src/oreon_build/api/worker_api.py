@@ -1133,6 +1133,17 @@ def _prune_superseded_repo_objects(
         else:
             binary_names.add(name)
 
+    # Safety net: artifact payload rows can occasionally miss metadata fields in edge cases.
+    # Derive names from the keep-set too so pruning still runs for the newly published package(s).
+    for fn in keep_artifact_filenames:
+        name = _rpm_name_from_filename(fn)
+        if not name:
+            continue
+        if fn.endswith(".src.rpm"):
+            src_names.add(name)
+        elif fn.endswith(".rpm"):
+            binary_names.add(name)
+
     # Binary RPMs (same branch/arch)
     bin_prefix = f"{repo_r2_prefix(releasename, branch, arch)}/RPMS/"
     for obj in r2.list_objects(bin_prefix):
@@ -1174,6 +1185,48 @@ def _prune_superseded_repo_objects(
         if old_name and old_name in src_names:
             r2.delete_object(key)
             logger.info("Pruned superseded SRPM %s", key)
+
+    # Strict policy enforcement: keep exactly one version per package name in repo paths.
+    # This protects against any historical leftovers even if a prior publish missed pruning.
+    def _enforce_single_version(prefix: str, *, src: bool) -> None:
+        by_name: dict[str, list[tuple[str, str, object]]] = {}
+        for obj in r2.list_objects(prefix):
+            key = obj.get("key")
+            if not key:
+                continue
+            base = key.rsplit("/", 1)[-1]
+            if src:
+                if not base.endswith(".src.rpm"):
+                    continue
+            else:
+                if not base.endswith(".rpm") or base.endswith(".src.rpm"):
+                    continue
+            name = _rpm_name_from_filename(base)
+            if not name:
+                continue
+            by_name.setdefault(name, []).append((key, base, obj.get("last_modified")))
+
+        for pkg_name, items in by_name.items():
+            if len(items) <= 1:
+                continue
+            preferred = [it for it in items if it[1] in keep_artifact_filenames]
+            candidates = preferred if preferred else items
+            keep_item = max(
+                candidates,
+                key=lambda it: (
+                    str(it[2] or ""),
+                    it[0],
+                ),
+            )
+            keep_key = keep_item[0]
+            for key, _base, _lm in items:
+                if key == keep_key:
+                    continue
+                r2.delete_object(key)
+                logger.info("Pruned old %s RPM (single-version policy) %s", "SRPM" if src else "binary", key)
+
+    _enforce_single_version(bin_prefix, src=False)
+    _enforce_single_version(src_prefix, src=True)
 
 
 _BUILD_LOG_PUT_CONTENT_TYPE = "text/plain; charset=utf-8"
