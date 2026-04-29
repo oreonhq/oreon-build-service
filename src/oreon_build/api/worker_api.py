@@ -759,6 +759,15 @@ async def upload_worker_rpm_complete(
     tunnel), verify size and SHA-256, ``rpm --addsign`` on that file, then ``put_object`` overwrites
     the same R2 key with the signed RPM bytes.
     """
+    # IMPORTANT: This endpoint does `await db.rollback()` while waiting on the distributed lock.
+    # SQLAlchemy can expire ORM attributes on rollback, so never access `worker.id` after the wait.
+    # Capture the plain int early and reuse it for audit logging.
+    try:
+        worker_id = int(worker.id)
+    except Exception:
+        # If ORM state is unexpectedly expired, avoid failing the whole upload complete endpoint.
+        worker_id = -1
+
     settings = get_settings()
     max_bytes = settings.max_worker_rpm_upload_mib * 1024 * 1024
     if body.size_bytes > max_bytes:
@@ -990,7 +999,7 @@ async def upload_worker_rpm_complete(
         action="worker.rpm_upload_presigned_complete",
         resource_type="build_attempt",
         resource_id=str(attempt_id),
-        details=f"worker_id={worker.id} {fname} {rk}",
+        details=f"worker_id={worker_id} {fname} {rk}",
         emit_discord=False,
     )
     return {
