@@ -23,6 +23,7 @@ from oreon_build.models import (
     MockEnvironment,
     Package,
     PackageVersion,
+    PublishTask,
     Release,
     Source,
     Worker,
@@ -560,14 +561,62 @@ async def advance_settled_chains() -> None:
     """
     from oreon_build.db.session import async_session_maker
 
+    async def _reconcile_stage_publish_done_from_publish_tasks(db: Any, chain: BuildChain) -> None:
+        """
+        Strict recovery for missed callbacks.
+
+        Count current-stage jobs whose publish task already succeeded, then sync
+        `stage_publish_done`. This is still fully publish-gated (no bypass).
+        """
+        if chain.stage_expected_jobs <= 0:
+            return
+        stage_job_ids = list(
+            (
+                await db.execute(
+                    select(BuildJob.id).where(
+                        BuildJob.chain_id == chain.id,
+                        BuildJob.chain_stage_index == chain.active_stage_index,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not stage_job_ids:
+            return
+        done_job_ids = list(
+            (
+                await db.execute(
+                    select(BuildAttempt.build_job_id)
+                    .join(PublishTask, PublishTask.attempt_id == BuildAttempt.id)
+                    .where(
+                        BuildAttempt.build_job_id.in_(stage_job_ids),
+                        PublishTask.status == "success",
+                    )
+                    .distinct()
+                )
+            )
+            .scalars()
+            .all()
+        )
+        done = len(done_job_ids)
+        if done > chain.stage_publish_done:
+            logger.info(
+                "chain_id=%s stage=%s reconciled publish progress %s -> %s",
+                chain.id,
+                chain.active_stage_index,
+                chain.stage_publish_done,
+                done,
+            )
+            chain.stage_publish_done = done
+
     now = datetime.now(timezone.utc)
     async with async_session_maker() as db:
         result = await db.execute(
             select(BuildChain)
             .where(
                 BuildChain.status.in_([BuildChainStatus.PENDING, BuildChainStatus.RUNNING]),
-                BuildChain.stage_advance_after.isnot(None),
-                BuildChain.stage_advance_after <= now,
+                BuildChain.stage_expected_jobs > 0,
             )
             .with_for_update(skip_locked=True)
         )
@@ -575,9 +624,24 @@ async def advance_settled_chains() -> None:
         if not chains:
             return
         for chain in chains:
+            await _reconcile_stage_publish_done_from_publish_tasks(db, chain)
             if chain.stage_publish_done < chain.stage_expected_jobs:
-                # Shouldn't happen, but guard against stale advance_after.
-                chain.stage_advance_after = None
+                continue
+            if chain.stage_advance_after is None:
+                settle = _chain_stage_settle_sec()
+                if settle > 0:
+                    chain.stage_advance_after = datetime.now(timezone.utc) + timedelta(seconds=settle)
+                    logger.info(
+                        "chain_id=%s stage=%s all publishes done; advancing in %ss at %s",
+                        chain.id,
+                        chain.active_stage_index,
+                        settle,
+                        chain.stage_advance_after.isoformat(),
+                    )
+                    continue
+                await _advance_chain_after_stage_complete(db, chain)
+                continue
+            if chain.stage_advance_after > now:
                 continue
             logger.info(
                 "chain_id=%s stage=%s settle elapsed, advancing to next stage",
