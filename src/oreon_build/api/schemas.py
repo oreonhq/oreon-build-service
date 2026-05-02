@@ -316,15 +316,16 @@ class BuildTrigger(BaseModel):
 
 
 class ChainBuildTrigger(BaseModel):
-    """DistGit chain build (colon separates parallel groups; no colon means one package per stage)."""
+    """DistGit chain build: colon marks parallel names in one stage; no colon means ordered one-per-stage."""
 
     chain_spec: str = Field(
         ...,
         min_length=1,
         max_length=4096,
         description=(
-            "Whitespace-separated NVRs or package names. Colon ``:`` separates groups that run in parallel; "
-            "groups run in order. With no colons, each package is its own group (strictly sequential)."
+            "Package names. Colon ``:`` splits stages. Names in the same segment (between colons) build in "
+            "parallel; each segment is one stage and stages run in order. A colon does not mean serial queue. "
+            "With no colon, whitespace-separated names are strictly sequential (one package per stage)."
         ),
     )
     release_id: int = Field(..., description="Release to build for")
