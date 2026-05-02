@@ -9,12 +9,13 @@ def parse_chain_build_spec(raw: str) -> list[list[str]]:
     """
     Chain-build line rules:
 
-    - If the line contains ``:``, split on ``:`` (with optional surrounding whitespace).
-      Each non-empty segment is a *group*. Packages in one group build in parallel.
-      Groups run in order. The next group starts only after the previous group is done.
+    - ``:`` means *parallel within that segment*, not "queue later". Split on ``:`` (optional
+      whitespace around it). Each non-empty segment is one stage *group*. Names inside a segment
+      are built in parallel for that stage. Stage groups run in order, the next group only after
+      the previous stage has finished its publish gate.
 
-    - If there is no ``:``, whitespace-separated names are separate groups of one package each
-      (strictly sequential).
+    - No ``:`` means *ordered only*: whitespace-separated names each become their own one-package
+      stage, strictly one after another.
 
     Package names in a group are deduplicated in order.
     """
