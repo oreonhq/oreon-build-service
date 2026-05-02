@@ -352,8 +352,11 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
         .order_by(BuildJob.priority.desc(), BuildJob.created_at.asc())
     )
     if get_settings().rpmbuild_strict_gate_enabled:
+        # Chain jobs use chain_stage_index for ordering; they must never be blocked by an active
+        # rpmbuild plan's current_open_layer even if layer metadata was populated historically.
         q = q.outerjoin(RpmbuildPlan, BuildJob.rpmbuild_plan_id == RpmbuildPlan.id).where(
-            (BuildJob.rpmbuild_plan_id.is_(None))
+            (BuildJob.chain_id.isnot(None))
+            | (BuildJob.rpmbuild_plan_id.is_(None))
             | (
                 RpmbuildPlan.status.in_((RpmbuildPlanStatus.RUNNING, RpmbuildPlanStatus.WAITING_SETTLE))
                 & (

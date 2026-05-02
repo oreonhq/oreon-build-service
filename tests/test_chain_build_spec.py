@@ -3,6 +3,10 @@ from oreon_build.core.chain_build_spec import parse_chain_build_spec
 
 def test_parse_colon_parallel_groups():
     assert parse_chain_build_spec("a b : c : d") == [["a", "b"], ["c"], ["d"]]
+    assert parse_chain_build_spec("libwidget libaselib : libgizmo") == [
+        ["libwidget", "libaselib"],
+        ["libgizmo"],
+    ]
 
 
 def test_parse_no_colon_sequential():
