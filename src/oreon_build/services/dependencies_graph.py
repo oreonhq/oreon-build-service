@@ -5,9 +5,11 @@ import gzip
 import bz2
 import hashlib
 import lzma
+import asyncio
 import logging
 import os
 import re
+import time
 import subprocess
 import sys
 import tempfile
@@ -28,6 +30,10 @@ from oreon_build.models import Release, ReleaseRepo, Repository
 from oreon_build.services.r2 import get_r2_client
 
 logger = logging.getLogger(__name__)
+
+# In-process response cache so the dependencies UI does not hammer R2 and rpm on every refresh.
+_deps_graph_cache_at: float = 0.0
+_deps_graph_cache_payload: dict[str, Any] | None = None
 
 RPM_NS = "{http://linux.duke.edu/metadata/rpm}"
 COMMON_NS = "{http://linux.duke.edu/metadata/common}"
@@ -587,7 +593,40 @@ async def _external_provides_for_release_arch(
     return out
 
 
-async def build_dependencies_graph(db: AsyncSession) -> dict[str, Any]:
+def _deps_graph_cache_ttl_sec() -> int:
+    raw = (os.environ.get("OREON_DEPS_GRAPH_CACHE_SEC") or "120").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 120
+    return max(0, min(n, 3600))
+
+
+def _deps_graph_max_concurrent() -> int:
+    raw = (os.environ.get("OREON_DEPS_GRAPH_MAX_CONCURRENT") or "4").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 4
+    return max(1, min(n, 16))
+
+
+async def build_dependencies_graph(db: AsyncSession, *, bypass_cache: bool = False) -> dict[str, Any]:
+    global _deps_graph_cache_at, _deps_graph_cache_payload
+    ttl = _deps_graph_cache_ttl_sec()
+    now_mono = time.monotonic()
+    if (
+        not bypass_cache
+        and ttl > 0
+        and _deps_graph_cache_payload is not None
+        and (now_mono - _deps_graph_cache_at) < ttl
+    ):
+        out = dict(_deps_graph_cache_payload)
+        out["cached"] = True
+        out["cache_ttl_sec"] = ttl
+        out["cache_age_sec"] = int(now_mono - _deps_graph_cache_at)
+        return out
+
     targets = await _collect_repo_targets(db)
     rel_rows = await db.execute(select(Release))
     releases = rel_rows.scalars().all()
@@ -595,27 +634,30 @@ async def build_dependencies_graph(db: AsyncSession) -> dict[str, Any]:
     rr = await db.execute(select(ReleaseRepo).where(ReleaseRepo.enabled.is_(True)))
     baseurl_by_release_name: dict[str, list[str]] = {}
     for row in rr.scalars().all():
-        rel = rel_by_name.get((getattr(row.release, "releasename", None) or "").strip()) if getattr(row, "release", None) else None
-        if rel is None:
+        rel_name = ""
+        if getattr(row, "release", None) is not None:
+            rel_name = (getattr(row.release, "releasename", None) or "").strip()
+        if not rel_name:
             rel_obj = await db.get(Release, row.release_id)
             rel_name = (rel_obj.releasename or "").strip() if rel_obj else ""
-        else:
-            rel_name = (rel.releasename or "").strip()
         if not rel_name:
             continue
         baseurl_by_release_name.setdefault(rel_name, []).append((row.baseurl or "").strip())
 
     ext_cache: dict[tuple[str, str], set[str]] = {}
+    sem = asyncio.Semaphore(_deps_graph_max_concurrent())
 
-    results = []
-    for t in targets:
+    async def _analyze_one(t: RepoTarget) -> dict[str, Any]:
         rk = (t.releasename, t.arch)
-        if rk not in ext_cache:
-            ext_cache[rk] = await _external_provides_for_release_arch(
-                baseurl_by_release_name.get(t.releasename, []),
-                t.arch,
-            )
-        results.append(_analyze_repo(t, external_provides=ext_cache[rk]))
+        async with sem:
+            if rk not in ext_cache:
+                ext_cache[rk] = await _external_provides_for_release_arch(
+                    baseurl_by_release_name.get(t.releasename, []),
+                    t.arch,
+                )
+            return await asyncio.to_thread(_analyze_repo, t, ext_cache[rk])
+
+    results = await asyncio.gather(*[_analyze_one(t) for t in targets])
 
     releases_set: set[str] = set()
     branches: set[str] = set()
@@ -664,7 +706,7 @@ async def build_dependencies_graph(db: AsyncSession) -> dict[str, Any]:
     for n in nodes:
         n["arches"] = sorted(n["arches"])
 
-    return {
+    out = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "summary": {
             "repositories_scanned": len(targets),
@@ -682,4 +724,11 @@ async def build_dependencies_graph(db: AsyncSession) -> dict[str, Any]:
         "missing": all_missing,
         "buildroot_missing": [],
         "repo_errors": repo_errors,
+        "cached": False,
+        "cache_ttl_sec": ttl,
     }
+    if ttl > 0:
+        _deps_graph_cache_payload = dict(out)
+        _deps_graph_cache_payload.pop("cached", None)
+        _deps_graph_cache_at = time.monotonic()
+    return out

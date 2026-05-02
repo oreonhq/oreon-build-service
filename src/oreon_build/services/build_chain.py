@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -36,6 +37,109 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_ARCH = ["x86_64", "aarch64"]
+
+# Cache distgit order for chain dep gating (GitHub + spec parse is expensive).
+_chain_distgit_order_cache: dict[tuple[str, str, str], tuple[float, Any]] = {}
+
+
+def _chain_use_distgit_dep_gate() -> bool:
+    return (os.getenv("OREON_CHAIN_USE_DISTGIT_ORDER_GATE") or "1").strip().lower() not in ("0", "false", "no")
+
+
+def _chain_dep_poll_sec() -> int:
+    raw = (os.getenv("OREON_CHAIN_DEPS_POLL_SEC") or "20").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 20
+    return max(5, min(n, 600))
+
+
+def _chain_distgit_order_cache_ttl_sec() -> float:
+    raw = (os.getenv("OREON_CHAIN_DISTGIT_ORDER_CACHE_SEC") or "300").strip()
+    try:
+        n = float(raw)
+    except ValueError:
+        n = 300.0
+    return max(30.0, min(n, 3600.0))
+
+
+def _predecessor_names_in_tree(order_edges: list[dict[str, str]], consumer: str) -> set[str]:
+    return {str(e["to"]) for e in order_edges if str(e.get("from")) == consumer}
+
+
+async def _cached_distgit_build_order(releasename: str, distgit_url: str, distgit_branch: str) -> Any:
+    from oreon_build.services.distgit_order import compute_distgit_build_order
+
+    k = (releasename.strip(), distgit_url.strip(), distgit_branch.strip())
+    now = time.monotonic()
+    ttl = _chain_distgit_order_cache_ttl_sec()
+    hit = _chain_distgit_order_cache.get(k)
+    if hit is not None and (now - hit[0]) < ttl:
+        return hit[1]
+    order = await compute_distgit_build_order(releasename=k[0], distgit_url=k[1], distgit_branch=k[2])
+    _chain_distgit_order_cache[k] = (now, order)
+    return order
+
+
+async def _chain_distgit_predecessors_built_for_stage(db: Any, chain: BuildChain, next_stage_index: int) -> bool:
+    """
+    Gate advancing into ``next_stage_index`` until distgit BuildRequires edges from
+    ``compute_distgit_build_order`` are satisfied by successful builds for predecessor
+    packages registered in this DB (same rule as mass rebuild).
+    """
+    stages: list[list[str]] = chain.stages_json if isinstance(chain.stages_json, list) else []
+    if next_stage_index <= 0 or next_stage_index >= len(stages):
+        return True
+    pkgs = [str(p) for p in stages[next_stage_index] if p]
+    if not pkgs:
+        return True
+
+    rr = await db.execute(select(Release).where(Release.id == chain.release_id))
+    release = rr.scalar_one_or_none()
+    if not release:
+        return False
+    releasename = (release.releasename or "").strip()
+    if not releasename:
+        return False
+
+    opt = _options_dict(chain)
+    arches = [normalize_machine_arch(str(x)) for x in opt.get("architectures") or DEFAULT_ARCH]
+    dg_url = str(opt.get("distgit_url") or "https://github.com/oreonhq/rpm-specfiles.git")
+    dg_br = str(opt.get("distgit_branch") or "main")
+    pm = opt.get("preferred_mock_environment_id")
+    if pm is None or pm == "":
+        pref_pm = None
+    else:
+        try:
+            pref_pm = int(pm)
+        except (TypeError, ValueError):
+            pref_pm = None
+
+    order = await _cached_distgit_build_order(releasename, dg_url, dg_br)
+    edges = order.edges if isinstance(order.edges, list) else []
+
+    for pkg in pkgs:
+        preds = _predecessor_names_in_tree(edges, pkg)
+        for pred in preds:
+            prow = await db.execute(select(Package.id).where(Package.name == pred).limit(1))
+            pid = prow.scalar_one_or_none()
+            if pid is None:
+                continue
+            pid = int(pid)
+            for arch in arches:
+                target = await get_or_create_build_target(db, chain.release_id, arch, pref_pm)
+                if not await has_successful_build_for_target(db, pid, chain.release_id, target.id, None):
+                    logger.info(
+                        "chain_id=%s dep gate waiting pred=%s for consumer=%s arch=%s next_stage=%s",
+                        chain.id,
+                        pred,
+                        pkg,
+                        arch,
+                        next_stage_index,
+                    )
+                    return False
+    return True
 
 
 def _chain_stage_settle_sec() -> int:
@@ -261,6 +365,17 @@ async def _advance_chain_after_stage_complete(db: Any, chain: BuildChain) -> Non
         chain.stage_publish_done = 0
         chain.stage_advance_after = None
         return
+
+    if nxt > 0 and _chain_use_distgit_dep_gate():
+        if not await _chain_distgit_predecessors_built_for_stage(db, chain, nxt):
+            chain.stage_advance_after = datetime.now(timezone.utc) + timedelta(seconds=_chain_dep_poll_sec())
+            await db.flush()
+            logger.info(
+                "chain_id=%s deferring advance to stage %s until distgit predecessors are built",
+                chain.id,
+                nxt,
+            )
+            return
 
     chain.active_stage_index = nxt
     chain.stage_expected_jobs = 0
