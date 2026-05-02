@@ -17,9 +17,12 @@ router = APIRouter(prefix="/dependencies", tags=["dependencies"])
 
 
 @router.get("/graph", response_model=dict)
-async def dependencies_graph(db: DbSession) -> dict:
+async def dependencies_graph(
+    db: DbSession,
+    refresh: bool = Query(False, description="Bypass in-process graph cache and rebuild"),
+) -> dict:
     try:
-        return await build_dependencies_graph(db)
+        return await build_dependencies_graph(db, bypass_cache=refresh)
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
 
