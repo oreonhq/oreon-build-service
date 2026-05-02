@@ -122,8 +122,8 @@
               <label>DistGit chain build</label>
               <p style="color:var(--text-muted); font-size:0.85rem; margin-bottom:0.5rem;">
                 Uses <code>oreonhq/rpm-specfiles</code> and <code>&lt;release&gt;/&lt;package&gt;/&lt;package&gt;.spec</code> like DistGit.
-                A colon <code>:</code> separates groups. Packages in one group build in parallel. The next group starts after RPMs from the previous group are published.
-                If you omit colons, each package name is its own stage (strictly sequential).
+                A colon <code>:</code> marks parallel packages in the same stage (one segment before the next colon). It does not mean enqueue for later. The next stage only starts after RPMs from the previous stage are published.
+                If you omit colons, whitespace-separated names are strictly sequential (one package per stage, in order).
                 If any job in the current stage fails or is cancelled, other pending, queued, or running jobs in that chain are cancelled so you can fix and use Resume with the chain id.
               </p>
               <textarea id="chainbuild-spec" class="form-control" rows="4" placeholder="Example (parallel then next):&#10;libwidget libaselib : libgizmo&#10;&#10;Sequential only:&#10;bash grep coreutils"></textarea>
