@@ -84,103 +84,11 @@ async def _cached_distgit_build_order(releasename: str, distgit_url: str, distgi
 
 async def _chain_distgit_predecessors_built_for_stage(db: Any, chain: BuildChain, next_stage_index: int) -> bool:
     """
-    Gate advancing into ``next_stage_index`` until distgit BuildRequires edges from
-    ``compute_distgit_build_order`` are satisfied by successful builds for predecessor
-    packages registered in this DB.
-
-    Packages that are themselves in this chain are always skipped from this check.
-    The user already specified the order they want, and chain-internal deps will be
-    satisfied by the chain itself in later stages. Blocking on them would cause a
-    permanent deadlock (e.g. kde-baseapps blocked on kdelibs which is stage 3).
+    The dep gate for external packages is intentionally removed. User-defined
+    chains specify their own build order; if an external dep is missing or broken
+    the consumer build fails naturally. Gating on external deps caused permanent
+    chain stalls (failed deps, system packages, wrong mock env, etc.).
     """
-    stages: list[list[str]] = chain.stages_json if isinstance(chain.stages_json, list) else []
-    if next_stage_index <= 0 or next_stage_index >= len(stages):
-        return True
-    pkgs = [str(p) for p in stages[next_stage_index] if p]
-    if not pkgs:
-        return True
-
-    # All packages in any stage of this chain are handled by this chain itself.
-    all_chain_pkg_names: set[str] = {
-        str(p).lower()
-        for stage in stages
-        for p in stage
-        if p
-    }
-
-    rr = await db.execute(select(Release).where(Release.id == chain.release_id))
-    release = rr.scalar_one_or_none()
-    if not release:
-        return False
-    releasename = (release.releasename or "").strip()
-    if not releasename:
-        return False
-
-    opt = _options_dict(chain)
-    arches = [normalize_machine_arch(str(x)) for x in opt.get("architectures") or DEFAULT_ARCH]
-    dg_url = str(opt.get("distgit_url") or "https://github.com/oreonhq/rpm-specfiles.git")
-    dg_br = str(opt.get("distgit_branch") or "main")
-    pm = opt.get("preferred_mock_environment_id")
-    if pm is None or pm == "":
-        pref_pm = None
-    else:
-        try:
-            pref_pm = int(pm)
-        except (TypeError, ValueError):
-            pref_pm = None
-
-    order = await _cached_distgit_build_order(releasename, dg_url, dg_br)
-    edges = order.edges if isinstance(order.edges, list) else []
-
-    for pkg in pkgs:
-        preds = _predecessor_names_in_tree(edges, pkg)
-        for pred in preds:
-            # Skip deps that will be satisfied by this chain itself.
-            if pred.lower() in all_chain_pkg_names:
-                continue
-            prow = await db.execute(select(Package.id).where(Package.name == pred).limit(1))
-            pid = prow.scalar_one_or_none()
-            if pid is None:
-                continue
-            pid = int(pid)
-            # Only gate on packages that have at least one build attempt for this
-            # release. If the package exists in the DB but has never been built
-            # here it is a system/buildroot package (e.g. "make", "gcc") that
-            # is provided by mock, not by our service. Gating on it would block
-            # the chain permanently since we will never build such packages.
-            any_job_row = await db.execute(
-                select(BuildJob.id)
-                .where(BuildJob.package_id == pid, BuildJob.release_id == chain.release_id)
-                .limit(1)
-            )
-            if any_job_row.scalar_one_or_none() is None:
-                continue
-            # Gate passes if the predecessor has at least one successful build for
-            # this release across ANY arch. We intentionally do not require per-arch
-            # success: if a dep failed for one arch that arch's consumer build will
-            # fail naturally, and the user can decide what to do. Requiring per-arch
-            # success blocks user chains permanently when a single arch build of an
-            # external dep is broken (e.g. libXtst aarch64 failed). We also ignore
-            # mock_environment_id -- the dep gate only cares whether the RPM exists
-            # in the repo at all, not which mock config produced it.
-            any_success_row = await db.execute(
-                select(BuildJob.id)
-                .where(
-                    BuildJob.package_id == pid,
-                    BuildJob.release_id == chain.release_id,
-                    BuildJob.status == BuildStatus.SUCCESS,
-                )
-                .limit(1)
-            )
-            if any_success_row.scalar_one_or_none() is None:
-                logger.info(
-                    "chain_id=%s dep gate waiting pred=%s for consumer=%s next_stage=%s",
-                    chain.id,
-                    pred,
-                    pkg,
-                    next_stage_index,
-                )
-                return False
     return True
 
 
