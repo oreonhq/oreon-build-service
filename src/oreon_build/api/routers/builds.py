@@ -636,6 +636,11 @@ async def trigger_build(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Release not found")
     publish_branch = r2_publish_branch(release_for_job)
 
+    # Fall back to the release-level default mock env if neither the build
+    # request nor the package carries a preference.
+    if preferred_mock_environment_id is None and release_for_job.default_mock_environment_id:
+        preferred_mock_environment_id = release_for_job.default_mock_environment_id
+
     architectures = data.architectures or DEFAULT_ARCHITECTURES
     if not architectures:
         architectures = DEFAULT_ARCHITECTURES
