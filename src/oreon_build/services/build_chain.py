@@ -86,7 +86,12 @@ async def _chain_distgit_predecessors_built_for_stage(db: Any, chain: BuildChain
     """
     Gate advancing into ``next_stage_index`` until distgit BuildRequires edges from
     ``compute_distgit_build_order`` are satisfied by successful builds for predecessor
-    packages registered in this DB (same rule as mass rebuild).
+    packages registered in this DB.
+
+    Packages that are themselves in this chain are always skipped from this check.
+    The user already specified the order they want, and chain-internal deps will be
+    satisfied by the chain itself in later stages. Blocking on them would cause a
+    permanent deadlock (e.g. kde-baseapps blocked on kdelibs which is stage 3).
     """
     stages: list[list[str]] = chain.stages_json if isinstance(chain.stages_json, list) else []
     if next_stage_index <= 0 or next_stage_index >= len(stages):
@@ -94,6 +99,14 @@ async def _chain_distgit_predecessors_built_for_stage(db: Any, chain: BuildChain
     pkgs = [str(p) for p in stages[next_stage_index] if p]
     if not pkgs:
         return True
+
+    # All packages in any stage of this chain are handled by this chain itself.
+    all_chain_pkg_names: set[str] = {
+        str(p).lower()
+        for stage in stages
+        for p in stage
+        if p
+    }
 
     rr = await db.execute(select(Release).where(Release.id == chain.release_id))
     release = rr.scalar_one_or_none()
@@ -122,6 +135,9 @@ async def _chain_distgit_predecessors_built_for_stage(db: Any, chain: BuildChain
     for pkg in pkgs:
         preds = _predecessor_names_in_tree(edges, pkg)
         for pred in preds:
+            # Skip deps that will be satisfied by this chain itself.
+            if pred.lower() in all_chain_pkg_names:
+                continue
             prow = await db.execute(select(Package.id).where(Package.name == pred).limit(1))
             pid = prow.scalar_one_or_none()
             if pid is None:
