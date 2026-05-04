@@ -260,7 +260,7 @@ async def lifespan(app: FastAPI):
 
     async def _publish_tasks_loop() -> None:
         from oreon_build.db.session import async_session_maker
-        from oreon_build.models import PublishTask
+        from oreon_build.models import BuildJob, PublishTask
         from oreon_build.services.repo_publish import run_repo_publish_for_attempt
 
         while True:
@@ -274,12 +274,18 @@ async def lifespan(app: FastAPI):
                 idle_interval_s = max(1.0, min(idle_interval_s, 60.0))
                 batch = max(1, int(s.repo_publish_poll_batch))
                 async with async_session_maker() as db:
+                    # Chain-related tasks go first so in-progress chain builds are not blocked by
+                    # a potentially large backlog of older non-chain publish tasks.
                     q = (
                         select(PublishTask)
+                        .join(BuildJob, BuildJob.id == PublishTask.build_job_id, isouter=True)
                         .where(PublishTask.status == "pending")
-                        .order_by(PublishTask.created_at.asc())
+                        .order_by(
+                            BuildJob.chain_id.isnot(None).desc(),
+                            PublishTask.created_at.asc(),
+                        )
                         .limit(batch)
-                        .with_for_update(skip_locked=True)
+                        .with_for_update(of=PublishTask, skip_locked=True)
                     )
                     result = await db.execute(q)
                     tasks = list(result.scalars().all())

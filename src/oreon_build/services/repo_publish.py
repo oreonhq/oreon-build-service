@@ -11,6 +11,7 @@ import logging
 import os
 import threading
 from datetime import datetime, timezone
+from typing import Any
 
 from sqlalchemy import select, update
 
@@ -111,6 +112,51 @@ def process_repo_publish_sync(
                 r2.delete_object(key)
             except Exception:
                 pass
+
+
+async def _dedup_pending_tasks_for_prefix(
+    db: Any,
+    release_id: int,
+    arch: str,
+    *,
+    exclude_attempt_id: int,
+) -> list[int]:
+    """
+    After a successful createrepo for (release_id, arch), mark every OTHER pending
+    PublishTask for that same prefix as success. The repodata we just generated already
+    includes all their RPMs (since _sync_rpms_dir_from_r2 pulls everything from R2).
+
+    Returns the list of attempt_ids that were deduplicated so callers can fire chain callbacks.
+    """
+    from oreon_build.models import BuildJob, BuildTarget
+
+    rows = await db.execute(
+        select(PublishTask.id, PublishTask.attempt_id)
+        .join(BuildJob, BuildJob.id == PublishTask.build_job_id)
+        .join(BuildTarget, BuildTarget.id == BuildJob.target_id)
+        .where(
+            PublishTask.status == "pending",
+            BuildJob.release_id == release_id,
+            BuildTarget.architecture == arch,
+            PublishTask.attempt_id != exclude_attempt_id,
+        )
+    )
+    rows = list(rows.fetchall())
+    if not rows:
+        return []
+    task_ids = [r[0] for r in rows]
+    attempt_ids = [r[1] for r in rows]
+    now = datetime.now(timezone.utc)
+    await db.execute(
+        update(PublishTask)
+        .where(PublishTask.id.in_(task_ids))
+        .values(
+            status="success",
+            finished_at=now,
+            error_message="deduplicated: repodata already regenerated for this arch/release",
+        )
+    )
+    return attempt_ids
 
 
 async def run_repo_publish_for_attempt(
@@ -215,17 +261,39 @@ async def run_repo_publish_for_attempt(
                 timeout=_repo_publish_timeout_sec(),
             )
 
+            now = datetime.now(timezone.utc)
             async with async_session_maker() as db:
                 await db.execute(
                     update(PublishTask)
                     .where(PublishTask.attempt_id == attempt_id)
                     .values(
                         status="success",
-                        finished_at=datetime.now(timezone.utc),
+                        finished_at=now,
                         error_message=None,
                     )
                 )
                 await db.commit()
+
+            # Dedup: any other pending tasks for the same (release, arch) are now redundant
+            # because _sync_rpms_dir_from_r2 already pulled ALL RPMs for that prefix and
+            # createrepo_c re-indexed everything. Mark them success so the queue drains fast.
+            deduped_attempt_ids: list[int] = []
+            try:
+                async with async_session_maker() as db:
+                    deduped_attempt_ids = await _dedup_pending_tasks_for_prefix(
+                        db, release.id, arch, exclude_attempt_id=attempt_id
+                    )
+                    await db.commit()
+                if deduped_attempt_ids:
+                    logger.info(
+                        "repo publish deduped %d pending tasks for release_id=%s arch=%s",
+                        len(deduped_attempt_ids),
+                        release.id,
+                        arch,
+                    )
+            except Exception:
+                logger.exception("repo publish dedup failed attempt_id=%s", attempt_id)
+
             logger.info("repo publish done attempt_id=%s", attempt_id)
             _publish_completed_attempts.add(attempt_id)
             _cleanup_old_locks()
@@ -233,6 +301,11 @@ async def run_repo_publish_for_attempt(
                 from oreon_build.services.build_chain import on_repo_publish_success_for_chain
 
                 await on_repo_publish_success_for_chain(attempt_id)
+                for ded_id in deduped_attempt_ids:
+                    try:
+                        await on_repo_publish_success_for_chain(ded_id)
+                    except Exception:
+                        logger.exception("build chain advance dedup attempt_id=%s", ded_id)
             except Exception:
                 logger.exception("build chain advance after publish attempt_id=%s", attempt_id)
             try:
