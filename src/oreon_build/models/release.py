@@ -49,7 +49,9 @@ class Release(Base):
     )
     build_jobs: Mapped[List["BuildJob"]] = relationship("BuildJob", back_populates="release")
     mock_environments: Mapped[List["MockEnvironment"]] = relationship(
-        "MockEnvironment", back_populates="release"
+        "MockEnvironment",
+        back_populates="release",
+        foreign_keys="MockEnvironment.release_id",
     )
     repositories: Mapped[List["Repository"]] = relationship(
         "Repository", back_populates="release", cascade="all, delete-orphan"
