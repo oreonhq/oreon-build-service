@@ -396,19 +396,57 @@ def _local_rpm_bytes_match_r2_etag(path: Path, etag: str) -> bool:
     return m.hexdigest() == etag.lower()
 
 
-def _sync_rpms_dir_from_r2(client: R2Client, rpms_prefix: str, rpms_dir: Path) -> int:
+def _etag_cache_path(container: Path) -> Path:
+    return container / ".etag-cache.json"
+
+
+def _load_etag_cache(container: Path) -> dict[str, str]:
+    """Load the persistent filename->etag map from the container directory."""
+    import json
+
+    p = _etag_cache_path(container)
+    if p.is_file():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items()}
+        except Exception:
+            pass
+    return {}
+
+
+def _save_etag_cache(container: Path, cache: dict[str, str]) -> None:
+    import json
+
+    p = _etag_cache_path(container)
+    try:
+        tmp = p.parent / (p.name + ".tmp")
+        tmp.write_text(json.dumps(cache), encoding="utf-8")
+        tmp.replace(p)
+    except Exception as exc:
+        logger.debug("Could not save etag cache to %s: %s", p, exc)
+
+
+def _sync_rpms_dir_from_r2(
+    client: R2Client,
+    rpms_prefix: str,
+    rpms_dir: Path,
+    *,
+    container: Path | None = None,
+) -> int:
     """
     Ensure ``rpms_dir`` matches R2 under ``rpms_prefix``.
 
-    R2 is the source of truth. A prior implementation skipped re-download when the local
-    file size matched the listing, which breaks if the object was replaced in R2 with new
-    content and the size stayed the same: createrepo would see stale bytes while clients
-    fetch fresh objects, producing "checksum does not match" in dnf.
-
-    We also compare MD5 to the object ETag when the ETag is a single-part content MD5. If
-    the ETag is absent or multipart (``-`` in the tag), we fall back to size only when the
-    tag is missing, otherwise re-download when size matches but the tag is non-md5.
+    R2 is the source of truth. We verify each local file against the R2 ETag:
+    - If a persistent ``container`` is provided, a JSON ETag cache is used so that files
+      already verified in a previous run are trusted without re-reading from disk. This
+      avoids reading tens of GB on every publish for repos with thousands of packages.
+    - On cache miss (first run or new files), MD5 is computed from disk and the result is
+      stored in the cache for next time.
+    - Files whose ETag is absent or multipart are accepted by size alone.
     """
+    import json as _json
+
     rpms_dir.mkdir(parents=True, exist_ok=True)
     objs = client.list_objects(rpms_prefix)
     wanted: dict[str, tuple[str, int, str]] = {}
@@ -431,29 +469,53 @@ def _sync_rpms_dir_from_r2(client: R2Client, rpms_prefix: str, rpms_dir: Path) -
             )
         wanted[base] = (key, sz, etag)
 
+    etag_cache: dict[str, str] = _load_etag_cache(container) if container else {}
+    cache_dirty = False
+
     for f in list(rpms_dir.iterdir()):
         if f.is_file() and f.suffix == ".rpm" and f.name not in wanted:
             try:
                 f.unlink()
             except OSError as e:
                 logger.warning("Could not remove stale local RPM %s: %s", f, e)
+            etag_cache.pop(f.name, None)
+            cache_dirty = True
 
+    fetched = 0
     for fname, (key, sz, etag) in wanted.items():
         dest = rpms_dir / fname
         need_fetch = True
         if sz > 0 and dest.is_file() and dest.stat().st_size == sz:
-            if _local_rpm_bytes_match_r2_etag(dest, etag):
+            if etag and _r2_etag_strong_content_md5(etag):
+                cached_etag = etag_cache.get(fname)
+                if cached_etag == etag:
+                    # Already verified against this exact ETag - no disk read needed.
+                    need_fetch = False
+                elif _local_rpm_bytes_match_r2_etag(dest, etag):
+                    need_fetch = False
+                    etag_cache[fname] = etag
+                    cache_dirty = True
+                # size matches but ETag differs: re-download (content changed in R2)
+            else:
+                # No strong ETag from R2: trust size match (R2 always sends etag but be safe).
                 need_fetch = False
-            elif not etag:
-                # Listing had no ETag: keep size-only skip (R2 should always send ETag)
-                need_fetch = False
-            # same size + non-matching or multipart ETag: must refresh from R2
+
         if not need_fetch:
             continue
         data = client.get_object(key)
         if not data:
             raise RuntimeError(f"missing or empty RPM object at {key!r}, aborting repodata update")
         dest.write_bytes(data)
+        fetched += 1
+        if etag and _r2_etag_strong_content_md5(etag):
+            etag_cache[fname] = etag
+            cache_dirty = True
+
+    if cache_dirty and container:
+        _save_etag_cache(container, etag_cache)
+
+    if fetched:
+        logger.info("Fetched %d new/changed RPMs from R2 under %s", fetched, rpms_prefix)
 
     return len(wanted)
 
@@ -632,7 +694,7 @@ def update_repodata_at_prefix(r2_prefix: str, r2_client: R2Client | None = None)
     try:
         with _repo_stage_lock(container):
             _progress(f"{r2_prefix} syncing RPMs to local stage (may take a while)")
-            n = _sync_rpms_dir_from_r2(client, rpms_prefix, rpms_dir)
+            n = _sync_rpms_dir_from_r2(client, rpms_prefix, rpms_dir, container=container)
             _progress(f"{r2_prefix} synced {n} RPMs, running createrepo_c")
             _run_createrepo(repo_root, container=container)
             _progress(f"{r2_prefix} createrepo_c done, uploading repodata to R2")
