@@ -76,6 +76,7 @@ class ReleaseUpdate(BaseModel):
     architectures: Optional[str] = None
     default_channel: Optional[ReleaseChannelSchema] = None
     default_repo_branch: Optional[str] = Field(None, max_length=32)
+    default_mock_environment_id: Optional[int] = None
     is_active: Optional[bool] = None
     base_repos: Optional[List[ReleaseRepoCreate]] = None
 
@@ -97,6 +98,7 @@ class ReleaseResponse(BaseModel):
     architectures: str
     default_channel: str
     default_repo_branch: str
+    default_mock_environment_id: Optional[int] = None
     is_active: bool
     created_at: datetime
     base_repos: List[ReleaseRepoResponse] = []
