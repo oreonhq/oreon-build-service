@@ -499,9 +499,21 @@ def _cleanup_old_repodata(
     )
 
 
-def _run_createrepo(repo_dir: Path) -> None:
+def _createrepo_cache_dir(container: Path) -> Path:
+    """Persistent per-prefix checksum cache for createrepo_c --cachedir across runs."""
+    d = container / ".createrepo-cache"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _run_createrepo(repo_dir: Path, *, container: Path | None = None) -> None:
     # Never use capture_output/PIPE here. createrepo_c can write a lot to stderr; a full pipe blocks the child
     # while the parent waits forever (looks like a hang with RPMs already on disk).
+    #
+    # When container is provided (persistent stage) we pass --update so only new/changed RPMs get
+    # re-checksummed. Without it every publish re-scans the entire repo which is extremely slow once
+    # there are hundreds of packages. --cachedir stores per-file checksums across API restarts so
+    # even after a service restart the next run is fast.
     def _cleanup_tmp_repodata() -> None:
         tmp_repodata = repo_dir / ".repodata"
         if tmp_repodata.exists():
@@ -516,12 +528,26 @@ def _run_createrepo(repo_dir: Path) -> None:
     def _run_once(workers: int) -> None:
         timeout_s = _createrepo_timeout_sec()
         comps_file = _write_buildsys_comps(repo_dir)
-        logger.info("createrepo_c starting repo_root=%s workers=%s", repo_dir, workers)
+        use_update = container is not None and (repo_dir / "repodata" / "repomd.xml").exists()
+        logger.info(
+            "createrepo_c starting repo_root=%s workers=%s update=%s",
+            repo_dir,
+            workers,
+            use_update,
+        )
         cmd = [
             "createrepo_c",
             str(repo_dir),
             f"--workers={workers}",
         ]
+        if use_update:
+            cmd.append("--update")
+        if container is not None:
+            try:
+                cache_dir = _createrepo_cache_dir(container)
+                cmd += ["--cachedir", str(cache_dir)]
+            except OSError:
+                pass
         if comps_file is not None and comps_file.exists():
             cmd += ["--groupfile", str(comps_file)]
         try:
@@ -538,7 +564,7 @@ def _run_createrepo(repo_dir: Path) -> None:
         repomd = repo_dir / "repodata" / "repomd.xml"
         if not repomd.exists():
             raise RuntimeError(f"createrepo_c reported success but {repomd} is missing")
-        logger.info("createrepo_c finished repo_root=%s workers=%s", repo_dir, workers)
+        logger.info("createrepo_c finished repo_root=%s workers=%s update=%s", repo_dir, workers, use_update)
 
     _cleanup_tmp_repodata()
     w = _createrepo_workers()
@@ -608,8 +634,7 @@ def update_repodata_at_prefix(r2_prefix: str, r2_client: R2Client | None = None)
             _progress(f"{r2_prefix} syncing RPMs to local stage (may take a while)")
             n = _sync_rpms_dir_from_r2(client, rpms_prefix, rpms_dir)
             _progress(f"{r2_prefix} synced {n} RPMs, running createrepo_c")
-            with _global_repogen_lock():
-                _run_createrepo(repo_root)
+            _run_createrepo(repo_root, container=container)
             _progress(f"{r2_prefix} createrepo_c done, uploading repodata to R2")
             repodata_dir = repo_root / "repodata"
             if repodata_dir.exists():
