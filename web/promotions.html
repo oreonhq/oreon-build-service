@@ -41,6 +41,10 @@
     <section class="card">
       <h2>Promotions</h2>
       <p id="promo-hint">Completed builds appear here as promotion candidates. Login to promote to Testing or Stable.</p>
+      <div id="promo-quick-actions" style="display:none; margin-bottom:1rem; display:flex; gap:0.5rem; flex-wrap:wrap;">
+        <button type="button" class="btn promo-testing" id="btn-promote-all-testing">Promote all to Testing</button>
+        <button type="button" class="btn promo-stable" id="btn-promote-all-stable">Promote all to Stable</button>
+      </div>
       <div class="form-group" style="margin-bottom:1rem; display:flex; gap:1rem; flex-wrap:wrap;">
         <label style="display:flex; align-items:center;">Filter</label>
         <input type="text" id="promo-text-filter" placeholder="Filter by package, ID…" style="padding:0.4rem; width:12rem;">
@@ -77,6 +81,30 @@
     (function() {
       const api = window.oreonApi;
       var promoPage = 0, promoPageSize = 25, promoTotal = 0;
+
+      function promoteAll(pathSuffix, label) {
+        if (!confirm('Promote ALL pending promotions to ' + label + '?\n\nThis will affect every pending item, not just this page.')) return;
+        if (!confirm('Are you absolutely sure? This will promote everything pending to ' + label + ' and cannot be undone.')) return;
+        var btn = document.getElementById(pathSuffix === 'to-testing' ? 'btn-promote-all-testing' : 'btn-promote-all-stable');
+        oreonWithLoading(btn, function() {
+          return api.get('/promotions?status_filter=pending&limit=10000').then(function(data) {
+            var items = (data && data.items) ? data.items : [];
+            var chain = Promise.resolve();
+            items.forEach(function(p) {
+              if (p.status === 'pending') {
+                chain = chain.then(function() { return api.post('/promotions/' + p.id + '/' + pathSuffix); });
+              }
+            });
+            return chain;
+          }).then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+        });
+      }
+
+      function updateQuickActions() {
+        var el = document.getElementById('promo-quick-actions');
+        if (!el) return;
+        el.style.display = api.token ? 'flex' : 'none';
+      }
       var promoTableSel = window.oreonBindTableSelection(document.getElementById('promo-tbody'), {
         rowCheckboxSelector: '.promo-row-cb',
         selectAll: document.getElementById('promo-select-all'),
@@ -179,6 +207,10 @@
           load();
         }, 300));
       }
+      document.getElementById('btn-promote-all-testing').addEventListener('click', function() { promoteAll('to-testing', 'Testing'); });
+      document.getElementById('btn-promote-all-stable').addEventListener('click', function() { promoteAll('to-stable', 'Stable'); });
+      window.addEventListener('auth-change', updateQuickActions);
+      updateQuickActions();
       load();
     })();
   </script>
