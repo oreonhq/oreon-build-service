@@ -109,6 +109,12 @@
           <input type="text" id="edit-default-repo-branch" placeholder="e.g. dev" maxlength="32" title="Folder under releasename/ where builds are published">
         </div>
         <div class="form-group">
+          <label>Default mock environment</label>
+          <select id="edit-release-mock-env">
+            <option value="">None (use package preference or highest priority)</option>
+          </select>
+        </div>
+        <div class="form-group">
           <label><input type="checkbox" id="edit-release-active"> Active</label>
         </div>
         <div class="modal-actions">
@@ -175,17 +181,31 @@
           var canAct = api.isAdmin();
           tbody.innerHTML = list.map(function(r) {
             var repoBr = r.default_repo_branch || 'dev';
-            var actions = canAct ? '<button type="button" class="btn edit-rel" data-id="' + r.id + '" data-desc="' + escapeAttr(r.description) + '" data-arch="' + escapeAttr(r.architectures) + '" data-channel="' + (r.default_channel || 'dev') + '" data-repo-branch="' + escapeAttr(repoBr) + '" data-active="' + (r.is_active ? '1' : '0') + '">Edit</button> <button type="button" class="btn delete-rel" data-id="' + r.id + '" data-name="' + escapeAttr(r.releasename) + '">Delete</button>' : '-';
+            var actions = canAct ? '<button type="button" class="btn edit-rel" data-id="' + r.id + '" data-desc="' + escapeAttr(r.description) + '" data-arch="' + escapeAttr(r.architectures) + '" data-channel="' + (r.default_channel || 'dev') + '" data-repo-branch="' + escapeAttr(repoBr) + '" data-active="' + (r.is_active ? '1' : '0') + '" data-default-mock-env="' + (r.default_mock_environment_id || '') + '">Edit</button> <button type="button" class="btn delete-rel" data-id="' + r.id + '" data-name="' + escapeAttr(r.releasename) + '">Delete</button>' : '-';
             return '<tr><td class="col-checkbox"><input type="checkbox" class="rel-row-cb" data-id="' + r.id + '"></td><td>' + r.id + '</td><td>' + escapeHtml(r.releasename || '') + '</td><td>' + escapeHtml(r.architectures || '') + '</td><td>' + (r.default_channel || '') + '</td><td>' + escapeHtml(repoBr) + '</td><td>' + (r.is_active ? 'Yes' : 'No') + '</td><td>' + actions + '</td></tr>';
           }).join('') || '<tr><td colspan="8">No releases</td></tr>';
           tbody.querySelectorAll('.edit-rel').forEach(function(btn) {
             btn.addEventListener('click', function() {
-              document.getElementById('edit-release-id').value = btn.dataset.id;
+              var releaseId = btn.dataset.id;
+              var currentMockEnvId = btn.dataset.defaultMockEnv || '';
+              document.getElementById('edit-release-id').value = releaseId;
               document.getElementById('edit-release-desc').value = btn.dataset.desc || '';
               document.getElementById('edit-release-arch').value = btn.dataset.arch || '';
               document.getElementById('edit-release-channel').value = btn.dataset.channel || 'dev';
               document.getElementById('edit-default-repo-branch').value = btn.dataset.repoBranch || 'dev';
               document.getElementById('edit-release-active').checked = btn.dataset.active === '1';
+              var mockSel = document.getElementById('edit-release-mock-env');
+              mockSel.innerHTML = '<option value="">None (use package preference or highest priority)</option>';
+              api.get('/mock-environments?release_id=' + releaseId + '&limit=200').then(function(data) {
+                var envs = (data && data.items) ? data.items : (Array.isArray(data) ? data : []);
+                envs.forEach(function(e) {
+                  var opt = document.createElement('option');
+                  opt.value = e.id;
+                  opt.textContent = e.name + ' (' + e.config_name + ')';
+                  if (String(e.id) === String(currentMockEnvId)) opt.selected = true;
+                  mockSel.appendChild(opt);
+                });
+              }).catch(function() {});
               document.getElementById('edit-release-modal').classList.add('open');
             });
           });
@@ -219,11 +239,13 @@
         var btn = this;
         var id = document.getElementById('edit-release-id').value;
         oreonWithLoading(btn, function() {
+          var mockEnvVal = document.getElementById('edit-release-mock-env').value;
           return api.patch('/releases/' + id, {
             description: document.getElementById('edit-release-desc').value.trim() || null,
             architectures: document.getElementById('edit-release-arch').value.trim() || null,
             default_channel: document.getElementById('edit-release-channel').value,
             default_repo_branch: document.getElementById('edit-default-repo-branch').value.trim() || null,
+            default_mock_environment_id: mockEnvVal ? parseInt(mockEnvVal, 10) : null,
             is_active: document.getElementById('edit-release-active').checked
           }).then(function() { document.getElementById('edit-release-modal').classList.remove('open'); load(); }).catch(function(e) { alert('Failed: ' + e.message); });
         });
