@@ -26,6 +26,7 @@ def _release_to_response(r: Release) -> ReleaseResponse:
         architectures=r.architectures,
         default_channel=r.default_channel.value,
         default_repo_branch=r2_publish_branch(r),
+        default_mock_environment_id=r.default_mock_environment_id,
         is_active=r.is_active,
         created_at=r.created_at,
         base_repos=[
@@ -135,6 +136,10 @@ async def update_release(
     if data.default_repo_branch is not None:
         s = data.default_repo_branch.strip()[:32]
         release.default_repo_branch = s or "dev"
+    if data.default_mock_environment_id is not None:
+        release.default_mock_environment_id = data.default_mock_environment_id
+    elif "default_mock_environment_id" in (data.model_fields_set or set()) and data.default_mock_environment_id is None:
+        release.default_mock_environment_id = None
     if data.is_active is not None:
         release.is_active = data.is_active
     if data.base_repos is not None:
