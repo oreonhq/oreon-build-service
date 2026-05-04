@@ -143,18 +143,44 @@ async def _chain_distgit_predecessors_built_for_stage(db: Any, chain: BuildChain
             if pid is None:
                 continue
             pid = int(pid)
-            for arch in arches:
-                target = await get_or_create_build_target(db, chain.release_id, arch, pref_pm)
-                if not await has_successful_build_for_target(db, pid, chain.release_id, target.id, None):
-                    logger.info(
-                        "chain_id=%s dep gate waiting pred=%s for consumer=%s arch=%s next_stage=%s",
-                        chain.id,
-                        pred,
-                        pkg,
-                        arch,
-                        next_stage_index,
-                    )
-                    return False
+            # Only gate on packages that have at least one build attempt for this
+            # release. If the package exists in the DB but has never been built
+            # here it is a system/buildroot package (e.g. "make", "gcc") that
+            # is provided by mock, not by our service. Gating on it would block
+            # the chain permanently since we will never build such packages.
+            any_job_row = await db.execute(
+                select(BuildJob.id)
+                .where(BuildJob.package_id == pid, BuildJob.release_id == chain.release_id)
+                .limit(1)
+            )
+            if any_job_row.scalar_one_or_none() is None:
+                continue
+            # Gate passes if the predecessor has at least one successful build for
+            # this release across ANY arch. We intentionally do not require per-arch
+            # success: if a dep failed for one arch that arch's consumer build will
+            # fail naturally, and the user can decide what to do. Requiring per-arch
+            # success blocks user chains permanently when a single arch build of an
+            # external dep is broken (e.g. libXtst aarch64 failed). We also ignore
+            # mock_environment_id -- the dep gate only cares whether the RPM exists
+            # in the repo at all, not which mock config produced it.
+            any_success_row = await db.execute(
+                select(BuildJob.id)
+                .where(
+                    BuildJob.package_id == pid,
+                    BuildJob.release_id == chain.release_id,
+                    BuildJob.status == BuildStatus.SUCCESS,
+                )
+                .limit(1)
+            )
+            if any_success_row.scalar_one_or_none() is None:
+                logger.info(
+                    "chain_id=%s dep gate waiting pred=%s for consumer=%s next_stage=%s",
+                    chain.id,
+                    pred,
+                    pkg,
+                    next_stage_index,
+                )
+                return False
     return True
 
 
