@@ -48,4 +48,8 @@ class MockEnvironment(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
-    release: Mapped["Release"] = relationship("Release", back_populates="mock_environments")
+    release: Mapped["Release"] = relationship(
+        "Release",
+        back_populates="mock_environments",
+        foreign_keys=[release_id],
+    )
