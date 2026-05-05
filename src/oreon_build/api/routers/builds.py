@@ -18,6 +18,7 @@ from oreon_build.api.schemas import (
     ChainBuildTrigger,
     ChainBuildTriggerResponse,
     ChainResumeRequest,
+    ChainStatusResponse,
     CurrentFailureItem,
     PaginatedResponse,
     RpmbuildPlanCreate,
@@ -26,7 +27,7 @@ from oreon_build.api.schemas import (
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
 from oreon_build.core.machine_arch import normalize_machine_arch
 from oreon_build.core.repo_branch import r2_publish_branch
-from oreon_build.models import BuildAttempt, BuildJob, BuildStatus, BuildTarget, Package, Release, RpmbuildPlan, Worker
+from oreon_build.models import BuildAttempt, BuildChain, BuildJob, BuildStatus, BuildTarget, Package, Release, RpmbuildPlan, Worker
 from oreon_build.services.build_target_util import get_or_create_build_target, has_successful_build_for_target
 from oreon_build.services.r2 import get_r2_client, upload_r2_key
 
@@ -748,6 +749,24 @@ async def trigger_chain_build_endpoint(
         stages=stages,
         chain_spec=chain.chain_spec,
         jobs=job_responses,
+    )
+
+
+@router.get("/chain/{chain_id}/status")
+async def get_chain_status(chain_id: int, db: DbSession):
+    result = await db.execute(select(BuildChain).where(BuildChain.id == chain_id))
+    chain = result.scalar_one_or_none()
+    if not chain:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chain not found")
+    stages_raw = chain.stages_json if isinstance(chain.stages_json, list) else []
+    stages: list[list[str]] = [[str(n) for n in grp] for grp in stages_raw if isinstance(grp, list)]
+    return ChainStatusResponse(
+        chain_id=chain.id,
+        status=chain.status.value,
+        active_stage_index=chain.active_stage_index,
+        stages=stages,
+        chain_spec=chain.chain_spec,
+        error_message=chain.error_message,
     )
 
 

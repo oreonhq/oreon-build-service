@@ -390,6 +390,15 @@ class ChainBuildTriggerResponse(BaseModel):
     jobs: List[BuildJobResponse]
 
 
+class ChainStatusResponse(BaseModel):
+    chain_id: int
+    status: str
+    active_stage_index: int
+    stages: List[List[str]]
+    chain_spec: str
+    error_message: Optional[str] = None
+
+
 class RpmbuildPlanCreate(BaseModel):
     release_id: int = Field(..., ge=1)
     repo_branch: str = Field(default="dev", min_length=1, max_length=64)

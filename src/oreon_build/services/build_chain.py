@@ -82,13 +82,117 @@ async def _cached_distgit_build_order(releasename: str, distgit_url: str, distgi
     return order
 
 
-async def _chain_distgit_predecessors_built_for_stage(db: Any, chain: BuildChain, next_stage_index: int) -> bool:
+async def _inject_missing_deps_for_stage(db: Any, chain: BuildChain, next_stage_index: int) -> bool:
     """
-    The dep gate for external packages is intentionally removed. User-defined
-    chains specify their own build order; if an external dep is missing or broken
-    the consumer build fails naturally. Gating on external deps caused permanent
-    chain stalls (failed deps, system packages, wrong mock env, etc.).
+    Before advancing into next_stage_index, find any distgit predecessors of its
+    packages that have never been attempted for this release and inject them as a
+    new stage immediately before next_stage_index so they get built first.
+
+    Rules:
+    - Only inject packages that ARE in our Package table (i.e., managed by us).
+    - Only inject if they have ZERO build jobs for this release (completely absent
+      from the repo). If a dep was previously attempted (even if it failed), we
+      let the chain proceed -- the consumer build may fail, but the user can see
+      it and react. This also prevents infinite injection loops.
+    - Deps already present anywhere in the chain stages are skipped (handled by
+      the chain itself).
+    - If a dep is in a PAST stage of this chain (should already be built) but has
+      no successful build AND has no build jobs at all, something went wrong with
+      the chain itself -- hard-fail with a clear error.
+    - On hard-fail: set chain.status=failed + chain.error_message and return False.
     """
+    stages: list[list[str]] = chain.stages_json if isinstance(chain.stages_json, list) else []
+    if next_stage_index <= 0 or next_stage_index >= len(stages):
+        return True
+
+    pkgs = [str(p) for p in stages[next_stage_index] if p]
+    if not pkgs:
+        return True
+
+    rr = await db.execute(select(Release).where(Release.id == chain.release_id))
+    release = rr.scalar_one_or_none()
+    if not release:
+        return True
+
+    opt = _options_dict(chain)
+    dg_url = str(opt.get("distgit_url") or "https://github.com/oreonhq/rpm-specfiles.git")
+    dg_br = str(opt.get("distgit_branch") or "main")
+    releasename = (release.releasename or "").strip()
+    if not releasename:
+        return True
+
+    order = await _cached_distgit_build_order(releasename, dg_url, dg_br)
+    edges = order.edges if isinstance(order.edges, list) else []
+
+    # All packages across every stage of this chain (handled internally).
+    all_chain_pkg_names: set[str] = {
+        str(p).lower() for stage in stages for p in stage if p
+    }
+    past_stage_pkg_names: set[str] = {
+        str(p).lower() for stage in stages[:next_stage_index] for p in stage if p
+    }
+
+    to_inject: set[str] = set()
+
+    for pkg in pkgs:
+        preds = _predecessor_names_in_tree(edges, pkg)
+        for pred in preds:
+            pred_lower = pred.lower()
+            if pred_lower in all_chain_pkg_names:
+                continue  # already in chain, handled by stage order
+
+            # Only care about packages we manage (in the Package table).
+            prow = await db.execute(select(Package.id).where(Package.name == pred).limit(1))
+            pid = prow.scalar_one_or_none()
+            if pid is None:
+                continue  # system/buildroot package, not managed by us
+
+            pid = int(pid)
+
+            # Check for any build attempt for this release.
+            any_job = await db.execute(
+                select(BuildJob.id)
+                .where(BuildJob.package_id == pid, BuildJob.release_id == chain.release_id)
+                .limit(1)
+            )
+            if any_job.scalar_one_or_none() is not None:
+                # Already attempted (success or failed). Don't inject; let the
+                # consumer build proceed and fail naturally if needed.
+                continue
+
+            # The dep has never been attempted for this release.
+            # If it was supposed to appear in a past stage of THIS chain but
+            # somehow has zero jobs, that's a chain logic error -- hard-fail.
+            if pred_lower in past_stage_pkg_names:
+                msg = (
+                    f"Chain error: '{pred}' was in a previous stage of this chain "
+                    f"(before stage {next_stage_index}) but was never built. "
+                    f"This should not happen. Please cancel and re-submit the chain."
+                )
+                chain.status = BuildChainStatus.FAILED
+                chain.error_message = msg
+                logger.error("chain_id=%s hard-fail: %s", chain.id, msg)
+                return False
+
+            to_inject.add(pred)
+
+    if not to_inject:
+        return True
+
+    # Inject as a new parallel stage immediately before next_stage_index.
+    injected_list = sorted(to_inject)
+    new_stages = list(stages)
+    new_stages.insert(next_stage_index, injected_list)
+    chain.stages_json = new_stages
+    await db.flush()
+
+    logger.info(
+        "chain_id=%s auto-injected missing deps %s as new stage %s before '%s'",
+        chain.id,
+        injected_list,
+        next_stage_index,
+        pkgs,
+    )
     return True
 
 
@@ -317,14 +421,19 @@ async def _advance_chain_after_stage_complete(db: Any, chain: BuildChain) -> Non
         return
 
     if nxt > 0 and _chain_use_distgit_dep_gate():
-        if not await _chain_distgit_predecessors_built_for_stage(db, chain, nxt):
-            chain.stage_advance_after = datetime.now(timezone.utc) + timedelta(seconds=_chain_dep_poll_sec())
+        ok = await _inject_missing_deps_for_stage(db, chain, nxt)
+        if not ok:
+            # Hard-fail: chain.status and chain.error_message already set.
             await db.flush()
-            logger.info(
-                "chain_id=%s deferring advance to stage %s until distgit predecessors are built",
-                chain.id,
-                nxt,
-            )
+            return
+        # stages_json may have grown; re-read so nxt still points to the right stage.
+        stages = chain.stages_json if isinstance(chain.stages_json, list) else []
+        if nxt >= len(stages):
+            chain.status = BuildChainStatus.SUCCESS
+            chain.stage_expected_jobs = 0
+            chain.stage_skip_slots = 0
+            chain.stage_publish_done = 0
+            chain.stage_advance_after = None
             return
 
     chain.active_stage_index = nxt

@@ -857,7 +857,8 @@
               var resumeChainBtn = canAct
                 ? '<button type="button" class="btn chain-resume-row" data-chain-id="' + escapeAttr(chainIdStr) + '" title="New chain, same spec, skip arches already built" style="padding:0.2rem 0.5rem; font-size:0.8rem; margin-left:0.2rem; vertical-align:middle;">Resume chain</button>'
                 : '';
-              chainPart = chainIdStr + stgNote + copyChainBtn + resumeChainBtn;
+              var chainErrBtn = '<button type="button" class="btn chain-status-btn" data-chain-id="' + escapeAttr(chainIdStr) + '" title="Check chain status / errors" style="padding:0.2rem 0.45rem; font-size:0.8rem; margin-left:0.2rem; vertical-align:middle;">Status</button>';
+              chainPart = chainIdStr + stgNote + copyChainBtn + resumeChainBtn + chainErrBtn;
             }
             return '<tr data-id="' + j.id + '" data-status="' + escapeAttr(j.status || '') + '"><td class="col-checkbox"><input type="checkbox" class="build-row-cb" data-id="' + j.id + '"></td><td>' + j.id + '</td><td>' + packageLabel(j) + '</td><td>' + releaseLabel(j) + '</td><td>' + arch + '</td><td><span class="' + statusClass(sd) + '">' + escapeHtml(sd) + '</span></td><td>' + signCell + '</td><td style="white-space:normal; max-width:16rem;">' + chainPart + '</td><td>' + (j.created_at || '').slice(0,19) + '</td><td><a href="/build.html?job_id=' + j.id + '">View</a>' + retryBtn + cancelBtn + '</td></tr>';
           }).join('') || '<tr><td colspan="10">No builds</td></tr>';
@@ -895,6 +896,27 @@
                   btn.disabled = false;
                 }, 1200);
               }).catch(function() { alert('Could not copy. Chain id: ' + raw); });
+            });
+          });
+          tbody.querySelectorAll('.chain-status-btn').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+              var cid = btn.getAttribute('data-chain-id');
+              oreonWithLoading(btn, function() {
+                return api.get('/builds/chain/' + cid + '/status').then(function(data) {
+                  var status = (data && data.status) || 'unknown';
+                  var errMsg = (data && data.error_message) ? data.error_message : null;
+                  var stageIdx = (data && data.active_stage_index != null) ? data.active_stage_index : '?';
+                  var stages = (data && data.stages) ? data.stages : [];
+                  var stagesStr = stages.map(function(s, i) {
+                    var marker = i === stageIdx ? ' <<< current' : '';
+                    return 'Stage ' + i + ': ' + s.join(', ') + marker;
+                  }).join('\n');
+                  var msg = 'Chain ' + cid + ' — status: ' + status + '\nActive stage: ' + stageIdx;
+                  if (errMsg) msg += '\n\nERROR: ' + errMsg;
+                  if (stagesStr) msg += '\n\nStages:\n' + stagesStr;
+                  alert(msg);
+                }).catch(function(e) { alert('Failed to fetch chain status: ' + (e.message || 'error')); });
+              });
             });
           });
           tbody.querySelectorAll('.chain-resume-row').forEach(function(btn) {
