@@ -111,13 +111,18 @@
         </div>
         <div class="burst-field" id="enroll-burst-fields">
           <div class="form-group">
-            <label>Whitelisted packages (one per line)</label>
-            <textarea id="enroll-whitelist" placeholder="package-foo&#10;package-bar"></textarea>
-            <p class="whitelist-hint">Only jobs for these packages will be assigned to this worker. Normal workers will never receive these packages.</p>
+            <label>GCP instance name <span style="color:var(--danger,#c00);">*</span></label>
+            <input type="text" id="enroll-gcp-instance" placeholder="e.g. burst-worker-1" maxlength="253">
+            <p class="whitelist-hint">The exact name of the Compute Engine instance to start/stop (lowercase letters, numbers, hyphens only).</p>
           </div>
           <div class="form-group">
             <label>GCP zone (optional, overrides global default)</label>
             <input type="text" id="enroll-gcp-zone" placeholder="e.g. us-central1-a" maxlength="128">
+          </div>
+          <div class="form-group">
+            <label>Whitelisted packages (one per line)</label>
+            <textarea id="enroll-whitelist" placeholder="package-foo&#10;package-bar"></textarea>
+            <p class="whitelist-hint">Only jobs for these packages will be assigned to this worker. Normal workers will never receive these packages.</p>
           </div>
         </div>
         <button type="button" class="btn primary" id="btn-enroll-worker">Enroll worker</button>
@@ -161,13 +166,18 @@
       </div>
       <div class="burst-field" id="edit-burst-fields">
         <div class="form-group">
-          <label>Whitelisted packages (one per line)</label>
-          <textarea id="edit-whitelist" placeholder="package-foo&#10;package-bar"></textarea>
-          <p class="whitelist-hint">Only jobs for these packages will be assigned to this worker. Normal workers will never receive these packages.</p>
+          <label>GCP instance name <span style="color:#c00;">*</span></label>
+          <input type="text" id="edit-gcp-instance" placeholder="e.g. burst-worker-1" maxlength="253">
+          <p class="whitelist-hint">The exact name of the Compute Engine instance to start/stop.</p>
         </div>
         <div class="form-group">
           <label>GCP zone (optional, overrides global default)</label>
           <input type="text" id="edit-gcp-zone" placeholder="e.g. us-central1-a" maxlength="128">
+        </div>
+        <div class="form-group">
+          <label>Whitelisted packages (one per line)</label>
+          <textarea id="edit-whitelist" placeholder="package-foo&#10;package-bar"></textarea>
+          <p class="whitelist-hint">Only jobs for these packages will be assigned to this worker. Normal workers will never receive these packages.</p>
         </div>
       </div>
       <div class="modal-actions">
@@ -254,12 +264,14 @@
             var actions = '-';
             if (canAdmin) {
               var whitelistAttr = escapeAttr((w.burst_whitelist || []).join('\n'));
+              var gcpInstAttr = escapeAttr(w.gcp_instance_name || '');
               var gcpZoneAttr = escapeAttr(w.gcp_zone || '');
               actions = '<button type="button" class="btn edit-worker" '
                 + 'data-id="' + w.id + '" '
                 + 'data-arch="' + escapeAttr(w.architecture || '') + '" '
                 + 'data-burst="' + (w.is_burst_worker ? '1' : '0') + '" '
                 + 'data-whitelist="' + whitelistAttr + '" '
+                + 'data-gcp-instance="' + gcpInstAttr + '" '
                 + 'data-gcp-zone="' + gcpZoneAttr + '" '
                 + 'style="margin-right:0.3rem;">Edit</button>'
                 + '<button type="button" class="btn delete-worker" data-id="' + w.id + '" data-name="' + escapeAttr(w.name) + '" style="color:var(--danger);">Delete</button>';
@@ -282,8 +294,9 @@
               document.getElementById('edit-arch').value = btn.dataset.arch || '';
               var isBurst = btn.dataset.burst === '1';
               document.getElementById('edit-burst').checked = isBurst;
-              document.getElementById('edit-whitelist').value = btn.dataset.whitelist || '';
+              document.getElementById('edit-gcp-instance').value = btn.dataset.gcpInstance || '';
               document.getElementById('edit-gcp-zone').value = btn.dataset.gcpZone || '';
+              document.getElementById('edit-whitelist').value = btn.dataset.whitelist || '';
               document.getElementById('edit-burst-fields').style.display = isBurst ? 'block' : 'none';
               document.getElementById('edit-modal-overlay').classList.add('open');
             });
@@ -322,6 +335,8 @@
         var token = document.getElementById('enroll-token').value;
         if (!name || !token) { alert('Worker name and enrollment token are required.'); return; }
         var isBurst = document.getElementById('enroll-burst').checked;
+        var gcpInstance = isBurst ? (document.getElementById('enroll-gcp-instance').value.trim() || null) : null;
+        if (isBurst && !gcpInstance) { alert('GCP instance name is required for burst workers.'); return; }
         var whitelistRaw = document.getElementById('enroll-whitelist').value;
         var whitelist = isBurst ? whitelistRaw.split('\n').map(function(s) { return s.trim(); }).filter(Boolean) : [];
         var gcpZone = isBurst ? (document.getElementById('enroll-gcp-zone').value.trim() || null) : null;
@@ -332,6 +347,7 @@
             architecture: document.getElementById('enroll-arch').value.trim() || null,
             is_burst_worker: isBurst,
             burst_whitelist: whitelist,
+            gcp_instance_name: gcpInstance,
             gcp_zone: gcpZone,
           }).then(function(data) {
             load();
@@ -353,6 +369,8 @@
         var id = document.getElementById('edit-worker-id').value;
         if (!id) return;
         var isBurst = document.getElementById('edit-burst').checked;
+        var gcpInstance = document.getElementById('edit-gcp-instance').value.trim() || null;
+        if (isBurst && !gcpInstance) { alert('GCP instance name is required for burst workers.'); return; }
         var whitelistRaw = document.getElementById('edit-whitelist').value;
         var whitelist = whitelistRaw.split('\n').map(function(s) { return s.trim(); }).filter(Boolean);
         var gcpZone = document.getElementById('edit-gcp-zone').value.trim() || null;
@@ -362,6 +380,7 @@
             architecture: arch,
             is_burst_worker: isBurst,
             burst_whitelist: isBurst ? whitelist : [],
+            gcp_instance_name: isBurst ? gcpInstance : null,
             gcp_zone: isBurst ? gcpZone : null,
           }).then(function() {
             document.getElementById('edit-modal-overlay').classList.remove('open');
