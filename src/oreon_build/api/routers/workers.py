@@ -6,7 +6,7 @@ from fastapi import APIRouter, Header, HTTPException, Query, status
 from sqlalchemy import func, select
 
 from oreon_build.api.deps import CurrentAdmin, DbSession
-from oreon_build.api.schemas import PaginatedResponse, WorkerEnroll, WorkerResponse
+from oreon_build.api.schemas import PaginatedResponse, WorkerEnroll, WorkerResponse, WorkerUpdate
 from oreon_build.config import get_settings
 from oreon_build.core.security import hash_password, worker_token_fingerprint
 from oreon_build.models import Worker, WorkerState
@@ -15,7 +15,16 @@ router = APIRouter(prefix="/workers", tags=["workers"])
 
 
 def _effective_worker_state(w: Worker) -> str:
-    """DB state stays idle/busy when a host dies. Treat stale or missing heartbeat as offline for API/UI."""
+    """DB state stays idle/busy when a host dies. Treat stale or missing heartbeat as offline for API/UI.
+
+    Burst workers never show as offline -- their VM may be stopped intentionally.
+    They always show as idle when not actively running a job.
+    """
+    if w.is_burst_worker:
+        if w.state == WorkerState.BUSY:
+            return WorkerState.BUSY.value
+        return WorkerState.IDLE.value
+
     max_age = get_settings().worker_offline_after_seconds
     if max_age <= 0:
         return w.state.value
@@ -40,6 +49,9 @@ def _worker_response(w: Worker) -> WorkerResponse:
         last_seen_at=w.last_seen_at,
         last_heartbeat=w.last_heartbeat,
         enrolled_at=w.enrolled_at,
+        is_burst_worker=w.is_burst_worker,
+        burst_whitelist=list(w.burst_whitelist or []),
+        gcp_zone=w.gcp_zone,
     )
 
 
@@ -76,12 +88,16 @@ async def enroll_worker(data: WorkerEnroll, db: DbSession, _: CurrentAdmin):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Worker name already enrolled")
     worker_token = secrets.token_urlsafe(32)
     token_hash = hash_password(worker_token)
+    whitelist = [str(p).strip() for p in (data.burst_whitelist or []) if str(p).strip()]
     worker = Worker(
         name=data.name,
         token_hash=token_hash,
         token_fingerprint=worker_token_fingerprint(worker_token),
         state=WorkerState.OFFLINE,
         architecture=data.architecture,
+        is_burst_worker=data.is_burst_worker,
+        burst_whitelist=whitelist,
+        gcp_zone=data.gcp_zone or None,
     )
     db.add(worker)
     await db.flush()
@@ -89,6 +105,24 @@ async def enroll_worker(data: WorkerEnroll, db: DbSession, _: CurrentAdmin):
         "worker": _worker_response(worker),
         "token": worker_token,
     }
+
+
+@router.patch("/{worker_id}", response_model=WorkerResponse)
+async def update_worker(worker_id: int, data: WorkerUpdate, db: DbSession, _: CurrentAdmin):
+    result = await db.execute(select(Worker).where(Worker.id == worker_id))
+    w = result.scalar_one_or_none()
+    if not w:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Worker not found")
+    if data.architecture is not None:
+        w.architecture = data.architecture or None
+    if data.is_burst_worker is not None:
+        w.is_burst_worker = data.is_burst_worker
+    if data.burst_whitelist is not None:
+        w.burst_whitelist = [str(p).strip() for p in data.burst_whitelist if str(p).strip()]
+    if data.gcp_zone is not None:
+        w.gcp_zone = data.gcp_zone.strip() or None
+    await db.flush()
+    return _worker_response(w)
 
 
 @router.delete("/{worker_id}", status_code=status.HTTP_204_NO_CONTENT)
