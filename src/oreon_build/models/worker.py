@@ -4,7 +4,7 @@ import enum
 from datetime import datetime
 from typing import TYPE_CHECKING, List, Optional
 
-from sqlalchemy import DateTime, Enum, String, Text, func
+from sqlalchemy import Boolean, DateTime, Enum, JSON, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from oreon_build.db.base import Base
@@ -39,6 +39,9 @@ class Worker(Base):
     last_heartbeat: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     current_build_attempt_id: Mapped[Optional[int]] = mapped_column(nullable=True)
     capabilities: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    is_burst_worker: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    burst_whitelist: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    gcp_zone: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     enrolled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
