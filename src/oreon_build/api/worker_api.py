@@ -108,9 +108,19 @@ def _pesign_material_configured(settings) -> bool:
     return False
 
 
-async def _maybe_stop_burst_vm(db: Any, worker: Worker) -> None:
-    """Stop the GCP VM for a burst worker if no more pending/running burst jobs exist."""
-    whitelist_lower = {n.lower() for n in (worker.burst_whitelist or []) if n}
+async def _maybe_stop_burst_vm(
+    db: Any,
+    worker_name: str,
+    whitelist: list[str],
+    gcp_instance_name: str | None,
+    gcp_zone: str | None,
+) -> None:
+    """Stop the GCP VM for a burst worker if no more pending/running burst jobs exist.
+
+    Takes explicit args instead of the Worker ORM object because this is called
+    after db.commit() when the worker object is expired and can't be lazy-loaded.
+    """
+    whitelist_lower = {n.lower() for n in whitelist if n}
     if not whitelist_lower:
         return
     pending_count = await db.scalar(
@@ -122,15 +132,15 @@ async def _maybe_stop_burst_vm(db: Any, worker: Worker) -> None:
         )
     )
     if (pending_count or 0) == 0:
-        instance = (worker.gcp_instance_name or "").strip()
+        instance = (gcp_instance_name or "").strip()
         if instance:
             from oreon_build.services.gcp_compute import stop_instance
             asyncio.create_task(
-                stop_instance(instance, zone=worker.gcp_zone or None),
-                name=f"burst-vm-stop-{worker.name}",
+                stop_instance(instance, zone=gcp_zone or None),
+                name=f"burst-vm-stop-{worker_name}",
             )
         else:
-            logger.warning("burst-vm: worker %s has no gcp_instance_name set, skipping VM stop", worker.name)
+            logger.warning("burst-vm: worker %s has no gcp_instance_name set, skipping VM stop", worker_name)
 
 
 def _worker_declared_max_parallel_attempts(worker: Worker) -> int:
@@ -1709,6 +1719,21 @@ async def report_result(
     job_result = await db.execute(select(BuildJob).where(BuildJob.id == attempt.build_job_id))
     job = job_result.scalar_one()
 
+    # Capture burst info now before any db.commit() expires the worker object.
+    _burst_worker_name = worker.name
+    _burst_whitelist: list[str] = list(worker.burst_whitelist or []) if worker.is_burst_worker else []
+    _burst_gcp_instance: str | None = worker.gcp_instance_name if worker.is_burst_worker else None
+    _burst_gcp_zone: str | None = worker.gcp_zone if worker.is_burst_worker else None
+    _is_burst = worker.is_burst_worker and bool(_burst_whitelist)
+
+    async def _burst_vm_stop_check() -> None:
+        if not _is_burst:
+            return
+        try:
+            await _maybe_stop_burst_vm(db, _burst_worker_name, _burst_whitelist, _burst_gcp_instance, _burst_gcp_zone)
+        except Exception:
+            logger.exception("burst-vm stop check failed for worker %s", _burst_worker_name)
+
     # Idempotency: if we already finalized this attempt, do nothing (no artifacts insert,
     # no promotion duplication, no repodata/prune/repack side effects).
     existing_final = await db.execute(
@@ -1768,6 +1793,8 @@ async def report_result(
             user_agent="worker",
         )
         await _insert_finalization_row(attempt.status.value)
+        await db.commit()
+        await _burst_vm_stop_check()
         return {"status": "ok", "job_cancelled": True}
 
     # Worker default HTTP read timeout can fire after this handler already committed rows. A later
@@ -1783,6 +1810,7 @@ async def report_result(
                     attempt_id,
                     prior_art_count,
                 )
+                await _burst_vm_stop_check()
                 return {"status": "ok", "ignored_stale_failure": True}
             if attempt.status == BuildStatus.FAILED:
                 logger.warning(
@@ -1842,6 +1870,7 @@ async def report_result(
                     user_agent="worker",
                 )
                 await _insert_finalization_row(attempt.status.value)
+                await _burst_vm_stop_check()
                 return {"status": "ok", "repaired_stale_failure": True}
 
     attempt.status = BuildStatus(payload.status)
@@ -1866,11 +1895,7 @@ async def report_result(
 
     # Burst VM lifecycle: stop the GCP instance if this was a burst worker and
     # there are no more pending/running burst jobs for its whitelisted packages.
-    if worker.is_burst_worker and worker.burst_whitelist:
-        try:
-            await _maybe_stop_burst_vm(db, worker)
-        except Exception:
-            logger.exception("burst-vm stop check failed for worker %s", worker.name)
+    await _burst_vm_stop_check()
 
     if st_l in ("failed", "cancelled"):
         try:
