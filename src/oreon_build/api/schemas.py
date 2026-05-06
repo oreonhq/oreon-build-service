@@ -496,6 +496,16 @@ class WorkerEnroll(BaseModel):
     name: str = Field(..., max_length=128)
     enrollment_token: str
     architecture: Optional[str] = None
+    is_burst_worker: bool = False
+    burst_whitelist: List[str] = []
+    gcp_zone: Optional[str] = Field(None, max_length=128)
+
+
+class WorkerUpdate(BaseModel):
+    architecture: Optional[str] = None
+    is_burst_worker: Optional[bool] = None
+    burst_whitelist: Optional[List[str]] = None
+    gcp_zone: Optional[str] = Field(None, max_length=128)
 
 
 class WorkerResponse(BaseModel):
@@ -506,6 +516,9 @@ class WorkerResponse(BaseModel):
     last_seen_at: Optional[datetime] = None
     last_heartbeat: Optional[datetime] = None
     enrolled_at: datetime
+    is_burst_worker: bool = False
+    burst_whitelist: List[str] = []
+    gcp_zone: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 

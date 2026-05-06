@@ -30,7 +30,7 @@ import tempfile
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Depends, File, Header, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse, Response
@@ -106,6 +106,27 @@ def _pesign_material_configured(settings) -> bool:
     if (settings.pesign_certificate_nickname or "").strip():
         return True
     return False
+
+
+async def _maybe_stop_burst_vm(db: Any, worker: Worker) -> None:
+    """Stop the GCP VM for a burst worker if no more pending/running burst jobs exist."""
+    whitelist_lower = {n.lower() for n in (worker.burst_whitelist or []) if n}
+    if not whitelist_lower:
+        return
+    pending_count = await db.scalar(
+        select(func.count(BuildJob.id))
+        .join(Package, BuildJob.package_id == Package.id)
+        .where(
+            BuildJob.status.in_([BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.RUNNING]),
+            func.lower(Package.name).in_(whitelist_lower),
+        )
+    )
+    if (pending_count or 0) == 0:
+        from oreon_build.services.gcp_compute import stop_instance
+        asyncio.create_task(
+            stop_instance(worker.name, zone=worker.gcp_zone or None),
+            name=f"burst-vm-stop-{worker.name}",
+        )
 
 
 def _worker_declared_max_parallel_attempts(worker: Worker) -> int:
@@ -371,6 +392,32 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
             q = q.outerjoin(BuildTarget, BuildJob.target_id == BuildTarget.id).where(
                 (BuildJob.target_id.is_(None)) | (BuildTarget.architecture.in_(arch_vals))
             )
+
+    # Burst worker routing: burst workers only handle their whitelisted packages;
+    # normal workers never handle packages reserved for any burst worker.
+    burst_workers_res = await db.execute(
+        select(Worker.burst_whitelist).where(Worker.is_burst_worker == True)  # noqa: E712
+    )
+    all_burst_names: set[str] = {
+        name.lower()
+        for row in burst_workers_res.all()
+        for name in (row[0] or [])
+        if name
+    }
+    if locked_worker.is_burst_worker:
+        whitelist_lower = {n.lower() for n in (locked_worker.burst_whitelist or []) if n}
+        if not whitelist_lower:
+            return {"job": None}
+        # Burst workers only pick up jobs for their whitelisted packages.
+        q = q.join(Package, BuildJob.package_id == Package.id).where(
+            func.lower(Package.name).in_(whitelist_lower)
+        )
+    elif all_burst_names:
+        # Normal workers skip jobs whose package is reserved for a burst worker.
+        q = q.outerjoin(Package, BuildJob.package_id == Package.id).where(
+            (BuildJob.package_id.is_(None)) | (~func.lower(Package.name).in_(all_burst_names))
+        )
+
     # One transaction must not claim the same job row twice (concurrent polls, duplicate worker
     # processes with the same token, or LB retry). Lock the chosen row until commit.
     q = q.limit(1).with_for_update(of=BuildJob, skip_locked=True)
@@ -1812,6 +1859,15 @@ async def report_result(
     # Final status transitions must survive failures in artifact insert / repo publish enqueue /
     # promotion creation / R2 cleanup during large autobuild bursts.
     await db.commit()
+
+    # Burst VM lifecycle: stop the GCP instance if this was a burst worker and
+    # there are no more pending/running burst jobs for its whitelisted packages.
+    if worker.is_burst_worker and worker.burst_whitelist:
+        try:
+            await _maybe_stop_burst_vm(db, worker)
+        except Exception:
+            logger.exception("burst-vm stop check failed for worker %s", worker.name)
+
     if st_l in ("failed", "cancelled"):
         try:
             from oreon_build.services.build_chain import notify_chain_job_terminal_after_result

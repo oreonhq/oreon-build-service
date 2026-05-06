@@ -396,6 +396,64 @@ async def lifespan(app: FastAPI):
 
     rpmbuild_settle_task = asyncio.create_task(_rpmbuild_settle_loop(), name="rpmbuild-settle")
 
+    async def _burst_vm_watcher_loop() -> None:
+        """Start GCP VMs for burst workers that have pending whitelisted jobs but are not yet online."""
+        from oreon_build.db.session import async_session_maker
+        from oreon_build.models import BuildJob, BuildStatus, Package, Worker
+        from oreon_build.services.gcp_compute import start_instance
+        from sqlalchemy import select, func
+
+        while True:
+            try:
+                async with async_session_maker() as db:
+                    burst_res = await db.execute(
+                        select(Worker).where(Worker.is_burst_worker == True)  # noqa: E712
+                    )
+                    burst_workers = list(burst_res.scalars().all())
+                    for bw in burst_workers:
+                        whitelist_lower = {n.lower() for n in (bw.burst_whitelist or []) if n}
+                        if not whitelist_lower:
+                            continue
+                        # Check if there are pending/queued burst jobs for this worker.
+                        pending = await db.scalar(
+                            select(func.count(BuildJob.id))
+                            .join(Package, BuildJob.package_id == Package.id)
+                            .where(
+                                BuildJob.status.in_([BuildStatus.PENDING, BuildStatus.QUEUED]),
+                                func.lower(Package.name).in_(whitelist_lower),
+                            )
+                        )
+                        if (pending or 0) == 0:
+                            continue
+                        # There are pending burst jobs. Check if the worker is offline
+                        # (no heartbeat or stale heartbeat) and start the VM.
+                        from datetime import datetime, timezone
+                        now = datetime.now(timezone.utc)
+                        hb = bw.last_heartbeat
+                        if hb and hb.tzinfo is None:
+                            hb = hb.replace(tzinfo=timezone.utc)
+                        offline = hb is None or (now - hb).total_seconds() > 60
+                        if offline:
+                            logger.info(
+                                "burst-vm: worker %s has %d pending burst jobs but is offline, starting VM",
+                                bw.name, pending,
+                            )
+                            asyncio.create_task(
+                                start_instance(bw.name, zone=bw.gcp_zone or None),
+                                name=f"burst-vm-start-{bw.name}",
+                            )
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("burst vm watcher loop error")
+                try:
+                    await asyncio.sleep(30)
+                except asyncio.CancelledError:
+                    break
+
+    burst_vm_task = asyncio.create_task(_burst_vm_watcher_loop(), name="burst-vm-watcher")
+
     yield
 
     for t, label in [
@@ -405,6 +463,7 @@ async def lifespan(app: FastAPI):
         (chain_settle_task, "chain-settle"),
         (mass_rebuild_task, "mass-rebuild"),
         (rpmbuild_settle_task, "rpmbuild-settle"),
+        (burst_vm_task, "burst-vm-watcher"),
     ]:
         if t is not None:
             t.cancel()
