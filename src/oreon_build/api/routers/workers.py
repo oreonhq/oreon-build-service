@@ -51,6 +51,7 @@ def _worker_response(w: Worker) -> WorkerResponse:
         enrolled_at=w.enrolled_at,
         is_burst_worker=w.is_burst_worker,
         burst_whitelist=list(w.burst_whitelist or []),
+        gcp_instance_name=w.gcp_instance_name,
         gcp_zone=w.gcp_zone,
     )
 
@@ -97,6 +98,7 @@ async def enroll_worker(data: WorkerEnroll, db: DbSession, _: CurrentAdmin):
         architecture=data.architecture,
         is_burst_worker=data.is_burst_worker,
         burst_whitelist=whitelist,
+        gcp_instance_name=data.gcp_instance_name or None,
         gcp_zone=data.gcp_zone or None,
     )
     db.add(worker)
@@ -119,6 +121,8 @@ async def update_worker(worker_id: int, data: WorkerUpdate, db: DbSession, _: Cu
         w.is_burst_worker = data.is_burst_worker
     if data.burst_whitelist is not None:
         w.burst_whitelist = [str(p).strip() for p in data.burst_whitelist if str(p).strip()]
+    if data.gcp_instance_name is not None:
+        w.gcp_instance_name = data.gcp_instance_name.strip() or None
     if data.gcp_zone is not None:
         w.gcp_zone = data.gcp_zone.strip() or None
     await db.flush()
