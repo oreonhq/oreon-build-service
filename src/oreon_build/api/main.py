@@ -434,12 +434,19 @@ async def lifespan(app: FastAPI):
                             hb = hb.replace(tzinfo=timezone.utc)
                         offline = hb is None or (now - hb).total_seconds() > 60
                         if offline:
+                            instance = (bw.gcp_instance_name or "").strip()
+                            if not instance:
+                                logger.warning(
+                                    "burst-vm: worker %s has pending jobs but no gcp_instance_name set, skipping VM start",
+                                    bw.name,
+                                )
+                                continue
                             logger.info(
-                                "burst-vm: worker %s has %d pending burst jobs but is offline, starting VM",
-                                bw.name, pending,
+                                "burst-vm: worker %s has %d pending burst jobs but is offline, starting VM %s",
+                                bw.name, pending, instance,
                             )
                             asyncio.create_task(
-                                start_instance(bw.name, zone=bw.gcp_zone or None),
+                                start_instance(instance, zone=bw.gcp_zone or None),
                                 name=f"burst-vm-start-{bw.name}",
                             )
                 await asyncio.sleep(30)

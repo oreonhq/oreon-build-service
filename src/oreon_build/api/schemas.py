@@ -498,6 +498,7 @@ class WorkerEnroll(BaseModel):
     architecture: Optional[str] = None
     is_burst_worker: bool = False
     burst_whitelist: List[str] = []
+    gcp_instance_name: Optional[str] = Field(None, max_length=253)
     gcp_zone: Optional[str] = Field(None, max_length=128)
 
 
@@ -505,6 +506,7 @@ class WorkerUpdate(BaseModel):
     architecture: Optional[str] = None
     is_burst_worker: Optional[bool] = None
     burst_whitelist: Optional[List[str]] = None
+    gcp_instance_name: Optional[str] = Field(None, max_length=253)
     gcp_zone: Optional[str] = Field(None, max_length=128)
 
 
@@ -518,6 +520,7 @@ class WorkerResponse(BaseModel):
     enrolled_at: datetime
     is_burst_worker: bool = False
     burst_whitelist: List[str] = []
+    gcp_instance_name: Optional[str] = None
     gcp_zone: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)

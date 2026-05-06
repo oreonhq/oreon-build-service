@@ -122,11 +122,15 @@ async def _maybe_stop_burst_vm(db: Any, worker: Worker) -> None:
         )
     )
     if (pending_count or 0) == 0:
-        from oreon_build.services.gcp_compute import stop_instance
-        asyncio.create_task(
-            stop_instance(worker.name, zone=worker.gcp_zone or None),
-            name=f"burst-vm-stop-{worker.name}",
-        )
+        instance = (worker.gcp_instance_name or "").strip()
+        if instance:
+            from oreon_build.services.gcp_compute import stop_instance
+            asyncio.create_task(
+                stop_instance(instance, zone=worker.gcp_zone or None),
+                name=f"burst-vm-stop-{worker.name}",
+            )
+        else:
+            logger.warning("burst-vm: worker %s has no gcp_instance_name set, skipping VM stop", worker.name)
 
 
 def _worker_declared_max_parallel_attempts(worker: Worker) -> int:
