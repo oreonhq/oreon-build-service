@@ -28,31 +28,33 @@
       display: none;
       position: fixed;
       inset: 0;
-      background: rgba(0,0,0,0.45);
+      background: rgba(0,0,0,0.35);
       z-index: 1000;
       align-items: center;
       justify-content: center;
     }
     #edit-modal-overlay.open { display: flex; }
     #edit-modal {
-      background: var(--card-bg, #1e2128);
-      border: 1px solid var(--border, #333);
+      background: #fff;
+      border: 1px solid #ddd;
       border-radius: 6px;
       padding: 1.5rem;
       min-width: 380px;
       max-width: 520px;
       width: 90%;
+      color: #222;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.13);
     }
-    #edit-modal h3 { margin-top: 0; }
+    #edit-modal h3 { margin-top: 0; color: #222; }
     #edit-modal .form-group { margin-bottom: 0.85rem; }
-    #edit-modal label { display: block; margin-bottom: 0.25rem; font-size: 0.9rem; }
+    #edit-modal label { display: block; margin-bottom: 0.25rem; font-size: 0.9rem; color: #444; }
     #edit-modal input[type=text], #edit-modal textarea {
       width: 100%; box-sizing: border-box;
       padding: 0.4rem 0.55rem;
-      background: var(--input-bg, #0d1117);
-      border: 1px solid var(--border, #444);
+      background: #f9f9f9;
+      border: 1px solid #ccc;
       border-radius: 4px;
-      color: inherit;
+      color: #222;
       font-size: 0.9rem;
     }
     #edit-modal textarea { min-height: 80px; resize: vertical; font-family: monospace; }
