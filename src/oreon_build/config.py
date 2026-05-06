@@ -262,6 +262,10 @@ class Settings(BaseSettings):
             "seconds (idle/busy in the DB are stale). Workers heartbeat about every 30s. 0 uses DB state only."
         ),
     )
+    # Google Cloud Platform (burst worker VM lifecycle)
+    gcp_project_id: Optional[str] = Field(default=None, description="GCP project ID for burst worker VM management")
+    gcp_zone: str = Field(default="us-central1-a", description="Default GCP zone for burst worker VMs")
+
     # Webhooks / integrations
     discord_webhook_url: Optional[str] = Field(default=None)
     security_discord_webhook_url: Optional[str] = Field(default=None)
