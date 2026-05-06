@@ -10,6 +10,55 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Workers - Oreon Build Service</title>
   <link rel="stylesheet" href="/static/style.css?v=3">
+  <style>
+    .burst-badge {
+      display: inline-block;
+      background: var(--accent, #e06c00);
+      color: #fff;
+      font-size: 0.72rem;
+      font-weight: 600;
+      padding: 0.1rem 0.4rem;
+      border-radius: 3px;
+      margin-left: 0.35rem;
+      vertical-align: middle;
+      letter-spacing: 0.02em;
+    }
+    .burst-field { display: none; }
+    #edit-modal-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.45);
+      z-index: 1000;
+      align-items: center;
+      justify-content: center;
+    }
+    #edit-modal-overlay.open { display: flex; }
+    #edit-modal {
+      background: var(--card-bg, #1e2128);
+      border: 1px solid var(--border, #333);
+      border-radius: 6px;
+      padding: 1.5rem;
+      min-width: 380px;
+      max-width: 520px;
+      width: 90%;
+    }
+    #edit-modal h3 { margin-top: 0; }
+    #edit-modal .form-group { margin-bottom: 0.85rem; }
+    #edit-modal label { display: block; margin-bottom: 0.25rem; font-size: 0.9rem; }
+    #edit-modal input[type=text], #edit-modal textarea {
+      width: 100%; box-sizing: border-box;
+      padding: 0.4rem 0.55rem;
+      background: var(--input-bg, #0d1117);
+      border: 1px solid var(--border, #444);
+      border-radius: 4px;
+      color: inherit;
+      font-size: 0.9rem;
+    }
+    #edit-modal textarea { min-height: 80px; resize: vertical; font-family: monospace; }
+    #edit-modal .modal-actions { display: flex; gap: 0.5rem; margin-top: 1rem; justify-content: flex-end; }
+    .whitelist-hint { font-size: 0.78rem; color: var(--text-muted); margin-top: 0.2rem; }
+  </style>
 </head>
 <body>
   <header class="header">
@@ -51,6 +100,24 @@
           <label>Architecture (optional)</label>
           <input type="text" id="enroll-arch" placeholder="e.g. x86_64">
         </div>
+        <div class="form-group">
+          <label style="display:flex; align-items:center; gap:0.5rem; cursor:pointer;">
+            <input type="checkbox" id="enroll-burst" style="width:auto; margin:0;">
+            Burst worker?
+          </label>
+          <p style="font-size:0.8rem; color:var(--text-muted); margin:0.25rem 0 0;">Burst workers only handle specific packages and their GCP VM is started/stopped automatically.</p>
+        </div>
+        <div class="burst-field" id="enroll-burst-fields">
+          <div class="form-group">
+            <label>Whitelisted packages (one per line)</label>
+            <textarea id="enroll-whitelist" placeholder="package-foo&#10;package-bar"></textarea>
+            <p class="whitelist-hint">Only jobs for these packages will be assigned to this worker. Normal workers will never receive these packages.</p>
+          </div>
+          <div class="form-group">
+            <label>GCP zone (optional, overrides global default)</label>
+            <input type="text" id="enroll-gcp-zone" placeholder="e.g. us-central1-a" maxlength="128">
+          </div>
+        </div>
         <button type="button" class="btn primary" id="btn-enroll-worker">Enroll worker</button>
       </div>
       <div class="list-toolbar">
@@ -74,10 +141,49 @@
       </table>
     </section>
   </main>
+
+  <!-- Edit worker modal -->
+  <div id="edit-modal-overlay" role="dialog" aria-modal="true" aria-labelledby="edit-modal-title">
+    <div id="edit-modal">
+      <h3 id="edit-modal-title">Edit worker</h3>
+      <input type="hidden" id="edit-worker-id">
+      <div class="form-group">
+        <label>Architecture</label>
+        <input type="text" id="edit-arch" placeholder="e.g. x86_64" maxlength="32">
+      </div>
+      <div class="form-group">
+        <label style="display:flex; align-items:center; gap:0.5rem; cursor:pointer;">
+          <input type="checkbox" id="edit-burst" style="width:auto; margin:0;">
+          Burst worker?
+        </label>
+      </div>
+      <div class="burst-field" id="edit-burst-fields">
+        <div class="form-group">
+          <label>Whitelisted packages (one per line)</label>
+          <textarea id="edit-whitelist" placeholder="package-foo&#10;package-bar"></textarea>
+          <p class="whitelist-hint">Only jobs for these packages will be assigned to this worker. Normal workers will never receive these packages.</p>
+        </div>
+        <div class="form-group">
+          <label>GCP zone (optional, overrides global default)</label>
+          <input type="text" id="edit-gcp-zone" placeholder="e.g. us-central1-a" maxlength="128">
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn" id="btn-edit-cancel">Cancel</button>
+        <button type="button" class="btn primary" id="btn-edit-save">Save</button>
+      </div>
+    </div>
+  </div>
+
   <script src="/static/app.js?v=6"></script>
   <script>
     (function() {
-      const api = window.oreonApi;
+      var api = window.oreonApi;
+
+      function escapeHtml(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+      function escapeAttr(s) { return escapeHtml(s || '').replace(/"/g, '&quot;'); }
+
+      // --- Bulk selection ---
       var workersTableSel = window.oreonBindTableSelection(document.getElementById('workers-tbody'), {
         rowCheckboxSelector: '.worker-row-cb',
         selectAll: document.getElementById('workers-select-all'),
@@ -85,9 +191,7 @@
         onSelectionChange: function(ids, btns) {
           var tbody = document.getElementById('workers-tbody');
           var clear = document.createElement('button');
-          clear.type = 'button';
-          clear.className = 'btn';
-          clear.textContent = 'Clear selection';
+          clear.type = 'button'; clear.className = 'btn'; clear.textContent = 'Clear selection';
           clear.addEventListener('click', function() {
             tbody.querySelectorAll('.worker-row-cb').forEach(function(cb) { cb.checked = false; });
             workersTableSel.refresh();
@@ -95,16 +199,12 @@
           btns.appendChild(clear);
           if (!api.isAdmin()) return;
           var del = document.createElement('button');
-          del.type = 'button';
-          del.className = 'btn';
-          del.style.color = 'var(--danger)';
+          del.type = 'button'; del.className = 'btn'; del.style.color = 'var(--danger)';
           del.textContent = 'Delete selected';
           del.addEventListener('click', function() {
             if (!confirm('Delete ' + ids.length + ' worker(s)? They will need to re-enroll.')) return;
             var chain = Promise.resolve();
-            ids.forEach(function(id) {
-              chain = chain.then(function() { return api.delete('/workers/' + id); });
-            });
+            ids.forEach(function(id) { chain = chain.then(function() { return api.delete('/workers/' + id); }); });
             oreonWithLoading(del, function() {
               return chain.then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
             });
@@ -112,17 +212,30 @@
           btns.appendChild(del);
         }
       });
+
+      // --- Burst checkbox toggle helpers ---
+      function bindBurstToggle(checkbox, fieldsDiv) {
+        checkbox.addEventListener('change', function() {
+          fieldsDiv.style.display = this.checked ? 'block' : 'none';
+        });
+        fieldsDiv.style.display = checkbox.checked ? 'block' : 'none';
+      }
+      bindBurstToggle(document.getElementById('enroll-burst'), document.getElementById('enroll-burst-fields'));
+      bindBurstToggle(document.getElementById('edit-burst'), document.getElementById('edit-burst-fields'));
+
+      // --- UI visibility ---
       function updateUI() {
         var hint = document.getElementById('workers-hint');
         var section = document.getElementById('enroll-worker-section');
         var isAdm = api.isAdmin();
-        if (api.token && hint) hint.textContent = isAdm ? 'Build workers. You can enroll or delete workers.' : 'Build workers. Admin role required to enroll or delete workers.';
+        if (api.token && hint) hint.textContent = isAdm ? 'Build workers. You can enroll, edit, or delete workers.' : 'Build workers. Admin role required to manage workers.';
         else if (hint) hint.textContent = 'Build workers. Login as admin to enroll workers.';
         if (section) section.style.display = isAdm ? 'block' : 'none';
       }
-      function escapeHtml(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
-      function escapeAttr(s) { return escapeHtml(s || '').replace(/"/g, '&quot;'); }
+
+      // --- Pagination state ---
       var workersPage = 0, workersPageSize = 25, workersTotal = 0;
+
       function load() {
         var offset = workersPage * workersPageSize;
         api.get('/workers?limit=' + workersPageSize + '&offset=' + offset).then(function(data) {
@@ -130,11 +243,51 @@
           if (!tbody) return;
           var list = (data && data.items) ? data.items : [];
           workersTotal = (data && typeof data.total === 'number') ? data.total : 0;
-          var canDel = api.isAdmin();
+          var canAdmin = api.isAdmin();
           tbody.innerHTML = list.map(function(w) {
-            var actions = canDel ? '<button type="button" class="btn delete-worker" data-id="' + w.id + '" data-name="' + escapeAttr(w.name) + '">Delete</button>' : '-';
-            return '<tr><td class="col-checkbox"><input type="checkbox" class="worker-row-cb" data-id="' + w.id + '"></td><td>' + w.id + '</td><td>' + escapeHtml(w.name || '') + '</td><td>' + (w.state || '') + '</td><td>' + (w.architecture || '-') + '</td><td>' + (w.last_seen_at ? w.last_seen_at.slice(0,19) : '-') + '</td><td>' + actions + '</td></tr>';
+            var namePart = escapeHtml(w.name || '');
+            if (w.is_burst_worker) namePart += '<span class="burst-badge" title="Burst worker">BURST</span>';
+            var wl = (w.burst_whitelist && w.burst_whitelist.length) ? w.burst_whitelist.join(', ') : '';
+            var wlTitle = wl ? ' title="Whitelist: ' + escapeAttr(wl) + '"' : '';
+            var actions = '-';
+            if (canAdmin) {
+              var whitelistAttr = escapeAttr((w.burst_whitelist || []).join('\n'));
+              var gcpZoneAttr = escapeAttr(w.gcp_zone || '');
+              actions = '<button type="button" class="btn edit-worker" '
+                + 'data-id="' + w.id + '" '
+                + 'data-arch="' + escapeAttr(w.architecture || '') + '" '
+                + 'data-burst="' + (w.is_burst_worker ? '1' : '0') + '" '
+                + 'data-whitelist="' + whitelistAttr + '" '
+                + 'data-gcp-zone="' + gcpZoneAttr + '" '
+                + 'style="margin-right:0.3rem;">Edit</button>'
+                + '<button type="button" class="btn delete-worker" data-id="' + w.id + '" data-name="' + escapeAttr(w.name) + '" style="color:var(--danger);">Delete</button>';
+            }
+            return '<tr' + wlTitle + '>'
+              + '<td class="col-checkbox"><input type="checkbox" class="worker-row-cb" data-id="' + w.id + '"></td>'
+              + '<td>' + w.id + '</td>'
+              + '<td>' + namePart + '</td>'
+              + '<td>' + (w.state || '') + '</td>'
+              + '<td>' + (w.architecture || '-') + '</td>'
+              + '<td>' + (w.last_seen_at ? w.last_seen_at.slice(0,19) : '-') + '</td>'
+              + '<td>' + actions + '</td>'
+              + '</tr>';
           }).join('') || '<tr><td colspan="7">No workers</td></tr>';
+
+          // Edit buttons
+          tbody.querySelectorAll('.edit-worker').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+              document.getElementById('edit-worker-id').value = btn.dataset.id;
+              document.getElementById('edit-arch').value = btn.dataset.arch || '';
+              var isBurst = btn.dataset.burst === '1';
+              document.getElementById('edit-burst').checked = isBurst;
+              document.getElementById('edit-whitelist').value = btn.dataset.whitelist || '';
+              document.getElementById('edit-gcp-zone').value = btn.dataset.gcpZone || '';
+              document.getElementById('edit-burst-fields').style.display = isBurst ? 'block' : 'none';
+              document.getElementById('edit-modal-overlay').classList.add('open');
+            });
+          });
+
+          // Delete buttons
           tbody.querySelectorAll('.delete-worker').forEach(function(btn) {
             btn.addEventListener('click', function() {
               if (!confirm('Delete worker "' + (btn.dataset.name || '') + '"? The worker will need to re-enroll.')) return;
@@ -143,6 +296,7 @@
               });
             });
           });
+
           var numPages = workersTotal ? Math.ceil(workersTotal / workersPageSize) : 1;
           document.getElementById('workers-page-info').textContent = 'Page ' + (workersPage + 1) + ' of ' + numPages;
           document.getElementById('workers-prev').disabled = workersPage <= 0;
@@ -153,28 +307,69 @@
           if (tbody) tbody.innerHTML = '<tr><td colspan="7">Failed to load</td></tr>';
         });
       }
-      (function initWorkersPagination() {
-        document.getElementById('workers-prev').addEventListener('click', function() { if (workersPage > 0) { workersPage--; load(); } });
-        document.getElementById('workers-next').addEventListener('click', function() { var n = workersTotal ? Math.ceil(workersTotal / workersPageSize) : 1; if (workersPage < n - 1) { workersPage++; load(); } });
-        document.getElementById('workers-page-size').addEventListener('change', function() { workersPageSize = parseInt(this.value, 10) || 25; workersPage = 0; load(); });
-      })();
-      updateUI();
-      window.addEventListener('auth-change', function() { updateUI(); load(); });
+
+      // --- Pagination ---
+      document.getElementById('workers-prev').addEventListener('click', function() { if (workersPage > 0) { workersPage--; load(); } });
+      document.getElementById('workers-next').addEventListener('click', function() { var n = workersTotal ? Math.ceil(workersTotal / workersPageSize) : 1; if (workersPage < n - 1) { workersPage++; load(); } });
+      document.getElementById('workers-page-size').addEventListener('change', function() { workersPageSize = parseInt(this.value, 10) || 25; workersPage = 0; load(); });
+
+      // --- Enroll ---
       document.getElementById('btn-enroll-worker').addEventListener('click', function() {
         var btn = this;
         var name = document.getElementById('enroll-worker-name').value.trim();
         var token = document.getElementById('enroll-token').value;
         if (!name || !token) { alert('Worker name and enrollment token are required.'); return; }
+        var isBurst = document.getElementById('enroll-burst').checked;
+        var whitelistRaw = document.getElementById('enroll-whitelist').value;
+        var whitelist = isBurst ? whitelistRaw.split('\n').map(function(s) { return s.trim(); }).filter(Boolean) : [];
+        var gcpZone = isBurst ? (document.getElementById('enroll-gcp-zone').value.trim() || null) : null;
         oreonWithLoading(btn, function() {
-          return api.post('/workers/enroll', { name: name, enrollment_token: token, architecture: document.getElementById('enroll-arch').value.trim() || null })
-            .then(function(data) {
-              load();
-              if (data.token) alert('Worker enrolled. One-time token (save it): ' + data.token);
-              else alert('Worker enrolled.');
-            })
-            .catch(function(e) { alert('Failed: ' + e.message); });
+          return api.post('/workers/enroll', {
+            name: name,
+            enrollment_token: token,
+            architecture: document.getElementById('enroll-arch').value.trim() || null,
+            is_burst_worker: isBurst,
+            burst_whitelist: whitelist,
+            gcp_zone: gcpZone,
+          }).then(function(data) {
+            load();
+            if (data.token) alert('Worker enrolled. One-time token (save it): ' + data.token);
+            else alert('Worker enrolled.');
+          }).catch(function(e) { alert('Failed: ' + e.message); });
         });
       });
+
+      // --- Edit modal ---
+      document.getElementById('btn-edit-cancel').addEventListener('click', function() {
+        document.getElementById('edit-modal-overlay').classList.remove('open');
+      });
+      document.getElementById('edit-modal-overlay').addEventListener('click', function(e) {
+        if (e.target === this) this.classList.remove('open');
+      });
+      document.getElementById('btn-edit-save').addEventListener('click', function() {
+        var btn = this;
+        var id = document.getElementById('edit-worker-id').value;
+        if (!id) return;
+        var isBurst = document.getElementById('edit-burst').checked;
+        var whitelistRaw = document.getElementById('edit-whitelist').value;
+        var whitelist = whitelistRaw.split('\n').map(function(s) { return s.trim(); }).filter(Boolean);
+        var gcpZone = document.getElementById('edit-gcp-zone').value.trim() || null;
+        var arch = document.getElementById('edit-arch').value.trim() || null;
+        oreonWithLoading(btn, function() {
+          return api.patch('/workers/' + id, {
+            architecture: arch,
+            is_burst_worker: isBurst,
+            burst_whitelist: isBurst ? whitelist : [],
+            gcp_zone: isBurst ? gcpZone : null,
+          }).then(function() {
+            document.getElementById('edit-modal-overlay').classList.remove('open');
+            load();
+          }).catch(function(e) { alert('Failed: ' + e.message); });
+        });
+      });
+
+      updateUI();
+      window.addEventListener('auth-change', function() { updateUI(); load(); });
       load();
     })();
   </script>
