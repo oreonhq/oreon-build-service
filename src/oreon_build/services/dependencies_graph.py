@@ -268,6 +268,20 @@ def _parse_br_tokens(raw: str) -> list[str]:
     return tokens
 
 
+def _parse_runtime_req_name(raw: str) -> str | None:
+    """Normalize one runtime Requires name from primary.xml.
+
+    Keep capability names as-is so they can be matched against provides index.
+    Skip file/rpmlib/config deps because they are not source-package edges.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return None
+    if s.startswith("/") or s.startswith("rpmlib(") or s.startswith("config("):
+        return None
+    return s
+
+
 def _get_buildrequires_cached(r2_client: Any, srpm_key: str) -> list[str]:
     """Download an SRPM from R2 and extract its BuildRequires using rpm(1).
 
@@ -396,7 +410,14 @@ def _analyze_repo(
     r2 = get_r2_client()
 
     # 1. Fetch and parse repomd + primary.xml to build the provides index.
-    _empty = {"repo": target, "packages": {}, "missing": [], "edges": []}
+    _empty = {
+        "repo": target,
+        "packages": {},
+        "missing": [],
+        "edges": [],
+        "runtime_missing": [],
+        "runtime_edges": [],
+    }
 
     repomd_key = f"{target.prefix}/repodata/repomd.xml"
     repomd = r2.get_object(repomd_key)
@@ -420,6 +441,8 @@ def _analyze_repo(
             "packages": {},
             "missing": [],
             "edges": [],
+            "runtime_missing": [],
+            "runtime_edges": [],
             "error": f"primary_parse_failed:{type(exc).__name__}:{exc}",
         }
 
@@ -429,7 +452,15 @@ def _analyze_repo(
     src_candidates = set(srpm_keys.keys())
 
     if not src_candidates:
-        return {"repo": target, "packages": {}, "missing": [], "edges": [], "error": None}
+        return {
+            "repo": target,
+            "packages": {},
+            "missing": [],
+            "edges": [],
+            "runtime_missing": [],
+            "runtime_edges": [],
+            "error": None,
+        }
 
     # 3. Fetch BuildRequires for all SRPMs in parallel (cached on disk).
     srpm_brs: dict[str, list[str]] = {}
@@ -449,6 +480,8 @@ def _analyze_repo(
     # 4. Build edges and missing entries from BuildRequires.
     edges: list[dict[str, Any]] = []
     missing: list[dict[str, Any]] = []
+    runtime_edges: list[dict[str, Any]] = []
+    runtime_missing: list[dict[str, Any]] = []
     packages: dict[str, dict[str, Any]] = {}
 
     for src_name, brs in srpm_brs.items():
@@ -508,11 +541,76 @@ def _analyze_repo(
                         }
                     )
 
+    # 5. Build runtime (install-time) Requires edges from primary.xml.
+    #    We map binary package requires back to source package edges.
+    try:
+        root = ET.fromstring(primary_xml)
+    except ET.ParseError:
+        root = None
+    if root is not None:
+        for pkg in root.findall(".//{*}package"):
+            pkg_arch = _safe_text(pkg.find("{*}arch"))
+            if pkg_arch == "src":
+                continue
+            src_name = _source_name_from_sourcerpm(_safe_text(pkg.find("{*}format/{*}sourcerpm")))
+            if not src_name:
+                continue
+            # Restrict graph to source packages known from the distgit src/ tree.
+            if src_name not in src_candidates:
+                continue
+
+            seen_runtime_req: set[str] = set()
+            for e in pkg.findall(f".//{RPM_NS}requires/{RPM_NS}entry"):
+                req_raw = (e.attrib.get("name") or "").strip()
+                req = _parse_runtime_req_name(req_raw)
+                if not req or req in seen_runtime_req:
+                    continue
+                seen_runtime_req.add(req)
+
+                # External/base repos satisfy this requirement, not an Oreon blocker.
+                if external_provides and req in external_provides:
+                    continue
+
+                providers = _map_br_to_source(req, provides_index, src_candidates, known_built_sources)
+                if providers is None:
+                    continue
+                is_satisfied = all(p in known_built_sources for p in providers)
+                for prov_src in sorted(providers):
+                    if prov_src == src_name:
+                        continue
+                    runtime_edges.append(
+                        {
+                            "release": target.releasename,
+                            "branch": target.branch,
+                            "arch": target.arch,
+                            "from": src_name,
+                            "to": prov_src,
+                            "requirement": req,
+                            "missing": not is_satisfied,
+                        }
+                    )
+                if not is_satisfied:
+                    for prov_src in sorted(providers):
+                        if prov_src == src_name:
+                            continue
+                        runtime_missing.append(
+                            {
+                                "release": target.releasename,
+                                "branch": target.branch,
+                                "arch": target.arch,
+                                "package": src_name,
+                                "requirement": req,
+                                "provider": prov_src,
+                            }
+                        )
+
     return {
         "repo": target,
         "packages": packages,
         "missing": missing,
         "edges": edges,
+        "runtime_missing": runtime_missing,
+        "runtime_edges": runtime_edges,
         "error": None,
     }
 
@@ -665,6 +763,8 @@ async def build_dependencies_graph(db: AsyncSession, *, bypass_cache: bool = Fal
     nodes_map: dict[tuple[str, str, str], dict[str, Any]] = {}
     all_edges: list[dict[str, Any]] = []
     all_missing: list[dict[str, Any]] = []
+    all_runtime_edges: list[dict[str, Any]] = []
+    all_runtime_missing: list[dict[str, Any]] = []
     repo_errors: list[dict[str, str]] = []
 
     for result in results:
@@ -700,8 +800,11 @@ async def build_dependencies_graph(db: AsyncSession, *, bypass_cache: bool = Fal
                 cur["missing_count"] = int(cur.get("missing_count") or 0) + 1
 
         all_edges.extend(result["edges"])
+        all_runtime_edges.extend(result.get("runtime_edges") or [])
+        all_runtime_missing.extend(result.get("runtime_missing") or [])
 
     all_missing.sort(key=lambda x: (x["release"], x["branch"], x["package"], x["requirement"], x["arch"]))
+    all_runtime_missing.sort(key=lambda x: (x["release"], x["branch"], x["package"], x["requirement"], x["arch"]))
     nodes = sorted(nodes_map.values(), key=lambda x: (x["release"], x["branch"], x["name"]))
     for n in nodes:
         n["arches"] = sorted(n["arches"])
@@ -714,6 +817,8 @@ async def build_dependencies_graph(db: AsyncSession, *, bypass_cache: bool = Fal
             "nodes": len(nodes),
             "edges": len(all_edges),
             "missing_requirements": len(all_missing),
+            "runtime_edges": len(all_runtime_edges),
+            "runtime_missing_requirements": len(all_runtime_missing),
             "buildroot_blockers": 0,
         },
         "releases": sorted(releases_set),
@@ -722,6 +827,8 @@ async def build_dependencies_graph(db: AsyncSession, *, bypass_cache: bool = Fal
         "nodes": nodes,
         "edges": all_edges,
         "missing": all_missing,
+        "runtime_edges": all_runtime_edges,
+        "runtime_missing": all_runtime_missing,
         "buildroot_missing": [],
         "repo_errors": repo_errors,
         "cached": False,

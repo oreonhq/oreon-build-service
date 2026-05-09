@@ -170,6 +170,36 @@
         <div id="deps-status" class="deps-status-text"></div>
         <div id="deps-summary" class="deps-summary"></div>
       </div>
+      <div style="margin-top:0.75rem;">
+        <label for="buildrequires-chain-output" style="display:block; font-size:0.9rem; color:var(--text-muted); margin-bottom:0.35rem;">
+          BuildRequires build chain string
+        </label>
+        <textarea
+          id="buildrequires-chain-output"
+          class="form-control deps-codebox"
+          rows="4"
+          readonly
+          placeholder="Generated from current filters. Format supports parallel groups with ':'"
+        ></textarea>
+        <div style="margin-top:0.45rem;">
+          <button type="button" class="btn primary" id="btn-copy-buildrequires-chain">Copy buildrequires chain string</button>
+        </div>
+      </div>
+      <div style="margin-top:0.75rem;">
+        <label for="requires-chain-output" style="display:block; font-size:0.9rem; color:var(--text-muted); margin-bottom:0.35rem;">
+          Requires install-time chain string
+        </label>
+        <textarea
+          id="requires-chain-output"
+          class="form-control deps-codebox"
+          rows="4"
+          readonly
+          placeholder="Generated from current filters for missing install-time Requires dependencies"
+        ></textarea>
+        <div style="margin-top:0.45rem;">
+          <button type="button" class="btn primary" id="btn-copy-requires-chain">Copy requires chain string</button>
+        </div>
+      </div>
     </section>
 
     <section class="card deps-card">
@@ -186,6 +216,22 @@
         </select>
       </div>
       <div id="missing-table" class="deps-table-wrap"></div>
+    </section>
+
+    <section class="card deps-card">
+      <h3 style="margin-top:0;">Missing install-time dependencies</h3>
+      <div class="deps-toolbar">
+        <button type="button" class="btn" id="runtime-missing-prev">Prev</button>
+        <span id="runtime-missing-page-info" class="deps-status-text" style="margin:0;">Page 1</span>
+        <button type="button" class="btn" id="runtime-missing-next">Next</button>
+        <label style="margin-left:0.5rem;">Per page</label>
+        <select id="runtime-missing-page-size" class="form-control" style="width:6rem;">
+          <option value="25" selected>25</option>
+          <option value="50">50</option>
+          <option value="100">100</option>
+        </select>
+      </div>
+      <div id="runtime-missing-table" class="deps-table-wrap"></div>
     </section>
 
     <section class="card deps-card">
@@ -216,6 +262,7 @@
       var packageUniverse = [];
       var neededUniverse = [];
       var missingPage = 1;
+      var runtimeMissingPage = 1;
       var edgesPage = 1;
 
       function byId(id) { return document.getElementById(id); }
@@ -274,6 +321,66 @@
       function includedBranch(v) { return branchSel.size === 0 || branchSel.has(v); }
       function textIncludes(hay, needle) { return String(hay || '').toLowerCase().indexOf(needle) >= 0; }
 
+      /**
+       * Build a chain-build string from the filtered missing-dependency edges.
+       *
+       * Each missing edge {from: A, to: B} means:
+       *   "A has a BuildRequires from B, but B is not yet built/published."
+       *
+       * The chain contains ONLY the PROVIDERS (the `to` packages), i.e.
+       * packages that need to be built to satisfy missing BuildRequires.
+       */
+      function buildChainFromFiltered(allEdges, missingEdges) {
+        var providers = new Set();
+        missingEdges.forEach(function(e) {
+          if (e.to) providers.add(e.to);
+        });
+
+        if (!providers.size) return '';
+
+        var providerList = Array.from(providers);
+        var deps = {};
+        var rdeps = {};
+        providerList.forEach(function(p) { deps[p] = new Set(); rdeps[p] = new Set(); });
+
+        allEdges.forEach(function(e) {
+          if (!providers.has(e.from) || !providers.has(e.to)) return;
+          if (e.from === e.to) return;
+          deps[e.from].add(e.to);
+          rdeps[e.to].add(e.from);
+        });
+
+        var inDeg = {};
+        providerList.forEach(function(n) { inDeg[n] = deps[n].size; });
+
+        function byPriority(a, b) {
+          var sa = rdeps[a] ? rdeps[a].size : 0;
+          var sb = rdeps[b] ? rdeps[b].size : 0;
+          if (sb !== sa) return sb - sa;
+          return a.localeCompare(b);
+        }
+
+        var done = new Set();
+        var groups = [];
+        while (done.size < providerList.length) {
+          var ready = providerList
+            .filter(function(n) { return !done.has(n) && inDeg[n] === 0; })
+            .sort(byPriority);
+          if (!ready.length) {
+            ready = providerList.filter(function(n) { return !done.has(n); }).sort(byPriority);
+          }
+          groups.push(ready);
+          ready.forEach(function(n) {
+            done.add(n);
+            if (rdeps[n]) rdeps[n].forEach(function(d) {
+              inDeg[d] = Math.max(0, (inDeg[d] || 0) - 1);
+            });
+          });
+        }
+
+        return groups.map(function(g) { return g.join(' '); }).join(' : ');
+      }
+
       function applyFilters() {
         if (!graph) return;
         var releaseText = (byId('filter-release-search').value || '').trim().toLowerCase();
@@ -293,6 +400,9 @@
         var filteredEdges = (graph.edges || []).filter(edgePass);
         var missingEdges = filteredEdges.filter(function(e) { return e.missing; });
         var okEdges = filteredEdges.filter(function(e) { return !e.missing; });
+        var filteredRuntimeEdges = (graph.runtime_edges || []).filter(edgePass);
+        var runtimeMissingEdges = filteredRuntimeEdges.filter(function(e) { return e.missing; });
+        var runtimeOkEdges = filteredRuntimeEdges.filter(function(e) { return !e.missing; });
 
         // Deduplicate missing edges by (from, to) across arches.
         var seenMissingKey = new Set();
@@ -305,9 +415,16 @@
           }
         });
 
+        var mainChain = buildChainFromFiltered(filteredEdges, uniqueMissingEdges);
+        byId('buildrequires-chain-output').value = mainChain || '';
+        var runtimeChain = buildChainFromFiltered(filteredRuntimeEdges, runtimeMissingEdges);
+        byId('requires-chain-output').value = runtimeChain || '';
+
         byId('deps-status').textContent =
           uniqueMissingEdges.length + ' missing build dependencies, '
-          + okEdges.length + ' satisfied dependencies with current filters.';
+          + runtimeMissingEdges.length + ' missing install-time dependencies, '
+          + okEdges.length + ' satisfied build dependencies, '
+          + runtimeOkEdges.length + ' satisfied install-time dependencies with current filters.';
 
         var summary = byId('deps-summary');
         if (summary) {
@@ -317,6 +434,7 @@
             '<span class="deps-chip">repos scanned ' + esc(s.repositories_scanned || 0) + '</span>'
             + '<span class="deps-chip">source packages ' + esc(s.nodes || 0) + '</span>'
             + '<span class="deps-chip">missing build deps ' + esc(uniqueMissingEdges.length) + '</span>'
+            + '<span class="deps-chip">missing install deps ' + esc(runtimeMissingEdges.length) + '</span>'
             + '<span class="deps-chip">satisfied deps ' + esc(okEdges.length) + '</span>'
             + (errCount ? ('<span class="deps-chip warn">repo errors ' + esc(errCount) + '</span>') : '');
         }
@@ -347,6 +465,42 @@
         byId('missing-page-info').textContent = 'Page ' + missingPage + ' of ' + missingPages + ' (' + uniqueMissingEdges.length + ' rows)';
         byId('missing-prev').disabled = missingPage <= 1;
         byId('missing-next').disabled = missingPage >= missingPages;
+
+        // Missing install-time dependency table (deduplicated, per release+branch).
+        var seenRuntimeMissingKey = new Set();
+        var uniqueRuntimeMissingEdges = [];
+        runtimeMissingEdges.forEach(function(e) {
+          var k = e.release + '|' + e.branch + '|' + e.from + '|' + e.to;
+          if (!seenRuntimeMissingKey.has(k)) {
+            seenRuntimeMissingKey.add(k);
+            uniqueRuntimeMissingEdges.push(e);
+          }
+        });
+        var runtimeMissingPageSize = parseInt(byId('runtime-missing-page-size').value || '25', 10);
+        var runtimeMissingPages = Math.max(1, Math.ceil(uniqueRuntimeMissingEdges.length / runtimeMissingPageSize));
+        if (runtimeMissingPage > runtimeMissingPages) runtimeMissingPage = runtimeMissingPages;
+        if (runtimeMissingPage < 1) runtimeMissingPage = 1;
+        var runtimeMissingStart = (runtimeMissingPage - 1) * runtimeMissingPageSize;
+        var runtimeMissingRows = uniqueRuntimeMissingEdges.slice(runtimeMissingStart, runtimeMissingStart + runtimeMissingPageSize).map(function(e) {
+          return '<tr>'
+            + '<td>' + esc(e.release) + '</td>'
+            + '<td>' + esc(e.branch) + '</td>'
+            + '<td>' + esc(e.from) + '</td>'
+            + '<td>' + esc(e.requirement) + '</td>'
+            + '<td style="color:#c0392b;">' + esc(e.to) + '</td>'
+            + '</tr>';
+        }).join('');
+        byId('runtime-missing-table').innerHTML =
+          '<table class="table-list"><thead><tr>'
+          + '<th>Release</th><th>Branch</th>'
+          + '<th>Package (requires)</th>'
+          + '<th>Requires</th>'
+          + '<th>Missing provider</th>'
+          + '</tr></thead>'
+          + '<tbody>' + (runtimeMissingRows || '<tr><td colspan="5">No missing install-time dependencies in this filter view.</td></tr>') + '</tbody></table>';
+        byId('runtime-missing-page-info').textContent = 'Page ' + runtimeMissingPage + ' of ' + runtimeMissingPages + ' (' + uniqueRuntimeMissingEdges.length + ' rows)';
+        byId('runtime-missing-prev').disabled = runtimeMissingPage <= 1;
+        byId('runtime-missing-next').disabled = runtimeMissingPage >= runtimeMissingPages;
 
         // All edges table (both satisfied and missing).
         var edgesPageSize = parseInt(byId('edges-page-size').value || '50', 10);
@@ -386,6 +540,7 @@
           branchSel = new Set(graph.branches || []);
           packageSel = new Set();
           missingPage = 1;
+          runtimeMissingPage = 1;
           edgesPage = 1;
           renderFilterBoxes();
           applyFilters();
@@ -412,17 +567,36 @@
         renderFilterBoxes();
         applyFilters();
       });
+      byId('btn-copy-buildrequires-chain').addEventListener('click', function() {
+        var txt = byId('buildrequires-chain-output').value || '';
+        navigator.clipboard.writeText(txt).then(function() {
+          byId('deps-status').textContent = 'BuildRequires chain string copied.';
+        }).catch(function() {
+          byId('deps-status').textContent = 'Copy failed, select and copy manually.';
+        });
+      });
+      byId('btn-copy-requires-chain').addEventListener('click', function() {
+        var txt = byId('requires-chain-output').value || '';
+        navigator.clipboard.writeText(txt).then(function() {
+          byId('deps-status').textContent = 'Requires chain string copied.';
+        }).catch(function() {
+          byId('deps-status').textContent = 'Copy failed, select and copy manually.';
+        });
+      });
       byId('filter-release-search').addEventListener('input', renderFilterBoxes);
       byId('filter-branch-search').addEventListener('input', renderFilterBoxes);
       byId('filter-package-search').addEventListener('input', renderFilterBoxes);
-      byId('filter-release-search').addEventListener('input', function() { missingPage = 1; edgesPage = 1; applyFilters(); });
-      byId('filter-branch-search').addEventListener('input', function() { missingPage = 1; edgesPage = 1; applyFilters(); });
-      byId('filter-package-search').addEventListener('input', function() { missingPage = 1; edgesPage = 1; applyFilters(); });
+      byId('filter-release-search').addEventListener('input', function() { missingPage = 1; runtimeMissingPage = 1; edgesPage = 1; applyFilters(); });
+      byId('filter-branch-search').addEventListener('input', function() { missingPage = 1; runtimeMissingPage = 1; edgesPage = 1; applyFilters(); });
+      byId('filter-package-search').addEventListener('input', function() { missingPage = 1; runtimeMissingPage = 1; edgesPage = 1; applyFilters(); });
       byId('missing-prev').addEventListener('click', function() { missingPage -= 1; applyFilters(); });
       byId('missing-next').addEventListener('click', function() { missingPage += 1; applyFilters(); });
+      byId('runtime-missing-prev').addEventListener('click', function() { runtimeMissingPage -= 1; applyFilters(); });
+      byId('runtime-missing-next').addEventListener('click', function() { runtimeMissingPage += 1; applyFilters(); });
       byId('edges-prev').addEventListener('click', function() { edgesPage -= 1; applyFilters(); });
       byId('edges-next').addEventListener('click', function() { edgesPage += 1; applyFilters(); });
       byId('missing-page-size').addEventListener('change', function() { missingPage = 1; applyFilters(); });
+      byId('runtime-missing-page-size').addEventListener('change', function() { runtimeMissingPage = 1; applyFilters(); });
       byId('edges-page-size').addEventListener('change', function() { edgesPage = 1; applyFilters(); });
 
       loadGraph();
