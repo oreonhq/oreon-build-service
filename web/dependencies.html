@@ -8,8 +8,8 @@
   <link rel="stylesheet" href="/static/style.css?v=3">
   <style>
     .deps-card {
-      border-radius: 10px;
-      box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+      border-radius: 6px;
+      box-shadow: none;
     }
     .deps-lead {
       color: var(--text-muted);
@@ -25,7 +25,7 @@
     .deps-filter-box {
       background: #fafafa;
       border: 1px solid var(--border);
-      border-radius: 8px;
+      border-radius: 6px;
       padding: 0.65rem;
     }
     .deps-filter-box label {
@@ -38,7 +38,7 @@
       max-height: 12rem;
       overflow: auto;
       border: 1px solid var(--border);
-      border-radius: 6px;
+      border-radius: 4px;
       background: #fff;
       padding: 0.35rem 0.45rem;
       margin-top: 0.35rem;
@@ -92,7 +92,7 @@
       flex-wrap: wrap;
       padding: 0.4rem 0.45rem;
       border: 1px solid var(--border);
-      border-radius: 8px;
+      border-radius: 4px;
       background: #fafafa;
     }
     .deps-toolbar label {
@@ -101,7 +101,7 @@
     }
     .deps-table-wrap {
       border: 1px solid var(--border);
-      border-radius: 8px;
+      border-radius: 4px;
       overflow: auto;
       background: #fff;
     }
@@ -169,33 +169,6 @@
       <div class="deps-status-row">
         <div id="deps-status" class="deps-status-text"></div>
         <div id="deps-summary" class="deps-summary"></div>
-      </div>
-    </section>
-
-    <section class="card deps-card">
-      <h3 style="margin-top:0;">Unbuilt list</h3>
-      <p class="deps-lead" style="margin-top:0;">
-        Full dump of packages present in <code>rpm-specfiles/&lt;releasename&gt;/</code> but missing from the DB package list.
-        Output is dist-git format, one package per line.
-      </p>
-      <div style="display:flex; flex-wrap:wrap; gap:0.5rem; align-items:center; margin-bottom:0.45rem;">
-        <input type="text" id="unbuilt-releasename" class="form-control" style="width:10rem;" placeholder="releasename">
-        <input type="text" id="unbuilt-distgit-url" class="form-control" style="min-width:12rem; flex:1; max-width:32rem;" placeholder="DistGit URL (optional, server default if empty)">
-        <input type="text" id="unbuilt-distgit-branch" class="form-control" style="width:7.5rem;" placeholder="distgit branch">
-        <button type="button" class="btn" id="btn-unbuilt-list">Dump unbuilt list</button>
-      </div>
-      <div id="unbuilt-list-status" class="deps-status-text" style="margin-bottom:0.35rem;"></div>
-      <textarea id="unbuilt-list-output" class="form-control deps-codebox" rows="10" readonly placeholder="package1&#10;package2&#10;package3"></textarea>
-    </section>
-
-    <section class="card deps-card">
-      <h3 style="margin-top:0;">Generated chain-build</h3>
-      <p class="deps-lead" style="margin-top:0;">
-        Packages that need to be built, in dependency order, from the filtered missing edges only.
-      </p>
-      <textarea id="chain-output" class="form-control deps-codebox" rows="4" readonly></textarea>
-      <div style="margin-top:0.5rem;">
-        <button type="button" class="btn primary" id="btn-copy-chain">Copy chain-build string</button>
       </div>
     </section>
 
@@ -301,82 +274,6 @@
       function includedBranch(v) { return branchSel.size === 0 || branchSel.has(v); }
       function textIncludes(hay, needle) { return String(hay || '').toLowerCase().indexOf(needle) >= 0; }
 
-      /**
-       * Build a chain-build string from the filtered missing-dependency edges.
-       *
-       * Each missing edge {from: A, to: B} means:
-       *   "A has a BuildRequires from B, but B is not yet built/published."
-       *
-       * The chain contains ONLY the PROVIDERS (the `to` packages) — i.e. the
-       * packages that actually need to be built to satisfy missing deps.
-       * Consumers (the `from` packages) that are already in the repo are NOT
-       * included, because they don't need to be rebuilt just because their
-       * provider is missing for one arch.
-       *
-       * Inter-provider ordering uses ALL edges (missing + satisfied) so that if
-       * two providers have a dependency on each other, they appear in the right
-       * stage.
-       */
-      function buildChainFromFiltered(allEdges, missingEdges) {
-        // The packages that need to be built: appear as `to` in any missing edge.
-        var providers = new Set();
-        missingEdges.forEach(function(e) {
-          if (e.to) providers.add(e.to);
-        });
-
-        if (!providers.size) return '';
-
-        var providerList = Array.from(providers);
-
-        // Build a dependency graph ONLY AMONG providers.
-        // If both A and B are providers and A has any edge to B (A needs B),
-        // then B must be built first.
-        var deps = {};     // provider -> Set of providers it depends on
-        var rdeps = {};    // provider -> Set of providers that depend on it
-        providerList.forEach(function(p) { deps[p] = new Set(); rdeps[p] = new Set(); });
-
-        allEdges.forEach(function(e) {
-          if (!providers.has(e.from) || !providers.has(e.to)) return;
-          if (e.from === e.to) return;
-          deps[e.from].add(e.to);
-          rdeps[e.to].add(e.from);
-        });
-
-        // Kahn's topological sort.
-        var inDeg = {};
-        providerList.forEach(function(n) { inDeg[n] = deps[n].size; });
-
-        // Sort stage members: more dependents first (more critical = build earlier),
-        // then alphabetically for stability.
-        function byPriority(a, b) {
-          var sa = rdeps[a] ? rdeps[a].size : 0;
-          var sb = rdeps[b] ? rdeps[b].size : 0;
-          if (sb !== sa) return sb - sa;
-          return a.localeCompare(b);
-        }
-
-        var done = new Set();
-        var groups = [];
-        while (done.size < providerList.length) {
-          var ready = providerList
-            .filter(function(n) { return !done.has(n) && inDeg[n] === 0; })
-            .sort(byPriority);
-          if (!ready.length) {
-            // Cycle: emit remaining as one group.
-            ready = providerList.filter(function(n) { return !done.has(n); }).sort(byPriority);
-          }
-          groups.push(ready);
-          ready.forEach(function(n) {
-            done.add(n);
-            if (rdeps[n]) rdeps[n].forEach(function(d) {
-              inDeg[d] = Math.max(0, (inDeg[d] || 0) - 1);
-            });
-          });
-        }
-
-        return groups.map(function(g) { return g.join(' '); }).join(' : ');
-      }
-
       function applyFilters() {
         if (!graph) return;
         var releaseText = (byId('filter-release-search').value || '').trim().toLowerCase();
@@ -407,9 +304,6 @@
             uniqueMissingEdges.push(e);
           }
         });
-
-        var mainChain = buildChainFromFiltered(filteredEdges, uniqueMissingEdges);
-        byId('chain-output').value = mainChain || '';
 
         byId('deps-status').textContent =
           uniqueMissingEdges.length + ' missing build dependencies, '
@@ -502,14 +396,6 @@
         });
       }
 
-      function inferDefaultReleasename() {
-        if (!graph || !graph.releases || !graph.releases.length) return;
-        var inp = byId('unbuilt-releasename');
-        if (!inp) return;
-        if (String(inp.value || '').trim()) return;
-        inp.value = String(graph.releases[0] || '');
-      }
-
       byId('btn-deps-refresh').addEventListener('click', loadGraph);
       byId('btn-select-all').addEventListener('click', function() {
         if (!graph) return;
@@ -526,38 +412,6 @@
         renderFilterBoxes();
         applyFilters();
       });
-      byId('btn-unbuilt-list').addEventListener('click', function() {
-        var reln = String((byId('unbuilt-releasename').value || '')).trim();
-        if (!reln) { alert('Enter releasename (folder in rpm-specfiles and R2 path).'); return; }
-        var u = (byId('unbuilt-distgit-url').value || '').trim();
-        var b = (byId('unbuilt-distgit-branch').value || '').trim();
-        var q = 'releasename=' + encodeURIComponent(reln);
-        if (u) q += '&distgit_url=' + encodeURIComponent(u);
-        if (b) q += '&distgit_branch=' + encodeURIComponent(b);
-        byId('unbuilt-list-status').textContent = 'Loading...';
-        byId('unbuilt-list-output').value = '';
-        api.get('/dependencies/unbuilt-list?' + q).then(function(d) {
-          byId('unbuilt-list-output').value = (d.unbuilt_packages || []).join('\n');
-          var errCount = (d.errors || []).length;
-          byId('unbuilt-list-status').textContent =
-            'Loaded ' + (d.unbuilt_count || 0)
-            + ' unbuilt packages out of ' + (d.total_spec_packages || 0)
-            + ' dist-git specs and ' + (d.total_db_packages || 0) + ' DB packages'
-            + (errCount ? (' (' + errCount + ' warnings)') : '');
-        }).catch(function(e) {
-          byId('unbuilt-list-status').textContent = 'Error: ' + (e && e.message ? e.message : String(e));
-        });
-      });
-
-      byId('btn-copy-chain').addEventListener('click', function() {
-        var txt = byId('chain-output').value || '';
-        navigator.clipboard.writeText(txt).then(function() {
-          byId('deps-status').textContent = 'chain-build string copied.';
-        }).catch(function() {
-          byId('deps-status').textContent = 'Copy failed, select and copy manually.';
-        });
-      });
-
       byId('filter-release-search').addEventListener('input', renderFilterBoxes);
       byId('filter-branch-search').addEventListener('input', renderFilterBoxes);
       byId('filter-package-search').addEventListener('input', renderFilterBoxes);
@@ -571,7 +425,7 @@
       byId('missing-page-size').addEventListener('change', function() { missingPage = 1; applyFilters(); });
       byId('edges-page-size').addEventListener('change', function() { edgesPage = 1; applyFilters(); });
 
-      loadGraph().then(function() { inferDefaultReleasename(); });
+      loadGraph();
     })();
   </script>
 </body>
