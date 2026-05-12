@@ -1,10 +1,12 @@
 """Shared helpers for resolving build targets and skip-complete checks (used by builds router and chain builds)."""
 from __future__ import annotations
 
+from datetime import datetime
+
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from oreon_build.models import BuildJob, BuildStatus, BuildTarget, MockEnvironment
+from oreon_build.models import BuildJob, BuildStatus, BuildTarget, MockEnvironment, PackageVersion
 
 
 async def get_or_create_build_target(
@@ -60,14 +62,36 @@ async def get_or_create_build_target(
     return created
 
 
+async def latest_package_version_id(db, package_id: int) -> int | None:
+    """Highest-id PackageVersion for a package, or None if the package has no versions."""
+    return (
+        await db.scalar(
+            select(PackageVersion.id)
+            .where(PackageVersion.package_id == package_id)
+            .order_by(PackageVersion.id.desc())
+            .limit(1)
+        )
+    )
+
+
 async def has_successful_build_for_target(
     db,
     package_id: int,
     release_id: int,
     target_id: int,
     package_version_id: int | None,
+    *,
+    jobs_created_on_or_after: datetime | None = None,
 ) -> bool:
-    """True if there is already a successful job for this package, release, and build target."""
+    """True if there is already a successful job for this package, release, and build target.
+
+    When ``package_version_id`` is set, only successes for that version count.
+
+    When ``jobs_created_on_or_after`` is set (used for chain builds), only successes
+    from jobs created at or after that time count. That prevents ``skip_complete_arches``
+    from treating pre-chain historical successes as satisfying a new chain after
+    distgit/spec updates where jobs used unpinned ``package_version_id``.
+    """
     q = (
         select(BuildJob.id)
         .where(
@@ -80,5 +104,12 @@ async def has_successful_build_for_target(
     )
     if package_version_id is not None:
         q = q.where(BuildJob.package_version_id == package_version_id)
+    if jobs_created_on_or_after is not None:
+        ref = jobs_created_on_or_after
+        if ref.tzinfo is None:
+            from datetime import timezone as _tz
+
+            ref = ref.replace(tzinfo=_tz.utc)
+        q = q.where(BuildJob.created_at >= ref)
     r = await db.execute(q)
     return r.scalar_one_or_none() is not None

@@ -29,7 +29,11 @@ from oreon_build.models import (
     Source,
     Worker,
 )
-from oreon_build.services.build_target_util import get_or_create_build_target, has_successful_build_for_target
+from oreon_build.services.build_target_util import (
+    get_or_create_build_target,
+    has_successful_build_for_target,
+    latest_package_version_id,
+)
 
 if TYPE_CHECKING:
     from oreon_build.models import Account
@@ -506,6 +510,21 @@ async def _enqueue_chain_stage_jobs(
     publish_branch = r2_publish_branch(release)
     releasename = (release.releasename or "").strip()
 
+    skip_jobs_not_before: datetime | None = None
+    opt_raw = chain.chain_options if isinstance(chain.chain_options, dict) else {}
+    raw_skip = opt_raw.get("skip_jobs_not_before")
+    if skip_complete_arches and raw_skip:
+        try:
+            skip_jobs_not_before = datetime.fromisoformat(str(raw_skip))
+            if skip_jobs_not_before.tzinfo is None:
+                skip_jobs_not_before = skip_jobs_not_before.replace(tzinfo=timezone.utc)
+        except ValueError:
+            skip_jobs_not_before = None
+    if skip_complete_arches and skip_jobs_not_before is None:
+        ca = getattr(chain, "created_at", None)
+        if ca is not None:
+            skip_jobs_not_before = ca if ca.tzinfo else ca.replace(tzinfo=timezone.utc)
+
     for pkg_name in pkgs:
         existing_r = await db.execute(select(Package).where(Package.name == pkg_name))
         existing_pkg = existing_r.scalar_one_or_none()
@@ -515,7 +534,7 @@ async def _enqueue_chain_stage_jobs(
 
         if existing_pkg:
             package_id = existing_pkg.id
-            package_version_id = None
+            package_version_id = await latest_package_version_id(db, package_id)
             # Chain-specified mock takes priority; fall back to package's stored preference.
             pref_mock = preferred_mock_environment_id or existing_pkg.preferred_mock_environment_id
         else:
@@ -563,7 +582,12 @@ async def _enqueue_chain_stage_jobs(
                 continue
             target = await get_or_create_build_target(db, chain.release_id, canon, pref_mock)
             if skip_complete_arches and await has_successful_build_for_target(
-                db, package_id, chain.release_id, target.id, package_version_id
+                db,
+                package_id,
+                chain.release_id,
+                target.id,
+                package_version_id,
+                jobs_created_on_or_after=skip_jobs_not_before,
             ):
                 skip_slots += 1
                 continue
@@ -677,6 +701,9 @@ async def trigger_chain_build(
         "distgit_branch": dg_branch,
         "preferred_mock_environment_id": preferred_mock_environment_id,
         "priority": priority,
+        # Only successes from jobs created on/after this instant count toward
+        # skip_complete_arches for this chain (avoids stale all-arch skips).
+        "skip_jobs_not_before": datetime.now(timezone.utc).isoformat(),
     }
     chain = BuildChain(
         release_id=release_id,

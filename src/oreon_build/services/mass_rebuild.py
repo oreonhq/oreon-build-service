@@ -20,7 +20,11 @@ from oreon_build.models import (
     Source,
     Worker,
 )
-from oreon_build.services.build_target_util import get_or_create_build_target, has_successful_build_for_target
+from oreon_build.services.build_target_util import (
+    get_or_create_build_target,
+    has_successful_build_for_target,
+    latest_package_version_id,
+)
 from oreon_build.services.distgit_order import compute_distgit_build_order
 
 logger = logging.getLogger(__name__)
@@ -162,7 +166,8 @@ async def run_mass_rebuild_pass(db: Any) -> dict[str, Any]:
                     break
                 m_id = await _resolve_mock_for_job(db, release, pkg_preferred, settings_mock)
                 target = await get_or_create_build_target(db, release.id, arch, m_id)
-                if await has_successful_build_for_target(db, pid, release.id, target.id, None):
+                pv_id = await latest_package_version_id(db, pid)
+                if await has_successful_build_for_target(db, pid, release.id, target.id, pv_id):
                     continue
                 if await has_active_build(db, pid, release.id, target.id):
                     continue
@@ -173,8 +178,9 @@ async def run_mass_rebuild_pass(db: Any) -> dict[str, Any]:
                     pida, p_pref = by_name[pred]
                     m2 = await _resolve_mock_for_job(db, release, p_pref, settings_mock)
                     t2 = await get_or_create_build_target(db, release.id, arch, m2)
+                    pred_pv = await latest_package_version_id(db, pida)
                     if not await has_successful_build_for_target(
-                        db, pida, release.id, t2.id, None
+                        db, pida, release.id, t2.id, pred_pv
                     ):
                         ok = False
                         break

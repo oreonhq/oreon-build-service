@@ -28,7 +28,11 @@ from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
 from oreon_build.core.machine_arch import normalize_machine_arch
 from oreon_build.core.repo_branch import r2_publish_branch
 from oreon_build.models import BuildAttempt, BuildChain, BuildJob, BuildStatus, BuildTarget, Package, Release, RpmbuildPlan, Worker
-from oreon_build.services.build_target_util import get_or_create_build_target, has_successful_build_for_target
+from oreon_build.services.build_target_util import (
+    get_or_create_build_target,
+    has_successful_build_for_target,
+    latest_package_version_id,
+)
 from oreon_build.services.r2 import get_r2_client, upload_r2_key
 
 router = APIRouter(prefix="/builds", tags=["builds"])
@@ -641,6 +645,9 @@ async def trigger_build(
     # request nor the package carries a preference.
     if preferred_mock_environment_id is None and release_for_job.default_mock_environment_id:
         preferred_mock_environment_id = release_for_job.default_mock_environment_id
+
+    if package_version_id is None:
+        package_version_id = await latest_package_version_id(db, package_id)
 
     architectures = data.architectures or DEFAULT_ARCHITECTURES
     if not architectures:

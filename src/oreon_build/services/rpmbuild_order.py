@@ -5,6 +5,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from datetime import datetime, timezone
+
 from fastapi import HTTPException, status
 from sqlalchemy import select
 
@@ -24,10 +26,24 @@ from oreon_build.models import (
     Worker,
 )
 from oreon_build.services.build_chain import distgit_new_package_dict
-from oreon_build.services.build_target_util import get_or_create_build_target, has_successful_build_for_target
+from oreon_build.services.build_target_util import (
+    get_or_create_build_target,
+    has_successful_build_for_target,
+    latest_package_version_id,
+)
 from oreon_build.services.distgit_order import compute_distgit_build_order
 
 logger = logging.getLogger(__name__)
+
+
+def _plan_skip_jobs_not_before(plan: RpmbuildPlan) -> datetime | None:
+    """Lower bound for ``skip_complete`` checks scoped to this rpmbuild plan."""
+    ca = plan.created_at
+    if ca is None:
+        return None
+    if ca.tzinfo is None:
+        return ca.replace(tzinfo=timezone.utc)
+    return ca
 
 
 @dataclass
@@ -110,6 +126,7 @@ async def enqueue_plan_layer_jobs(
     publish_branch = r2_publish_branch(release)
     jobs: list[BuildJob] = []
     layer_pkgs = [str(x) for x in layers[layer_index] if str(x).strip()]
+    plan_not_before = _plan_skip_jobs_not_before(plan)
     for pkg_name in layer_pkgs:
         pkg, pref = await _get_or_create_distgit_package(
             db,
@@ -123,7 +140,15 @@ async def enqueue_plan_layer_jobs(
             canon = normalize_machine_arch(arch)
             m_id = await _resolve_mock_for_pkg(db, release.id, pref)
             target = await get_or_create_build_target(db, release.id, canon, m_id)
-            if skip_complete_arches and await has_successful_build_for_target(db, pkg.id, release.id, target.id, None):
+            pv_id = await latest_package_version_id(db, pkg.id)
+            if skip_complete_arches and await has_successful_build_for_target(
+                db,
+                pkg.id,
+                release.id,
+                target.id,
+                pv_id,
+                jobs_created_on_or_after=plan_not_before,
+            ):
                 continue
             act = await db.execute(
                 select(BuildJob.id)
@@ -225,6 +250,7 @@ async def create_rpmbuild_plan(
     )
     db.add(plan)
     await db.flush()
+    await db.refresh(plan)
 
     # Minimal seed bootstrap behavior: only queue seed packages in the opening layer.
     initial_jobs: list[BuildJob] = []
@@ -246,7 +272,15 @@ async def create_rpmbuild_plan(
                 normalize_machine_arch(arch),
                 await _resolve_mock_for_pkg(db, release.id, pref),
             )
-            if await has_successful_build_for_target(db, pkg.id, release.id, target.id, None):
+            pv_id = await latest_package_version_id(db, pkg.id)
+            if await has_successful_build_for_target(
+                db,
+                pkg.id,
+                release.id,
+                target.id,
+                pv_id,
+                jobs_created_on_or_after=_plan_skip_jobs_not_before(plan),
+            ):
                 continue
             job = BuildJob(
                 package_id=pkg.id,
