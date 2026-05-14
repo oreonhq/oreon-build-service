@@ -192,7 +192,7 @@ def _platform_display(affected: list[dict]) -> str:
             names.append(rn)
     if not names:
         return "-"
-    return ", ".join(f"Oreon-{n}" for n in names)
+    return ", ".join(names)
 
 
 def _enrich_errata_row(d: dict) -> None:
