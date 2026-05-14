@@ -137,7 +137,11 @@ async def send_discord_embed(
 
 
 async def send_security_discord_embed(
-    title: str, description: str, fields: list[tuple[str, str]]
+    title: str,
+    description: str,
+    fields: list[tuple[str, str]],
+    *,
+    color: int | None = None,
 ) -> None:
     """Send a CVE/security embed to the dedicated security webhook (if configured)."""
     settings = get_settings()
@@ -167,10 +171,11 @@ async def send_security_discord_embed(
         if not value:
             continue
         embed_fields.append({"name": name, "value": value[:900], "inline": False})
+    embed_color = color if color is not None else 0xB91C1C  # default red-ish for new advisories
     embed = {
         "title": title[:256] if title else "Oreon Security Advisory",
         "description": (description or "")[:1000],
-        "color": 0xB91C1C,  # red-ish
+        "color": embed_color,
         "fields": embed_fields,
     }
     await _post({"embeds": [embed]}, webhook_url=url)

@@ -30,6 +30,7 @@ from fastapi.staticfiles import StaticFiles
 
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import selectinload
 from oreon_build.db.session import async_session_maker
 from oreon_build.core.auth import require_admin, require_account
 from oreon_build.api.routers.auth import router as auth_router
@@ -43,7 +44,7 @@ from oreon_build.models import (
     TrackedRpm,
 )
 from oreon_build.config import get_settings as get_app_settings
-from oreon_build.services.discord import send_security_discord_embed
+from oreon_build.services.discord import DISCORD_COLOR_SUCCESS, send_security_discord_embed
 from oreon_build.watchdog.package_names import (
     parse_omit_subpackage_suffixes,
     tracked_rpm_not_subpackage_predicate,
@@ -219,6 +220,35 @@ def _enrich_errata_row(d: dict) -> None:
     d["updated_at"] = _dt_to_iso(upd)
     d["updated_at_display"] = _fmt_us_date(upd)
     d["platform_display"] = _platform_display(d.get("affected_releases") or [])
+
+
+async def _discord_notify_advisory_resolved(
+    *,
+    kind: str,
+    row: dict,
+    admin_username: str,
+    extra_fields: list[tuple[str, str]] | None = None,
+) -> None:
+    """Best-effort Discord post to SECURITY_DISCORD_WEBHOOK_URL when an advisory is resolved."""
+    d = dict(row)
+    _enrich_errata_row(d)
+    d.pop("_created_at", None)
+    d.pop("_handled_at", None)
+    d.pop("_sort_ts", None)
+    fields: list[tuple[str, str]] = [
+        ("Type", "CVE match" if kind == "cve" else "Custom advisory"),
+        ("ORSA id", str(d.get("errata_id") or "-")),
+        ("Advisory title", str(d.get("bulletin_title") or "-")),
+        ("Platform", str(d.get("platform_display") or "-")),
+    ]
+    if extra_fields:
+        fields.extend(extra_fields)
+    await send_security_discord_embed(
+        title="security.advisory / resolved",
+        description=f"Marked resolved by {admin_username}",
+        fields=fields,
+        color=DISCORD_COLOR_SUCCESS,
+    )
 
 
 @asynccontextmanager
@@ -1052,19 +1082,61 @@ def create_app() -> FastAPI:
         notes_val = notes or None
 
         async with async_session_maker() as db:
-            q = select(CveMatch).where(CveMatch.id == cve_match_id)
+            q = (
+                select(CveMatch)
+                .where(CveMatch.id == cve_match_id)
+                .options(selectinload(CveMatch.tracked_rpm))
+            )
             res = await db.execute(q)
             m = res.scalar_one_or_none()
             if not m:
                 return JSONResponse(content={"detail": "CVE advisory not found"}, status_code=404)
             if m.is_handled:
                 return JSONResponse(content={"ok": True, "already_resolved": True})
+            rel_rows = await db.execute(
+                select(Release.releasename)
+                .join(CveMatchRelease, CveMatchRelease.release_id == Release.id)
+                .where(CveMatchRelease.cve_match_id == cve_match_id)
+            )
+            affected = [
+                {"releasename": (name or "").strip()}
+                for (name,) in rel_rows.all()
+                if name and str(name).strip()
+            ]
+            rpm = m.tracked_rpm
+            pkg_ver = f"{rpm.rpm_version}-{rpm.rpm_release}" if rpm else None
+            handled_at = datetime.now(timezone.utc)
             m.is_handled = True
-            m.handled_at = datetime.now(timezone.utc)
+            m.handled_at = handled_at
             m.handled_by_account_id = admin.id
             m.handled_reason = reason_val
             m.handled_notes = notes_val
             await db.commit()
+            try:
+                await _discord_notify_advisory_resolved(
+                    kind="cve",
+                    row={
+                        "kind": "cve",
+                        "id": int(m.id),
+                        "cve_id": m.cve_id,
+                        "title": None,
+                        "package_name": rpm.package_name if rpm else None,
+                        "package_version": pkg_ver,
+                        "severity": m.severity,
+                        "affected_releases": affected,
+                        "is_handled": True,
+                        "_created_at": m.created_at,
+                        "_handled_at": handled_at,
+                    },
+                    admin_username=admin.username,
+                    extra_fields=[
+                        ("CVE", m.cve_id or "-"),
+                        ("Reason", reason_val or "-"),
+                        ("Notes", notes_val or "-"),
+                    ],
+                )
+            except Exception:
+                pass
             return JSONResponse(content={"ok": True})
 
     @app.post("/api/security/advisories/custom/{advisory_id}/resolve")
@@ -1080,10 +1152,42 @@ def create_app() -> FastAPI:
                 return JSONResponse(content={"detail": "Custom advisory not found"}, status_code=404)
             if adv.is_handled:
                 return JSONResponse(content={"ok": True, "already_resolved": True})
+            rel_rows = await db.execute(
+                select(Release.releasename)
+                .join(SecurityAdvisoryRelease, SecurityAdvisoryRelease.release_id == Release.id)
+                .where(SecurityAdvisoryRelease.advisory_id == advisory_id)
+            )
+            affected = [
+                {"releasename": (name or "").strip()}
+                for (name,) in rel_rows.all()
+                if name and str(name).strip()
+            ]
+            handled_at = datetime.now(timezone.utc)
             adv.is_handled = True
-            adv.handled_at = datetime.now(timezone.utc)
+            adv.handled_at = handled_at
             adv.handled_by_account_id = admin.id
             await db.commit()
+            try:
+                await _discord_notify_advisory_resolved(
+                    kind="custom",
+                    row={
+                        "kind": "custom",
+                        "id": int(adv.id),
+                        "cve_id": adv.cve_id,
+                        "title": adv.title,
+                        "package_name": adv.package_name,
+                        "package_version": adv.package_version,
+                        "severity": adv.severity,
+                        "affected_releases": affected,
+                        "is_handled": True,
+                        "_created_at": adv.created_at,
+                        "_handled_at": handled_at,
+                    },
+                    admin_username=admin.username,
+                    extra_fields=[("CVE (optional)", adv.cve_id or "-")],
+                )
+            except Exception:
+                pass
             return JSONResponse(content={"ok": True})
 
     return app

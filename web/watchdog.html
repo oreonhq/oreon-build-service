@@ -34,14 +34,13 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     .errata-table th.errata-col-status { text-align: center; width: 8.5rem; }
     .errata-table td { padding: 0.5rem 0.65rem; border-bottom: 1px solid #e8e8e8; vertical-align: middle; }
     .errata-table tbody tr:hover { background: #f9fafb; }
+    .errata-table .badge.pending { background: var(--danger, #b91c1c); color: #fff; }
     .errata-table .errata-id { font-family: ui-monospace, monospace; white-space: nowrap; }
     .errata-table .errata-title { color: var(--text); }
     .errata-pager { display: flex; align-items: center; justify-content: flex-end; gap: 0.35rem; margin-top: 0.75rem; flex-wrap: wrap; }
     .errata-pager .pager-frac { font-size: 0.9rem; color: var(--text-muted); margin: 0 0.5rem; }
     .errata-pager .btn-errata-nav { min-width: 2.25rem; padding: 0.25rem 0.45rem; }
     .errata-admin-bar { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 0.5rem; }
-    .errata-summary-chips { display: flex; flex-wrap: wrap; gap: 0.4rem 0.75rem; font-size: 0.85rem; color: var(--text-muted); margin-top: 0.5rem; }
-    .errata-summary-chips span { color: var(--text); font-weight: 600; }
   </style>
 </head>
 <body>
@@ -61,7 +60,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     <section class="card">
       <h1 style="margin:0 0 0.35rem; font-size:1.35rem;">Oreon Watchdog</h1>
       <p class="errata-lead">
-        Precautionary security advisories for RPMs tracked from successful build artifacts. Rows include custom advisories you create and legacy CVE match rows still in the database. Resolved means marked handled by your team. Precautionary means still open for review or remediation. This service does not auto-ingest NVD or OSV for new CVEs on its own.
+        Precautionary security advisories for RPMs tracked from successful build artifacts. Resolved means marked handled by our team. Precautionary means still open and not yet resolved.
       </p>
 
       <div class="errata-filters">
@@ -142,17 +141,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           <button type="button" class="btn primary" id="btn-create-custom-advisory">Create advisory</button>
           <div id="custom-create-status" style="color:var(--text-muted); font-size:0.9rem;"></div>
         </div>
-      </div>
-
-      <div id="security-summary-wrap" style="margin-top:1.25rem; padding-top:1rem; border-top:1px solid var(--border, rgba(0,0,0,0.1));">
-        <div style="font-weight:600; margin-bottom:0.5rem;">Summary (same filters)</div>
-        <div id="security-summary-row" class="errata-summary-chips">
-          <span>Open CVE matches <span id="sum-open-cve">...</span></span>
-          <span>All CVE matches <span id="sum-total-cve">...</span></span>
-          <span>Open custom advisories <span id="sum-open-custom">...</span></span>
-          <span>Monitored RPM identities <span id="sum-monitored">...</span></span>
-        </div>
-        <p style="font-size:0.85rem; color:var(--text-muted); margin:0.6rem 0 0;">Open means not marked handled. Monitored count ignores release unless you filter by package. If monitored count is zero, log in as admin and run DB diagnostics to confirm this Watchdog instance points at the same Postgres as the build API.</p>
       </div>
     </section>
 
@@ -307,34 +295,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       function resetPages() {
         pgState.trackedPage = 1;
         pgState.advisoriesPage = 1;
-      }
-
-      function loadSummary() {
-        var releaseId = document.getElementById('advisories-release-id').value || '';
-        var pkg = document.getElementById('advisories-package-name').value || '';
-        var qs = [];
-        if (releaseId) qs.push('release_id=' + urlEncode(releaseId));
-        if (pkg) qs.push('package_name=' + urlEncode(pkg));
-        var path = '/security/summary' + (qs.length ? ('?' + qs.join('&')) : '');
-        var elOpen = document.getElementById('sum-open-cve');
-        var elTot = document.getElementById('sum-total-cve');
-        var elCust = document.getElementById('sum-open-custom');
-        var elMon = document.getElementById('sum-monitored');
-        if (elOpen) elOpen.textContent = '...';
-        if (elTot) elTot.textContent = '...';
-        if (elCust) elCust.textContent = '...';
-        if (elMon) elMon.textContent = '...';
-        api.get(path).then(function(s) {
-          if (elOpen) elOpen.textContent = String(s.open_cve_match_count != null ? s.open_cve_match_count : 0);
-          if (elTot) elTot.textContent = String(s.total_cve_match_count != null ? s.total_cve_match_count : 0);
-          if (elCust) elCust.textContent = String(s.open_custom_advisory_count != null ? s.open_custom_advisory_count : 0);
-          if (elMon) elMon.textContent = String(s.monitored_rpm_count != null ? s.monitored_rpm_count : 0);
-        }).catch(function() {
-          if (elOpen) elOpen.textContent = '?';
-          if (elTot) elTot.textContent = '?';
-          if (elCust) elCust.textContent = '?';
-          if (elMon) elMon.textContent = '?';
-        });
       }
 
       function esc(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; }
@@ -543,7 +503,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
       document.getElementById('advisories-release-id').addEventListener('change', function() {
         resetPages();
-        loadSummary();
         loadAdvisories();
         loadTrackedPackages();
       });
@@ -551,7 +510,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         clearTimeout(window.__watchdogDebounce);
         window.__watchdogDebounce = setTimeout(function() {
           resetPages();
-          loadSummary();
           loadAdvisories();
           loadTrackedPackages();
         }, 250);
@@ -561,7 +519,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       if (pageSizeSel) {
         pageSizeSel.addEventListener('change', function() {
           resetPages();
-          loadSummary();
           loadAdvisories();
           loadTrackedPackages();
         });
@@ -599,7 +556,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             btnScan.disabled = false;
             setTimeout(function() {
               resetPages();
-              loadSummary();
               loadAdvisories();
               loadTrackedPackages();
             }, 8000);
@@ -676,20 +632,17 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
       if (isAuthed()) {
         loadReleases();
-        loadSummary();
         loadAdvisories();
         loadTrackedPackages();
         refreshAdminUI();
       } else {
         loadReleases();
-        loadSummary();
         loadAdvisories();
         loadTrackedPackages();
         refreshAdminUI();
       }
       window.addEventListener('auth-change', function() {
         loadReleases();
-        loadSummary();
         loadAdvisories();
         loadTrackedPackages();
         refreshAdminUI();
