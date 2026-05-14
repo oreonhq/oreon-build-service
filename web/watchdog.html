@@ -21,8 +21,28 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Oreon Watchdog - Security Advisories</title>
+  <title>Oreon Watchdog</title>
   <link rel="stylesheet" href="/static/style.css?v=3">
+  <style>
+    .errata-shell { max-width: 1100px; margin: 0 auto; }
+    .errata-lead { color: var(--text-muted); font-size: 0.92rem; line-height: 1.45; margin: 0 0 1rem; }
+    .errata-filters { display: flex; flex-wrap: wrap; gap: 0.75rem 1rem; align-items: flex-end; margin-bottom: 1rem; padding: 0.75rem 0; border-bottom: 1px solid var(--border); }
+    .errata-filters .form-group { margin-bottom: 0; min-width: 10rem; }
+    .errata-table-wrap { border: 1px solid var(--border); border-radius: 4px; background: #fff; overflow: auto; }
+    .errata-table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+    .errata-table th { text-align: left; font-weight: 600; padding: 0.55rem 0.65rem; border-bottom: 1px solid var(--border); background: #fafafa; color: var(--text); }
+    .errata-table th.errata-col-status { text-align: center; width: 8.5rem; }
+    .errata-table td { padding: 0.5rem 0.65rem; border-bottom: 1px solid #e8e8e8; vertical-align: middle; }
+    .errata-table tbody tr:hover { background: #f9fafb; }
+    .errata-table .errata-id { font-family: ui-monospace, monospace; white-space: nowrap; }
+    .errata-table .errata-title { color: var(--text); }
+    .errata-pager { display: flex; align-items: center; justify-content: flex-end; gap: 0.35rem; margin-top: 0.75rem; flex-wrap: wrap; }
+    .errata-pager .pager-frac { font-size: 0.9rem; color: var(--text-muted); margin: 0 0.5rem; }
+    .errata-pager .btn-errata-nav { min-width: 2.25rem; padding: 0.25rem 0.45rem; }
+    .errata-admin-bar { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 0.5rem; }
+    .errata-summary-chips { display: flex; flex-wrap: wrap; gap: 0.4rem 0.75rem; font-size: 0.85rem; color: var(--text-muted); margin-top: 0.5rem; }
+    .errata-summary-chips span { color: var(--text); font-weight: 600; }
+  </style>
 </head>
 <body>
   <header class="header">
@@ -36,38 +56,40 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         <button id="btn-logout" type="button" style="display:none">Logout</button>
       </span>
       <span id="watchdog-auth">
-        <span style="color:var(--text-muted); font-size:0.9rem;">Security advisories (CVE)</span>
+        <span style="color:var(--text-muted); font-size:0.9rem;">Oreon Watchdog</span>
       </span>
     </nav>
   </header>
-  <main class="main">
+  <main class="main errata-shell">
     <section class="card">
-      <h2>Security Advisory Dashboard</h2>
-      <p style="color:var(--text-muted); font-size:0.9rem; margin-bottom:1rem;">
-        Matches lists advisories you record here (custom entries) plus any legacy CVE rows still in the database. Watchdog does not pull OSV, NVD, or R2 for new CVEs. Monitored RPMs is the inventory from build artifacts, refreshed on a schedule. Resolve rows from a detail page when appropriate (e.g. backport).
+      <h1 style="margin:0 0 0.35rem; font-size:1.35rem;">Oreon Watchdog</h1>
+      <p class="errata-lead">
+        Precautionary security advisories for RPMs tracked from successful build artifacts. Rows include custom advisories you create and legacy CVE match rows still in the database. Resolved means marked handled by your team. Precautionary means still open for review or remediation. This service does not auto-ingest NVD or OSV for new CVEs on its own.
       </p>
 
-      <div class="form-group">
-        <label>Filter by Oreon release (optional)</label>
-        <select id="advisories-release-id" class="form-control">
-          <option value="">All releases</option>
-        </select>
-      </div>
-      <div class="form-group">
-        <label>Filter by RPM package name (optional)</label>
-        <input type="text" id="advisories-package-name" class="form-control" placeholder="e.g. openssl">
-      </div>
-      <div class="form-group" style="max-width:12rem;">
-        <label>Rows per page (both tables)</label>
-        <select id="watchdog-page-size" class="form-control">
-          <option value="25">25</option>
-          <option value="50">50</option>
-          <option value="100" selected>100</option>
-          <option value="200">200</option>
-        </select>
+      <div class="errata-filters">
+        <div class="form-group">
+          <label for="advisories-release-id">Release</label>
+          <select id="advisories-release-id" class="form-control">
+            <option value="">All releases</option>
+          </select>
+        </div>
+        <div class="form-group" style="flex:1; min-width:12rem; max-width:20rem;">
+          <label for="advisories-package-name">Package name</label>
+          <input type="text" id="advisories-package-name" class="form-control" placeholder="e.g. openssl">
+        </div>
+        <div class="form-group" style="max-width:9rem;">
+          <label for="watchdog-page-size">Per page</label>
+          <select id="watchdog-page-size" class="form-control">
+            <option value="25">25</option>
+            <option value="50">50</option>
+            <option value="100" selected>100</option>
+            <option value="200">200</option>
+          </select>
+        </div>
       </div>
 
-      <div class="modal-actions" style="margin-top:0.75rem;" id="watchdog-authed-actions">
+      <div class="errata-admin-bar" id="watchdog-authed-actions">
         <button type="button" class="btn primary" id="btn-scan-now" style="display:none;">Refresh inventory</button>
         <button type="button" class="btn" id="btn-diagnostics" style="display:none;">DB diagnostics</button>
       </div>
@@ -125,41 +147,37 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         </div>
       </div>
 
-      <div id="security-summary-wrap" style="margin-top:1.25rem; padding-top:1rem; border-top:1px solid var(--border, rgba(255,255,255,0.12));">
-        <div style="font-weight:600; margin-bottom:0.5rem;">Counts for filters above</div>
-        <div id="security-summary-row" style="display:flex; flex-wrap:wrap; gap:1rem 2rem; align-items:baseline; font-size:0.95rem;">
-          <span style="color:var(--text-muted);">Active CVE rows <span id="sum-open-cve" style="color:var(--text); font-weight:600;">–</span></span>
-          <span style="color:var(--text-muted);">All CVE rows <span id="sum-total-cve" style="color:var(--text); font-weight:600;">–</span></span>
-          <span style="color:var(--text-muted);">Active custom advisories <span id="sum-open-custom" style="color:var(--text); font-weight:600;">–</span></span>
-          <span style="color:var(--text-muted);">Monitored RPM identities <span id="sum-monitored" style="color:var(--text); font-weight:600;">–</span></span>
+      <div id="security-summary-wrap" style="margin-top:1.25rem; padding-top:1rem; border-top:1px solid var(--border, rgba(0,0,0,0.1));">
+        <div style="font-weight:600; margin-bottom:0.5rem;">Summary (same filters)</div>
+        <div id="security-summary-row" class="errata-summary-chips">
+          <span>Open CVE matches <span id="sum-open-cve">...</span></span>
+          <span>All CVE matches <span id="sum-total-cve">...</span></span>
+          <span>Open custom advisories <span id="sum-open-custom">...</span></span>
+          <span>Monitored RPM identities <span id="sum-monitored">...</span></span>
         </div>
-        <p style="font-size:0.85rem; color:var(--text-muted); margin:0.6rem 0 0;">Active means not marked resolved. Monitored count ignores release (package filter applies). CVE counts only change when you add advisories or if older CVE rows remain in the database. If monitored RPM count is zero, log in as admin and use DB diagnostics to confirm this Watchdog uses the same Postgres as the build API.</p>
+        <p style="font-size:0.85rem; color:var(--text-muted); margin:0.6rem 0 0;">Open means not marked handled. Monitored count ignores release unless you filter by package. If monitored count is zero, log in as admin and run DB diagnostics to confirm this Watchdog instance points at the same Postgres as the build API.</p>
       </div>
     </section>
 
     <section class="card">
-      <h2>Matches</h2>
-      <div id="advisories-status" style="color:var(--text-muted); font-size:0.9rem; margin-bottom:0.75rem;">Loading…</div>
-      <table class="table-list">
-        <thead>
-          <tr>
-            <th>Type</th>
-            <th>ID</th>
-            <th>CVE / Title</th>
-            <th>Package</th>
-            <th>Version</th>
-            <th>Severity</th>
-            <th>Upstream</th>
-            <th>Fix</th>
-            <th>Fixed hint</th>
-            <th>Handled as</th>
-            <th>Affected Oreon releases</th>
-            <th>Actions</th>
-          </tr>
-        </thead>
-        <tbody id="advisories-tbody"></tbody>
-      </table>
-      <div id="advisories-pagination" aria-label="Matches pages"></div>
+      <h2 style="margin-top:0;">Security advisories</h2>
+      <div id="advisories-status" style="color:var(--text-muted); font-size:0.9rem; margin-bottom:0.75rem;">Loading...</div>
+      <div class="errata-table-wrap">
+        <table class="errata-table">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th class="errata-col-status">Status</th>
+              <th>Updated date</th>
+              <th>Platform</th>
+              <th>Advisory title</th>
+              <th style="min-width:7.5rem;">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="advisories-tbody"></tbody>
+        </table>
+      </div>
+      <div id="advisories-pagination" class="errata-pager" aria-label="Security advisory pages"></div>
     </section>
 
     <section class="card">
@@ -167,7 +185,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       <p style="color:var(--text-muted); font-size:0.9rem; margin-bottom:0.75rem;">
         Distinct name plus version-release from successful build artifacts (source package name must match the binary RPM name). Refreshed on the Watchdog schedule (admins can trigger a refresh). CVE columns count database rows only.
       </p>
-      <div id="tracked-status" style="color:var(--text-muted); font-size:0.9rem; margin-bottom:0.75rem;">Loading…</div>
+      <div id="tracked-status" style="color:var(--text-muted); font-size:0.9rem; margin-bottom:0.75rem;">Loading...</div>
       <table class="table-list">
         <thead>
           <tr>
@@ -205,6 +223,25 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         return n;
       }
 
+      function renderErrataPagination(el, page, total, pageSize) {
+        if (!el) return;
+        el.dataset.total = String(total || 0);
+        if (!total) {
+          el.innerHTML = '';
+          return;
+        }
+        var totalPages = Math.max(1, Math.ceil(total / pageSize));
+        page = Math.min(Math.max(1, page), totalPages);
+        var h = '';
+        h += '<button type="button" class="btn primary btn-errata-nav" data-watchdog-pg="advisories" data-goto="first"' + (page <= 1 ? ' disabled' : '') + ' title="First page">&laquo;</button>';
+        h += '<button type="button" class="btn primary btn-errata-nav" data-watchdog-pg="advisories" data-goto="prev"' + (page <= 1 ? ' disabled' : '') + ' title="Previous page">&lsaquo;</button>';
+        h += '<span class="pager-frac">' + page + ' / ' + totalPages + '</span>';
+        h += '<button type="button" class="btn primary btn-errata-nav" data-watchdog-pg="advisories" data-goto="next"' + (page >= totalPages ? ' disabled' : '') + ' title="Next page">&rsaquo;</button>';
+        h += '<button type="button" class="btn primary btn-errata-nav" data-watchdog-pg="advisories" data-goto="last"' + (page >= totalPages ? ' disabled' : '') + ' title="Last page">&raquo;</button>';
+        h += '<span style="color:var(--text-muted);font-size:0.82rem;margin-left:0.45rem;">' + total + ' rows</span>';
+        el.innerHTML = h;
+      }
+
       function renderPagination(el, navId, page, total, pageSize) {
         if (!el) return;
         el.dataset.total = String(total || 0);
@@ -233,7 +270,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         for (var k = 0; k < nums.length; k++) {
           var n = nums[k];
           if (n === 0) {
-            h += '<span style="color:var(--text-muted);padding:0 0.2rem;">…</span>';
+            h += '<span style="color:var(--text-muted);padding:0 0.2rem;">...</span>';
             continue;
           }
           var isCur = n === page;
@@ -257,7 +294,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         var totalPages = Math.max(1, Math.ceil(total / pageSize));
         var p = navId === 'tracked' ? pgState.trackedPage : pgState.advisoriesPage;
         var g = btn.getAttribute('data-goto');
-        if (g === 'prev') p--;
+        if (g === 'first') p = 1;
+        else if (g === 'last') p = totalPages;
+        else if (g === 'prev') p--;
         else if (g === 'next') p++;
         else p = parseInt(g, 10);
         if (!Number.isFinite(p)) return;
@@ -284,10 +323,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         var elTot = document.getElementById('sum-total-cve');
         var elCust = document.getElementById('sum-open-custom');
         var elMon = document.getElementById('sum-monitored');
-        if (elOpen) elOpen.textContent = '…';
-        if (elTot) elTot.textContent = '…';
-        if (elCust) elCust.textContent = '…';
-        if (elMon) elMon.textContent = '…';
+        if (elOpen) elOpen.textContent = '...';
+        if (elTot) elTot.textContent = '...';
+        if (elCust) elCust.textContent = '...';
+        if (elMon) elMon.textContent = '...';
         api.get(path).then(function(s) {
           if (elOpen) elOpen.textContent = String(s.open_cve_match_count != null ? s.open_cve_match_count : 0);
           if (elTot) elTot.textContent = String(s.total_cve_match_count != null ? s.total_cve_match_count : 0);
@@ -381,10 +420,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         var offset = (pgState.trackedPage - 1) * pageSize;
         var path = '/security/tracked-packages?limit=' + pageSize + '&offset=' + offset;
         if (pkg) path += '&package_name=' + urlEncode(pkg);
-        trackedStatusEl.textContent = 'Loading…';
+        trackedStatusEl.textContent = 'Loading...';
         api.get(path).then(function(res) {
           var items = (res && res.items) ? res.items : [];
-          total = (typeof res.total === 'number') ? res.total : items.length;
+          var total = (typeof res.total === 'number') ? res.total : items.length;
           var totalPages = Math.max(1, Math.ceil(total / pageSize));
           if (pgState.trackedPage > totalPages) {
             pgState.trackedPage = totalPages;
@@ -407,14 +446,14 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
               + '<tr>'
               + '<td>' + esc(r.package_name || '-') + '</td>'
               + '<td>' + esc(r.package_version || '-') + '</td>'
-              + '<td>' + esc(r.last_checked_at || '—') + '</td>'
+              + '<td>' + esc(r.last_checked_at || '-') + '</td>'
               + '<td>' + esc(String(r.cve_match_count != null ? r.cve_match_count : 0)) + '</td>'
               + '<td>' + esc(String(r.open_cve_match_count != null ? r.open_cve_match_count : 0)) + '</td>'
               + '</tr>';
           }).join('');
           var start = (pgState.trackedPage - 1) * pageSize + 1;
           var end = start + items.length - 1;
-          trackedStatusEl.textContent = 'Rows ' + start + '–' + end + ' of ' + total;
+          trackedStatusEl.textContent = 'Rows ' + start + ' to ' + end + ' of ' + total;
         }).catch(function(e) {
           trackedStatusEl.textContent = 'Failed to load inventory: ' + (e.message || e);
           trackedTbody.innerHTML = '';
@@ -431,7 +470,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         var path = '/security/advisories?limit=' + pageSize + '&offset=' + offset;
         if (releaseId) path += '&release_id=' + urlEncode(releaseId);
         if (pkg) path += '&package_name=' + urlEncode(pkg);
-        statusEl.textContent = 'Loading…';
+        statusEl.textContent = 'Loading...';
         api.get(path).then(function(res) {
           var items = (res && res.items) ? res.items : [];
           var total = (typeof res.total === 'number') ? res.total : items.length;
@@ -441,60 +480,53 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             loadAdvisories();
             return;
           }
-          renderPagination(advisoriesPaginationEl, 'advisories', pgState.advisoriesPage, total, pageSize);
+          renderErrataPagination(advisoriesPaginationEl, pgState.advisoriesPage, total, pageSize);
           if (!total) {
-            tbody.innerHTML = '<tr><td colspan="12" style="color:var(--text-muted);">No advisories.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);">No advisories.</td></tr>';
             statusEl.textContent = '0 advisories';
             return;
           }
           if (!items.length) {
-            tbody.innerHTML = '<tr><td colspan="12" style="color:var(--text-muted);">No rows on this page.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);">No rows on this page.</td></tr>';
             statusEl.textContent = 'Page ' + pgState.advisoriesPage + ' (empty)';
             return;
           }
           tbody.innerHTML = items.map(function(a) {
-            var releases = (a.affected_releases || []).map(function(r) { return r.releasename || r.release_id; }).join(', ');
-            var upstream = a.upstream_url ? '<a href="' + (a.upstream_url || '') + '" target="_blank" rel="noreferrer">Upstream</a>' : '-';
-            var fix = esc(a.recommended_fix || '-');
-            var osvFixed = (a.kind === 'cve' && a.osv_fixed_version) ? esc(a.osv_fixed_version) : '-';
-            var handledAs = (a.is_handled && a.handled_reason) ? esc(a.handled_reason) : '-';
-            var type = a.kind === 'custom' ? 'Custom' : 'CVE';
-            var cveOrTitle = (a.kind === 'custom') ? (a.title || '-') : (a.cve_id || '-');
+            var eidRaw = a.errata_id || '';
+            var eid = esc(eidRaw || ('OW-' + a.kind + '-' + a.id));
+            var isResolved = (a.advisory_status === 'released' || a.is_handled);
+            var statusLabel = a.status_label || (isResolved ? 'Resolved' : 'Precautionary');
+            var statusBadge = '<span class="badge ' + (isResolved ? 'success' : 'pending') + '">' + esc(statusLabel) + '</span>';
+            var advisoryTitle = esc(a.bulletin_title || ((a.package_name || '') + ' security update'));
+            var plat = esc(a.platform_display || '-');
+            var updated = esc(a.updated_at_display || '-');
             var detailsUrl = a.kind === 'custom' ? ('/advisories/custom/' + a.id) : ('/advisories/cve/' + a.id);
-            var statusBadge = a.is_handled ? '<span class="badge success">Resolved</span>' : '<span class="badge pending">Unresolved</span>';
             var resolveBtn = '';
             if (!a.is_handled && adminNow) {
-              resolveBtn = ' <button type="button" class="btn primary" data-resolve-kind="' + esc(a.kind) + '" data-resolve-id="' + esc(a.id) + '">Resolve</button>';
+              resolveBtn = '<button type="button" class="btn primary" style="padding:0.2rem 0.45rem;font-size:0.8rem;" data-resolve-kind="' + esc(a.kind) + '" data-resolve-id="' + esc(a.id) + '">Resolve</button>';
             }
             return ''
               + '<tr>'
-              + '<td>' + esc(type) + '</td>'
-              + '<td>' + esc(a.id) + '</td>'
-              + '<td>' + esc(cveOrTitle) + '</td>'
-              + '<td>' + esc(a.package_name || '-') + '</td>'
-              + '<td>' + esc(a.package_version || '-') + '</td>'
-              + '<td>' + esc(a.severity || '-') + '</td>'
-              + '<td>' + upstream + '</td>'
-              + '<td>' + fix + '</td>'
-              + '<td>' + osvFixed + '</td>'
-              + '<td>' + handledAs + '</td>'
-              + '<td>' + esc(releases || '-') + '</td>'
-              + '<td>' + statusBadge
-              + ' <a class="btn" href="' + esc(detailsUrl) + '" style="display:inline-block; text-decoration:none;">Details</a>'
+              + '<td class="errata-id">' + eid + '</td>'
+              + '<td class="errata-col-status" style="text-align:center;">' + statusBadge + '</td>'
+              + '<td>' + updated + '</td>'
+              + '<td>' + plat + '</td>'
+              + '<td class="errata-title">' + advisoryTitle + '</td>'
+              + '<td><a class="btn" href="' + esc(detailsUrl) + '" style="display:inline-block;text-decoration:none;padding:0.2rem 0.45rem;font-size:0.8rem;">Details</a> '
               + resolveBtn
               + '</td>'
               + '</tr>';
           }).join('');
           var start = (pgState.advisoriesPage - 1) * pageSize + 1;
           var end = start + items.length - 1;
-          statusEl.textContent = 'Rows ' + start + '–' + end + ' of ' + total;
+          statusEl.textContent = 'Rows ' + start + ' to ' + end + ' of ' + total;
 
           tbody.querySelectorAll('button[data-resolve-id]').forEach(function(btn) {
             btn.addEventListener('click', function() {
               var kind = btn.dataset.resolveKind;
               var id = btn.dataset.resolveId;
               btn.disabled = true;
-              btn.textContent = 'Resolving…';
+              btn.textContent = 'Resolving...';
               var endpoint = '/security/advisories/' + (kind === 'custom' ? ('custom/' + id) : ('cve/' + id)) + '/resolve';
               api.post(endpoint, {}).then(function() {
                 loadAdvisories();
@@ -610,7 +642,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           releaseIds = (releaseIds || []).filter(function(x) { return Number.isFinite(x); });
           if (!releaseIds.length) { alert('Select at least one affected Oreon release.'); return; }
 
-          if (createStatus) createStatus.textContent = 'Creating…';
+          if (createStatus) createStatus.textContent = 'Creating...';
           api.post('/security/advisories/custom', {
             title: title,
             cve_id: cveId || null,

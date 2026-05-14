@@ -106,6 +106,121 @@ def _dt_to_iso(dt) -> str | None:
         return str(dt)
 
 
+_US_MONTHS = (
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+)
+
+
+def _dt_utc(dt):
+    if dt is None:
+        return None
+    if getattr(dt, "tzinfo", None) is None:
+        from datetime import timezone as _tz
+
+        return dt.replace(tzinfo=_tz.utc)
+    return dt
+
+
+def _fmt_us_date(dt) -> str:
+    d = _dt_utc(dt)
+    if d is None:
+        return "-"
+    return f"{_US_MONTHS[d.month - 1]} {d.day}, {d.year}"
+
+
+def _errata_year_for_id(dt) -> int:
+    d = _dt_utc(dt)
+    if d is None:
+        from datetime import datetime as _dt, timezone as _tz
+
+        return _dt.now(_tz.utc).year
+    return d.year
+
+
+def _olea_errata_id(*, kind: str, numeric_id: int, dt_for_year) -> str:
+    """Public errata-style id (similar to ALSA-YYYY:nnnn). OLEA = Oreon Linux Errata Advisory."""
+    y = _errata_year_for_id(dt_for_year)
+    return f"OLEA-{y}:{numeric_id}"
+
+
+def _capitalize_severity(sev: str | None) -> str:
+    s = (sev or "").strip().lower()
+    if not s:
+        return "Moderate"
+    return s[:1].upper() + s[1:] if len(s) > 1 else s.upper()
+
+
+def _bulletin_title(
+    *,
+    kind: str,
+    severity: str | None,
+    package_name: str | None,
+    package_version: str | None,
+    cve_id: str | None,
+    title: str | None,
+) -> str:
+    sev = _capitalize_severity(severity)
+    pkg = (package_name or "").strip() or "package"
+    ver = (package_version or "").strip()
+    core = f"{pkg}:{ver}" if ver else pkg
+    if kind == "custom" and (title or "").strip():
+        t = (title or "").strip()
+        return f"{sev}: {core} - {t}"[:512]
+    base = f"{sev}: {core} security update"
+    cve = (cve_id or "").strip()
+    if cve:
+        return f"{base} ({cve})"
+    return base
+
+
+def _platform_display(affected: list[dict]) -> str:
+    names: list[str] = []
+    for row in affected or []:
+        rn = (row.get("releasename") or "").strip()
+        if rn and rn not in names:
+            names.append(rn)
+    if not names:
+        return "-"
+    return ", ".join(f"Oreon-{n}" for n in names)
+
+
+def _enrich_errata_row(d: dict) -> None:
+    """Add AlmaLinux-style errata fields for the precautionary advisory UI."""
+    kind = str(d.get("kind") or "")
+    numeric_id = int(d.get("id") or 0)
+    created = d.get("_created_at")
+    handled_at = d.get("_handled_at")
+    is_handled = bool(d.get("is_handled"))
+    sort_ts = handled_at if is_handled and handled_at else created
+    d["errata_id"] = _olea_errata_id(kind=kind, numeric_id=numeric_id, dt_for_year=sort_ts or created)
+    d["bulletin_title"] = _bulletin_title(
+        kind=kind,
+        severity=d.get("severity"),
+        package_name=d.get("package_name"),
+        package_version=d.get("package_version"),
+        cve_id=d.get("cve_id"),
+        title=d.get("title"),
+    )
+    d["advisory_status"] = "released" if is_handled else "precautionary"
+    d["status_label"] = "Resolved" if is_handled else "Precautionary"
+    d["status_sub_label"] = "" if is_handled else "not resolved"
+    upd = handled_at if is_handled and handled_at else created
+    d["updated_at"] = _dt_to_iso(upd)
+    d["updated_at_display"] = _fmt_us_date(upd)
+    d["platform_display"] = _platform_display(d.get("affected_releases") or [])
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # DDL is owned by the API process (see oreon_build.api.main lifespan init_db). This process
@@ -233,6 +348,7 @@ def create_app() -> FastAPI:
                 select(
                     CveMatch.id,
                     CveMatch.created_at,
+                    CveMatch.handled_at,
                     CveMatch.cve_id,
                     CveMatch.upstream_url,
                     CveMatch.recommended_fix,
@@ -266,6 +382,7 @@ def create_app() -> FastAPI:
                 select(
                     SecurityAdvisory.id,
                     SecurityAdvisory.created_at,
+                    SecurityAdvisory.handled_at,
                     SecurityAdvisory.title,
                     SecurityAdvisory.cve_id,
                     SecurityAdvisory.upstream_url,
@@ -328,6 +445,7 @@ def create_app() -> FastAPI:
             for (
                 cid,
                 created_at,
+                handled_at,
                 cve_id,
                 upstream_url,
                 recommended_fix,
@@ -345,6 +463,9 @@ def create_app() -> FastAPI:
                     {"release_id": rid, "releasename": release_map.get(rid)}
                     for rid in sorted(cve_rel_map.get(int(cid), set()))
                 ]
+                ca = created_at or datetime.now(timezone.utc)
+                ha = handled_at
+                sort_ts = ha if is_handled and ha else ca
                 items_with_sort.append(
                     {
                         "kind": "cve",
@@ -362,13 +483,16 @@ def create_app() -> FastAPI:
                         "osv_fixed_version": osv_fixed_version,
                         "handled_reason": handled_reason,
                         "handled_notes": handled_notes,
-                        "_created_at": created_at or datetime.now(timezone.utc),
+                        "_created_at": ca,
+                        "_handled_at": ha,
+                        "_sort_ts": sort_ts,
                     }
                 )
 
             for (
                 aid,
                 created_at,
+                handled_at,
                 title,
                 cve_id,
                 upstream_url,
@@ -383,6 +507,9 @@ def create_app() -> FastAPI:
                     {"release_id": rid, "releasename": release_map.get(rid)}
                     for rid in sorted(custom_rel_map.get(int(aid), set()))
                 ]
+                ca = created_at or datetime.now(timezone.utc)
+                ha = handled_at
+                sort_ts = ha if is_handled and ha else ca
                 items_with_sort.append(
                     {
                         "kind": "custom",
@@ -397,15 +524,20 @@ def create_app() -> FastAPI:
                         "severity": severity,
                         "affected_releases": affected,
                         "is_handled": bool(is_handled),
-                        "_created_at": created_at or datetime.now(timezone.utc),
+                        "_created_at": ca,
+                        "_handled_at": ha,
+                        "_sort_ts": sort_ts,
                     }
                 )
 
-            items_with_sort.sort(key=lambda x: x.get("_created_at"), reverse=True)
+            items_with_sort.sort(key=lambda x: x.get("_sort_ts") or x.get("_created_at"), reverse=True)
             page_items = items_with_sort[offset : offset + limit]
 
             for it in page_items:
+                _enrich_errata_row(it)
                 it.pop("_created_at", None)
+                it.pop("_handled_at", None)
+                it.pop("_sort_ts", None)
 
             return JSONResponse(content={"items": page_items, "total": total})
 
