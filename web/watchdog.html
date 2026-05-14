@@ -493,7 +493,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           }
           tbody.innerHTML = items.map(function(a) {
             var eidRaw = a.errata_id || '';
-            var eid = esc(eidRaw || ('OW-' + a.kind + '-' + a.id));
+            var eid = esc(eidRaw || ('ORSA-' + a.kind + '-' + a.id));
             var isResolved = (a.advisory_status === 'released' || a.is_handled);
             var statusLabel = a.status_label || (isResolved ? 'Resolved' : 'Precautionary');
             var statusBadge = '<span class="badge ' + (isResolved ? 'success' : 'pending') + '">' + esc(statusLabel) + '</span>';

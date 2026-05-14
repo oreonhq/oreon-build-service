@@ -148,10 +148,10 @@ def _errata_year_for_id(dt) -> int:
     return d.year
 
 
-def _olea_errata_id(*, kind: str, numeric_id: int, dt_for_year) -> str:
-    """Public errata-style id (similar to ALSA-YYYY:nnnn). OLEA = Oreon Linux Errata Advisory."""
+def _orsa_errata_id(*, kind: str, numeric_id: int, dt_for_year) -> str:
+    """Public errata-style id (similar to ALSA-YYYY:nnnn). ORSA = Oreon security advisory."""
     y = _errata_year_for_id(dt_for_year)
-    return f"OLEA-{y}:{numeric_id}"
+    return f"ORSA-{y}:{numeric_id}"
 
 
 def _capitalize_severity(sev: str | None) -> str:
@@ -203,7 +203,7 @@ def _enrich_errata_row(d: dict) -> None:
     handled_at = d.get("_handled_at")
     is_handled = bool(d.get("is_handled"))
     sort_ts = handled_at if is_handled and handled_at else created
-    d["errata_id"] = _olea_errata_id(kind=kind, numeric_id=numeric_id, dt_for_year=sort_ts or created)
+    d["errata_id"] = _orsa_errata_id(kind=kind, numeric_id=numeric_id, dt_for_year=sort_ts or created)
     d["bulletin_title"] = _bulletin_title(
         kind=kind,
         severity=d.get("severity"),
