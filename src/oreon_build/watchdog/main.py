@@ -97,6 +97,18 @@ class CustomAdvisoryCreate(BaseModel):
     affected_release_ids: list[int] = Field(..., min_length=1)
 
 
+class CustomAdvisoryUpdate(BaseModel):
+    title: str | None = Field(None, min_length=1, max_length=256)
+    cve_id: str | None = Field(None, max_length=64)
+    package_name: str | None = Field(None, min_length=1, max_length=256)
+    package_version: str | None = Field(None, min_length=1, max_length=128)
+    severity: str | None = Field(None, max_length=32)
+    upstream_url: str | None = Field(None, max_length=1024)
+    summary: str | None = Field(None)
+    recommended_fix: str | None = Field(None)
+    affected_release_ids: list[int] | None = Field(None, min_length=1)
+
+
 def _dt_to_iso(dt) -> str | None:
     # Starlette/JSONResponse can’t serialize datetime directly.
     if not dt:
@@ -220,6 +232,18 @@ def _enrich_errata_row(d: dict) -> None:
     d["updated_at"] = _dt_to_iso(upd)
     d["updated_at_display"] = _fmt_us_date(upd)
     d["platform_display"] = _platform_display(d.get("affected_releases") or [])
+
+
+def _json_advisory_detail(d: dict) -> dict:
+    """Return advisory dict for API with errata fields and without internal sort keys."""
+    out = dict(d)
+    _enrich_errata_row(out)
+    out.pop("_created_at", None)
+    out.pop("_handled_at", None)
+    out.pop("_sort_ts", None)
+    if "_created_at" in d:
+        out["created_at"] = _dt_to_iso(d.get("_created_at"))
+    return out
 
 
 async def _discord_notify_advisory_resolved(
@@ -889,27 +913,28 @@ def create_app() -> FastAPI:
                 {"release_id": rid, "releasename": rel_map.get(rid)} for rid in sorted(set(rel_ids))
             ]
 
-            return JSONResponse(
-                content={
-                    "kind": "cve",
-                    "id": int(cid),
-                    "cve_id": cve_id,
-                    "title": None,
-                    "package_name": pkg_name,
-                    "package_version": f"{rpm_ver}-{rpm_rel}" if rpm_ver and rpm_rel else None,
-                    "upstream_url": upstream_url,
-                    "recommended_fix": recommended_fix,
-                    "summary": summary,
-                    "severity": severity,
-                    "affected_releases": affected,
-                    "is_handled": bool(is_handled),
-                    "handled_at": _dt_to_iso(handled_at),
-                    "handled_by_account_id": handled_by_account_id,
-                    "osv_fixed_version": osv_fixed_version,
-                    "handled_reason": handled_reason,
-                    "handled_notes": handled_notes,
-                }
-            )
+            detail = {
+                "kind": "cve",
+                "id": int(cid),
+                "cve_id": cve_id,
+                "title": None,
+                "package_name": pkg_name,
+                "package_version": f"{rpm_ver}-{rpm_rel}" if rpm_ver and rpm_rel else None,
+                "upstream_url": upstream_url,
+                "recommended_fix": recommended_fix,
+                "summary": summary,
+                "severity": severity,
+                "affected_releases": affected,
+                "is_handled": bool(is_handled),
+                "handled_at": _dt_to_iso(handled_at),
+                "handled_by_account_id": handled_by_account_id,
+                "osv_fixed_version": osv_fixed_version,
+                "handled_reason": handled_reason,
+                "handled_notes": handled_notes,
+                "_created_at": created_at,
+                "_handled_at": handled_at,
+            }
+            return JSONResponse(content=_json_advisory_detail(detail))
 
     @app.get("/api/security/advisories/custom/{advisory_id}")
     async def get_custom_advisory(advisory_id: int):
@@ -969,24 +994,131 @@ def create_app() -> FastAPI:
                 {"release_id": rid, "releasename": rel_map.get(rid)} for rid in sorted(set(rel_ids))
             ]
 
-            return JSONResponse(
-                content={
-                    "kind": "custom",
-                    "id": int(aid),
-                    "cve_id": cve_id,
-                    "title": title,
-                    "package_name": pkg_name,
-                    "package_version": pkg_version,
-                    "upstream_url": upstream_url,
-                    "recommended_fix": recommended_fix,
-                    "summary": summary,
-                    "severity": severity,
-                    "affected_releases": affected,
-                    "is_handled": bool(is_handled),
-                    "handled_at": _dt_to_iso(handled_at),
-                    "handled_by_account_id": handled_by_account_id,
-                }
+            detail = {
+                "kind": "custom",
+                "id": int(aid),
+                "cve_id": cve_id,
+                "title": title,
+                "package_name": pkg_name,
+                "package_version": pkg_version,
+                "upstream_url": upstream_url,
+                "recommended_fix": recommended_fix,
+                "summary": summary,
+                "severity": severity,
+                "affected_releases": affected,
+                "is_handled": bool(is_handled),
+                "handled_at": _dt_to_iso(handled_at),
+                "handled_by_account_id": handled_by_account_id,
+                "_created_at": created_at,
+                "_handled_at": handled_at,
+            }
+            return JSONResponse(content=_json_advisory_detail(detail))
+
+    @app.patch("/api/security/advisories/custom/{advisory_id}")
+    async def update_custom_advisory(
+        advisory_id: int,
+        payload: dict = Body(...),
+        admin=Depends(require_admin),
+    ):
+        from sqlalchemy import delete, select
+
+        data = CustomAdvisoryUpdate.model_validate(payload)
+        if not data.model_fields_set:
+            return JSONResponse(content={"detail": "No fields to update"}, status_code=400)
+
+        async with async_session_maker() as db:
+            res = await db.execute(select(SecurityAdvisory).where(SecurityAdvisory.id == advisory_id))
+            adv = res.scalar_one_or_none()
+            if not adv:
+                return JSONResponse(content={"detail": "Custom advisory not found"}, status_code=404)
+
+            if "title" in data.model_fields_set:
+                adv.title = data.title
+            if "cve_id" in data.model_fields_set:
+                adv.cve_id = data.cve_id
+            if "package_name" in data.model_fields_set:
+                if not (data.package_name or "").strip():
+                    return JSONResponse(content={"detail": "package_name required"}, status_code=400)
+                adv.package_name = data.package_name
+            if "package_version" in data.model_fields_set:
+                if not (data.package_version or "").strip():
+                    return JSONResponse(content={"detail": "package_version required"}, status_code=400)
+                adv.package_version = data.package_version
+            if "severity" in data.model_fields_set:
+                adv.severity = data.severity
+            if "upstream_url" in data.model_fields_set:
+                adv.upstream_url = data.upstream_url
+            if "summary" in data.model_fields_set:
+                adv.summary = data.summary
+            if "recommended_fix" in data.model_fields_set:
+                fix = (data.recommended_fix or "").strip()
+                if not fix:
+                    return JSONResponse(
+                        content={"detail": "recommended_fix cannot be empty"}, status_code=400
+                    )
+                adv.recommended_fix = fix
+
+            if "affected_release_ids" in data.model_fields_set:
+                release_ids = data.affected_release_ids or []
+                expected_ids = {int(i) for i in release_ids}
+                if not expected_ids:
+                    return JSONResponse(
+                        content={"detail": "affected_release_ids required"}, status_code=400
+                    )
+                releases_q = await db.execute(
+                    select(Release.id).where(Release.id.in_(expected_ids))
+                )
+                release_ids_found = {int(r[0]) for r in releases_q.all()}
+                if not expected_ids.issubset(release_ids_found):
+                    return JSONResponse(
+                        content={"detail": "One or more release IDs do not exist"}, status_code=400
+                    )
+                await db.execute(
+                    delete(SecurityAdvisoryRelease).where(
+                        SecurityAdvisoryRelease.advisory_id == advisory_id
+                    )
+                )
+                for rid in sorted(expected_ids):
+                    db.add(SecurityAdvisoryRelease(advisory_id=adv.id, release_id=int(rid)))
+
+            await db.commit()
+            await db.refresh(adv)
+
+            rel_rows = await db.execute(
+                select(SecurityAdvisoryRelease.release_id).where(
+                    SecurityAdvisoryRelease.advisory_id == int(advisory_id)
+                )
             )
+            rel_ids = [int(r[0]) for r in rel_rows.all()]
+            rel_map: dict[int, str] = {}
+            if rel_ids:
+                release_rows = await db.execute(
+                    select(Release.id, Release.releasename).where(Release.id.in_(set(rel_ids)))
+                )
+                rel_map = {int(rid): name for rid, name in release_rows.all()}
+            affected = [
+                {"release_id": rid, "releasename": rel_map.get(rid)} for rid in sorted(set(rel_ids))
+            ]
+
+            detail = {
+                "kind": "custom",
+                "id": int(adv.id),
+                "cve_id": adv.cve_id,
+                "title": adv.title,
+                "package_name": adv.package_name,
+                "package_version": adv.package_version,
+                "upstream_url": adv.upstream_url,
+                "recommended_fix": adv.recommended_fix,
+                "summary": adv.summary,
+                "severity": adv.severity,
+                "affected_releases": affected,
+                "is_handled": bool(adv.is_handled),
+                "handled_at": _dt_to_iso(adv.handled_at),
+                "handled_by_account_id": adv.handled_by_account_id,
+                "_created_at": adv.created_at,
+                "_handled_at": adv.handled_at,
+            }
+            return JSONResponse(content=_json_advisory_detail(detail))
 
     @app.post("/api/security/advisories/custom")
     async def create_custom_advisory(
