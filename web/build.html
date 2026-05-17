@@ -134,8 +134,8 @@
           var relLabel = relName ? escapeHtml(relName) + ' (' + job.release_id + ')' : ('#' + (job.release_id || '—'));
           var jobDisp = window.oreonJobDisplayStatus ? window.oreonJobDisplayStatus(job) : String(job.status || '');
           var meta = document.getElementById('build-meta');
-          var signingRow = window.oreonControllerKeyHtml
-            ? '<dt>Controller</dt><dd>' + window.oreonControllerKeyHtml(job.signing_status) + '</dd>'
+          var signingRow = window.oreonSigningKeyHtml
+            ? '<dt>Signing</dt><dd>' + window.oreonSigningKeyHtml(job.signing_status) + '</dd>'
             : '';
           meta.innerHTML = '<dl><dt>Package</dt><dd>' + pkgLabel + '</dd>' +
             '<dt>Release</dt><dd>' + relLabel + '</dd>' +
@@ -158,8 +158,8 @@
             var adisp = window.oreonJobDisplayStatus
               ? window.oreonJobDisplayStatus({ display_status: a.display_status, status: a.status })
               : st;
-            var signingLine = window.oreonControllerKeyHtml
-              ? '<div style="margin-top:0.35rem">' + window.oreonControllerKeyHtml(a.signing_status) + '</div>'
+            var signingLine = window.oreonSigningKeyHtml
+              ? '<div style="margin-top:0.35rem"><span style="color:var(--text-muted);font-size:0.85rem;margin-right:0.35rem;">Signing</span>' + window.oreonSigningKeyHtml(a.signing_status) + '</div>'
               : '';
             var workerLine = '';
             if (a.worker_name || a.worker_id) {
