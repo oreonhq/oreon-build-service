@@ -342,31 +342,31 @@ function updateAuthUI() {
 }
 
 /**
- * Controller pipeline after mock (GPG and repodata run on the controller, not on the worker).
+ * Signing pipeline after mock (GPG and repodata on the controller, not on the worker).
  * Needs Font Awesome 6 (``fa-solid fa-key``) on the page.
  */
-function oreonControllerKeyHtml(controllerStatus) {
-  var ss = (controllerStatus || 'not_started').toLowerCase();
+function oreonSigningKeyHtml(signingStatus) {
+  var ss = (signingStatus || 'not_started').toLowerCase();
   if (ss === 'uploading') {
     ss = 'running';
   }
   var c = '#94a3b8';
   var label = 'Pending';
   var tip =
-    'Controller: waiting for the build to finish (mock still running or worker has not notified yet).';
+    'Signing: waiting for the build to finish (mock still running or worker has not notified yet).';
   if (ss === 'running') {
     c = '#3b82f6';
     label = 'Running';
     tip =
-      'Controller pipeline in progress (RPM upload, GPG signing, R2, repodata) after mock succeeded.';
+      'Signing in progress (RPM upload, GPG signing, R2, repodata) after mock succeeded.';
   } else if (ss === 'signed') {
     c = '#22c55e';
     label = 'Complete';
-    tip = 'Controller finished GPG signing, repo publish, and finalization.';
+    tip = 'Signing finished (GPG, repo publish, and finalization).';
   } else if (ss === 'failed') {
     c = '#ef4444';
     label = 'Failed';
-    tip = 'Failed during upload or on the controller (signing, R2, or repodata).';
+    tip = 'Signing failed during upload, GPG signing, R2, or repodata.';
   }
   function esc(s) {
     return String(s)
@@ -395,8 +395,11 @@ function oreonJobDisplayStatus(job) {
   return String(job.status || '').toLowerCase();
 }
 
+function oreonControllerKeyHtml(signingStatus) {
+  return oreonSigningKeyHtml(signingStatus);
+}
+window.oreonSigningKeyHtml = oreonSigningKeyHtml;
 window.oreonControllerKeyHtml = oreonControllerKeyHtml;
-window.oreonSigningKeyHtml = oreonControllerKeyHtml;
 window.oreonJobDisplayStatus = oreonJobDisplayStatus;
 
 document.addEventListener('DOMContentLoaded', function() {
