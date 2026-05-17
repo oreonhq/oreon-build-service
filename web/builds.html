@@ -846,7 +846,7 @@
             }
             var arch = (j.architecture != null && j.architecture !== '') ? j.architecture : '—';
             var sd = window.oreonJobDisplayStatus ? window.oreonJobDisplayStatus(j) : String(j.status || '');
-            var signCell = window.oreonControllerKeyHtml ? window.oreonControllerKeyHtml(j.signing_status) : '—';
+            var signCell = window.oreonSigningKeyHtml ? window.oreonSigningKeyHtml(j.signing_status) : '—';
             var chainPart = '—';
             if (j.chain_id != null && j.chain_id !== undefined) {
               var chainIdStr = String(j.chain_id);
