@@ -40,7 +40,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   <main class="main">
     <section class="card">
       <div style="display:flex; gap:0.75rem; align-items:center; flex-wrap:wrap;">
-        <h2 style="margin:0;">CVE Advisory</h2>
+        <h2 id="advisory-heading" style="margin:0;">Loading...</h2>
         <span id="advisory-status-badge" class="badge pending" style="display:none;"></span>
       </div>
       <div id="advisory-title" style="margin-top:0.5rem; color:var(--text-muted); font-size:0.95rem;"></div>
@@ -53,6 +53,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   <script>
     (function() {
       const api = window.oreonApi;
+      const headingEl = document.getElementById('advisory-heading');
       const statusBadge = document.getElementById('advisory-status-badge');
       const contentEl = document.getElementById('advisory-content');
       const titleEl = document.getElementById('advisory-title');
@@ -90,12 +91,15 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       function renderDetail(ad) {
         actionsEl.innerHTML = '';
         contentEl.innerHTML = '';
-        titleEl.textContent = 'CVE: ' + (ad.cve_id || '-') + ' (ID ' + ad.id + ')';
+        var orsa = ad.errata_id || ('ORSA-' + ad.id);
+        headingEl.textContent = orsa;
+        document.title = orsa + ' - Oreon Watchdog';
+        titleEl.textContent = ad.cve_id ? ('CVE: ' + ad.cve_id) : (ad.bulletin_title || '');
 
         var handled = !!ad.is_handled;
         statusBadge.style.display = 'inline-block';
         statusBadge.className = 'badge ' + (handled ? 'success' : 'pending');
-        statusBadge.textContent = handled ? 'Resolved' : 'Unresolved';
+        statusBadge.textContent = handled ? 'Resolved' : 'Precautionary';
 
         var releases = (ad.affected_releases || []).map(function(r) {
           return r.releasename || ('#' + r.release_id);
