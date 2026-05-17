@@ -363,10 +363,10 @@ class Settings(BaseSettings):
     # Stuck builds: jobs stay RUNNING until the worker posts a result; sweep marks them failed if
     # the attempt is too old or the worker has not heartbeated (see services/stale_builds.py).
     build_stale_running_minutes: int = Field(
-        default=2880,
+        default=10080,
         ge=0,
         le=43200,
-        description="Fail RUNNING attempts older than this many minutes (0 = disable). Default 48h; raise for very long kernel builds.",
+        description="Fail RUNNING attempts older than this many minutes (0 = disable). Default 7 days.",
     )
     build_stale_worker_heartbeat_minutes: int = Field(
         default=120,

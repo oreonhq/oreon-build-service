@@ -181,7 +181,7 @@ async def reconcile_queue_inconsistencies(db: AsyncSession) -> tuple[int, int, i
     # ---- BuildAttempt RUNNING but parent job already terminal ----
     # This happens when cancel/timeout handlers changed the job row but the attempt update lost
     # the race (transient error, pod kill, connection drop). The attempt would otherwise keep
-    # the assigned worker stuck BUSY until the global runtime cutoff (default 48h).
+    # the assigned worker stuck BUSY until the global runtime cutoff (default 7 days).
     running_with_terminal_job = await db.execute(
         select(BuildAttempt)
         .join(BuildJob, BuildAttempt.build_job_id == BuildJob.id)
