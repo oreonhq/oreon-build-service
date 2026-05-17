@@ -132,7 +132,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                 var arch = b.architecture || '—';
                 var created = (b.created_at || '').slice(0, 19);
                 var sd = jobDisplayStatus(b);
-                var signCell = window.oreonControllerKeyHtml ? window.oreonControllerKeyHtml(b.signing_status) : '—';
+                var signCell = window.oreonSigningKeyHtml ? window.oreonSigningKeyHtml(b.signing_status) : '—';
                 return '<tr>'
                   + '<td><a href="/build.html?job_id=' + b.id + '">#' + b.id + '</a></td>'
                   + '<td>' + pkgLabel + '</td>'
