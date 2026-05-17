@@ -159,7 +159,7 @@
               ? window.oreonJobDisplayStatus({ display_status: a.display_status, status: a.status })
               : st;
             var signingLine = window.oreonSigningKeyHtml
-              ? '<div style="margin-top:0.35rem"><span style="color:var(--text-muted);font-size:0.85rem;margin-right:0.35rem;">Signing</span>' + window.oreonSigningKeyHtml(a.signing_status) + '</div>'
+              ? '<div style="margin-top:0.35rem">' + window.oreonSigningKeyHtml(a.signing_status) + '</div>'
               : '';
             var workerLine = '';
             if (a.worker_name || a.worker_id) {
