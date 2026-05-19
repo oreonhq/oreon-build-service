@@ -791,7 +791,7 @@ async def _chain_to_status_response(db: DbSession, chain: BuildChain) -> ChainSt
         stages=stages,
         chain_spec=chain.chain_spec,
         error_message=chain.error_message,
-        preparing=_chain_options_preparing(opt),
+        preparing=_chain_options_preparing(opt, chain_status=chain.status),
         job_count=int(job_n or 0),
         releasename=(rel.releasename if rel else None),
         distgit_url=str(opt.get("distgit_url") or "") or None,
