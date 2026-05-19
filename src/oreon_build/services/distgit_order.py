@@ -91,6 +91,58 @@ def _github_owner_repo_from_git_url(url: str) -> tuple[str, str] | None:
     return parts[0], parts[1]
 
 
+_RE_RPM_MACRO = re.compile(r"%\{([^}]+)\}")
+_RE_GLOBAL_LINE = re.compile(r"^%\s*global\s+(\S+)\s+(.+)$", re.IGNORECASE)
+_RE_GLOBAL_IN_CONDITIONAL = re.compile(r"%global\s+(\S+)\s+([^}%]+)", re.IGNORECASE)
+
+
+def _parse_spec_macro_table(spec_text: str) -> dict[str, str]:
+    """Collect ``%global`` / ``%define`` values and globals embedded in ``%{?cond:...}`` lines."""
+    macros: dict[str, str] = {}
+    for line in (spec_text or "").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        m = _RE_GLOBAL_LINE.match(s)
+        if m:
+            macros[m.group(1)] = m.group(2).strip()
+            continue
+        if "%{?" in s and "%global" in s.lower():
+            for gm in _RE_GLOBAL_IN_CONDITIONAL.finditer(s):
+                macros[gm.group(1)] = gm.group(2).strip()
+    return macros
+
+
+def _expand_rpm_macros(value: str, macros: dict[str, str], *, max_rounds: int = 24) -> str:
+    """Expand ``%{name}`` using macro values from the same spec (no conditionals)."""
+    out = value or ""
+    for _ in range(max_rounds):
+        changed = False
+
+        def repl(match: re.Match[str]) -> str:
+            nonlocal changed
+            key = match.group(1)
+            if key in macros:
+                changed = True
+                return macros[key]
+            return match.group(0)
+
+        new = _RE_RPM_MACRO.sub(repl, out)
+        if not changed:
+            break
+        out = new
+    return out
+
+
+def _add_capability_tokens(target: set[str], raw: str, macros: dict[str, str]) -> None:
+    expanded = _expand_rpm_macros(raw, macros).strip()
+    if not expanded or "%" in expanded:
+        return
+    for tok in _extract_br_tokens_from_tag_value(expanded):
+        if tok and "%" not in tok:
+            target.add(tok)
+
+
 def _extract_br_tokens_from_tag_value(value: str) -> list[str]:
     out: list[str] = []
     for chunk in (value or "").replace("\n", ",").split(","):
@@ -134,6 +186,7 @@ def _parse_spec_text(spec_text: str, filename_hint: str = "inline.spec") -> _Spe
     br_seen: set[str] = set()
     provided: set[str] = set()
     source_name = Path(filename_hint).stem
+    macros = _parse_spec_macro_table(spec_text)
     # Fast path parser (line oriented) for large trees.
     # This avoids `specfile`'s expensive parse on thousands of specs.
     for line in (spec_text or "").splitlines():
@@ -142,19 +195,20 @@ def _parse_spec_text(spec_text: str, filename_hint: str = "inline.spec") -> _Spe
             continue
         us = s.upper()
         if us.startswith("NAME:"):
-            val = s.split(":", 1)[1].strip()
-            if val:
+            val = _expand_rpm_macros(s.split(":", 1)[1].strip(), macros)
+            if val and "%" not in val:
                 source_name = val
             continue
         if us.startswith("%PACKAGE "):
             opts = s.split(None, 1)[1].strip() if len(s.split(None, 1)) > 1 else ""
-            pkg_name = _extract_pkg_name_from_package_options(opts, source_name)
+            opts_exp = _expand_rpm_macros(opts, macros)
+            pkg_name = _extract_pkg_name_from_package_options(opts_exp, source_name)
             if pkg_name:
-                provided.add(pkg_name)
+                _add_capability_tokens(provided, pkg_name, macros)
             continue
         if us.startswith("BUILDREQUIRES:"):
             val = s.split(":", 1)[1]
-            for tok in _extract_br_tokens_from_tag_value(val):
+            for tok in _extract_br_tokens_from_tag_value(_expand_rpm_macros(val, macros)):
                 if tok in br_seen:
                     continue
                 br_seen.add(tok)
@@ -162,7 +216,7 @@ def _parse_spec_text(spec_text: str, filename_hint: str = "inline.spec") -> _Spe
             continue
         if us.startswith("PROVIDES:"):
             val = s.split(":", 1)[1]
-            for tok in _extract_br_tokens_from_tag_value(val):
+            for tok in _extract_br_tokens_from_tag_value(_expand_rpm_macros(val, macros)):
                 if not tok or "%" in tok or tok.startswith("bundled("):
                     continue
                 provided.add(tok)
@@ -405,12 +459,26 @@ async def compute_distgit_build_order(
     )
 
 
-def _sources_for_capability_prefix(cap: str, spec_names: set[str]) -> list[str]:
-    """Longest spec source name where ``cap == name`` or ``cap`` is a subpackage ``name-suffix``."""
-    matches = [s for s in spec_names if cap == s or cap.startswith(s + "-")]
-    if not matches:
-        return []
-    return [max(matches, key=len)]
+def _sources_from_spec_capability_map(
+    capability: str,
+    prov_map: dict[str, list[str]],
+    spec_set: set[str],
+) -> set[str]:
+    """Source packages whose spec lists ``capability`` as a Provide or subpackage name."""
+    cap = (capability or "").strip()
+    if not cap:
+        return set()
+    found: set[str] = set()
+    if cap in spec_set:
+        found.add(cap)
+    hit = prov_map.get(cap)
+    if hit:
+        found.update(s for s in hit if s in spec_set)
+    cap_low = cap.lower()
+    for key, srcs in prov_map.items():
+        if key.lower() == cap_low:
+            found.update(s for s in srcs if s in spec_set)
+    return found
 
 
 def resolve_distgit_sources_for_capability(
@@ -421,38 +489,29 @@ def resolve_distgit_sources_for_capability(
     repo_known_sources: set[str] | None = None,
 ) -> list[str]:
     """
-    Map a dnf/RPM capability to distgit source package name(s).
+    Map a dnf/RPM capability to distgit source package name(s) that Provide it.
 
-    Uses parsed spec Provides / subpackage names, optional published-repo primary.xml,
-    and longest-prefix match against spec source directory names. No package-specific rules.
+    Lookup order:
+    1. Parsed spec ``Provides:`` / ``%package`` names (with ``%global`` expansion).
+    2. Published repo ``primary.xml`` provide entries (already-built binaries).
     """
     cap = (capability or "").strip()
     if not cap:
         return []
     spec_set = set(order.package_names)
     prov_map = order.capability_providers or {}
-    found: set[str] = set()
-
-    if cap in spec_set:
-        found.add(cap)
-    hit = prov_map.get(cap)
-    if hit:
-        found.update(hit)
-    cap_low = cap.lower()
-    for key, srcs in prov_map.items():
-        if key.lower() == cap_low:
-            found.update(srcs)
-
-    for src in _sources_for_capability_prefix(cap, spec_set):
-        found.add(src)
+    found = _sources_from_spec_capability_map(cap, prov_map, spec_set)
 
     if repo_provides_index:
-        from oreon_build.services.dependencies_graph import _map_br_to_source
-
-        known = repo_known_sources if repo_known_sources is not None else spec_set
-        mapped = _map_br_to_source(cap, repo_provides_index, spec_set, known)
-        if mapped:
-            found.update(mapped)
+        providers = repo_provides_index.get(cap)
+        if not providers:
+            cap_low = cap.lower()
+            for key, srcs in repo_provides_index.items():
+                if key.lower() == cap_low:
+                    providers = srcs
+                    break
+        if providers:
+            found.update(s for s in providers if s in spec_set)
 
     return sorted(found)
 

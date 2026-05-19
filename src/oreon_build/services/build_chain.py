@@ -127,21 +127,15 @@ def parse_dnf_missing_providers(text: str) -> list[str]:
     return out
 
 
-def _package_name_prefix_candidates(cap: str) -> list[str]:
-    """Try progressively shorter hyphenated prefixes (full name, then parent, …)."""
-    parts = [p for p in (cap or "").split("-") if p]
-    if not parts:
-        return []
-    return ["-".join(parts[:i]) for i in range(len(parts), 0, -1)]
-
-
 async def _resolve_sources_from_package_registry(db: Any, capability: str) -> list[str]:
-    """Match dnf capability names to OBS ``Package`` rows (chain builds use these names)."""
-    for name in _package_name_prefix_candidates(capability):
-        prow = await db.execute(select(Package.name).where(Package.name == name).limit(1))
-        hit = prow.scalar_one_or_none()
-        if hit:
-            return [str(hit)]
+    """When a capability equals an OBS package name, treat that package as the source."""
+    cap = (capability or "").strip()
+    if not cap:
+        return []
+    prow = await db.execute(select(Package.name).where(Package.name == cap).limit(1))
+    hit = prow.scalar_one_or_none()
+    if hit:
+        return [str(hit)]
     return []
 
 
@@ -214,9 +208,9 @@ async def resolve_chain_sources_for_missing_providers(
     repo_arch: str | None = None,
 ) -> set[str]:
     """
-    Resolve mock/dnf missing capabilities to source package names for chain auto-inject.
+    Resolve mock/dnf missing capabilities to distgit source packages that Provide them.
 
-    Uses spec Provides metadata, published-repo primary.xml, spec name prefixes, then OBS package names.
+    Uses parsed spec Provides / subpackage names, published-repo primary.xml, then exact OBS package names.
     """
     repo_pi: dict[str, set[str]] = {}
     repo_known: set[str] = set()
@@ -293,16 +287,17 @@ def format_chain_unresolved_providers_message(
     if not caps:
         lines.append("No capability name was recorded.")
     else:
-        lines.append("Missing capabilities with no matching package/spec:")
+        lines.append("Capabilities not Provided by any spec in this release tree:")
         for cap in caps[:15]:
             lines.append(f"  - {cap}")
         if len(caps) > 15:
             lines.append(f"  … and {len(caps) - 15} more")
     lines.append("")
     lines.append(
-        "If the RPM name does not match any spec Provides or subpackage name, add a "
-        "Provides alias in the spec or queue the source package in an earlier chain stage. "
-        "Dependencies that only exist in Fedora need mock lookaside repos on this environment."
+        "Chain resolution scans every spec for Provides: tags and %package subpackage names "
+        "(with %global macro expansion), then published repo metadata. If the capability is "
+        "missing, add Provides: <capability> on the subpackage that should supply it, or queue "
+        "that source package earlier. Dependencies only in Fedora need mock lookaside repos."
     )
     return "\n".join(lines)
 
@@ -359,6 +354,92 @@ def _transitive_spec_predecessors(
             needed.add(pred)
             stack.append(pred)
     return needed
+
+
+def _earliest_stage_index_for_packages(
+    stages: list[list[str]],
+    package_names: set[str],
+) -> int | None:
+    want = {str(n).lower() for n in package_names if n}
+    if not want:
+        return None
+    for idx, stage in enumerate(stages):
+        for pkg in stage:
+            if str(pkg).lower() in want:
+                return idx
+    return None
+
+
+def _isolate_packages_into_prior_stage(
+    stages: list[list[str]],
+    stage_index: int,
+    package_names: set[str],
+) -> list[list[str]] | None:
+    """Move ``package_names`` out of ``stages[stage_index]`` into a new stage inserted before it."""
+    if stage_index < 0 or stage_index >= len(stages):
+        return None
+    want = {str(n).lower() for n in package_names if n}
+    current = [str(p) for p in stages[stage_index] if p]
+    isolated = sorted(p for p in current if p.lower() in want)
+    if not isolated:
+        return None
+    rest = [p for p in current if p.lower() not in want]
+    before = [list(s) for s in stages[:stage_index]]
+    after = [list(s) for s in stages[stage_index + 1 :]]
+    if rest:
+        return before + [isolated, rest] + after
+    return before + [isolated] + after
+
+
+def _capability_in_repo_provides(cap: str, repo_pi: dict[str, set[str]]) -> bool:
+    c = (cap or "").strip()
+    if not c:
+        return False
+    for key in (c, c.lower()):
+        if repo_pi.get(key):
+            return True
+    return False
+
+
+def format_chain_repo_capability_still_missing_message(
+    capabilities: list[str],
+    built_sources: list[str],
+    *,
+    releasename: str,
+    distgit_url: str,
+    distgit_branch: str,
+    failed_package: str | None = None,
+) -> str:
+    caps = sorted({(c or "").strip() for c in capabilities if (c or "").strip()})
+    srcs = sorted({(s or "").strip() for s in built_sources if (s or "").strip()})
+    lines = [
+        "Chain build stopped: a dependency RPM is already in your Oreon repo (or was built "
+        "successfully on this chain), but mock/dnf still cannot satisfy a capability name.",
+        "",
+    ]
+    if failed_package:
+        lines.append(f"Failed package: {failed_package}")
+        lines.append("")
+    lines.append(f"Release: {releasename}")
+    lines.append(f"Specs repo: {distgit_url} (branch {distgit_branch})")
+    lines.append("")
+    if srcs:
+        lines.append("Source package(s) already built for this chain:")
+        for s in srcs[:12]:
+            lines.append(f"  - {s}")
+        lines.append("")
+    lines.append("Capabilities still missing from published repo metadata:")
+    for cap in caps[:12]:
+        lines.append(f"  - {cap}")
+    if len(caps) > 12:
+        lines.append(f"  … and {len(caps) - 12} more")
+    lines.append("")
+    lines.append(
+        "The built RPM likely does not Provide the capability name dnf requested. Add a "
+        "Provides: entry in the spec for that capability on the subpackage that should supply "
+        "it, rebuild the source package(s) listed above, then resume the chain."
+    )
+    return "\n".join(lines)
 
 
 def _layers_for_package_subset(
@@ -753,6 +834,33 @@ async def _inject_missing_dep_layers_before(
     return True
 
 
+async def _chain_sources_lacking_success(
+    db: Any,
+    chain: BuildChain,
+    source_names: set[str],
+    *,
+    architectures: list[str],
+    preferred_mock_environment_id: int | None,
+    skip_jobs_not_before: datetime | None,
+) -> set[str]:
+    lacking: set[str] = set()
+    for name in sorted(source_names):
+        pid = await _package_id_for_name(db, name)
+        if pid is None:
+            lacking.add(name)
+            continue
+        if not await _chain_has_successful_build_all_arches(
+            db,
+            chain,
+            pid,
+            architectures=architectures,
+            preferred_mock_environment_id=preferred_mock_environment_id,
+            skip_jobs_not_before=skip_jobs_not_before,
+        ):
+            lacking.add(name)
+    return lacking
+
+
 async def _cancel_chain_stage_active_jobs(
     db: Any,
     chain: BuildChain,
@@ -770,6 +878,63 @@ async def _cancel_chain_stage_active_jobs(
     )
     for job in jres.scalars().all():
         await _cancel_job_and_running_attempts(db, job, note)
+
+
+async def _cancel_chain_jobs_from_stage(
+    db: Any,
+    chain: BuildChain,
+    from_stage_index: int,
+    note: str,
+) -> None:
+    jres = await db.execute(
+        select(BuildJob).where(
+            BuildJob.chain_id == chain.id,
+            BuildJob.chain_stage_index >= from_stage_index,
+            BuildJob.status.in_(
+                (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.RUNNING),
+            ),
+        )
+    )
+    for job in jres.scalars().all():
+        await _cancel_job_and_running_attempts(db, job, note)
+
+
+async def _rewind_chain_to_stage(
+    db: Any,
+    chain: BuildChain,
+    rewind_stage: int,
+    *,
+    note: str,
+) -> None:
+    await _cancel_chain_jobs_from_stage(db, chain, rewind_stage, note)
+    chain.active_stage_index = rewind_stage
+    chain.stage_expected_jobs = 0
+    chain.stage_skip_slots = 0
+    chain.stage_publish_done = 0
+    chain.stage_advance_after = None
+    opt = _options_dict(chain)
+    arches = [str(x) for x in opt.get("architectures") or DEFAULT_ARCH]
+    pm = opt.get("preferred_mock_environment_id")
+    if pm is None or pm == "":
+        pref_pm = None
+    else:
+        try:
+            pref_pm = int(pm)
+        except (TypeError, ValueError):
+            pref_pm = None
+    await _enqueue_chain_stage_jobs(
+        db,
+        chain,
+        rewind_stage,
+        architectures=arches,
+        skip_complete_arches=bool(opt.get("skip_complete_arches", True)),
+        distgit_url=str(opt.get("distgit_url") or "https://github.com/oreonhq/rpm-specfiles.git"),
+        distgit_branch=str(opt.get("distgit_branch") or "main"),
+        preferred_mock_environment_id=pref_pm,
+        priority=int(opt.get("priority") or 0),
+        triggered_by_id=chain.triggered_by_id,
+        request=None,
+    )
 
 
 async def _try_recover_chain_after_failure(
@@ -792,6 +957,12 @@ async def _try_recover_chain_after_failure(
     stage_count_before = len(stages_before)
 
     extra_roots: set[str] = set()
+    providers: list[str] = []
+    releasename = ""
+    dg_url = "https://github.com/oreonhq/rpm-specfiles.git"
+    dg_br = "main"
+    repo_branch = ""
+    canon_arch = "x86_64"
     if _chain_use_dnf_provider_recovery():
         opt = _options_dict(chain)
         recovery_n = int(opt.get("dnf_recovery_count") or 0)
@@ -804,13 +975,13 @@ async def _try_recover_chain_after_failure(
                 dg_br = str(opt.get("distgit_branch") or "main")
                 fail_text = await _failure_text_for_chain_recovery(db, failed_job, reason)
                 providers = parse_dnf_missing_providers(fail_text)
+                arches = [str(x) for x in opt.get("architectures") or DEFAULT_ARCH]
+                canon_arch = normalize_machine_arch(arches[0] if arches else "x86_64")
+                repo_branch = (
+                    r2_publish_branch(release) if release else str(opt.get("branch") or "dev")
+                )
                 if providers:
                     order = await _cached_distgit_build_order(releasename, dg_url, dg_br)
-                    arches = [str(x) for x in opt.get("architectures") or DEFAULT_ARCH]
-                    canon_arch = normalize_machine_arch(arches[0] if arches else "x86_64")
-                    repo_branch = (
-                        r2_publish_branch(release) if release else str(opt.get("branch") or "dev")
-                    )
                     missing_in_distgit = await unresolved_chain_capabilities(
                         db,
                         order,
@@ -868,6 +1039,90 @@ async def _try_recover_chain_after_failure(
 
     stages_after = chain.stages_json if isinstance(chain.stages_json, list) else []
     if len(stages_after) <= stage_count_before:
+        if not extra_roots:
+            return False
+        opt = _options_dict(chain)
+        arches = [str(x) for x in opt.get("architectures") or DEFAULT_ARCH]
+        pm = opt.get("preferred_mock_environment_id")
+        if pm is None or pm == "":
+            pref_pm = None
+        else:
+            try:
+                pref_pm = int(pm)
+            except (TypeError, ValueError):
+                pref_pm = None
+        skip_not_before = (
+            _parse_skip_jobs_not_before(chain) if bool(opt.get("skip_complete_arches", True)) else None
+        )
+        stages_now = chain.stages_json if isinstance(chain.stages_json, list) else []
+        stage_names = (
+            {str(p).lower() for p in stages_now[stage_idx]}
+            if 0 <= stage_idx < len(stages_now)
+            else set()
+        )
+        same_stage = {s for s in extra_roots if s.lower() in stage_names}
+        if same_stage:
+            isolated = _isolate_packages_into_prior_stage(stages_now, stage_idx, same_stage)
+            if isolated:
+                chain.stages_json = isolated
+                await db.flush()
+                stages_now = isolated
+                logger.info(
+                    "chain_id=%s isolated parallel deps %s into stage %s before retry",
+                    chain.id,
+                    sorted(same_stage),
+                    stage_idx,
+                )
+
+        lacking = await _chain_sources_lacking_success(
+            db,
+            chain,
+            extra_roots,
+            architectures=arches,
+            preferred_mock_environment_id=pref_pm,
+            skip_jobs_not_before=skip_not_before,
+        )
+        if lacking:
+            rewind = _earliest_stage_index_for_packages(stages_now, lacking)
+            if rewind is None:
+                return False
+            await _rewind_chain_to_stage(
+                db,
+                chain,
+                rewind,
+                note="Chain rewinding to build missing dependencies",
+            )
+            logger.info(
+                "chain_id=%s recovered from job %s by rewinding to stage %s for %s",
+                chain.id,
+                failed_job.id,
+                rewind,
+                sorted(lacking),
+            )
+            return True
+
+        if providers and releasename and repo_branch:
+            repo_pi, _ = await _cached_repo_provides_index(releasename, repo_branch, canon_arch)
+            still_missing = [c for c in providers if not _capability_in_repo_provides(c, repo_pi)]
+            if still_missing:
+                pkg_r = await db.execute(
+                    select(Package.name).where(Package.id == failed_job.package_id)
+                )
+                pkg_name = pkg_r.scalar_one_or_none()
+                await fail_chain(
+                    db,
+                    chain,
+                    format_chain_repo_capability_still_missing_message(
+                        still_missing,
+                        sorted(extra_roots),
+                        releasename=releasename,
+                        distgit_url=dg_url,
+                        distgit_branch=dg_br,
+                        failed_package=str(pkg_name) if pkg_name else None,
+                    ),
+                    terminal=BuildChainStatus.FAILED,
+                )
+                return True
         return False
 
     await _cancel_chain_stage_active_jobs(

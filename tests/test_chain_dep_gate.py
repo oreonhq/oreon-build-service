@@ -48,14 +48,14 @@ def test_format_chain_unresolved_providers_message():
     from oreon_build.services.build_chain import format_chain_unresolved_providers_message
 
     msg = format_chain_unresolved_providers_message(
-        ["python-setuptools-wheel"],
+        ["libfoo-missing-cap"],
         releasename="oreon-11-rp1",
         distgit_url="https://github.com/oreonhq/rpm-specfiles.git",
         distgit_branch="main",
         context="Build of foo failed in mock.",
     )
     assert "Chain build stopped" in msg
-    assert "python-setuptools-wheel" in msg
+    assert "libfoo-missing-cap" in msg
     assert "oreon-11-rp1" in msg
     assert "lookaside" in msg.lower()
 
@@ -67,25 +67,40 @@ async def test_unresolved_chain_capabilities():
     order = _make_order(
         edges=[],
         layers=[],
-        package_names=["python3-setuptools"],
-        capability_providers={"python-setuptools-wheel": ["python3-setuptools"]},
+        package_names=["libfoo"],
+        capability_providers={"libfoo-plugin": ["libfoo"]},
     )
     db = AsyncMock()
-    assert await unresolved_chain_capabilities(db, order, ["python-setuptools-wheel"]) == []
+    assert await unresolved_chain_capabilities(db, order, ["libfoo-plugin"]) == []
     assert await unresolved_chain_capabilities(db, order, ["not-in-tree"]) == ["not-in-tree"]
 
 
-def test_resolve_capability_via_longest_spec_prefix():
+def test_resolve_capability_via_spec_provide_only():
     from oreon_build.services.distgit_order import resolve_distgit_sources_for_capability
 
     order = _make_order(
         edges=[],
         layers=[],
         package_names=["libfoo"],
-        capability_providers={"libfoo": ["libfoo"]},
+        capability_providers={"libfoo-plugin": ["libfoo"]},
     )
-    got = resolve_distgit_sources_for_capability(order, "libfoo-plugin-wheel")
-    assert got == ["libfoo"]
+    assert resolve_distgit_sources_for_capability(order, "libfoo-plugin") == ["libfoo"]
+    assert resolve_distgit_sources_for_capability(order, "libfoo-plugin-wheel") == []
+
+
+def test_parse_spec_macro_expanded_subpackage_is_capability():
+    from oreon_build.services.distgit_order import _parse_spec_text
+
+    spec = """
+Name: python-libfoo
+%global srcname libfoo
+%global wheel_prefix python3
+%package -n %{wheel_prefix}-%{srcname}-plugin
+Provides: libfoo-missing-cap
+"""
+    parsed = _parse_spec_text(spec, "python-libfoo.spec")
+    assert "python3-libfoo-plugin" in parsed.provided_binary_names
+    assert "libfoo-missing-cap" in parsed.provided_binary_names
 
 
 def test_parse_dnf_missing_providers():
@@ -93,10 +108,10 @@ def test_parse_dnf_missing_providers():
 
     text = (
         "Problem: conflicting requests\n"
-        "- nothing provides python-setuptools-wheel needed by "
-        "python3-test-3.14.3-2.or11.x86_64 from oreon-base\n"
+        "- nothing provides libfoo-missing-cap needed by "
+        "libbar-1.0-1.fc43.x86_64 from oreon-base\n"
     )
-    assert parse_dnf_missing_providers(text) == ["python-setuptools-wheel"]
+    assert parse_dnf_missing_providers(text) == ["libfoo-missing-cap"]
 
 
 def test_resolve_distgit_sources_for_missing_providers():
@@ -104,18 +119,15 @@ def test_resolve_distgit_sources_for_missing_providers():
 
     order = _make_order(
         edges=[],
-        layers=[["python3-setuptools"], ["python3-test"]],
-        package_names=["python3-setuptools", "python3-test"],
-        capability_providers={
-            "python-setuptools-wheel": ["python3-setuptools"],
-            "python3-setuptools": ["python3-setuptools"],
-        },
+        layers=[["libfoo"], ["libbar"]],
+        package_names=["libfoo", "libbar"],
+        capability_providers={"libfoo-plugin": ["libfoo"]},
     )
     got = resolve_distgit_sources_for_missing_providers(
         order,
-        ["python-setuptools-wheel"],
+        ["libfoo-plugin"],
     )
-    assert got == {"python3-setuptools"}
+    assert got == {"libfoo"}
 
 
 @pytest.mark.asyncio
