@@ -823,9 +823,13 @@ def analyze_repo_runtime_primary_only(
     *,
     external_provides: set[str] | None = None,
     spec_capability_providers: dict[str, list[str]] | None = None,
+    consumer_sources: set[str] | None = None,
 ) -> dict[str, Any]:
     """
     Fast chain prepare path: runtime Requires from primary.xml only (no SRPM header scans).
+
+    When ``consumer_sources`` is set, only binary packages built from those source names are scanned
+    (avoids walking every RPM in a large published repo during chain prepare).
     """
     _empty: dict[str, Any] = {
         "repo": target,
@@ -866,6 +870,8 @@ def analyze_repo_runtime_primary_only(
                 continue
             src_name = _source_name_from_sourcerpm(_safe_text(pkg.find("{*}format/{*}sourcerpm")))
             if not src_name:
+                continue
+            if consumer_sources is not None and src_name not in consumer_sources:
                 continue
             seen_runtime_req: set[str] = set()
             for e in pkg.findall(f".//{RPM_NS}requires/{RPM_NS}entry"):

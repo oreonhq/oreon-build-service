@@ -796,6 +796,7 @@ async def _build_chain_expand_context(
     from oreon_build.services.distgit_order import compute_distgit_build_order_for_chain
 
     roots = _chain_root_package_names(chain)
+    logger.info("chain_id=%s prepare: distgit order (download + BR closure)", chain.id)
     t0 = time.monotonic()
     order = await compute_distgit_build_order_for_chain(
         releasename=releasename,
@@ -804,10 +805,10 @@ async def _build_chain_expand_context(
         root_packages=roots,
     )
     logger.info(
-        "chain_id=%s distgit closure from %s root(s), %s specs parsed in %.1fs",
+        "chain_id=%s distgit order done: %s specs from %s root(s) in %.1fs",
         chain.id,
-        len(roots),
         len(order.package_names or []),
+        len(roots),
         time.monotonic() - t0,
     )
 
@@ -817,21 +818,24 @@ async def _build_chain_expand_context(
         arch=canon_arch,
         prefix=f"{releasename}/{publish_branch}/{canon_arch}",
     )
+    logger.info("chain_id=%s prepare: repo primary.xml", chain.id)
     t1 = time.monotonic()
     repo_sat, sat_err = await asyncio.to_thread(load_repo_satisfaction_index, target)
     if sat_err:
         logger.warning("chain_id=%s repo satisfaction: %s", chain.id, sat_err)
-    logger.info("chain_id=%s repo primary.xml (fresh) in %.1fs", chain.id, time.monotonic() - t1)
+    logger.info("chain_id=%s repo primary.xml done in %.1fs", chain.id, time.monotonic() - t1)
 
     spec_caps = order.capability_providers if isinstance(order.capability_providers, dict) else {}
     runtime_analysis: dict[str, Any] = {}
     if _chain_proactive_repo_runtime():
         t2 = time.monotonic()
+        chain_sources = set(order.package_names or []) | set(roots)
         if _chain_proactive_repo_runtime_fast():
             runtime_analysis = await asyncio.to_thread(
                 analyze_repo_runtime_primary_only,
                 target,
                 spec_capability_providers=spec_caps,
+                consumer_sources=chain_sources,
             )
             mode = "fast-primary"
         else:
@@ -934,6 +938,7 @@ async def _cached_repo_runtime_analysis(
     arch: str,
     *,
     spec_capability_providers: dict[str, list[str]] | None = None,
+    consumer_sources: set[str] | None = None,
 ) -> dict[str, Any]:
     from oreon_build.services.dependencies_graph import (
         RepoTarget,
@@ -960,6 +965,7 @@ async def _cached_repo_runtime_analysis(
             analyze_repo_runtime_primary_only,
             target,
             spec_capability_providers=spec_capability_providers or None,
+            consumer_sources=consumer_sources,
         )
     else:
         analysis = await asyncio.to_thread(
@@ -1005,12 +1011,14 @@ async def _proactive_extra_roots_from_repo_runtime(
         repo_sat, _ = await _cached_repo_satisfaction_index(releasename, branch, canon_arch)
     from oreon_build.services.chain_satisfaction import _requirement_status
     spec_caps = order.capability_providers if isinstance(order.capability_providers, dict) else {}
+    spec_names = {str(n) for n in (order.package_names or []) if n}
     if analysis is None:
         analysis = await _cached_repo_runtime_analysis(
             releasename,
             branch,
             canon_arch,
             spec_capability_providers=spec_caps,
+            consumer_sources=spec_names,
         )
     if analysis.get("error"):
         logger.info(
@@ -1019,8 +1027,6 @@ async def _proactive_extra_roots_from_repo_runtime(
             analysis.get("error"),
         )
         return set(), []
-
-    spec_names = {str(n) for n in (order.package_names or []) if n}
     stages: list[list[str]] = chain.stages_json if isinstance(chain.stages_json, list) else []
     chain_names = {str(p) for stage in stages for p in stage if p}
     deps_map = _deps_map_from_edges(order.edges if isinstance(order.edges, list) else [])
@@ -1249,11 +1255,13 @@ async def _inject_missing_dep_layers_before(
         repo_known = repo_sat_index.known_sources
         analysis = {}
         if _chain_proactive_repo_runtime():
+            inject_sources = set(order.package_names or [])
             if _chain_proactive_repo_runtime_fast():
                 analysis = await asyncio.to_thread(
                     analyze_repo_runtime_primary_only,
                     target,
                     spec_capability_providers=spec_caps,
+                    consumer_sources=inject_sources,
                 )
             else:
                 from oreon_build.services.dependencies_graph import _analyze_repo
@@ -2387,6 +2395,7 @@ async def _complete_chain_prepare(
                         pref_pm = int(pm_raw)
                     except (TypeError, ValueError):
                         pref_pm = None
+                logger.info("chain_id=%s prepare: build expand context", chain.id)
                 t_expand = time.monotonic()
                 expand_ctx = await _build_chain_expand_context(
                     db,
@@ -2397,9 +2406,10 @@ async def _complete_chain_prepare(
                     arches=arches,
                     pref_pm=pref_pm,
                 )
+                logger.info("chain_id=%s prepare: inject dependency stages", chain.id)
                 ok = await _expand_chain_stages_dependencies(db, chain, 0, ctx=expand_ctx)
                 logger.info(
-                    "chain_id=%s dependency expand finished in %.1fs",
+                    "chain_id=%s dependency inject finished in %.1fs",
                     chain.id,
                     time.monotonic() - t_expand,
                 )
@@ -2413,6 +2423,7 @@ async def _complete_chain_prepare(
         if chain.status != BuildChainStatus.PENDING:
             return []
 
+    logger.info("chain_id=%s prepare: enqueue stage 0", chain.id)
     return await _enqueue_chain_stage_jobs(
         db,
         chain,

@@ -8,6 +8,7 @@ import os
 import re
 import tempfile
 import tarfile
+import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -390,8 +391,12 @@ async def _download_distgit_tarball(
     return r.content, None
 
 
-def _tarball_spec_package_names(tarball: bytes, releasename: str) -> set[str]:
-    names: set[str] = set()
+def _tarball_spec_member_index(
+    tarball: bytes, releasename: str
+) -> tuple[set[str], dict[str, tarfile.TarInfo]]:
+    """One ``getmembers()`` pass: package names and TarInfo for each ``<pkg>/<pkg>.spec``."""
+    all_names: set[str] = set()
+    members: dict[str, tarfile.TarInfo] = {}
     with tarfile.open(fileobj=io.BytesIO(tarball), mode="r:gz") as tf:
         for m in tf.getmembers():
             if not m.isfile():
@@ -401,36 +406,41 @@ def _tarball_spec_package_names(tarball: bytes, releasename: str) -> set[str]:
                 continue
             pkg, fn = parts[2], parts[3]
             if fn == f"{pkg}.spec":
-                names.add(pkg)
-    return names
+                all_names.add(pkg)
+                members[pkg] = m
+    return all_names, members
+
+
+def _tarball_spec_package_names(tarball: bytes, releasename: str) -> set[str]:
+    all_names, _ = _tarball_spec_member_index(tarball, releasename)
+    return all_names
 
 
 def _read_specs_from_tarball(
     tarball: bytes,
     releasename: str,
     packages: set[str],
+    *,
+    members: dict[str, tarfile.TarInfo] | None = None,
 ) -> dict[str, str]:
-    """Read only ``packages`` spec files from an already-downloaded tarball."""
+    """Read only ``packages`` spec files from an already-downloaded tarball (single tar open)."""
     want = set(packages)
     if not want:
         return {}
     specs: dict[str, str] = {}
+    if members is None:
+        _, members = _tarball_spec_member_index(tarball, releasename)
     with tarfile.open(fileobj=io.BytesIO(tarball), mode="r:gz") as tf:
-        for m in tf.getmembers():
-            if not m.isfile():
+        for pkg in want:
+            if pkg in specs:
                 continue
-            parts = m.name.split("/")
-            if len(parts) < 4 or parts[1] != releasename:
-                continue
-            pkg, fn = parts[2], parts[3]
-            if pkg not in want or fn != f"{pkg}.spec":
+            m = members.get(pkg)
+            if m is None:
                 continue
             f = tf.extractfile(m)
             if f is None:
                 continue
             specs[pkg] = f.read().decode("utf-8", errors="replace")
-            if len(specs) >= len(want):
-                break
     return specs
 
 
@@ -532,12 +542,18 @@ def _expand_chain_spec_closure(
     all_names: set[str],
     tarball: bytes,
     releasename: str,
+    *,
+    members: dict[str, tarfile.TarInfo] | None = None,
 ) -> tuple[dict[str, str], list[str]]:
     """
     Incrementally read/parse specs along BuildRequires from ``roots`` (not the full distgit tree).
+
+    Uses a pre-built tarball member index so we do not rescan the archive once per package.
     """
     err: list[str] = []
     names_set = set(all_names)
+    if members is None:
+        names_set, members = _tarball_spec_member_index(tarball, releasename)
     specs: dict[str, str] = {}
     provider_map: dict[str, set[str]] = {}
     needed: set[str] = set()
@@ -554,28 +570,33 @@ def _expand_chain_spec_closure(
         queue.append(rn)
 
     max_parse = _chain_distgit_max_parse()
-    while queue and len(needed) <= max_parse:
-        pkg = queue.popleft()
-        if pkg in specs:
-            continue
-        batch = _read_specs_from_tarball(tarball, releasename, {pkg})
-        if pkg not in batch:
-            err.append(f"spec missing in tarball for {pkg}")
-            continue
-        specs[pkg] = batch[pkg]
-        parsed = _parse_spec_text(specs[pkg], f"{pkg}.spec")
-        for cap, srcs in _provider_map_from_specs({pkg: parsed}).items():
-            provider_map.setdefault(cap, set()).update(srcs)
-        for br in parsed.build_requires:
-            provs = set(provider_map.get(br) or set())
-            if br in names_set:
-                provs.add(br)
-            for prov in provs:
-                if prov not in names_set or prov == pkg:
-                    continue
-                if prov not in needed:
-                    needed.add(prov)
-                    queue.append(prov)
+    with tarfile.open(fileobj=io.BytesIO(tarball), mode="r:gz") as tf:
+        while queue and len(needed) <= max_parse:
+            pkg = queue.popleft()
+            if pkg in specs:
+                continue
+            m = members.get(pkg)
+            if m is None:
+                err.append(f"spec missing in tarball for {pkg}")
+                continue
+            f = tf.extractfile(m)
+            if f is None:
+                err.append(f"spec missing in tarball for {pkg}")
+                continue
+            specs[pkg] = f.read().decode("utf-8", errors="replace")
+            parsed = _parse_spec_text(specs[pkg], f"{pkg}.spec")
+            for cap, srcs in _provider_map_from_specs({pkg: parsed}).items():
+                provider_map.setdefault(cap, set()).update(srcs)
+            for br in parsed.build_requires:
+                provs = set(provider_map.get(br) or set())
+                if br in names_set:
+                    provs.add(br)
+                for prov in provs:
+                    if prov not in names_set or prov == pkg:
+                        continue
+                    if prov not in needed:
+                        needed.add(prov)
+                        queue.append(prov)
 
     if len(needed) > max_parse:
         err.append(
@@ -630,13 +651,28 @@ async def compute_distgit_build_order_for_chain(
             err=err,
         )
 
-    all_names = await asyncio.to_thread(_tarball_spec_package_names, tarball, releasename)
+    t_index = time.monotonic()
+    all_names, members = await asyncio.to_thread(_tarball_spec_member_index, tarball, releasename)
+    logger.info(
+        "distgit tarball index: %s packages under %s in %.1fs",
+        len(all_names),
+        releasename,
+        time.monotonic() - t_index,
+    )
+    t_closure = time.monotonic()
     specs_by_pkg, cerr = await asyncio.to_thread(
         _expand_chain_spec_closure,
         root_packages,
         all_names,
         tarball,
         releasename,
+        members=members,
+    )
+    logger.info(
+        "distgit BR closure: %s specs from %s root(s) in %.1fs",
+        len(specs_by_pkg),
+        len(root_packages),
+        time.monotonic() - t_closure,
     )
     err.extend(cerr)
     parsed_by_source, perr = await _parse_specs_parallel_async(specs_by_pkg)
