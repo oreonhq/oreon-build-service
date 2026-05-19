@@ -85,3 +85,76 @@ def test_source_published_at_least_spec():
         {"kernel": "0:6.9.0-1"},
         repo,
     )
+
+
+def test_chain_sources_missing_from_repo_for_consumers():
+    from oreon_build.services.chain_satisfaction import (
+        chain_sources_missing_from_repo_for_consumers,
+    )
+
+    order = MagicMock()
+    order.build_requires_raw = {"kde-workspace": ["kactivities-devel"]}
+    order.capability_providers = {"kactivities-devel": ["kactivities"]}
+    order.package_names = ["kde-workspace", "kactivities"]
+
+    k_evr = RpmEvr(0, "1.0", "1")
+    repo = RepoSatisfactionIndex(
+        provides_index={"kactivities": {"kactivities"}},
+        known_sources={"kactivities"},
+        provide_best_evr={"kactivities": k_evr},
+        source_best_evr={"kactivities": k_evr},
+    )
+    needed = chain_sources_missing_from_repo_for_consumers(
+        {"kde-workspace"},
+        order,
+        repo,
+    )
+    assert "kactivities" in needed
+
+
+def test_chain_source_required_when_devel_br_missing():
+    from oreon_build.services.chain_satisfaction import chain_source_still_required_for_consumers
+
+    order = MagicMock()
+    order.build_requires_raw = {"kde-workspace": ["kactivities-devel"]}
+    order.capability_providers = {"kactivities-devel": ["kactivities"]}
+    order.package_names = ["kde-workspace", "kactivities"]
+
+    k_evr = RpmEvr(0, "1.0", "1")
+    repo = RepoSatisfactionIndex(
+        provides_index={"kactivities": {"kactivities"}},
+        known_sources={"kactivities"},
+        provide_best_evr={"kactivities": k_evr},
+        source_best_evr={"kactivities": k_evr},
+    )
+    assert chain_source_still_required_for_consumers(
+        "kactivities",
+        order,
+        repo,
+        {"kde-workspace"},
+    )
+
+
+def test_devel_br_needs_build_when_only_base_source_in_repo():
+    """kactivities in repo must not skip building when kde-workspace still needs kactivities-devel."""
+    order = MagicMock()
+    order.package_names = ["kde-workspace", "kactivities"]
+    order.spec_evrs = {"kde-workspace": "0:1-1", "kactivities": "0:1.0-1"}
+    order.build_requires_raw = {"kde-workspace": ["kactivities-devel"]}
+    order.capability_providers = {"kactivities-devel": ["kactivities"]}
+
+    k_evr = RpmEvr(0, "1.0", "1")
+    repo = RepoSatisfactionIndex(
+        provides_index={"kactivities": {"kactivities"}},
+        known_sources={"kactivities"},
+        provide_best_evr={"kactivities": k_evr},
+        source_best_evr={"kactivities": k_evr},
+    )
+    plan = compute_chain_dependency_build_set(
+        ["kde-workspace"],
+        order,
+        repo,
+        {"kde-workspace"},
+    )
+    assert "kactivities" in plan.sources_to_build
+    assert not plan.conflicts

@@ -31,8 +31,9 @@ def test_chain_closure_uses_single_tar_pass_for_reads() -> None:
     tarball = _make_mini_tarball(releasename, specs)
     all_names, members = _tarball_spec_member_index(tarball, releasename)
     assert all_names == {"a", "b", "c"}
-    got, err = _expand_chain_spec_closure(
+    got, parsed, err = _expand_chain_spec_closure(
         ["a"], all_names, tarball, releasename, members=members
     )
     assert not err
     assert set(got.keys()) == {"a", "b"}
+    assert set(parsed.keys()) == {"a", "b"}

@@ -403,6 +403,20 @@ def test_chain_user_targets_from_options():
     assert _skip_jobs_not_before_for_package(chain, "kernel", t0) is None
 
 
+def test_distgit_packages_in_layers_before_user_target():
+    from oreon_build.services.build_chain import _distgit_packages_in_layers_before
+
+    layers = [["a", "b"], ["c"], ["kernel-headers"]]
+    got = _distgit_packages_in_layers_before(
+        layers,
+        ["kernel-headers"],
+        user_lower={"kernel-headers"},
+        already_in_chain_lower=set(),
+        spec_names={"a", "b", "c", "kernel-headers"},
+    )
+    assert got == {"a", "b", "c"}
+
+
 def test_chain_user_targets_parsed_from_spec():
     from oreon_build.services.build_chain import _chain_user_target_names
 
