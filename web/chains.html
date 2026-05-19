@@ -208,6 +208,10 @@
             var created = c.created_at ? String(c.created_at).slice(0, 19).replace('T', ' ') : '-';
             var rowCls = statusRowClass(st, c.preparing);
             if (highlightId && id === highlightId) rowCls += ' chain-row-highlight';
+            var canCancel = api.token && (st === 'pending' || st === 'running' || c.preparing);
+            var cancelBtn = canCancel
+              ? '<button type="button" class="btn chain-cancel-btn" data-chain-id="' + id + '">Cancel</button>'
+              : '';
             var resumeBtn = api.token
               ? '<button type="button" class="btn chain-resume-btn" data-chain-id="' + id + '">Resume</button>'
               : '';
@@ -222,6 +226,7 @@
               '<td><div class="chain-actions">' +
               '<button type="button" class="btn chain-detail-btn" data-chain-id="' + id + '">Details</button>' +
               '<a href="/builds.html?chain_id=' + id + '">Builds</a>' +
+              cancelBtn +
               resumeBtn +
               '</div></td></tr>' +
               '<tr class="chain-detail-expand" data-chain-id="' + id + '" style="display:none"><td colspan="8">' +
@@ -261,6 +266,19 @@
           });
 
           restoreOpenDetails();
+
+          tbody.querySelectorAll('.chain-cancel-btn').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+              if (!api.token) { alert('Log in to cancel.'); return; }
+              var cid = parseInt(btn.getAttribute('data-chain-id'), 10);
+              if (!confirm('Cancel chain ' + cid + '? Pending and running jobs in this chain will be stopped.')) return;
+              oreonWithLoading(btn, function() {
+                return api.post('/builds/chain/' + cid + '/cancel')
+                  .then(function() { loadChains(); })
+                  .catch(function(e) { alert('Cancel failed: ' + (e.message || 'error')); });
+              });
+            });
+          });
 
           tbody.querySelectorAll('.chain-resume-btn').forEach(function(btn) {
             btn.addEventListener('click', function() {
