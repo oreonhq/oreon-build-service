@@ -15,7 +15,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
-"""Promotions - list candidates (pending); to-testing / to-stable require auth."""
+"""Promotions - list candidates (pending); to-testing/to-stable require auth."""
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
