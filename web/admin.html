@@ -40,7 +40,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       <a href="/dependencies.html">Dependencies</a>
       <a href="/admin.html">Administration</a>
       <form class="navbar-search" action="/search.html" method="get" style="display:inline-flex; margin-left:0.5rem;">
-        <input type="search" name="q" placeholder="Search…" style="padding:0.25rem 0.5rem; width:10rem;">
+        <input type="search" name="q" placeholder="Search" style="padding:0.25rem 0.5rem; width:10rem;">
         <button type="submit" class="btn" style="margin-left:0.25rem;">Go</button>
       </form>
       <span id="auth-section">
@@ -116,7 +116,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
     <section class="card" id="accounts-table-card" style="display:none;">
       <h2 style="margin-top:0;">Login accounts</h2>
-      <div id="accounts-status" style="color:var(--text-muted); font-size:0.9rem; margin-bottom:0.75rem;">Loading…</div>
+      <div id="accounts-status" style="color:var(--text-muted); font-size:0.9rem; margin-bottom:0.75rem;">Loading</div>
       <table class="table-list">
         <thead>
           <tr>
@@ -192,7 +192,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         setEditSelected(null);
         var tbody = document.getElementById('accounts-tbody');
         var status = document.getElementById('accounts-status');
-        if (status) status.textContent = 'Loading…';
+        if (status) status.textContent = 'Loading';
         try {
           var res = await api.get('/accounts');
           // Current backend list is not paginated; it returns a plain array.
