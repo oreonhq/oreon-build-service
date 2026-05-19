@@ -236,7 +236,7 @@ window.oreonWithLoading = function(btn, asyncFn) {
   var orig = btn.textContent;
   btn.disabled = true;
   btn.classList.add('loading');
-  btn.textContent = orig + ' …';
+  btn.textContent = orig + ' ';
   return asyncFn().finally(function() {
     btn.disabled = false;
     btn.classList.remove('loading');
