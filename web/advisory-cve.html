@@ -150,7 +150,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           ta.className = 'form-control';
           ta.id = 'cve-resolve-notes';
           ta.rows = 3;
-          ta.placeholder = 'e.g. RHSA-… backport, commit hash, or why this is a false positive';
+          ta.placeholder = 'e.g. RHSA- backport, commit hash, or why this is a false positive';
           var btn = document.createElement('button');
           btn.type = 'button';
           btn.className = 'btn primary';
@@ -167,7 +167,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             btn.disabled = true;
             sel.disabled = true;
             ta.disabled = true;
-            statusLine.textContent = 'Saving…';
+            statusLine.textContent = 'Saving';
             api.post('/security/advisories/cve/' + ad.id + '/resolve', body).then(function() {
               load();
             }).catch(function(e) {
@@ -203,7 +203,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         var idStr = parts[parts.length - 1];
         var id = parseInt(idStr, 10);
         if (!id) return;
-        titleEl.textContent = 'Loading…';
+        titleEl.textContent = 'Loading';
 
         try {
           var ad = await api.get('/security/advisories/cve/' + id);
