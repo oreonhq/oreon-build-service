@@ -47,6 +47,8 @@ class DistgitBuildOrderResult:
     layers: list[list[str]]  # topological levels (parallel groups)
     # Capability name (Provides / subpackage / source name) -> distgit source packages that provide it.
     capability_providers: dict[str, list[str]]
+    spec_evrs: dict[str, str]
+    build_requires_raw: dict[str, list[str]]
     errors: list[str]
     cycle_warning: bool
 
@@ -87,6 +89,19 @@ class _SpecParseResult:
     source_name: str
     build_requires: list[str]
     provided_binary_names: set[str]
+    build_requires_raw: list[str] = None  # type: ignore[assignment]
+    epoch: int = 0
+    version: str = ""
+    release: str = ""
+
+    def __post_init__(self) -> None:
+        if self.build_requires_raw is None:
+            self.build_requires_raw = list(self.build_requires)
+
+    def evr_canonical(self) -> str:
+        ver = (self.version or "0").strip() or "0"
+        rel = (self.release or "0").strip() or "0"
+        return f"{int(self.epoch)}:{ver}-{rel}"
 
 
 def _github_owner_repo_from_git_url(url: str) -> tuple[str, str] | None:
@@ -199,9 +214,13 @@ def _extract_pkg_name_from_package_options(opts: str, source_name: str) -> str |
 
 def _parse_spec_text(spec_text: str, filename_hint: str = "inline.spec") -> _SpecParseResult:
     br_out: list[str] = []
+    br_raw: list[str] = []
     br_seen: set[str] = set()
     provided: set[str] = set()
     source_name = Path(filename_hint).stem
+    epoch = 0
+    version = ""
+    release = ""
     macros = _parse_spec_macro_table(spec_text)
     # Fast path parser (line oriented) for large trees.
     # This avoids `specfile`'s expensive parse on thousands of specs.
@@ -222,9 +241,27 @@ def _parse_spec_text(spec_text: str, filename_hint: str = "inline.spec") -> _Spe
             if pkg_name:
                 _add_capability_tokens(provided, pkg_name, macros)
             continue
+        if us.startswith("VERSION:"):
+            version = _expand_rpm_macros(s.split(":", 1)[1].strip(), macros)
+            continue
+        if us.startswith("RELEASE:"):
+            release = _expand_rpm_macros(s.split(":", 1)[1].strip(), macros)
+            continue
+        if us.startswith("EPOCH:"):
+            try:
+                epoch = int(_expand_rpm_macros(s.split(":", 1)[1].strip(), macros) or "0")
+            except ValueError:
+                epoch = 0
+            continue
         if us.startswith("BUILDREQUIRES:"):
             val = s.split(":", 1)[1]
-            for tok in _extract_br_tokens_from_tag_value(_expand_rpm_macros(val, macros)):
+            expanded = _expand_rpm_macros(val, macros)
+            for chunk in expanded.replace("\n", ",").split(","):
+                line = chunk.strip()
+                if not line:
+                    continue
+                br_raw.append(line)
+            for tok in _extract_br_tokens_from_tag_value(expanded):
                 if tok in br_seen:
                     continue
                 br_seen.add(tok)
@@ -239,7 +276,15 @@ def _parse_spec_text(spec_text: str, filename_hint: str = "inline.spec") -> _Spe
     provided.add(source_name)
     # Optional slow path for max fidelity. Keep disabled by default.
     if (os.environ.get("OREON_SPECFILE_DEEP_PARSE") or "").strip().lower() not in ("1", "true", "yes", "on"):
-        return _SpecParseResult(source_name=source_name, build_requires=br_out, provided_binary_names=provided)
+        return _SpecParseResult(
+            source_name=source_name,
+            build_requires=br_out,
+            provided_binary_names=provided,
+            build_requires_raw=br_raw,
+            epoch=epoch,
+            version=version,
+            release=release,
+        )
 
     # Slow path with specfile library (opt-in).
     try:
@@ -275,11 +320,27 @@ def _parse_spec_text(spec_text: str, filename_hint: str = "inline.spec") -> _Spe
                 pkg_name = _extract_pkg_name_from_package_options(str(getattr(sec, "options", "") or ""), source_name)
                 if pkg_name:
                     provided.add(pkg_name)
-        return _SpecParseResult(source_name=source_name, build_requires=br_out, provided_binary_names=provided)
+        return _SpecParseResult(
+            source_name=source_name,
+            build_requires=br_out,
+            provided_binary_names=provided,
+            build_requires_raw=br_raw,
+            epoch=epoch,
+            version=version,
+            release=release,
+        )
     except Exception as exc:
         logger.warning("specfile parse failed for %s: %s", filename_hint, exc)
     # Return the fast-path result if deep parse fails.
-    return _SpecParseResult(source_name=source_name, build_requires=br_out, provided_binary_names=provided)
+    return _SpecParseResult(
+        source_name=source_name,
+        build_requires=br_out,
+        provided_binary_names=provided,
+        build_requires_raw=br_raw,
+        epoch=epoch,
+        version=version,
+        release=release,
+    )
 
 
 def _provider_map_from_specs(parsed_by_source: dict[str, _SpecParseResult]) -> dict[str, set[str]]:
@@ -394,6 +455,8 @@ async def compute_distgit_build_order(
             edges=[],
             layers=[],
             capability_providers={},
+            spec_evrs={},
+            build_requires_raw={},
             errors=[f"distgit_url is not a supported github.com URL: {distgit_url!r}"],
             cycle_warning=False,
         )
@@ -427,7 +490,12 @@ async def compute_distgit_build_order(
     for (pkg, _spec_text), parsed_or_exc in zip(specs_by_pkg.items(), parse_results, strict=False):
         if isinstance(parsed_or_exc, Exception):
             err.append(f"{pkg}: parse failed ({type(parsed_or_exc).__name__}: {parsed_or_exc})")
-            parsed_by_source[pkg] = _SpecParseResult(source_name=pkg, build_requires=[], provided_binary_names={pkg})
+            parsed_by_source[pkg] = _SpecParseResult(
+                source_name=pkg,
+                build_requires=[],
+                provided_binary_names={pkg},
+                build_requires_raw=[],
+            )
         else:
             parsed_by_source[pkg] = parsed_or_exc
 
@@ -461,6 +529,8 @@ async def compute_distgit_build_order(
         err.append("Warning: a cycle exists in distgit BuildRequires; some parallel layers may be conservative.")
 
     capability_providers = {cap: sorted(srcs) for cap, srcs in sorted(provider_map.items())}
+    spec_evrs = {src: parsed.evr_canonical() for src, parsed in parsed_by_source.items()}
+    build_requires_raw = {src: list(parsed.build_requires_raw) for src, parsed in parsed_by_source.items()}
 
     return DistgitBuildOrderResult(
         releasename=releasename,
@@ -470,6 +540,8 @@ async def compute_distgit_build_order(
         edges=edges,
         layers=layers,
         capability_providers=capability_providers,
+        spec_evrs=spec_evrs,
+        build_requires_raw=build_requires_raw,
         errors=err,
         cycle_warning=cyc,
     )

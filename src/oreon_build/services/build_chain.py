@@ -37,7 +37,6 @@ from oreon_build.services.build_target_util import (
     batch_latest_package_version_ids,
     batch_package_ids_by_name,
     get_or_create_build_target,
-    has_successful_build_for_target,
     latest_package_version_id,
     package_ids_with_success_on_all_targets,
 )
@@ -55,6 +54,7 @@ _chain_distgit_order_cache: dict[tuple[str, str, str], tuple[float, Any]] = {}
 _chain_repo_runtime_cache: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
 # Cache provide_name -> source from repo primary.xml (shared by chain capability resolution).
 _chain_repo_provides_cache: dict[tuple[str, str, str], tuple[float, dict[str, set[str]], set[str]]] = {}
+_chain_repo_sat_cache: dict[tuple[str, str, str], tuple[float, Any]] = {}
 
 
 def _chain_use_distgit_dep_gate() -> bool:
@@ -205,6 +205,32 @@ async def _cached_repo_provides_index(
         pi, known = {}, set()
     _chain_repo_provides_cache[k] = (now, pi, known)
     return pi, known
+
+
+async def _cached_repo_satisfaction_index(
+    releasename: str,
+    branch: str,
+    arch: str,
+) -> tuple[Any, str | None]:
+    from oreon_build.services.dependencies_graph import RepoTarget, load_repo_satisfaction_index
+
+    k = (releasename.strip(), branch.strip(), normalize_machine_arch(arch))
+    now = time.monotonic()
+    ttl = float((os.getenv("OREON_CHAIN_REPO_RUNTIME_CACHE_SEC") or "120").strip() or "120")
+    ttl = max(30.0, min(ttl, 600.0))
+    hit = _chain_repo_sat_cache.get(k)
+    if hit is not None and (now - hit[0]) < ttl:
+        return hit[1], None
+
+    target = RepoTarget(
+        releasename=k[0],
+        branch=k[1],
+        arch=k[2],
+        prefix=f"{k[0]}/{k[1]}/{k[2]}",
+    )
+    repo_sat, err = await asyncio.to_thread(load_repo_satisfaction_index, target)
+    _chain_repo_sat_cache[k] = (now, repo_sat)
+    return repo_sat, err
 
 
 async def resolve_chain_sources_for_missing_providers(
@@ -520,46 +546,22 @@ async def _chain_package_still_needs_build(
     *,
     architectures: list[str],
     preferred_mock_environment_id: int | None,
-    skip_jobs_not_before: datetime | None,
     republish_needed: set[str] | None = None,
+    order: Any | None = None,
+    repo_sat: Any | None = None,
 ) -> bool:
-    """True when this chain still needs to build ``package_name`` (failed, never built, or repo lacks Provides)."""
-    if republish_needed and package_name in republish_needed:
-        return True
-    pid = await _package_id_for_name(db, package_name)
-    if pid is None:
-        return True
-    return not await _chain_has_successful_build_all_arches(
+    """True when this chain still needs to build ``package_name``."""
+    still = await _batch_chain_packages_still_needing_build(
         db,
         chain,
-        pid,
+        [package_name],
         architectures=architectures,
         preferred_mock_environment_id=preferred_mock_environment_id,
-        skip_jobs_not_before=skip_jobs_not_before,
+        republish_needed=republish_needed,
+        order=order,
+        repo_sat=repo_sat,
     )
-
-
-async def _chain_has_successful_build_all_arches(
-    db: Any,
-    chain: BuildChain,
-    package_id: int,
-    *,
-    architectures: list[str],
-    preferred_mock_environment_id: int | None,
-    skip_jobs_not_before: datetime | None,
-) -> bool:
-    """True when every chain architecture already has a successful build for this package."""
-    if not architectures:
-        return False
-    lacking = await _package_ids_still_needing_chain_build(
-        db,
-        chain,
-        [package_id],
-        architectures=architectures,
-        preferred_mock_environment_id=preferred_mock_environment_id,
-        skip_jobs_not_before=skip_jobs_not_before,
-    )
-    return package_id not in lacking
+    return package_name in still
 
 
 async def _chain_build_target_ids(
@@ -586,13 +588,12 @@ async def _package_ids_still_needing_chain_build(
     *,
     architectures: list[str],
     preferred_mock_environment_id: int | None,
-    skip_jobs_not_before: datetime | None,
+    version_by_package: dict[int, int | None],
 ) -> set[int]:
-    """package_ids that do not yet have SUCCESS on every chain architecture."""
+    """package_ids that do not yet have SUCCESS on every chain architecture for pinned spec versions."""
     ids = [int(p) for p in package_ids if p]
     if not ids or not architectures:
         return set(ids)
-    pv_map = await batch_latest_package_version_ids(db, ids)
     target_ids = await _chain_build_target_ids(
         db,
         chain,
@@ -604,10 +605,45 @@ async def _package_ids_still_needing_chain_build(
         package_ids=ids,
         release_id=chain.release_id,
         target_ids=target_ids,
-        version_by_package={pid: pv_map.get(pid) for pid in ids},
-        jobs_created_on_or_after=skip_jobs_not_before,
+        version_by_package=version_by_package,
+        jobs_created_on_or_after=None,
     )
     return {pid for pid in ids if pid not in complete_ids}
+
+
+async def _batch_package_version_ids_for_spec(
+    db: Any,
+    name_to_id: dict[str, int],
+    spec_evrs: dict[str, str],
+) -> dict[str, int | None]:
+    """Map package name -> package_version_id for the distgit spec EVR (None if no row yet)."""
+    if not name_to_id:
+        return {}
+    wanted_versions = {
+        spec_evrs.get(name) for name in name_to_id if spec_evrs.get(name)
+    }
+    wanted_versions.discard(None)
+    if not wanted_versions:
+        return {name: None for name in name_to_id}
+
+    rows = await db.execute(
+        select(PackageVersion.package_id, PackageVersion.id, PackageVersion.version).where(
+            PackageVersion.package_id.in_(list(name_to_id.values())),
+            PackageVersion.version.in_(list(wanted_versions)),
+        )
+    )
+    by_pkg_ver: dict[tuple[int, str], int] = {}
+    for pkg_id, vid, ver in rows.all():
+        by_pkg_ver[(int(pkg_id), str(ver))] = int(vid)
+
+    out: dict[str, int | None] = {}
+    for name, pkg_id in name_to_id.items():
+        spec_ver = spec_evrs.get(name)
+        if not spec_ver:
+            out[name] = None
+            continue
+        out[name] = by_pkg_ver.get((pkg_id, spec_ver))
+    return out
 
 
 async def _batch_chain_packages_still_needing_build(
@@ -617,31 +653,69 @@ async def _batch_chain_packages_still_needing_build(
     *,
     architectures: list[str],
     preferred_mock_environment_id: int | None,
-    skip_jobs_not_before: datetime | None,
     republish_needed: set[str] | None,
+    order: Any | None = None,
+    repo_sat: Any | None = None,
 ) -> set[str]:
-    """Package names that still need a chain build (batched DB lookups)."""
+    """Package names that still need a chain build (repo + spec version + DB success)."""
+    from oreon_build.services.chain_satisfaction import (
+        chain_target_needs_build,
+        source_published_at_least_spec,
+    )
+
     still: set[str] = set()
     if republish_needed:
         still |= {n for n in package_names if n in republish_needed}
     to_lookup = [n for n in package_names if n and n not in still]
     if not to_lookup:
         return still
+
+    spec_evrs: dict[str, str] = (
+        order.spec_evrs if order is not None and isinstance(getattr(order, "spec_evrs", None), dict) else {}
+    )
+    user_targets = _chain_user_target_names(chain)
     name_to_id = await batch_package_ids_by_name(db, to_lookup)
-    for n in to_lookup:
-        if n not in name_to_id:
-            still.add(n)
-    if not name_to_id:
+    pv_by_name = await _batch_package_version_ids_for_spec(db, name_to_id, spec_evrs)
+
+    check_ids: list[int] = []
+    id_to_name: dict[int, str] = {}
+    for name in to_lookup:
+        if name not in name_to_id:
+            still.add(name)
+            continue
+        pid = name_to_id[name]
+        is_user = name.lower() in user_targets
+        if repo_sat is not None and spec_evrs and not is_user:
+            if source_published_at_least_spec(name, spec_evrs, repo_sat):
+                continue
+        if is_user and repo_sat is not None and spec_evrs:
+            if not chain_target_needs_build(name, spec_evrs, repo_sat):
+                pv_id = pv_by_name.get(name)
+                if pv_id is None:
+                    still.add(name)
+                    continue
+                check_ids.append(pid)
+                id_to_name[pid] = name
+                continue
+        pv_id = pv_by_name.get(name)
+        if pv_id is None:
+            still.add(name)
+            continue
+        check_ids.append(pid)
+        id_to_name[pid] = name
+
+    if not check_ids:
         return still
+
+    version_by_package = {pid: pv_by_name.get(id_to_name[pid]) for pid in check_ids}
     lacking_ids = await _package_ids_still_needing_chain_build(
         db,
         chain,
-        list(name_to_id.values()),
+        check_ids,
         architectures=architectures,
         preferred_mock_environment_id=preferred_mock_environment_id,
-        skip_jobs_not_before=skip_jobs_not_before,
+        version_by_package=version_by_package,
     )
-    id_to_name = {pid: name for name, pid in name_to_id.items()}
     for pid in lacking_ids:
         still.add(id_to_name[pid])
     return still
@@ -661,6 +735,7 @@ def invalidate_repo_chain_caches(releasename: str, branch: str, arch: str) -> No
     """Drop cached repodata indexes after a publish or spec Provides change."""
     k = (releasename.strip(), branch.strip(), normalize_machine_arch(arch))
     _chain_repo_provides_cache.pop(k, None)
+    _chain_repo_sat_cache.pop(k, None)
     _chain_repo_runtime_cache.pop(k, None)
 
 
@@ -748,9 +823,9 @@ async def _proactive_extra_roots_from_repo_runtime(
     *,
     architectures: list[str],
     preferred_mock_environment_id: int | None,
-    skip_jobs_not_before: datetime | None,
     repo_pi: dict[str, set[str]] | None = None,
     repo_known: set[str] | None = None,
+    repo_sat: Any | None = None,
     analysis: dict[str, Any] | None = None,
 ) -> tuple[set[str], list[str]]:
     """
@@ -769,6 +844,9 @@ async def _proactive_extra_roots_from_repo_runtime(
     if repo_pi is None or repo_known is None:
         repo_pi, repo_known = await _cached_repo_provides_index(releasename, branch, canon_arch)
     repo_known = repo_known or set()
+    if repo_sat is None:
+        repo_sat, _ = await _cached_repo_satisfaction_index(releasename, branch, canon_arch)
+    from oreon_build.services.chain_satisfaction import _requirement_status
     spec_caps = order.capability_providers if isinstance(order.capability_providers, dict) else {}
     if analysis is None:
         analysis = await _cached_repo_runtime_analysis(
@@ -790,7 +868,7 @@ async def _proactive_extra_roots_from_repo_runtime(
     chain_names = {str(p) for stage in stages for p in stage if p}
     deps_map = _deps_map_from_edges(order.edges if isinstance(order.edges, list) else [])
     related = chain_names | _transitive_spec_predecessors(deps_map, list(chain_names), spec_names)
-    scope = (os.getenv("OREON_CHAIN_PROACTIVE_REPO_RUNTIME_SCOPE") or "wide").strip().lower()
+    scope = (os.getenv("OREON_CHAIN_PROACTIVE_REPO_RUNTIME_SCOPE") or "chain").strip().lower()
 
     items: list[tuple[str, str, str, str]] = []
     caps_to_resolve: set[str] = set()
@@ -801,6 +879,9 @@ async def _proactive_extra_roots_from_repo_runtime(
         req = str(item.get("requirement") or "")
         prov = str(item.get("provider") or "")
         if scope == "chain" and consumer and consumer not in related:
+            continue
+        req_line = req or prov
+        if req_line and _requirement_status(req_line, repo_sat)[0] == "satisfied":
             continue
         for candidate in (prov, req):
             if not candidate:
@@ -855,8 +936,9 @@ async def _proactive_extra_roots_from_repo_runtime(
         sorted(srcs_to_check),
         architectures=architectures,
         preferred_mock_environment_id=preferred_mock_environment_id,
-        skip_jobs_not_before=skip_jobs_not_before,
         republish_needed=None,
+        order=order,
+        repo_sat=repo_sat,
     )
     for src, cap_to_check, _mapped in pending:
         if src in still_need:
@@ -965,13 +1047,12 @@ async def _inject_missing_dep_layers_before(
             pref_pm = int(pm)
         except (TypeError, ValueError):
             pref_pm = None
-    skip_not_before = _parse_skip_jobs_not_before(chain) if bool(opt.get("skip_complete_arches", True)) else None
     publish_branch = r2_publish_branch(release)
     canon_arch = normalize_machine_arch(arches[0] if arches else "x86_64")
 
     order = await _cached_distgit_build_order(releasename, dg_url, dg_br)
     spec_caps = order.capability_providers if isinstance(order.capability_providers, dict) else {}
-    (repo_pi, repo_known), analysis = await asyncio.gather(
+    (repo_pi, repo_known), analysis, repo_sat = await asyncio.gather(
         _cached_repo_provides_index(releasename, publish_branch, canon_arch),
         _cached_repo_runtime_analysis(
             releasename,
@@ -979,7 +1060,9 @@ async def _inject_missing_dep_layers_before(
             canon_arch,
             spec_capability_providers=spec_caps,
         ),
+        _cached_repo_satisfaction_index(releasename, publish_branch, canon_arch),
     )
+    repo_sat_index = repo_sat[0] if isinstance(repo_sat, tuple) else repo_sat
     caps_needed = list(required_capabilities or [])
     republish_needed = _sources_missing_repo_capabilities(order, repo_pi, caps_needed)
 
@@ -994,9 +1077,9 @@ async def _inject_missing_dep_layers_before(
         order,
         architectures=arches,
         preferred_mock_environment_id=pref_pm,
-        skip_jobs_not_before=skip_not_before,
         repo_pi=repo_pi,
         repo_known=repo_known,
+        repo_sat=repo_sat_index,
         analysis=analysis,
     )
     if repo_unmapped:
@@ -1017,28 +1100,51 @@ async def _inject_missing_dep_layers_before(
         return False
     merged_extra = set(extra_roots or set()) | proactive_roots
 
-    deps_map = _deps_map_from_edges(edges)
     all_chain_pkg_names: set[str] = {str(p).lower() for stage in stages for p in stage if p}
-    past_stage_pkg_names: set[str] = {
-        str(p).lower() for stage in stages[:stage_index] for p in stage if p
-    }
+
+    from oreon_build.services.chain_satisfaction import (
+        compute_chain_dependency_build_set,
+        format_chain_version_conflict_message,
+    )
 
     roots = list(pkgs)
     if merged_extra:
         roots.extend(sorted(merged_extra))
-    candidates = _transitive_spec_predecessors(deps_map, roots, spec_names)
-    if merged_extra:
-        candidates.update(s for s in merged_extra if s in spec_names)
+    user_targets = _chain_user_target_names(chain)
+    dep_plan = compute_chain_dependency_build_set(
+        roots,
+        order,
+        repo_sat_index,
+        user_targets,
+    )
+    if dep_plan.conflicts:
+        chain.status = BuildChainStatus.FAILED
+        chain.error_message = format_chain_version_conflict_message(
+            dep_plan.conflicts,
+            releasename=releasename,
+            distgit_url=dg_url,
+            distgit_branch=dg_br,
+        )[:8000]
+        logger.error(
+            "chain_id=%s version conflicts: %s",
+            chain.id,
+            [c.requirement for c in dep_plan.conflicts[:5]],
+        )
+        return False
+
+    candidate_list = sorted(
+        p for p in dep_plan.sources_to_build if str(p).lower() not in all_chain_pkg_names
+    )
     to_inject: set[str] = set()
-    candidate_list = sorted(candidates)
     still_needing = await _batch_chain_packages_still_needing_build(
         db,
         chain,
         candidate_list,
         architectures=arches,
         preferred_mock_environment_id=pref_pm,
-        skip_jobs_not_before=skip_not_before,
         republish_needed=republish_needed,
+        order=order,
+        repo_sat=repo_sat_index,
     )
     for pred in candidate_list:
         pred_lower = pred.lower()
@@ -1079,9 +1185,9 @@ async def _chain_sources_lacking_success(
     *,
     architectures: list[str],
     preferred_mock_environment_id: int | None,
-    skip_jobs_not_before: datetime | None,
     order: Any | None = None,
     repo_pi: dict[str, set[str]] | None = None,
+    repo_sat: Any | None = None,
     required_capabilities: list[str] | None = None,
 ) -> set[str]:
     lacking: set[str] = set()
@@ -1094,8 +1200,9 @@ async def _chain_sources_lacking_success(
         names,
         architectures=architectures,
         preferred_mock_environment_id=preferred_mock_environment_id,
-        skip_jobs_not_before=skip_jobs_not_before,
         republish_needed=None,
+        order=order,
+        repo_sat=repo_sat,
     )
     return lacking
 
@@ -1299,9 +1406,6 @@ async def _try_recover_chain_after_failure(
                 pref_pm = int(pm)
             except (TypeError, ValueError):
                 pref_pm = None
-        skip_not_before = (
-            _parse_skip_jobs_not_before(chain) if bool(opt.get("skip_complete_arches", True)) else None
-        )
         stages_now = chain.stages_json if isinstance(chain.stages_json, list) else []
         stage_names = (
             {str(p).lower() for p in stages_now[stage_idx]}
@@ -1324,17 +1428,21 @@ async def _try_recover_chain_after_failure(
 
         order_for_check = await _cached_distgit_build_order(releasename, dg_url, dg_br)
         repo_pi: dict[str, set[str]] = {}
+        repo_sat_check = None
         if releasename and repo_branch:
             repo_pi, _ = await _cached_repo_provides_index(releasename, repo_branch, canon_arch)
+            repo_sat_check, _ = await _cached_repo_satisfaction_index(
+                releasename, repo_branch, canon_arch
+            )
         lacking = await _chain_sources_lacking_success(
             db,
             chain,
             extra_roots,
             architectures=arches,
             preferred_mock_environment_id=pref_pm,
-            skip_jobs_not_before=skip_not_before,
             order=order_for_check,
             repo_pi=repo_pi,
+            repo_sat=repo_sat_check,
             required_capabilities=providers,
         )
         if lacking:
@@ -1469,6 +1577,7 @@ def distgit_new_package_dict(
     distgit_url: str,
     distgit_branch: str,
     preferred_mock_environment_id: int | None,
+    spec_version: str | None = None,
 ) -> dict[str, Any]:
     spec_rel = f"{releasename}/{pkg}/{pkg}.spec"
     url = f"{distgit_url.rstrip('/')}#{distgit_branch}:{spec_rel}"
@@ -1483,8 +1592,34 @@ def distgit_new_package_dict(
         "source_urls": None,
         "source_branch": distgit_branch,
         "source_path": spec_rel,
-        "version": "0.0.1",
+        "version": (spec_version or "0.0.1").strip() or "0.0.1",
     }
+
+
+async def _ensure_spec_package_version(
+    db: Any,
+    package_id: int,
+    spec_canonical: str | None,
+) -> int | None:
+    """Return PackageVersion id for distgit spec EVR, creating a row when the spec was bumped."""
+    if not spec_canonical:
+        return await latest_package_version_id(db, package_id)
+    row = await db.execute(
+        select(PackageVersion.id)
+        .where(
+            PackageVersion.package_id == package_id,
+            PackageVersion.version == spec_canonical,
+        )
+        .order_by(PackageVersion.id.desc())
+        .limit(1)
+    )
+    vid = row.scalar_one_or_none()
+    if vid is not None:
+        return int(vid)
+    pv = PackageVersion(package_id=package_id, version=spec_canonical)
+    db.add(pv)
+    await db.flush()
+    return pv.id
 
 
 def _infer_github_html_url_from_distgit(url: str) -> str | None:
@@ -1662,6 +1797,37 @@ def _options_dict(chain: BuildChain) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
+def _chain_user_target_names(chain: BuildChain) -> set[str]:
+    """Lowercase package names the user listed in chain_spec (not auto-injected deps)."""
+    opt = _options_dict(chain)
+    raw = opt.get("chain_user_targets")
+    if isinstance(raw, list):
+        return {str(n).lower() for n in raw if n}
+    try:
+        groups = parse_chain_build_spec(chain.chain_spec or "")
+    except ValueError:
+        return set()
+    return {str(n).lower() for grp in groups for n in grp if n}
+
+
+def _skip_jobs_not_before_for_package(
+    chain: BuildChain,
+    package_name: str,
+    skip_jobs_not_before: datetime | None,
+) -> datetime | None:
+    """
+    Chain-start skip window applies only to user-named targets.
+
+    Auto-injected dependencies use any prior successful build on all arches so we do
+    not queue kernel (etc.) again when it was built before this chain started.
+    """
+    if skip_jobs_not_before is None:
+        return None
+    if package_name.lower() in _chain_user_target_names(chain):
+        return skip_jobs_not_before
+    return None
+
+
 def _set_chain_options(chain: BuildChain, options: dict[str, Any]) -> None:
     """Persist chain_options (SQLAlchemy does not track in-place JSON dict mutation)."""
     chain.chain_options = dict(options)
@@ -1789,20 +1955,32 @@ async def _enqueue_chain_stage_jobs(
     publish_branch = r2_publish_branch(release)
     releasename = (release.releasename or "").strip()
 
-    skip_jobs_not_before: datetime | None = None
-    opt_raw = chain.chain_options if isinstance(chain.chain_options, dict) else {}
-    raw_skip = opt_raw.get("skip_jobs_not_before")
-    if skip_complete_arches and raw_skip:
-        try:
-            skip_jobs_not_before = datetime.fromisoformat(str(raw_skip))
-            if skip_jobs_not_before.tzinfo is None:
-                skip_jobs_not_before = skip_jobs_not_before.replace(tzinfo=timezone.utc)
-        except ValueError:
-            skip_jobs_not_before = None
-    if skip_complete_arches and skip_jobs_not_before is None:
-        ca = getattr(chain, "created_at", None)
-        if ca is not None:
-            skip_jobs_not_before = ca if ca.tzinfo else ca.replace(tzinfo=timezone.utc)
+    order = None
+    repo_sat_index = None
+    spec_evrs: dict[str, str] = {}
+    if skip_complete_arches and releasename:
+        order = await _cached_distgit_build_order(
+            releasename, distgit_url, distgit_branch
+        )
+        spec_evrs = order.spec_evrs if isinstance(getattr(order, "spec_evrs", None), dict) else {}
+        repo_sat_index, _ = await _cached_repo_satisfaction_index(
+            releasename,
+            publish_branch,
+            normalize_machine_arch(architectures[0] if architectures else "x86_64"),
+        )
+
+    still_need_names: set[str] = set()
+    if skip_complete_arches:
+        still_need_names = await _batch_chain_packages_still_needing_build(
+            db,
+            chain,
+            pkgs,
+            architectures=architectures,
+            preferred_mock_environment_id=preferred_mock_environment_id,
+            republish_needed=None,
+            order=order,
+            repo_sat=repo_sat_index,
+        )
 
     for pkg_name in pkgs:
         existing_r = await db.execute(select(Package).where(Package.name == pkg_name))
@@ -1811,9 +1989,11 @@ async def _enqueue_chain_stage_jobs(
         package_version_id: int | None
         pref_mock: int | None
 
+        spec_ver = spec_evrs.get(pkg_name) if spec_evrs else None
+
         if existing_pkg:
             package_id = existing_pkg.id
-            package_version_id = await latest_package_version_id(db, package_id)
+            package_version_id = await _ensure_spec_package_version(db, package_id, spec_ver)
             # Chain-specified mock takes priority; fall back to package's stored preference.
             pref_mock = preferred_mock_environment_id or existing_pkg.preferred_mock_environment_id
         else:
@@ -1823,6 +2003,7 @@ async def _enqueue_chain_stage_jobs(
                 distgit_url=distgit_url,
                 distgit_branch=distgit_branch,
                 preferred_mock_environment_id=preferred_mock_environment_id,
+                spec_version=spec_ver,
             )
             gh_url = _infer_github_html_url_from_distgit(npd["source_url"] or "")
             pkg = Package(
@@ -1860,14 +2041,7 @@ async def _enqueue_chain_stage_jobs(
             if not workers_by_arch.get(canon, False):
                 continue
             target = await get_or_create_build_target(db, chain.release_id, canon, pref_mock)
-            if skip_complete_arches and await has_successful_build_for_target(
-                db,
-                package_id,
-                chain.release_id,
-                target.id,
-                package_version_id,
-                jobs_created_on_or_after=skip_jobs_not_before,
-            ):
+            if skip_complete_arches and pkg_name not in still_need_names:
                 skip_slots += 1
                 continue
             expected_jobs += 1
@@ -2163,6 +2337,7 @@ async def trigger_chain_build(
     dg_url = (distgit_url or "https://github.com/oreonhq/rpm-specfiles.git").strip()
     dg_branch = (distgit_branch or "main").strip()
 
+    user_targets = sorted({str(n).lower() for grp in stages for n in grp if n})
     chain_options: dict[str, Any] = {
         "architectures": arches,
         "skip_complete_arches": skip_complete_arches,
@@ -2170,8 +2345,9 @@ async def trigger_chain_build(
         "distgit_branch": dg_branch,
         "preferred_mock_environment_id": preferred_mock_environment_id,
         "priority": priority,
+        "chain_user_targets": user_targets,
         # Only successes from jobs created on/after this instant count toward
-        # skip_complete_arches for this chain (avoids stale all-arch skips).
+        # skip_complete_arches for user-named targets (avoids stale all-arch skips).
         "skip_jobs_not_before": datetime.now(timezone.utc).isoformat(),
     }
     chain = BuildChain(
