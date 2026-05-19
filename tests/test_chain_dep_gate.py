@@ -23,11 +23,12 @@ def _make_chain(stages_json, active_stage=0, chain_options=None):
     return chain
 
 
-def _make_order(*, edges, layers, package_names):
+def _make_order(*, edges, layers, package_names, capability_providers=None):
     r = MagicMock()
     r.edges = edges
     r.layers = layers
     r.package_names = package_names
+    r.capability_providers = capability_providers if capability_providers is not None else {}
     return r
 
 
@@ -41,6 +42,65 @@ def test_transitive_spec_predecessors():
     spec = {"firefox", "libfoo", "libbar"}
     got = _transitive_spec_predecessors(deps, ["firefox"], spec)
     assert got == {"libfoo", "libbar"}
+
+
+def test_format_chain_unresolved_providers_message():
+    from oreon_build.services.build_chain import format_chain_unresolved_providers_message
+
+    msg = format_chain_unresolved_providers_message(
+        ["python-setuptools-wheel"],
+        releasename="oreon-11-rp1",
+        distgit_url="https://github.com/oreonhq/rpm-specfiles.git",
+        distgit_branch="main",
+        context="Build of foo failed in mock.",
+    )
+    assert "not in your distgit specfiles tree" in msg
+    assert "python-setuptools-wheel" in msg
+    assert "oreon-11-rp1" in msg
+    assert "lookaside" in msg.lower()
+
+
+def test_unresolved_distgit_capabilities():
+    from oreon_build.services.build_chain import unresolved_distgit_capabilities
+
+    order = _make_order(
+        edges=[],
+        layers=[],
+        package_names=["python3-setuptools"],
+        capability_providers={"python-setuptools-wheel": ["python3-setuptools"]},
+    )
+    assert unresolved_distgit_capabilities(order, ["python-setuptools-wheel"]) == []
+    assert unresolved_distgit_capabilities(order, ["not-in-tree"]) == ["not-in-tree"]
+
+
+def test_parse_dnf_missing_providers():
+    from oreon_build.services.build_chain import parse_dnf_missing_providers
+
+    text = (
+        "Problem: conflicting requests\n"
+        "- nothing provides python-setuptools-wheel needed by "
+        "python3-test-3.14.3-2.or11.x86_64 from oreon-base\n"
+    )
+    assert parse_dnf_missing_providers(text) == ["python-setuptools-wheel"]
+
+
+def test_resolve_distgit_sources_for_missing_providers():
+    from oreon_build.services.build_chain import resolve_distgit_sources_for_missing_providers
+
+    order = _make_order(
+        edges=[],
+        layers=[["python3-setuptools"], ["python3-test"]],
+        package_names=["python3-setuptools", "python3-test"],
+    )
+    order.capability_providers = {
+        "python-setuptools-wheel": ["python3-setuptools"],
+        "python3-setuptools": ["python3-setuptools"],
+    }
+    got = resolve_distgit_sources_for_missing_providers(
+        order,
+        ["python-setuptools-wheel"],
+    )
+    assert got == {"python3-setuptools"}
 
 
 def test_layers_for_package_subset_preserves_order():

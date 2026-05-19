@@ -1,8 +1,11 @@
 """Distgit chain builds: colon-separated parallel groups, sequential stages, gated on repo publish."""
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
@@ -44,10 +47,149 @@ DEFAULT_ARCH = ["x86_64", "aarch64"]
 
 # Cache distgit order for chain dep gating (GitHub + spec parse is expensive).
 _chain_distgit_order_cache: dict[tuple[str, str, str], tuple[float, Any]] = {}
+# Cache repo primary.xml analysis for proactive runtime Requires (R2 fetch).
+_chain_repo_runtime_cache: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
 
 
 def _chain_use_distgit_dep_gate() -> bool:
     return (os.getenv("OREON_CHAIN_USE_DISTGIT_ORDER_GATE") or "1").strip().lower() not in ("0", "false", "no")
+
+
+def _chain_use_dnf_provider_recovery() -> bool:
+    return (os.getenv("OREON_CHAIN_DNF_PROVIDER_RECOVERY") or "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+
+
+def _chain_proactive_repo_runtime() -> bool:
+    """Scan published repo primary.xml at chain expand time for broken runtime Requires."""
+    return (os.getenv("OREON_CHAIN_PROACTIVE_REPO_RUNTIME") or "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+
+
+def _chain_expand_max_rounds() -> int:
+    raw = (os.getenv("OREON_CHAIN_EXPAND_MAX_ROUNDS") or "12").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 12
+    return max(1, min(n, 64))
+
+
+def _chain_dnf_recovery_max_per_chain() -> int:
+    raw = (os.getenv("OREON_CHAIN_DNF_RECOVERY_MAX") or "32").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 32
+    return max(1, min(n, 256))
+
+
+_RE_NOTHING_PROVIDES = re.compile(
+    r"\bnothing provides ([^\n]+?) needed by\b",
+    re.IGNORECASE,
+)
+
+
+def _rpm_name_from_nevra(token: str) -> str:
+    s = (token or "").strip()
+    if not s:
+        return ""
+    if s.endswith(".rpm"):
+        s = s[:-4]
+    parts = s.rsplit("-", 2)
+    if len(parts) == 3 and parts[1] and parts[1][0].isdigit():
+        return parts[0]
+    return s
+
+
+def parse_dnf_missing_providers(text: str) -> list[str]:
+    """Extract capability names from mock/dnf 'nothing provides … needed by' lines."""
+    if not text:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in _RE_NOTHING_PROVIDES.finditer(text):
+        cap = m.group(1).strip()
+        if not cap:
+            continue
+        cap = cap.split(",", 1)[0].strip()
+        if cap and cap not in seen:
+            seen.add(cap)
+            out.append(cap)
+    return out
+
+
+def resolve_distgit_sources_for_missing_providers(
+    order: Any,
+    providers: list[str],
+) -> set[str]:
+    from oreon_build.services.distgit_order import resolve_distgit_sources_for_capability
+
+    sources: set[str] = set()
+    for cap in providers:
+        for src in resolve_distgit_sources_for_capability(order, cap):
+            sources.add(src)
+        nevra_name = _rpm_name_from_nevra(cap)
+        if nevra_name and nevra_name != cap:
+            for src in resolve_distgit_sources_for_capability(order, nevra_name):
+                sources.add(src)
+    return sources
+
+
+def unresolved_distgit_capabilities(order: Any, capabilities: list[str]) -> list[str]:
+    """Capabilities that do not map to any source package in the distgit spec tree."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for cap in capabilities:
+        c = (cap or "").strip()
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        if not resolve_distgit_sources_for_missing_providers(order, [c]):
+            out.append(c)
+    return sorted(out)
+
+
+def format_chain_unresolved_providers_message(
+    capabilities: list[str],
+    *,
+    releasename: str,
+    distgit_url: str,
+    distgit_branch: str,
+    context: str | None = None,
+) -> str:
+    caps = sorted({(c or "").strip() for c in capabilities if (c or "").strip()})
+    lines = [
+        "Chain stopped: a required dependency is not in your distgit specfiles tree, "
+        "so OBS cannot queue a build for it.",
+        "",
+    ]
+    if context and context.strip():
+        lines.append(context.strip())
+        lines.append("")
+    lines.append(f"Spec tree: {distgit_url} (branch {distgit_branch})")
+    lines.append(f"Release path: {releasename}/")
+    lines.append("")
+    if not caps:
+        lines.append("No capability name was recorded.")
+    else:
+        lines.append("Not found in distgit (no source spec Provides these names):")
+        for cap in caps[:15]:
+            lines.append(f"  - {cap}")
+        if len(caps) > 15:
+            lines.append(f"  … and {len(caps) - 15} more")
+    lines.append("")
+    lines.append(
+        "Add a package under that release in distgit, or add mock lookaside repos "
+        "on this mock environment if the dependency only exists in Fedora."
+    )
+    return "\n".join(lines)
 
 
 def _chain_dep_poll_sec() -> int:
@@ -189,10 +331,153 @@ async def _cached_distgit_build_order(releasename: str, distgit_url: str, distgi
     return order
 
 
+async def _cached_repo_runtime_analysis(releasename: str, branch: str, arch: str) -> dict[str, Any]:
+    from oreon_build.services.dependencies_graph import RepoTarget, _analyze_repo
+
+    k = (releasename.strip(), branch.strip(), normalize_machine_arch(arch))
+    now = time.monotonic()
+    ttl = float((os.getenv("OREON_CHAIN_REPO_RUNTIME_CACHE_SEC") or "120").strip() or "120")
+    hit = _chain_repo_runtime_cache.get(k)
+    if hit is not None and (now - hit[0]) < max(30.0, min(ttl, 600.0)):
+        return hit[1]
+    target = RepoTarget(
+        releasename=k[0],
+        branch=k[1],
+        arch=k[2],
+        prefix=f"{k[0]}/{k[1]}/{k[2]}",
+    )
+    analysis = await asyncio.to_thread(_analyze_repo, target)
+    _chain_repo_runtime_cache[k] = (now, analysis)
+    return analysis
+
+
+async def _proactive_extra_roots_from_repo_runtime(
+    db: Any,
+    chain: BuildChain,
+    release: Release,
+    order: Any,
+    *,
+    architectures: list[str],
+    preferred_mock_environment_id: int | None,
+    skip_jobs_not_before: datetime | None,
+) -> tuple[set[str], list[str]]:
+    """
+    Before any mock run, use repodata + distgit Provides map to queue source packages that
+    fix known broken runtime Requires in the published repo (e.g. python3-test needs
+    python-setuptools-wheel while setuptools source is not built yet).
+    """
+    if not _chain_proactive_repo_runtime():
+        return set(), []
+
+    releasename = (release.releasename or "").strip()
+    if not releasename:
+        return set(), []
+
+    branch = r2_publish_branch(release)
+    arch = architectures[0] if architectures else "x86_64"
+    analysis = await _cached_repo_runtime_analysis(releasename, branch, arch)
+    if analysis.get("error"):
+        logger.info(
+            "chain_id=%s proactive repo scan skipped (%s)",
+            chain.id,
+            analysis.get("error"),
+        )
+        return set(), []
+
+    spec_names = {str(n) for n in (order.package_names or []) if n}
+    stages: list[list[str]] = chain.stages_json if isinstance(chain.stages_json, list) else []
+    chain_names = {str(p) for stage in stages for p in stage if p}
+    deps_map = _deps_map_from_edges(order.edges if isinstance(order.edges, list) else [])
+    related = chain_names | _transitive_spec_predecessors(deps_map, list(chain_names), spec_names)
+    scope = (os.getenv("OREON_CHAIN_PROACTIVE_REPO_RUNTIME_SCOPE") or "wide").strip().lower()
+
+    sources: set[str] = set()
+    unmapped: set[str] = set()
+    for item in analysis.get("runtime_missing") or []:
+        if not isinstance(item, dict):
+            continue
+        consumer = str(item.get("package") or "")
+        req = str(item.get("requirement") or "")
+        prov = str(item.get("provider") or "")
+        if scope == "chain" and consumer and consumer not in related:
+            continue
+        for candidate in (prov, req):
+            if not candidate:
+                continue
+            mapped = resolve_distgit_sources_for_missing_providers(order, [candidate])
+            if not mapped:
+                if consumer and consumer in related:
+                    unmapped.add(candidate)
+                continue
+            for src in mapped:
+                if src not in spec_names:
+                    continue
+                pid = await _package_id_for_name(db, src)
+                if pid is not None and await _chain_has_successful_build_all_arches(
+                    db,
+                    chain,
+                    pid,
+                    architectures=architectures,
+                    preferred_mock_environment_id=preferred_mock_environment_id,
+                    skip_jobs_not_before=skip_jobs_not_before,
+                ):
+                    continue
+                sources.add(src)
+    if sources:
+        logger.info(
+            "chain_id=%s proactive repo runtime deps: %s",
+            chain.id,
+            sorted(sources),
+        )
+    return sources, sorted(unmapped)
+
+
+async def _expand_chain_stages_dependencies(db: Any, chain: BuildChain, stage_index: int) -> bool:
+    """Repeat distgit + repo-runtime injection until the stage list stops growing."""
+    for round_n in range(_chain_expand_max_rounds()):
+        before = json.dumps(chain.stages_json if isinstance(chain.stages_json, list) else [])
+        ok = await _inject_missing_dep_layers_before(db, chain, stage_index)
+        if not ok:
+            return False
+        after = json.dumps(chain.stages_json if isinstance(chain.stages_json, list) else [])
+        if after == before:
+            return True
+        logger.info(
+            "chain_id=%s dependency expand round %s grew stages before index %s",
+            chain.id,
+            round_n + 1,
+            stage_index,
+        )
+    chain.status = BuildChainStatus.FAILED
+    chain.error_message = (
+        "Chain dependency expansion did not converge (too many missing-dependency rounds). "
+        "Narrow the chain spec or fix the distgit/repo graph."
+    )
+    return False
+
+
+async def _failure_text_for_chain_recovery(db: Any, failed_job: BuildJob, reason: str) -> str:
+    parts: list[str] = []
+    if reason and reason.strip():
+        parts.append(reason.strip())
+    att_r = await db.execute(
+        select(BuildAttempt)
+        .where(BuildAttempt.build_job_id == failed_job.id)
+        .order_by(BuildAttempt.id.desc())
+        .limit(1)
+    )
+    att = att_r.scalar_one_or_none()
+    if att and (att.error_message or "").strip():
+        parts.append(att.error_message.strip())
+    return "\n".join(parts)
+
+
 async def _inject_missing_dep_layers_before(
     db: Any,
     chain: BuildChain,
     stage_index: int,
+    *,
+    extra_roots: set[str] | None = None,
 ) -> bool:
     """
     Insert distgit dependency stages immediately before ``stage_index``.
@@ -245,13 +530,44 @@ async def _inject_missing_dep_layers_before(
     order_layers = order.layers if isinstance(order.layers, list) else []
     spec_names = {str(n) for n in (order.package_names or []) if n}
 
+    proactive_roots, repo_unmapped = await _proactive_extra_roots_from_repo_runtime(
+        db,
+        chain,
+        release,
+        order,
+        architectures=arches,
+        preferred_mock_environment_id=pref_pm,
+        skip_jobs_not_before=skip_not_before,
+    )
+    if repo_unmapped:
+        ctx = (
+            "Published repo metadata lists runtime dependencies that are not satisfied "
+            f"(example consumer: {repo_unmapped[0]})."
+        )
+        chain.status = BuildChainStatus.FAILED
+        chain.error_message = format_chain_unresolved_providers_message(
+            repo_unmapped,
+            releasename=releasename,
+            distgit_url=dg_url,
+            distgit_branch=dg_br,
+            context=ctx,
+        )[:4000]
+        logger.error("chain_id=%s unmapped repo runtime deps: %s", chain.id, repo_unmapped)
+        return False
+    merged_extra = set(extra_roots or set()) | proactive_roots
+
     deps_map = _deps_map_from_edges(edges)
     all_chain_pkg_names: set[str] = {str(p).lower() for stage in stages for p in stage if p}
     past_stage_pkg_names: set[str] = {
         str(p).lower() for stage in stages[:stage_index] for p in stage if p
     }
 
-    candidates = _transitive_spec_predecessors(deps_map, pkgs, spec_names)
+    roots = list(pkgs)
+    if merged_extra:
+        roots.extend(sorted(merged_extra))
+    candidates = _transitive_spec_predecessors(deps_map, roots, spec_names)
+    if merged_extra:
+        candidates.update(s for s in merged_extra if s in spec_names)
     to_inject: set[str] = set()
 
     for pred in candidates:
@@ -339,10 +655,14 @@ async def _try_recover_chain_after_failure(
     db: Any,
     chain: BuildChain,
     failed_job: BuildJob,
+    reason: str,
 ) -> bool:
     """
     On a stage failure, inject missing distgit deps before the active stage and
     re-queue that stage instead of failing the whole chain.
+
+    Uses distgit BuildRequires edges plus dnf log lines of the form
+    ``nothing provides CAPABILITY needed by …``, resolved via spec Provides metadata.
     """
     if failed_job.chain_stage_index is None:
         return False
@@ -350,7 +670,59 @@ async def _try_recover_chain_after_failure(
     stages_before = chain.stages_json if isinstance(chain.stages_json, list) else []
     stage_count_before = len(stages_before)
 
-    ok = await _inject_missing_dep_layers_before(db, chain, stage_idx)
+    extra_roots: set[str] = set()
+    if _chain_use_dnf_provider_recovery():
+        opt = _options_dict(chain)
+        recovery_n = int(opt.get("dnf_recovery_count") or 0)
+        if recovery_n < _chain_dnf_recovery_max_per_chain():
+            rr = await db.execute(select(Release).where(Release.id == chain.release_id))
+            release = rr.scalar_one_or_none()
+            releasename = (release.releasename or "").strip() if release else ""
+            if releasename:
+                dg_url = str(opt.get("distgit_url") or "https://github.com/oreonhq/rpm-specfiles.git")
+                dg_br = str(opt.get("distgit_branch") or "main")
+                fail_text = await _failure_text_for_chain_recovery(db, failed_job, reason)
+                providers = parse_dnf_missing_providers(fail_text)
+                if providers:
+                    order = await _cached_distgit_build_order(releasename, dg_url, dg_br)
+                    missing_in_distgit = unresolved_distgit_capabilities(order, providers)
+                    if missing_in_distgit:
+                        pkg_r = await db.execute(
+                            select(Package.name).where(Package.id == failed_job.package_id)
+                        )
+                        pkg_name = pkg_r.scalar_one_or_none() or "?"
+                        ctx = (
+                            f"Build of {pkg_name} failed in mock because dnf could not install "
+                            "a dependency package already in your Oreon repo."
+                        )
+                        await fail_chain(
+                            db,
+                            chain,
+                            format_chain_unresolved_providers_message(
+                                missing_in_distgit,
+                                releasename=releasename,
+                                distgit_url=dg_url,
+                                distgit_branch=dg_br,
+                                context=ctx,
+                            ),
+                            terminal=BuildChainStatus.FAILED,
+                        )
+                        return True
+                    extra_roots = resolve_distgit_sources_for_missing_providers(order, providers)
+                    if extra_roots:
+                        opt = dict(opt)
+                        opt["dnf_recovery_count"] = recovery_n + 1
+                        chain.chain_options = opt
+                        logger.info(
+                            "chain_id=%s dnf recovery: providers %s -> distgit sources %s",
+                            chain.id,
+                            providers,
+                            sorted(extra_roots),
+                        )
+
+    ok = await _inject_missing_dep_layers_before(
+        db, chain, stage_idx, extra_roots=extra_roots or None
+    )
     if not ok:
         return False
 
@@ -522,7 +894,7 @@ async def on_build_job_failed_for_chain(db: Any, job: BuildJob, reason: str) -> 
         return
     if job.chain_stage_index is not None and job.chain_stage_index != chain.active_stage_index:
         return
-    if await _try_recover_chain_after_failure(db, chain, job):
+    if await _try_recover_chain_after_failure(db, chain, job, reason):
         return
     await fail_chain(db, chain, reason, terminal=BuildChainStatus.FAILED)
 
@@ -629,7 +1001,7 @@ async def _advance_chain_after_stage_complete(db: Any, chain: BuildChain) -> Non
         return
 
     if _chain_use_distgit_dep_gate():
-        ok = await _inject_missing_dep_layers_before(db, chain, nxt)
+        ok = await _expand_chain_stages_dependencies(db, chain, nxt)
         if not ok:
             # Hard-fail: chain.status and chain.error_message already set.
             await db.flush()
@@ -922,7 +1294,7 @@ async def trigger_chain_build(
     await db.flush()
 
     if _chain_use_distgit_dep_gate():
-        ok = await _inject_missing_dep_layers_before(db, chain, 0)
+        ok = await _expand_chain_stages_dependencies(db, chain, 0)
         if not ok:
             await db.flush()
             raise HTTPException(

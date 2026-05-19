@@ -33,6 +33,8 @@ class DistgitBuildOrderResult:
     package_names: list[str]
     edges: list[dict[str, str]]  # { "from": consumer, "to": provider } consumer needs provider
     layers: list[list[str]]  # topological levels (parallel groups)
+    # Capability name (Provides / subpackage / source name) -> distgit source packages that provide it.
+    capability_providers: dict[str, list[str]]
     errors: list[str]
     cycle_warning: bool
 
@@ -308,6 +310,7 @@ async def compute_distgit_build_order(
             package_names=[],
             edges=[],
             layers=[],
+            capability_providers={},
             errors=[f"distgit_url is not a supported github.com URL: {distgit_url!r}"],
             cycle_warning=False,
         )
@@ -374,6 +377,8 @@ async def compute_distgit_build_order(
     if cyc:
         err.append("Warning: a cycle exists in distgit BuildRequires; some parallel layers may be conservative.")
 
+    capability_providers = {cap: sorted(srcs) for cap, srcs in sorted(provider_map.items())}
+
     return DistgitBuildOrderResult(
         releasename=releasename,
         distgit_url=distgit_url,
@@ -381,9 +386,32 @@ async def compute_distgit_build_order(
         package_names=sorted(names_set),
         edges=edges,
         layers=layers,
+        capability_providers=capability_providers,
         errors=err,
         cycle_warning=cyc,
     )
+
+
+def resolve_distgit_sources_for_capability(
+    order: DistgitBuildOrderResult,
+    capability: str,
+) -> list[str]:
+    """Map a dnf/RPM capability (Provides token or package name) to distgit source name(s)."""
+    cap = (capability or "").strip()
+    if not cap:
+        return []
+    spec_set = set(order.package_names)
+    if cap in spec_set:
+        return [cap]
+    prov_map = order.capability_providers or {}
+    hit = prov_map.get(cap)
+    if hit:
+        return list(hit)
+    low = cap.lower()
+    for key, srcs in prov_map.items():
+        if key.lower() == low:
+            return list(srcs)
+    return []
 
 
 async def compute_spec_tree_dependency_plan(
