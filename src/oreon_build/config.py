@@ -266,7 +266,7 @@ class Settings(BaseSettings):
     gcp_project_id: Optional[str] = Field(default=None, description="GCP project ID for burst worker VM management")
     gcp_zone: str = Field(default="us-central1-a", description="Default GCP zone for burst worker VMs")
 
-    # Webhooks / integrations
+    # Webhooks/integrations
     discord_webhook_url: Optional[str] = Field(default=None)
     security_discord_webhook_url: Optional[str] = Field(default=None)
 
@@ -296,7 +296,7 @@ class Settings(BaseSettings):
         ),
     )
 
-    # Secure Boot / PE signing: controller holds NSS + rules; workers fetch a short-lived bundle
+    # Secure Boot/PE signing: controller holds NSS + rules; workers fetch a short-lived bundle
     # (GET /api/worker/pesign-bundle) and run pesign before upload. Controller only GPG-signs RPMs.
     # Workers need pesign, rpmrebuild, file, bash on PATH.
     pesign_nss_dir: str = Field(
