@@ -409,3 +409,51 @@ def test_chain_user_targets_parsed_from_spec():
     chain = _make_chain([["foo", "bar"]])
     chain.chain_spec = "foo bar"
     assert _chain_user_target_names(chain) == {"foo", "bar"}
+
+
+@pytest.mark.asyncio
+async def test_ensure_distgit_source_adds_missing_row():
+    from oreon_build.services.build_chain import _ensure_distgit_source_on_package_version
+
+    db = AsyncMock()
+    db.flush = AsyncMock()
+    scalar = MagicMock(return_value=None)
+    db.execute = AsyncMock(return_value=MagicMock(scalar_one_or_none=scalar))
+
+    await _ensure_distgit_source_on_package_version(
+        db,
+        99,
+        pkg_name="kde-workspace",
+        releasename="oreon-11-rp1",
+        distgit_url="https://github.com/oreonhq/rpm-specfiles.git",
+        distgit_branch="main",
+    )
+    db.add.assert_called_once()
+    added = db.add.call_args[0][0]
+    assert added.kind == "distgit"
+    assert added.package_version_id == 99
+    assert "oreon-11-rp1/kde-workspace/kde-workspace.spec" in added.url
+    db.flush.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ensure_distgit_source_updates_stale_url():
+    from oreon_build.services.build_chain import _ensure_distgit_source_on_package_version
+
+    src = MagicMock()
+    src.url = "https://github.com/oreonhq/rpm-specfiles.git#main:old/path.spec"
+    db = AsyncMock()
+    db.flush = AsyncMock()
+    db.execute = AsyncMock(return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=src)))
+
+    await _ensure_distgit_source_on_package_version(
+        db,
+        7,
+        pkg_name="kde-workspace",
+        releasename="oreon-11-rp1",
+        distgit_url="https://github.com/oreonhq/rpm-specfiles.git",
+        distgit_branch="main",
+    )
+    db.add.assert_not_called()
+    assert "oreon-11-rp1/kde-workspace/kde-workspace.spec" in src.url
+    db.flush.assert_awaited()

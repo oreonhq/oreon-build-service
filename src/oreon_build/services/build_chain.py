@@ -1836,6 +1836,43 @@ async def _ensure_spec_package_version(
     return pv.id
 
 
+async def _ensure_distgit_source_on_package_version(
+    db: Any,
+    package_version_id: int | None,
+    *,
+    pkg_name: str,
+    releasename: str,
+    distgit_url: str,
+    distgit_branch: str,
+) -> None:
+    """Chain jobs must expose distgit in poll sources even when the package already existed."""
+    if package_version_id is None or not releasename.strip():
+        return
+    want_url = distgit_new_package_dict(
+        pkg_name,
+        releasename,
+        distgit_url=distgit_url,
+        distgit_branch=distgit_branch,
+        preferred_mock_environment_id=None,
+    )["source_url"]
+    row = await db.execute(
+        select(Source)
+        .where(
+            Source.package_version_id == package_version_id,
+            Source.kind == "distgit",
+        )
+        .limit(1)
+    )
+    src = row.scalar_one_or_none()
+    if src is None:
+        db.add(Source(package_version_id=package_version_id, kind="distgit", url=want_url))
+        await db.flush()
+        return
+    if (src.url or "").strip() != want_url:
+        src.url = want_url
+        await db.flush()
+
+
 def _infer_github_html_url_from_distgit(url: str) -> str | None:
     if not url or "github.com" not in url.lower():
         return None
@@ -2264,6 +2301,15 @@ async def _enqueue_chain_stage_jobs(
         if existing_pkg:
             package_id = existing_pkg.id
             package_version_id = await _ensure_spec_package_version(db, package_id, spec_ver)
+            if releasename:
+                await _ensure_distgit_source_on_package_version(
+                    db,
+                    package_version_id,
+                    pkg_name=pkg_name,
+                    releasename=releasename,
+                    distgit_url=distgit_url,
+                    distgit_branch=distgit_branch,
+                )
             # Chain-specified mock takes priority; fall back to package's stored preference.
             pref_mock = preferred_mock_environment_id or existing_pkg.preferred_mock_environment_id
         else:
