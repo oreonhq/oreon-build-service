@@ -341,6 +341,77 @@ function updateAuthUI() {
   }
 }
 
+/** Canonical OBS top nav (single source of truth for all build-service pages). */
+var OREON_NAV_ITEMS = [
+  { href: '/', label: 'Dashboard', match: function(p) { return p === '/' || p === '/index.html'; } },
+  { href: '/builds.html', label: 'Builds', match: function(p) { return p === '/builds.html' || p === '/build.html'; } },
+  { href: '/chains.html', label: 'Chains', match: function(p) { return p === '/chains.html'; } },
+  { href: '/failures.html', label: 'Failures', match: function(p) { return p === '/failures.html'; } },
+  { href: '/packages.html', label: 'Packages', match: function(p) { return p === '/packages.html'; } },
+  { href: '/releases.html', label: 'Releases', match: function(p) { return p === '/releases.html'; } },
+  { href: '/workers.html', label: 'Workers', match: function(p) { return p === '/workers.html'; } },
+  { href: '/mock-environments.html', label: 'Mock Environments', match: function(p) { return p === '/mock-environments.html'; } },
+  { href: '/repos.html', label: 'Repositories', match: function(p) { return p === '/repos.html'; } },
+  { href: '/promotions.html', label: 'Promotions', match: function(p) { return p === '/promotions.html'; } },
+  { href: '/dependencies.html', label: 'Dependencies', match: function(p) { return p === '/dependencies.html'; } },
+  { href: '/admin.html', label: 'Administration', match: function(p) { return p === '/admin.html'; } },
+];
+
+function oreonNavbarShouldSkip(header) {
+  if (!header) return true;
+  if (header.getAttribute('data-oreon-nav-skip') === '1') return true;
+  var logo = header.querySelector('.header-logo');
+  var src = logo && logo.getAttribute('src') ? logo.getAttribute('src') : '';
+  if (src.indexOf('owdlogo') >= 0) return true;
+  return false;
+}
+
+function oreonNavbarSearchQuery() {
+  var el = document.getElementById('nav-search-q');
+  if (el && el.value && String(el.value).trim()) return String(el.value).trim();
+  try {
+    return new URLSearchParams(window.location.search).get('q') || '';
+  } catch (_) {
+    return '';
+  }
+}
+
+function oreonInitNavbar() {
+  var header = document.querySelector('header.header');
+  if (!header || oreonNavbarShouldSkip(header)) return;
+  var nav = header.querySelector('nav');
+  if (!nav) return;
+
+  var path = window.location.pathname || '/';
+  var searchQ = oreonNavbarSearchQuery();
+  var parts = [];
+  for (var i = 0; i < OREON_NAV_ITEMS.length; i++) {
+    var item = OREON_NAV_ITEMS[i];
+    var active = item.match(path);
+    parts.push(
+      '<a href="' + item.href + '"' +
+      (active ? ' class="active" aria-current="page"' : '') +
+      '>' + item.label + '</a>'
+    );
+  }
+  var qAttr = searchQ.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+  parts.push(
+    '<form class="navbar-search" action="/search.html" method="get" style="display:inline-flex; margin-left:0.5rem;">' +
+    '<input type="search" name="q" id="nav-search-q" placeholder="Search" value="' + qAttr + '" style="padding:0.25rem 0.5rem; width:10rem;">' +
+    '<button type="submit" class="btn" style="margin-left:0.25rem;">Go</button></form>'
+  );
+  parts.push(
+    '<span id="auth-section">' +
+    '<span id="user-info"></span>' +
+    '<button id="btn-login" type="button">Login</button>' +
+    '<button id="btn-logout" type="button" style="display:none">Logout</button>' +
+    '</span>'
+  );
+  nav.innerHTML = parts.join('');
+}
+
+window.oreonInitNavbar = oreonInitNavbar;
+
 /**
  * Signing pipeline after mock (GPG and repodata on the controller, not on the worker).
  * Needs Font Awesome 6 (``fa-solid fa-key``) on the page.
@@ -403,6 +474,7 @@ window.oreonControllerKeyHtml = oreonControllerKeyHtml;
 window.oreonJobDisplayStatus = oreonJobDisplayStatus;
 
 document.addEventListener('DOMContentLoaded', function() {
+  oreonInitNavbar();
   oreonLoadStoredAuth(window.oreonApi);
   updateAuthUI();
   window.addEventListener('auth-change', function() {

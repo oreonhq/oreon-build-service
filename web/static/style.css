@@ -70,6 +70,11 @@ body {
   text-decoration: none;
 }
 .header nav a:hover { color: var(--accent); }
+.header nav a.active,
+.header nav a[aria-current="page"] {
+  color: var(--accent);
+  font-weight: 600;
+}
 #auth-section { display: flex; align-items: center; gap: 0.5rem; }
 #user-info { color: var(--text-muted); font-size: 0.9rem; }
 .main { flex: 1; padding: 1.5rem 2rem; max-width: 1440px; margin: 0 auto; width: 100%; }
