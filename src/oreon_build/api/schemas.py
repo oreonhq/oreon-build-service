@@ -388,6 +388,7 @@ class ChainBuildTriggerResponse(BaseModel):
     stages: List[List[str]]
     chain_spec: str
     jobs: List[BuildJobResponse]
+    preparing: bool = False
 
 
 class ChainStatusResponse(BaseModel):
@@ -397,6 +398,7 @@ class ChainStatusResponse(BaseModel):
     stages: List[List[str]]
     chain_spec: str
     error_message: Optional[str] = None
+    preparing: bool = False
 
 
 class RpmbuildPlanCreate(BaseModel):

@@ -338,6 +338,24 @@ async def lifespan(app: FastAPI):
 
     chain_settle_task = asyncio.create_task(_chain_settle_loop(), name="chain-settle")
 
+    async def _chain_prepare_loop() -> None:
+        from oreon_build.services.build_chain import prepare_pending_chains
+
+        while True:
+            try:
+                await prepare_pending_chains()
+                await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Chain prepare loop error")
+                try:
+                    await asyncio.sleep(15)
+                except asyncio.CancelledError:
+                    break
+
+    chain_prepare_task = asyncio.create_task(_chain_prepare_loop(), name="chain-prepare")
+
     async def _mass_rebuild_loop() -> None:
         from oreon_build.db.session import async_session_maker
         from oreon_build.services.mass_rebuild import run_mass_rebuild_pass
@@ -468,6 +486,7 @@ async def lifespan(app: FastAPI):
         (catchup_task, "github-push-catchup"),
         (publish_task, "publish-tasks"),
         (chain_settle_task, "chain-settle"),
+        (chain_prepare_task, "chain-prepare"),
         (mass_rebuild_task, "mass-rebuild"),
         (rpmbuild_settle_task, "rpmbuild-settle"),
         (burst_vm_task, "burst-vm-watcher"),
