@@ -72,6 +72,19 @@
         <span id="chains-last-updated" class="chains-hint" style="margin-left:0.75rem;"></span>
       </p>
       <div id="chains-status" class="chains-hint">Loading</div>
+      <div class="list-toolbar" id="chains-pagination-bar" style="display:none;">
+        <div class="pagination">
+          <button type="button" class="btn" id="chains-prev" disabled>Prev</button>
+          <span class="page-info" id="chains-page-info">Page 1 of 1</span>
+          <button type="button" class="btn" id="chains-next" disabled>Next</button>
+          <select class="page-size" id="chains-page-size" title="Chains per page">
+            <option value="10">10</option>
+            <option value="25" selected>25</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+          </select>
+        </div>
+      </div>
       <div id="chains-table-wrap" style="display:none;">
         <table class="chains-table" id="chains-table">
           <thead>
@@ -100,6 +113,10 @@
       var highlightId = null;
       var openDetailIds = {};
       var didAutoOpenHighlight = false;
+      var chainsPage = 0;
+      var chainsPageSize = 25;
+      var chainsTotal = 0;
+      var focusChainOnce = null;
 
       function plainUiText(s) {
         return String(s == null ? '' : s)
@@ -118,8 +135,40 @@
         var h = params.get('chain_id') || params.get('highlight');
         if (h) {
           var n = parseInt(h, 10);
-          if (n > 0) highlightId = n;
+          if (n > 0) {
+            highlightId = n;
+            focusChainOnce = n;
+          }
         }
+        var pg = parseInt(params.get('page') || '1', 10);
+        if (!isNaN(pg) && pg > 1) chainsPage = pg - 1;
+        var psz = parseInt(params.get('page_size') || '', 10);
+        if (!isNaN(psz) && psz >= 10 && psz <= 100) {
+          chainsPageSize = psz;
+          var sel = document.getElementById('chains-page-size');
+          if (sel) sel.value = String(psz);
+        }
+      }
+
+      function syncChainsPageUrl() {
+        var u = new URL(window.location.href);
+        if (chainsPage > 0) u.searchParams.set('page', String(chainsPage + 1));
+        else u.searchParams.delete('page');
+        if (chainsPageSize !== 25) u.searchParams.set('page_size', String(chainsPageSize));
+        else u.searchParams.delete('page_size');
+        var qs = u.searchParams.toString();
+        history.replaceState(null, '', u.pathname + (qs ? '?' + qs : ''));
+      }
+
+      function updateChainsPager() {
+        var bar = document.getElementById('chains-pagination-bar');
+        var numPages = chainsTotal ? Math.max(1, Math.ceil(chainsTotal / chainsPageSize)) : 1;
+        if (chainsPage >= numPages) chainsPage = Math.max(0, numPages - 1);
+        if (bar) bar.style.display = chainsTotal > 0 ? 'flex' : 'none';
+        document.getElementById('chains-page-info').textContent =
+          'Page ' + (chainsPage + 1) + ' of ' + numPages;
+        document.getElementById('chains-prev').disabled = chainsPage <= 0;
+        document.getElementById('chains-next').disabled = chainsPage >= numPages - 1;
       }
 
       function statusRowClass(status, preparing) {
@@ -183,8 +232,22 @@
         var statusEl = document.getElementById('chains-status');
         var wrap = document.getElementById('chains-table-wrap');
         var tbody = document.getElementById('chains-tbody');
-        return api.get('/builds/chains?limit=80').then(function(rows) {
-          if (!Array.isArray(rows)) rows = [];
+        var offset = chainsPage * chainsPageSize;
+        var url = '/builds/chains?limit=' + chainsPageSize;
+        if (focusChainOnce) {
+          url += '&focus_chain_id=' + focusChainOnce;
+        } else {
+          url += '&offset=' + offset;
+        }
+        return api.get(url).then(function(data) {
+          var rows = (data && data.items) ? data.items : [];
+          chainsTotal = (data && typeof data.total === 'number') ? data.total : 0;
+          if (focusChainOnce) {
+            chainsPage = Math.floor((data.offset || 0) / chainsPageSize);
+            focusChainOnce = null;
+            syncChainsPageUrl();
+          }
+          updateChainsPager();
           document.getElementById('chains-last-updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
           var failedN = rows.filter(function(r) {
             var s = (r.status || '').toLowerCase();
@@ -194,8 +257,11 @@
             var s = (r.status || '').toLowerCase();
             return r.preparing && s !== 'failed' && s !== 'cancelled' && s !== 'success';
           }).length;
-          statusEl.textContent = rows.length
-            ? (rows.length + ' chain(s)' + (failedN ? ', ' + failedN + ' failed/cancelled' : '') + (prepN ? ', ' + prepN + ' preparing' : ''))
+          var numPages = chainsTotal ? Math.max(1, Math.ceil(chainsTotal / chainsPageSize)) : 1;
+          statusEl.textContent = chainsTotal
+            ? (chainsTotal + ' chain(s) total, page ' + (chainsPage + 1) + ' of ' + numPages +
+              (failedN ? ', ' + failedN + ' failed/cancelled on this page' : '') +
+              (prepN ? ', ' + prepN + ' preparing on this page' : ''))
             : 'No chain builds yet.';
           if (!rows.length) {
             wrap.style.display = 'none';
@@ -314,6 +380,7 @@
         }).catch(function(e) {
           statusEl.textContent = 'Failed to load: ' + (e.message || 'error');
           wrap.style.display = 'none';
+          document.getElementById('chains-pagination-bar').style.display = 'none';
         });
       }
 
@@ -324,8 +391,35 @@
         }
       }
 
-      document.getElementById('btn-refresh-chains').addEventListener('click', loadChains);
+      document.getElementById('btn-refresh-chains').addEventListener('click', function() {
+        if (window.oreonWithLoading) {
+          oreonWithLoading(document.getElementById('btn-refresh-chains'), loadChains);
+        } else {
+          loadChains();
+        }
+      });
       document.getElementById('chains-auto-refresh').addEventListener('change', scheduleRefresh);
+      document.getElementById('chains-prev').addEventListener('click', function() {
+        if (chainsPage > 0) {
+          chainsPage--;
+          syncChainsPageUrl();
+          loadChains();
+        }
+      });
+      document.getElementById('chains-next').addEventListener('click', function() {
+        var numPages = chainsTotal ? Math.ceil(chainsTotal / chainsPageSize) : 1;
+        if (chainsPage < numPages - 1) {
+          chainsPage++;
+          syncChainsPageUrl();
+          loadChains();
+        }
+      });
+      document.getElementById('chains-page-size').addEventListener('change', function() {
+        chainsPageSize = parseInt(this.value, 10) || 25;
+        chainsPage = 0;
+        syncChainsPageUrl();
+        loadChains();
+      });
 
       parseQueryHighlight();
       loadChains().then(scheduleRefresh);

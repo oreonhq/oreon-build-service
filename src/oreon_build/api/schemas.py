@@ -14,6 +14,7 @@ class PaginatedResponse(BaseModel, Generic[T]):
     """List response with total count for pagination."""
     items: List[T]
     total: int
+    offset: int = 0
 
 
 # --- Account ---

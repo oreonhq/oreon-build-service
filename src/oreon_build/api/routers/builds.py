@@ -805,18 +805,36 @@ async def _chain_to_status_response(db: DbSession, chain: BuildChain) -> ChainSt
     )
 
 
-@router.get("/chains", response_model=list[ChainStatusResponse])
+@router.get("/chains", response_model=PaginatedResponse[ChainStatusResponse])
 async def list_chains(
     db: DbSession,
-    limit: int = Query(50, ge=1, le=200),
+    limit: int = Query(25, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    focus_chain_id: int | None = Query(
+        None,
+        ge=1,
+        description="Jump to the page containing this chain id (newest-first ordering).",
+    ),
 ):
     """Recent distgit chain builds (newest first) with full prepare/error details."""
+    effective_offset = offset
+    if focus_chain_id is not None:
+        newer = await db.scalar(
+            select(func.count()).select_from(BuildChain).where(BuildChain.id > focus_chain_id)
+        )
+        if newer is not None:
+            effective_offset = (int(newer) // limit) * limit
+
+    total = (await db.execute(select(func.count()).select_from(BuildChain))).scalar() or 0
     result = await db.execute(
-        select(BuildChain).order_by(BuildChain.id.desc()).limit(limit).offset(offset)
+        select(BuildChain)
+        .order_by(BuildChain.id.desc())
+        .limit(limit)
+        .offset(effective_offset)
     )
     chains = list(result.scalars().all())
-    return [await _chain_to_status_response(db, c) for c in chains]
+    items = [await _chain_to_status_response(db, c) for c in chains]
+    return PaginatedResponse(items=items, total=int(total), offset=effective_offset)
 
 
 @router.get("/chain/{chain_id}/status", response_model=ChainStatusResponse)
