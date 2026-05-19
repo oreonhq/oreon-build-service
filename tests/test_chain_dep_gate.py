@@ -102,6 +102,52 @@ Provides: libfoo-missing-cap = 1.0-1
     assert "libfoo" in pm.get("libfoo-missing-cap", [])
 
 
+def test_requirement_not_satisfied_when_provider_built_but_capability_missing():
+    from oreon_build.services.dependencies_graph import _requirement_satisfied_in_repo
+
+    provides_index = {"python3-setuptools-wheel": {"python-setuptools"}}
+    assert not _requirement_satisfied_in_repo(
+        "python-setuptools-wheel",
+        {"python-setuptools"},
+        {"python-setuptools"},
+        provides_index,
+    )
+    provides_index["python-setuptools-wheel"] = {"python-setuptools"}
+    assert _requirement_satisfied_in_repo(
+        "python-setuptools-wheel",
+        {"python-setuptools"},
+        {"python-setuptools"},
+        provides_index,
+    )
+
+
+def test_providers_for_requirement_uses_spec_when_not_in_r2_src():
+    from oreon_build.services.dependencies_graph import _providers_for_requirement
+
+    spec_caps = {
+        "python-setuptools-wheel": ["python-setuptools"],
+        "python-setuptools": ["python-setuptools"],
+    }
+    got = _providers_for_requirement(
+        "python-setuptools-wheel",
+        {},
+        set(),  # no R2 src/ candidates
+        set(),  # nothing built
+        spec_caps,
+    )
+    assert got == {"python-setuptools"}
+
+
+def test_map_br_to_source_built_subpackage_capability():
+    from oreon_build.services.dependencies_graph import _map_br_to_source
+
+    src = {"python-setuptools"}
+    known = {"python-setuptools"}
+    pi: dict[str, set[str]] = {"python3-setuptools-wheel": {"python-setuptools"}}
+    got = _map_br_to_source("python-setuptools-wheel", pi, src, known)
+    assert got == {"python-setuptools"}
+
+
 def test_sources_missing_repo_capabilities():
     from oreon_build.services.build_chain import _sources_missing_repo_capabilities
 
