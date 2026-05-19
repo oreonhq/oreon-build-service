@@ -105,7 +105,7 @@ def _sleep_with_jitter(base_seconds: float, jitter_ratio: float = 0.15) -> None:
     high = max(low, base_seconds + delta)
     time.sleep(random.uniform(low, high))
 
-# Ignore a second dispatch for the same build_attempt_id (duplicate poll / misbehaving client).
+# Ignore a second dispatch for the same build_attempt_id (duplicate poll/misbehaving client).
 _inflight_attempt_lock = threading.Lock()
 _inflight_attempt_ids: set[int] = set()
 # Active work-tmpdir paths (same process, multi-thread safety).
@@ -148,7 +148,7 @@ def _is_transient_http_error(exc: BaseException) -> bool:
         resp = exc.response
         if resp is not None:
             sc = resp.status_code
-            # Cloudflare 522/524 (origin down / timeout), plus generic gateway overload.
+            # Cloudflare 522/524 (origin down/timeout), plus generic gateway overload.
             if sc in (408, 425, 429, 500, 502, 503, 504, 522, 523, 524):
                 return True
     if isinstance(exc, OSError) and exc.errno in (errno.EPIPE, errno.ECONNRESET, errno.ETIMEDOUT):
@@ -1017,7 +1017,7 @@ def _mock_shared_host_cache_enabled() -> bool:
 
     Default off so parallel jobs do not share ``/var/cache/mock/<root>/dnf_cache`` (mock uses
     ``shared_root_name`` without ``uniqueext`` for that path). Sharing it causes dnf5 races
-    (tmpdir / directory iterator errors) under load.
+    (tmpdir/directory iterator errors) under load.
     """
     return _truthy_env("OREON_WORKER_MOCK_SHARED_CACHE")
 
@@ -1949,7 +1949,7 @@ def _cleanup_job_disk(attempt_id: int, mock_config: str, mock_unique_ext: str, w
     """
     After each job: mock scrub (umount), then rm -rf this attempt's trees under /var/lib/mock,
     then this job's work tmpdir and any matching oreon-worker-<id>-* dirs, then stale prune.
-    Safe with parallel builds (everything keyed by attempt_id / known work path).
+    Safe with parallel builds (everything keyed by attempt_id/known work path).
     """
     tmp_parent = _worker_temp_parent_dir()
     # Remove the in-dir sentinel and deregister from the active-path set before any rmtree so that
