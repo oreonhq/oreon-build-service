@@ -1,4 +1,4 @@
-"""Add lookaside_repo_urls to mock_environments (bootstrap / Fedora lookaside)."""
+"""Add lookaside_repo_urls to mock_environments (bootstrap/Fedora lookaside)."""
 
 from __future__ import annotations
 
