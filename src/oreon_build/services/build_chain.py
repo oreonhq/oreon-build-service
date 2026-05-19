@@ -33,9 +33,12 @@ from oreon_build.models import (
     Worker,
 )
 from oreon_build.services.build_target_util import (
+    batch_latest_package_version_ids,
+    batch_package_ids_by_name,
     get_or_create_build_target,
     has_successful_build_for_target,
     latest_package_version_id,
+    package_ids_with_success_on_all_targets,
 )
 
 if TYPE_CHECKING:
@@ -528,20 +531,100 @@ async def _chain_has_successful_build_all_arches(
     """True when every chain architecture already has a successful build for this package."""
     if not architectures:
         return False
-    pv_id = await latest_package_version_id(db, package_id)
+    lacking = await _package_ids_still_needing_chain_build(
+        db,
+        chain,
+        [package_id],
+        architectures=architectures,
+        preferred_mock_environment_id=preferred_mock_environment_id,
+        skip_jobs_not_before=skip_jobs_not_before,
+    )
+    return package_id not in lacking
+
+
+async def _chain_build_target_ids(
+    db: Any,
+    chain: BuildChain,
+    *,
+    architectures: list[str],
+    preferred_mock_environment_id: int | None,
+) -> list[int]:
+    target_ids: list[int] = []
     for arch in architectures:
         canon = normalize_machine_arch(arch)
-        target = await get_or_create_build_target(db, chain.release_id, canon, preferred_mock_environment_id)
-        if not await has_successful_build_for_target(
-            db,
-            package_id,
-            chain.release_id,
-            target.id,
-            pv_id,
-            jobs_created_on_or_after=skip_jobs_not_before,
-        ):
-            return False
-    return True
+        target = await get_or_create_build_target(
+            db, chain.release_id, canon, preferred_mock_environment_id
+        )
+        target_ids.append(target.id)
+    return target_ids
+
+
+async def _package_ids_still_needing_chain_build(
+    db: Any,
+    chain: BuildChain,
+    package_ids: list[int],
+    *,
+    architectures: list[str],
+    preferred_mock_environment_id: int | None,
+    skip_jobs_not_before: datetime | None,
+) -> set[int]:
+    """package_ids that do not yet have SUCCESS on every chain architecture."""
+    ids = [int(p) for p in package_ids if p]
+    if not ids or not architectures:
+        return set(ids)
+    pv_map = await batch_latest_package_version_ids(db, ids)
+    target_ids = await _chain_build_target_ids(
+        db,
+        chain,
+        architectures=architectures,
+        preferred_mock_environment_id=preferred_mock_environment_id,
+    )
+    complete_ids = await package_ids_with_success_on_all_targets(
+        db,
+        package_ids=ids,
+        release_id=chain.release_id,
+        target_ids=target_ids,
+        version_by_package={pid: pv_map.get(pid) for pid in ids},
+        jobs_created_on_or_after=skip_jobs_not_before,
+    )
+    return {pid for pid in ids if pid not in complete_ids}
+
+
+async def _batch_chain_packages_still_needing_build(
+    db: Any,
+    chain: BuildChain,
+    package_names: list[str],
+    *,
+    architectures: list[str],
+    preferred_mock_environment_id: int | None,
+    skip_jobs_not_before: datetime | None,
+    republish_needed: set[str] | None,
+) -> set[str]:
+    """Package names that still need a chain build (batched DB lookups)."""
+    still: set[str] = set()
+    if republish_needed:
+        still |= {n for n in package_names if n in republish_needed}
+    to_lookup = [n for n in package_names if n and n not in still]
+    if not to_lookup:
+        return still
+    name_to_id = await batch_package_ids_by_name(db, to_lookup)
+    for n in to_lookup:
+        if n not in name_to_id:
+            still.add(n)
+    if not name_to_id:
+        return still
+    lacking_ids = await _package_ids_still_needing_chain_build(
+        db,
+        chain,
+        list(name_to_id.values()),
+        architectures=architectures,
+        preferred_mock_environment_id=preferred_mock_environment_id,
+        skip_jobs_not_before=skip_jobs_not_before,
+    )
+    id_to_name = {pid: name for name, pid in name_to_id.items()}
+    for pid in lacking_ids:
+        still.add(id_to_name[pid])
+    return still
 
 
 def invalidate_distgit_order_cache(
@@ -646,6 +729,9 @@ async def _proactive_extra_roots_from_repo_runtime(
     architectures: list[str],
     preferred_mock_environment_id: int | None,
     skip_jobs_not_before: datetime | None,
+    repo_pi: dict[str, set[str]] | None = None,
+    repo_known: set[str] | None = None,
+    analysis: dict[str, Any] | None = None,
 ) -> tuple[set[str], list[str]]:
     """
     Before any mock run, use repodata + spec Provides metadata to queue source packages that
@@ -660,14 +746,17 @@ async def _proactive_extra_roots_from_repo_runtime(
 
     branch = r2_publish_branch(release)
     canon_arch = normalize_machine_arch(architectures[0] if architectures else "x86_64")
-    repo_pi, _ = await _cached_repo_provides_index(releasename, branch, canon_arch)
+    if repo_pi is None or repo_known is None:
+        repo_pi, repo_known = await _cached_repo_provides_index(releasename, branch, canon_arch)
+    repo_known = repo_known or set()
     spec_caps = order.capability_providers if isinstance(order.capability_providers, dict) else {}
-    analysis = await _cached_repo_runtime_analysis(
-        releasename,
-        branch,
-        canon_arch,
-        spec_capability_providers=spec_caps,
-    )
+    if analysis is None:
+        analysis = await _cached_repo_runtime_analysis(
+            releasename,
+            branch,
+            canon_arch,
+            spec_capability_providers=spec_caps,
+        )
     if analysis.get("error"):
         logger.info(
             "chain_id=%s proactive repo scan skipped (%s)",
@@ -683,8 +772,8 @@ async def _proactive_extra_roots_from_repo_runtime(
     related = chain_names | _transitive_spec_predecessors(deps_map, list(chain_names), spec_names)
     scope = (os.getenv("OREON_CHAIN_PROACTIVE_REPO_RUNTIME_SCOPE") or "wide").strip().lower()
 
-    sources: set[str] = set()
-    unmapped: set[str] = set()
+    items: list[tuple[str, str, str, str]] = []
+    caps_to_resolve: set[str] = set()
     for item in analysis.get("runtime_missing") or []:
         if not isinstance(item, dict):
             continue
@@ -696,37 +785,65 @@ async def _proactive_extra_roots_from_repo_runtime(
         for candidate in (prov, req):
             if not candidate:
                 continue
-            mapped = await resolve_chain_sources_for_missing_providers(
-                db,
-                order,
-                [candidate],
-                releasename=releasename,
-                repo_branch=branch,
-                repo_arch=canon_arch,
-            )
-            if not mapped:
-                # Only block the chain for gaps on packages the user actually queued,
-                # not every transitive/distgit sibling with broken runtime requires.
-                if consumer and consumer in chain_names:
-                    unmapped.add(candidate)
+            caps_to_resolve.add(candidate)
+            items.append((consumer, req, prov, candidate))
+
+    cap_to_sources: dict[str, set[str]] = {}
+    for cap in caps_to_resolve:
+        cap_to_sources[cap] = resolve_distgit_sources_for_missing_providers(
+            order,
+            [cap],
+            repo_provides_index=repo_pi or None,
+            repo_known_sources=repo_known or None,
+        )
+    registry_caps: set[str] = {c for c, srcs in cap_to_sources.items() if not srcs}
+    if registry_caps:
+        reg_names = set(registry_caps)
+        for cap in list(registry_caps):
+            nevra = _rpm_name_from_nevra(cap)
+            if nevra and nevra != cap:
+                reg_names.add(nevra)
+        reg_hits = await batch_package_ids_by_name(db, reg_names)
+        for cap in registry_caps:
+            if cap in reg_hits:
+                cap_to_sources[cap] = {cap}
+            else:
+                nevra = _rpm_name_from_nevra(cap)
+                if nevra and nevra in reg_hits:
+                    cap_to_sources[cap] = {nevra}
+
+    srcs_to_check: set[str] = set()
+    pending: list[tuple[str, str, set[str]]] = []
+    sources: set[str] = set()
+    unmapped: set[str] = set()
+    for consumer, req, _prov, candidate in items:
+        mapped = cap_to_sources.get(candidate) or set()
+        if not mapped:
+            if consumer and consumer in chain_names:
+                unmapped.add(candidate)
+            continue
+        cap_to_check = req or candidate
+        for src in mapped:
+            if src not in spec_names:
                 continue
-            for src in mapped:
-                if src not in spec_names:
-                    continue
-                pid = await _package_id_for_name(db, src)
-                cap_to_check = req or candidate
-                if pid is not None and await _chain_has_successful_build_all_arches(
-                    db,
-                    chain,
-                    pid,
-                    architectures=architectures,
-                    preferred_mock_environment_id=preferred_mock_environment_id,
-                    skip_jobs_not_before=skip_jobs_not_before,
-                ):
-                    if cap_to_check and not _capability_in_repo_provides(cap_to_check, repo_pi):
-                        sources.add(src)
-                    continue
-                sources.add(src)
+            srcs_to_check.add(src)
+            pending.append((src, cap_to_check, mapped))
+
+    still_need = await _batch_chain_packages_still_needing_build(
+        db,
+        chain,
+        sorted(srcs_to_check),
+        architectures=architectures,
+        preferred_mock_environment_id=preferred_mock_environment_id,
+        skip_jobs_not_before=skip_jobs_not_before,
+        republish_needed=None,
+    )
+    for src, cap_to_check, _mapped in pending:
+        if src in still_need:
+            sources.add(src)
+            continue
+        if cap_to_check and not _capability_in_repo_provides(cap_to_check, repo_pi):
+            sources.add(src)
     if sources:
         logger.info(
             "chain_id=%s proactive repo runtime deps: %s",
@@ -833,7 +950,16 @@ async def _inject_missing_dep_layers_before(
     canon_arch = normalize_machine_arch(arches[0] if arches else "x86_64")
 
     order = await _cached_distgit_build_order(releasename, dg_url, dg_br)
-    repo_pi, _repo_known = await _cached_repo_provides_index(releasename, publish_branch, canon_arch)
+    spec_caps = order.capability_providers if isinstance(order.capability_providers, dict) else {}
+    (repo_pi, repo_known), analysis = await asyncio.gather(
+        _cached_repo_provides_index(releasename, publish_branch, canon_arch),
+        _cached_repo_runtime_analysis(
+            releasename,
+            publish_branch,
+            canon_arch,
+            spec_capability_providers=spec_caps,
+        ),
+    )
     caps_needed = list(required_capabilities or [])
     republish_needed = _sources_missing_repo_capabilities(order, repo_pi, caps_needed)
 
@@ -849,6 +975,9 @@ async def _inject_missing_dep_layers_before(
         architectures=arches,
         preferred_mock_environment_id=pref_pm,
         skip_jobs_not_before=skip_not_before,
+        repo_pi=repo_pi,
+        repo_known=repo_known,
+        analysis=analysis,
     )
     if repo_unmapped:
         ctx = (
@@ -880,8 +1009,17 @@ async def _inject_missing_dep_layers_before(
     if merged_extra:
         candidates.update(s for s in merged_extra if s in spec_names)
     to_inject: set[str] = set()
-
-    for pred in candidates:
+    candidate_list = sorted(candidates)
+    still_needing = await _batch_chain_packages_still_needing_build(
+        db,
+        chain,
+        candidate_list,
+        architectures=arches,
+        preferred_mock_environment_id=pref_pm,
+        skip_jobs_not_before=skip_not_before,
+        republish_needed=republish_needed,
+    )
+    for pred in candidate_list:
         pred_lower = pred.lower()
         # Already listed on this chain (even if not built yet). Do not insert duplicate
         # stages each expand round; enqueue/rewind handles packages that still need builds.
@@ -889,16 +1027,7 @@ async def _inject_missing_dep_layers_before(
             continue
         if pred not in spec_names:
             continue
-        still_needs = await _chain_package_still_needs_build(
-            db,
-            chain,
-            pred,
-            architectures=arches,
-            preferred_mock_environment_id=pref_pm,
-            skip_jobs_not_before=skip_not_before,
-            republish_needed=republish_needed,
-        )
-        if not still_needs:
+        if pred not in still_needing:
             continue
         to_inject.add(pred)
 
@@ -937,22 +1066,16 @@ async def _chain_sources_lacking_success(
     lacking: set[str] = set()
     if order is not None and repo_pi is not None and required_capabilities:
         lacking |= _sources_missing_repo_capabilities(order, repo_pi, required_capabilities)
-    for name in sorted(source_names):
-        if name in lacking:
-            continue
-        pid = await _package_id_for_name(db, name)
-        if pid is None:
-            lacking.add(name)
-            continue
-        if not await _chain_has_successful_build_all_arches(
-            db,
-            chain,
-            pid,
-            architectures=architectures,
-            preferred_mock_environment_id=preferred_mock_environment_id,
-            skip_jobs_not_before=skip_jobs_not_before,
-        ):
-            lacking.add(name)
+    names = sorted(n for n in source_names if n not in lacking)
+    lacking |= await _batch_chain_packages_still_needing_build(
+        db,
+        chain,
+        names,
+        architectures=architectures,
+        preferred_mock_environment_id=preferred_mock_environment_id,
+        skip_jobs_not_before=skip_jobs_not_before,
+        republish_needed=None,
+    )
     return lacking
 
 

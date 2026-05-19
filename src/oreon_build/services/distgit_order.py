@@ -8,7 +8,9 @@ import os
 import re
 import tempfile
 import tarfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -20,6 +22,16 @@ from oreon_build.config import get_settings
 from oreon_build.services.r2 import get_r2_client
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _distgit_spec_parse_executor() -> ThreadPoolExecutor:
+    raw = (os.getenv("OREON_CHAIN_PREPARE_WORKERS") or "32").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 32
+    return ThreadPoolExecutor(max_workers=max(4, min(n, 64)))
 
 # Match BuildRequires name token (source-package-like token extraction)
 _BR_NAME = re.compile(r"^([A-Za-z0-9_][A-Za-z0-9+._-]*)")
@@ -406,12 +418,12 @@ async def compute_distgit_build_order(
     names_set: set[str] = set(specs_by_pkg.keys())
     parsed_by_source: dict[str, _SpecParseResult] = {}
     loop = asyncio.get_running_loop()
-    with tempfile.TemporaryDirectory(prefix="oreon-distgit-") as _tmp:
-        tasks = [
-            loop.run_in_executor(None, _parse_spec_text, spec_text, f"{pkg}.spec")
-            for pkg, spec_text in specs_by_pkg.items()
-        ]
-        parse_results = await asyncio.gather(*tasks, return_exceptions=True)
+    pool = _distgit_spec_parse_executor()
+    tasks = [
+        loop.run_in_executor(pool, _parse_spec_text, spec_text, f"{pkg}.spec")
+        for pkg, spec_text in specs_by_pkg.items()
+    ]
+    parse_results = await asyncio.gather(*tasks, return_exceptions=True)
     for (pkg, _spec_text), parsed_or_exc in zip(specs_by_pkg.items(), parse_results, strict=False):
         if isinstance(parsed_or_exc, Exception):
             err.append(f"{pkg}: parse failed ({type(parsed_or_exc).__name__}: {parsed_or_exc})")
@@ -576,8 +588,9 @@ async def compute_spec_tree_dependency_plan(
     never_built = sorted(n for n in names_set if n not in built_sources)
 
     loop = asyncio.get_running_loop()
+    pool = _distgit_spec_parse_executor()
     tasks = [
-        loop.run_in_executor(None, _parse_spec_text, spec_text, f"{pkg}.spec")
+        loop.run_in_executor(pool, _parse_spec_text, spec_text, f"{pkg}.spec")
         for pkg, spec_text in specs_by_pkg.items()
     ]
     parse_results = await asyncio.gather(*tasks, return_exceptions=True)

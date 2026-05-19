@@ -569,7 +569,13 @@ def _analyze_repo(
 
     # 3. Fetch BuildRequires for all SRPMs in parallel (cached on disk).
     srpm_brs: dict[str, list[str]] = {}
-    with ThreadPoolExecutor(max_workers=16) as pool:
+    raw_workers = (os.getenv("OREON_CHAIN_REPO_ANALYZE_WORKERS") or "24").strip()
+    try:
+        analyze_workers = int(raw_workers)
+    except ValueError:
+        analyze_workers = 24
+    analyze_workers = max(4, min(analyze_workers, 64))
+    with ThreadPoolExecutor(max_workers=analyze_workers) as pool:
         future_to_name = {
             pool.submit(_get_buildrequires_cached, r2, key): src_name
             for src_name, key in srpm_keys.items()

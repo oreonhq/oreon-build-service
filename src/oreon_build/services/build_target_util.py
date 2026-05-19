@@ -1,12 +1,14 @@
 """Shared helpers for resolving build targets and skip-complete checks (used by builds router and chain builds)."""
 from __future__ import annotations
 
-from datetime import datetime
+from collections import defaultdict
+from datetime import datetime, timezone
+from typing import Iterable
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
-from oreon_build.models import BuildJob, BuildStatus, BuildTarget, MockEnvironment, PackageVersion
+from oreon_build.models import BuildJob, BuildStatus, BuildTarget, MockEnvironment, Package, PackageVersion
 
 
 async def get_or_create_build_target(
@@ -113,3 +115,72 @@ async def has_successful_build_for_target(
         q = q.where(BuildJob.created_at >= ref)
     r = await db.execute(q)
     return r.scalar_one_or_none() is not None
+
+
+async def batch_package_ids_by_name(db, names: Iterable[str]) -> dict[str, int]:
+    """Map package name -> id in one query."""
+    uniq = sorted({(n or "").strip() for n in names if (n or "").strip()})
+    if not uniq:
+        return {}
+    rows = await db.execute(select(Package.name, Package.id).where(Package.name.in_(uniq)))
+    return {str(name): int(pid) for name, pid in rows.all()}
+
+
+async def batch_latest_package_version_ids(db, package_ids: list[int]) -> dict[int, int | None]:
+    """Highest PackageVersion id per package_id."""
+    if not package_ids:
+        return {}
+    rows = await db.execute(
+        select(
+            PackageVersion.package_id,
+            func.max(PackageVersion.id).label("vid"),
+        )
+        .where(PackageVersion.package_id.in_(package_ids))
+        .group_by(PackageVersion.package_id)
+    )
+    out: dict[int, int | None] = {pid: None for pid in package_ids}
+    for pkg_id, vid in rows.all():
+        if vid is not None:
+            out[int(pkg_id)] = int(vid)
+    return out
+
+
+async def package_ids_with_success_on_all_targets(
+    db,
+    *,
+    package_ids: list[int],
+    release_id: int,
+    target_ids: list[int],
+    version_by_package: dict[int, int | None],
+    jobs_created_on_or_after: datetime | None,
+) -> set[int]:
+    """package_ids that already have SUCCESS on every target_id (with matching package_version_id)."""
+    if not package_ids or not target_ids:
+        return set()
+    required_targets = set(target_ids)
+    q = select(
+        BuildJob.package_id,
+        BuildJob.target_id,
+        BuildJob.package_version_id,
+    ).where(
+        BuildJob.package_id.in_(package_ids),
+        BuildJob.release_id == release_id,
+        BuildJob.target_id.in_(target_ids),
+        BuildJob.status == BuildStatus.SUCCESS,
+    )
+    if jobs_created_on_or_after is not None:
+        ref = jobs_created_on_or_after
+        if ref.tzinfo is None:
+            ref = ref.replace(tzinfo=timezone.utc)
+        q = q.where(BuildJob.created_at >= ref)
+    rows = await db.execute(q)
+    hits: dict[int, set[int]] = defaultdict(set)
+    for pid, tid, pvid in rows.all():
+        pid_i = int(pid)
+        expected_pv = version_by_package.get(pid_i)
+        if expected_pv is not None and pvid != expected_pv:
+            continue
+        if expected_pv is None and pvid is not None:
+            continue
+        hits[pid_i].add(int(tid))
+    return {pid for pid in package_ids if required_targets <= hits.get(pid, set())}
