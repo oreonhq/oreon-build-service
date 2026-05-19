@@ -150,6 +150,33 @@ def _resolve_primary_key(repo_prefix: str, repomd_bytes: bytes) -> str | None:
     return _resolve_repodata_key(repo_prefix, repomd_bytes, "primary")
 
 
+def load_repo_provides_index(
+    target: RepoTarget,
+) -> tuple[dict[str, set[str]], set[str], str | None]:
+    """
+    Parse published repo primary.xml into provide_name -> source package names.
+
+    Returns ``(provides_index, known_built_sources, error)`` where ``error`` is set on failure.
+    """
+    r2 = get_r2_client()
+    repomd_key = f"{target.prefix}/repodata/repomd.xml"
+    repomd = r2.get_object(repomd_key)
+    if not repomd:
+        return {}, set(), "repomd_missing"
+    primary_key = _resolve_primary_key(target.prefix, repomd)
+    if not primary_key:
+        return {}, set(), "primary_missing_in_repomd"
+    primary_raw = r2.get_object(primary_key)
+    if not primary_raw:
+        return {}, set(), "primary_blob_missing"
+    try:
+        primary_xml = _decompress_if_needed(primary_raw, primary_key)
+        pi, known = _build_provides_index(primary_xml)
+        return pi, known, None
+    except Exception as exc:
+        return {}, set(), f"primary_parse_failed:{type(exc).__name__}:{exc}"
+
+
 def _resolve_primary_href(repomd_bytes: bytes) -> str | None:
     try:
         root = ET.fromstring(repomd_bytes)

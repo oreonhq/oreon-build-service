@@ -159,6 +159,13 @@ def _parse_spec_text(spec_text: str, filename_hint: str = "inline.spec") -> _Spe
                     continue
                 br_seen.add(tok)
                 br_out.append(tok)
+            continue
+        if us.startswith("PROVIDES:"):
+            val = s.split(":", 1)[1]
+            for tok in _extract_br_tokens_from_tag_value(val):
+                if not tok or "%" in tok or tok.startswith("bundled("):
+                    continue
+                provided.add(tok)
     provided.add(source_name)
     # Optional slow path for max fidelity. Keep disabled by default.
     if (os.environ.get("OREON_SPECFILE_DEEP_PARSE") or "").strip().lower() not in ("1", "true", "yes", "on"):
@@ -175,6 +182,12 @@ def _parse_spec_text(spec_text: str, filename_hint: str = "inline.spec") -> _Spe
                 lname = name.lower()
                 if lname == "name" and not source_name:
                     source_name = str(getattr(t, "value", "") or "").strip()
+                if lname == "provides":
+                    for tok in _extract_br_tokens_from_tag_value(str(getattr(t, "value", "") or "")):
+                        if not tok or "%" in tok or tok.startswith("bundled("):
+                            continue
+                        provided.add(tok)
+                    continue
                 if lname != "buildrequires":
                     continue
                 for tok in _extract_br_tokens_from_tag_value(str(getattr(t, "value", "") or "")):
@@ -392,26 +405,56 @@ async def compute_distgit_build_order(
     )
 
 
+def _sources_for_capability_prefix(cap: str, spec_names: set[str]) -> list[str]:
+    """Longest spec source name where ``cap == name`` or ``cap`` is a subpackage ``name-suffix``."""
+    matches = [s for s in spec_names if cap == s or cap.startswith(s + "-")]
+    if not matches:
+        return []
+    return [max(matches, key=len)]
+
+
 def resolve_distgit_sources_for_capability(
     order: DistgitBuildOrderResult,
     capability: str,
+    *,
+    repo_provides_index: dict[str, set[str]] | None = None,
+    repo_known_sources: set[str] | None = None,
 ) -> list[str]:
-    """Map a dnf/RPM capability (Provides token or package name) to distgit source name(s)."""
+    """
+    Map a dnf/RPM capability to distgit source package name(s).
+
+    Uses parsed spec Provides / subpackage names, optional published-repo primary.xml,
+    and longest-prefix match against spec source directory names. No package-specific rules.
+    """
     cap = (capability or "").strip()
     if not cap:
         return []
     spec_set = set(order.package_names)
-    if cap in spec_set:
-        return [cap]
     prov_map = order.capability_providers or {}
+    found: set[str] = set()
+
+    if cap in spec_set:
+        found.add(cap)
     hit = prov_map.get(cap)
     if hit:
-        return list(hit)
-    low = cap.lower()
+        found.update(hit)
+    cap_low = cap.lower()
     for key, srcs in prov_map.items():
-        if key.lower() == low:
-            return list(srcs)
-    return []
+        if key.lower() == cap_low:
+            found.update(srcs)
+
+    for src in _sources_for_capability_prefix(cap, spec_set):
+        found.add(src)
+
+    if repo_provides_index:
+        from oreon_build.services.dependencies_graph import _map_br_to_source
+
+        known = repo_known_sources if repo_known_sources is not None else spec_set
+        mapped = _map_br_to_source(cap, repo_provides_index, spec_set, known)
+        if mapped:
+            found.update(mapped)
+
+    return sorted(found)
 
 
 async def compute_spec_tree_dependency_plan(

@@ -54,14 +54,15 @@ def test_format_chain_unresolved_providers_message():
         distgit_branch="main",
         context="Build of foo failed in mock.",
     )
-    assert "not in your distgit specfiles tree" in msg
+    assert "Chain build stopped" in msg
     assert "python-setuptools-wheel" in msg
     assert "oreon-11-rp1" in msg
     assert "lookaside" in msg.lower()
 
 
-def test_unresolved_distgit_capabilities():
-    from oreon_build.services.build_chain import unresolved_distgit_capabilities
+@pytest.mark.asyncio
+async def test_unresolved_chain_capabilities():
+    from oreon_build.services.build_chain import unresolved_chain_capabilities
 
     order = _make_order(
         edges=[],
@@ -69,8 +70,22 @@ def test_unresolved_distgit_capabilities():
         package_names=["python3-setuptools"],
         capability_providers={"python-setuptools-wheel": ["python3-setuptools"]},
     )
-    assert unresolved_distgit_capabilities(order, ["python-setuptools-wheel"]) == []
-    assert unresolved_distgit_capabilities(order, ["not-in-tree"]) == ["not-in-tree"]
+    db = AsyncMock()
+    assert await unresolved_chain_capabilities(db, order, ["python-setuptools-wheel"]) == []
+    assert await unresolved_chain_capabilities(db, order, ["not-in-tree"]) == ["not-in-tree"]
+
+
+def test_resolve_capability_via_longest_spec_prefix():
+    from oreon_build.services.distgit_order import resolve_distgit_sources_for_capability
+
+    order = _make_order(
+        edges=[],
+        layers=[],
+        package_names=["libfoo"],
+        capability_providers={"libfoo": ["libfoo"]},
+    )
+    got = resolve_distgit_sources_for_capability(order, "libfoo-plugin-wheel")
+    assert got == ["libfoo"]
 
 
 def test_parse_dnf_missing_providers():
@@ -91,16 +106,38 @@ def test_resolve_distgit_sources_for_missing_providers():
         edges=[],
         layers=[["python3-setuptools"], ["python3-test"]],
         package_names=["python3-setuptools", "python3-test"],
+        capability_providers={
+            "python-setuptools-wheel": ["python3-setuptools"],
+            "python3-setuptools": ["python3-setuptools"],
+        },
     )
-    order.capability_providers = {
-        "python-setuptools-wheel": ["python3-setuptools"],
-        "python3-setuptools": ["python3-setuptools"],
-    }
     got = resolve_distgit_sources_for_missing_providers(
         order,
         ["python-setuptools-wheel"],
     )
     assert got == {"python3-setuptools"}
+
+
+@pytest.mark.asyncio
+async def test_resolve_chain_sources_falls_back_to_package_registry():
+    from oreon_build.services.build_chain import resolve_chain_sources_for_missing_providers
+
+    order = _make_order(
+        edges=[],
+        layers=[],
+        package_names=[],
+        capability_providers={},
+    )
+    db = AsyncMock()
+    db.execute = AsyncMock(
+        return_value=MagicMock(scalar_one_or_none=MagicMock(return_value="libfoo"))
+    )
+    got = await resolve_chain_sources_for_missing_providers(
+        db,
+        order,
+        ["libfoo-plugin"],
+    )
+    assert got == {"libfoo"}
 
 
 def test_layers_for_package_subset_preserves_order():

@@ -49,6 +49,8 @@ DEFAULT_ARCH = ["x86_64", "aarch64"]
 _chain_distgit_order_cache: dict[tuple[str, str, str], tuple[float, Any]] = {}
 # Cache repo primary.xml analysis for proactive runtime Requires (R2 fetch).
 _chain_repo_runtime_cache: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
+# Cache provide_name -> source from repo primary.xml (shared by chain capability resolution).
+_chain_repo_provides_cache: dict[tuple[str, str, str], tuple[float, dict[str, set[str]], set[str]]] = {}
 
 
 def _chain_use_distgit_dep_gate() -> bool:
@@ -125,25 +127,130 @@ def parse_dnf_missing_providers(text: str) -> list[str]:
     return out
 
 
+def _package_name_prefix_candidates(cap: str) -> list[str]:
+    """Try progressively shorter hyphenated prefixes (full name, then parent, …)."""
+    parts = [p for p in (cap or "").split("-") if p]
+    if not parts:
+        return []
+    return ["-".join(parts[:i]) for i in range(len(parts), 0, -1)]
+
+
+async def _resolve_sources_from_package_registry(db: Any, capability: str) -> list[str]:
+    """Match dnf capability names to OBS ``Package`` rows (chain builds use these names)."""
+    for name in _package_name_prefix_candidates(capability):
+        prow = await db.execute(select(Package.name).where(Package.name == name).limit(1))
+        hit = prow.scalar_one_or_none()
+        if hit:
+            return [str(hit)]
+    return []
+
+
 def resolve_distgit_sources_for_missing_providers(
     order: Any,
     providers: list[str],
+    *,
+    repo_provides_index: dict[str, set[str]] | None = None,
+    repo_known_sources: set[str] | None = None,
 ) -> set[str]:
     from oreon_build.services.distgit_order import resolve_distgit_sources_for_capability
 
     sources: set[str] = set()
     for cap in providers:
-        for src in resolve_distgit_sources_for_capability(order, cap):
+        for src in resolve_distgit_sources_for_capability(
+            order,
+            cap,
+            repo_provides_index=repo_provides_index,
+            repo_known_sources=repo_known_sources,
+        ):
             sources.add(src)
         nevra_name = _rpm_name_from_nevra(cap)
         if nevra_name and nevra_name != cap:
-            for src in resolve_distgit_sources_for_capability(order, nevra_name):
+            for src in resolve_distgit_sources_for_capability(
+                order,
+                nevra_name,
+                repo_provides_index=repo_provides_index,
+                repo_known_sources=repo_known_sources,
+            ):
                 sources.add(src)
     return sources
 
 
-def unresolved_distgit_capabilities(order: Any, capabilities: list[str]) -> list[str]:
-    """Capabilities that do not map to any source package in the distgit spec tree."""
+async def _cached_repo_provides_index(
+    releasename: str,
+    branch: str,
+    arch: str,
+) -> tuple[dict[str, set[str]], set[str]]:
+    from oreon_build.services.dependencies_graph import RepoTarget, load_repo_provides_index
+
+    k = (releasename.strip(), branch.strip(), normalize_machine_arch(arch))
+    now = time.monotonic()
+    ttl = float((os.getenv("OREON_CHAIN_REPO_RUNTIME_CACHE_SEC") or "120").strip() or "120")
+    ttl = max(30.0, min(ttl, 600.0))
+    hit = _chain_repo_provides_cache.get(k)
+    if hit is not None and (now - hit[0]) < ttl:
+        return hit[1], hit[2]
+
+    target = RepoTarget(
+        releasename=k[0],
+        branch=k[1],
+        arch=k[2],
+        prefix=f"{k[0]}/{k[1]}/{k[2]}",
+    )
+    pi, known, err = await asyncio.to_thread(load_repo_provides_index, target)
+    if err:
+        logger.info("repo provides index unavailable for %s/%s/%s: %s", k[0], k[1], k[2], err)
+        pi, known = {}, set()
+    _chain_repo_provides_cache[k] = (now, pi, known)
+    return pi, known
+
+
+async def resolve_chain_sources_for_missing_providers(
+    db: Any,
+    order: Any,
+    providers: list[str],
+    *,
+    releasename: str | None = None,
+    repo_branch: str | None = None,
+    repo_arch: str | None = None,
+) -> set[str]:
+    """
+    Resolve mock/dnf missing capabilities to source package names for chain auto-inject.
+
+    Uses spec Provides metadata, published-repo primary.xml, spec name prefixes, then OBS package names.
+    """
+    repo_pi: dict[str, set[str]] = {}
+    repo_known: set[str] = set()
+    if releasename and repo_branch and repo_arch:
+        repo_pi, repo_known = await _cached_repo_provides_index(releasename, repo_branch, repo_arch)
+
+    sources = resolve_distgit_sources_for_missing_providers(
+        order,
+        providers,
+        repo_provides_index=repo_pi or None,
+        repo_known_sources=repo_known or None,
+    )
+    if sources:
+        return sources
+    for cap in providers:
+        for src in await _resolve_sources_from_package_registry(db, cap):
+            sources.add(src)
+        nevra_name = _rpm_name_from_nevra(cap)
+        if nevra_name and nevra_name != cap:
+            for src in await _resolve_sources_from_package_registry(db, nevra_name):
+                sources.add(src)
+    return sources
+
+
+async def unresolved_chain_capabilities(
+    db: Any,
+    order: Any,
+    capabilities: list[str],
+    *,
+    releasename: str | None = None,
+    repo_branch: str | None = None,
+    repo_arch: str | None = None,
+) -> list[str]:
+    """Capabilities the chain cannot map to a buildable source package name."""
     out: list[str] = []
     seen: set[str] = set()
     for cap in capabilities:
@@ -151,7 +258,14 @@ def unresolved_distgit_capabilities(order: Any, capabilities: list[str]) -> list
         if not c or c in seen:
             continue
         seen.add(c)
-        if not resolve_distgit_sources_for_missing_providers(order, [c]):
+        if not await resolve_chain_sources_for_missing_providers(
+            db,
+            order,
+            [c],
+            releasename=releasename,
+            repo_branch=repo_branch,
+            repo_arch=repo_arch,
+        ):
             out.append(c)
     return sorted(out)
 
@@ -166,28 +280,29 @@ def format_chain_unresolved_providers_message(
 ) -> str:
     caps = sorted({(c or "").strip() for c in capabilities if (c or "").strip()})
     lines = [
-        "Chain stopped: a required dependency is not in your distgit specfiles tree, "
-        "so OBS cannot queue a build for it.",
+        "Chain build stopped: OBS could not find a source package to build for a missing "
+        "dependency.",
         "",
     ]
     if context and context.strip():
         lines.append(context.strip())
         lines.append("")
-    lines.append(f"Spec tree: {distgit_url} (branch {distgit_branch})")
-    lines.append(f"Release path: {releasename}/")
+    lines.append(f"Release: {releasename}")
+    lines.append(f"Specs repo: {distgit_url} (branch {distgit_branch})")
     lines.append("")
     if not caps:
         lines.append("No capability name was recorded.")
     else:
-        lines.append("Not found in distgit (no source spec Provides these names):")
+        lines.append("Missing capabilities with no matching package/spec:")
         for cap in caps[:15]:
             lines.append(f"  - {cap}")
         if len(caps) > 15:
             lines.append(f"  … and {len(caps) - 15} more")
     lines.append("")
     lines.append(
-        "Add a package under that release in distgit, or add mock lookaside repos "
-        "on this mock environment if the dependency only exists in Fedora."
+        "If the RPM name does not match any spec Provides or subpackage name, add a "
+        "Provides alias in the spec or queue the source package in an earlier chain stage. "
+        "Dependencies that only exist in Fedora need mock lookaside repos on this environment."
     )
     return "\n".join(lines)
 
@@ -362,9 +477,8 @@ async def _proactive_extra_roots_from_repo_runtime(
     skip_jobs_not_before: datetime | None,
 ) -> tuple[set[str], list[str]]:
     """
-    Before any mock run, use repodata + distgit Provides map to queue source packages that
-    fix known broken runtime Requires in the published repo (e.g. python3-test needs
-    python-setuptools-wheel while setuptools source is not built yet).
+    Before any mock run, use repodata + spec Provides metadata to queue source packages that
+    fix known broken runtime Requires in the published repo.
     """
     if not _chain_proactive_repo_runtime():
         return set(), []
@@ -374,8 +488,8 @@ async def _proactive_extra_roots_from_repo_runtime(
         return set(), []
 
     branch = r2_publish_branch(release)
-    arch = architectures[0] if architectures else "x86_64"
-    analysis = await _cached_repo_runtime_analysis(releasename, branch, arch)
+    canon_arch = normalize_machine_arch(architectures[0] if architectures else "x86_64")
+    analysis = await _cached_repo_runtime_analysis(releasename, branch, canon_arch)
     if analysis.get("error"):
         logger.info(
             "chain_id=%s proactive repo scan skipped (%s)",
@@ -404,7 +518,14 @@ async def _proactive_extra_roots_from_repo_runtime(
         for candidate in (prov, req):
             if not candidate:
                 continue
-            mapped = resolve_distgit_sources_for_missing_providers(order, [candidate])
+            mapped = await resolve_chain_sources_for_missing_providers(
+                db,
+                order,
+                [candidate],
+                releasename=releasename,
+                repo_branch=branch,
+                repo_arch=canon_arch,
+            )
             if not mapped:
                 if consumer and consumer in related:
                     unmapped.add(candidate)
@@ -685,7 +806,19 @@ async def _try_recover_chain_after_failure(
                 providers = parse_dnf_missing_providers(fail_text)
                 if providers:
                     order = await _cached_distgit_build_order(releasename, dg_url, dg_br)
-                    missing_in_distgit = unresolved_distgit_capabilities(order, providers)
+                    arches = [str(x) for x in opt.get("architectures") or DEFAULT_ARCH]
+                    canon_arch = normalize_machine_arch(arches[0] if arches else "x86_64")
+                    repo_branch = (
+                        r2_publish_branch(release) if release else str(opt.get("branch") or "dev")
+                    )
+                    missing_in_distgit = await unresolved_chain_capabilities(
+                        db,
+                        order,
+                        providers,
+                        releasename=releasename,
+                        repo_branch=repo_branch,
+                        repo_arch=canon_arch,
+                    )
                     if missing_in_distgit:
                         pkg_r = await db.execute(
                             select(Package.name).where(Package.id == failed_job.package_id)
@@ -708,7 +841,14 @@ async def _try_recover_chain_after_failure(
                             terminal=BuildChainStatus.FAILED,
                         )
                         return True
-                    extra_roots = resolve_distgit_sources_for_missing_providers(order, providers)
+                    extra_roots = await resolve_chain_sources_for_missing_providers(
+                        db,
+                        order,
+                        providers,
+                        releasename=releasename,
+                        repo_branch=repo_branch,
+                        repo_arch=canon_arch,
+                    )
                     if extra_roots:
                         opt = dict(opt)
                         opt["dnf_recovery_count"] = recovery_n + 1
