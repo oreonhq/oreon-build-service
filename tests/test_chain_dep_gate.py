@@ -23,12 +23,14 @@ def _make_chain(stages_json, active_stage=0, chain_options=None):
     return chain
 
 
-def _make_order(*, edges, layers, package_names, capability_providers=None):
+def _make_order(*, edges, layers, package_names, capability_providers=None, spec_evrs=None, build_requires_raw=None):
     r = MagicMock()
     r.edges = edges
     r.layers = layers
     r.package_names = package_names
     r.capability_providers = capability_providers if capability_providers is not None else {}
+    r.spec_evrs = spec_evrs if spec_evrs is not None else {}
+    r.build_requires_raw = build_requires_raw if build_requires_raw is not None else {}
     return r
 
 
@@ -378,3 +380,32 @@ async def test_inject_skips_chain_internal_packages():
 
     assert ok is True
     assert chain.stages_json == [["jline"], ["kde-baseapps"], ["kdelibs"]]
+
+
+def test_chain_user_targets_from_options():
+    from datetime import datetime, timezone
+
+    from oreon_build.services.build_chain import (
+        _chain_user_target_names,
+        _skip_jobs_not_before_for_package,
+    )
+
+    chain = _make_chain(
+        [["kde-workspace"]],
+        chain_options={
+            "chain_user_targets": ["kde-workspace"],
+            "skip_jobs_not_before": "2026-05-18T12:00:00+00:00",
+        },
+    )
+    assert _chain_user_target_names(chain) == {"kde-workspace"}
+    t0 = datetime(2026, 5, 18, 12, 0, 0, tzinfo=timezone.utc)
+    assert _skip_jobs_not_before_for_package(chain, "kde-workspace", t0) == t0
+    assert _skip_jobs_not_before_for_package(chain, "kernel", t0) is None
+
+
+def test_chain_user_targets_parsed_from_spec():
+    from oreon_build.services.build_chain import _chain_user_target_names
+
+    chain = _make_chain([["foo", "bar"]])
+    chain.chain_spec = "foo bar"
+    assert _chain_user_target_names(chain) == {"foo", "bar"}
