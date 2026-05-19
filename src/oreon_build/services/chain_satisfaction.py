@@ -205,15 +205,62 @@ def chain_target_needs_build(
     return not source_published_at_least_spec(source, spec_evrs, repo)
 
 
+def chain_source_still_required_for_consumers(
+    source: str,
+    order: Any,
+    repo: RepoSatisfactionIndex,
+    consumer_packages: Iterable[str],
+) -> bool:
+    """
+    True when some chain consumer still has an unsatisfied BuildRequires line that
+    resolves to ``source`` (e.g. kde-workspace needs kactivities-devel -> kactivities).
+    """
+    br_by_src: dict[str, list[str]] = (
+        order.build_requires_raw
+        if isinstance(getattr(order, "build_requires_raw", None), dict)
+        else {}
+    )
+    consumers = {str(c).strip() for c in consumer_packages if str(c).strip()}
+    if not consumers:
+        return True
+    prov_cache: dict[str, set[str]] = {}
+    for cons in consumers:
+        if cons == source:
+            continue
+        for br_line in br_by_src.get(cons, []):
+            br_name, _, _ = _parse_br_requirement(br_line)
+            if not br_name:
+                continue
+            status, _ = _requirement_status(br_line, repo)
+            if status == "satisfied":
+                continue
+            if br_name not in prov_cache:
+                prov_cache[br_name] = _providers_for_br(br_name, order, repo, spec_only=True)
+            for prov in prov_cache[br_name]:
+                if prov == source:
+                    return True
+    return False
+
+
 def _providers_for_br(
     br_name: str,
     order: Any,
     repo: RepoSatisfactionIndex,
+    *,
+    spec_only: bool = False,
 ) -> set[str]:
+    cap_map = order.capability_providers if isinstance(order.capability_providers, dict) else {}
+    spec_names = {str(n) for n in (order.package_names or [])}
+    found: set[str] = set()
+    if br_name in cap_map:
+        for src in cap_map[br_name]:
+            s = str(src)
+            if s in spec_names:
+                found.add(s)
+    if found or spec_only:
+        return found
     from oreon_build.services.distgit_order import resolve_distgit_sources_for_capability
 
-    cap_map = order.capability_providers if isinstance(order.capability_providers, dict) else {}
-    found: set[str] = set()
     for src in resolve_distgit_sources_for_capability(
         order,
         br_name,
@@ -221,11 +268,40 @@ def _providers_for_br(
         repo_known_sources=repo.known_sources,
     ):
         found.add(src)
-    if br_name in cap_map:
-        for src in cap_map[br_name]:
-            found.add(str(src))
-    spec_names = {str(n) for n in (order.package_names or [])}
     return {s for s in found if s in spec_names}
+
+
+def chain_sources_missing_from_repo_for_consumers(
+    consumer_packages: Iterable[str],
+    order: Any,
+    repo: RepoSatisfactionIndex,
+    *,
+    spec_names: set[str] | None = None,
+) -> set[str]:
+    """One pass: distgit sources to build for repo-missing BuildRequires (spec Provides only)."""
+    br_by_src: dict[str, list[str]] = (
+        order.build_requires_raw
+        if isinstance(getattr(order, "build_requires_raw", None), dict)
+        else {}
+    )
+    consumers = {str(c).strip() for c in consumer_packages if str(c).strip()}
+    names = spec_names if spec_names is not None else {str(n) for n in (order.package_names or []) if n}
+    prov_cache: dict[str, set[str]] = {}
+    needed: set[str] = set()
+    for cons in consumers:
+        for br_line in br_by_src.get(cons, []):
+            br_name, _, _ = _parse_br_requirement(br_line)
+            if not br_name:
+                continue
+            status, _ = _requirement_status(br_line, repo)
+            if status != "missing":
+                continue
+            if br_name not in prov_cache:
+                prov_cache[br_name] = _providers_for_br(br_name, order, repo, spec_only=True)
+            for prov in prov_cache[br_name]:
+                if prov != cons and prov in names:
+                    needed.add(prov)
+    return needed
 
 
 def compute_chain_dependency_build_set(
@@ -282,10 +358,16 @@ def compute_chain_dependency_build_set(
                 )
                 continue
 
-            for prov_src in sorted(_providers_for_br(br_name, order, repo)):
+            for prov_src in sorted(_providers_for_br(br_name, order, repo, spec_only=True)):
                 if prov_src == cons or prov_src not in spec_names:
                     continue
-                if source_published_at_least_spec(prov_src, spec_evrs, repo):
+                # Repo may ship the base source RPM while this BR names -devel or pkgconfig
+                # caps that are still missing. Do not skip just because the provider source
+                # is published when the requirement name is different.
+                if (
+                    prov_src.lower() == br_name.lower()
+                    and source_published_at_least_spec(prov_src, spec_evrs, repo)
+                ):
                     continue
                 if prov_src not in plan.sources_to_build:
                     plan.sources_to_build.add(prov_src)

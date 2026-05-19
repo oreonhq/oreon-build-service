@@ -544,7 +544,7 @@ def _expand_chain_spec_closure(
     releasename: str,
     *,
     members: dict[str, tarfile.TarInfo] | None = None,
-) -> tuple[dict[str, str], list[str]]:
+) -> tuple[dict[str, str], dict[str, _SpecParseResult], list[str]]:
     """
     Incrementally read/parse specs along BuildRequires from ``roots`` (not the full distgit tree).
 
@@ -555,6 +555,7 @@ def _expand_chain_spec_closure(
     if members is None:
         names_set, members = _tarball_spec_member_index(tarball, releasename)
     specs: dict[str, str] = {}
+    parsed_by_source: dict[str, _SpecParseResult] = {}
     provider_map: dict[str, set[str]] = {}
     needed: set[str] = set()
     queue: deque[str] = deque()
@@ -583,8 +584,10 @@ def _expand_chain_spec_closure(
             if f is None:
                 err.append(f"spec missing in tarball for {pkg}")
                 continue
-            specs[pkg] = f.read().decode("utf-8", errors="replace")
-            parsed = _parse_spec_text(specs[pkg], f"{pkg}.spec")
+            spec_text = f.read().decode("utf-8", errors="replace")
+            specs[pkg] = spec_text
+            parsed = _parse_spec_text(spec_text, f"{pkg}.spec")
+            parsed_by_source[pkg] = parsed
             for cap, srcs in _provider_map_from_specs({pkg: parsed}).items():
                 provider_map.setdefault(cap, set()).update(srcs)
             for br in parsed.build_requires:
@@ -602,7 +605,7 @@ def _expand_chain_spec_closure(
         err.append(
             f"Chain distgit closure exceeded OREON_CHAIN_DISTGIT_MAX_PARSE ({max_parse}); narrow the chain spec."
         )
-    return specs, err
+    return specs, parsed_by_source, err
 
 
 async def compute_distgit_build_order_for_chain(
@@ -660,7 +663,7 @@ async def compute_distgit_build_order_for_chain(
         time.monotonic() - t_index,
     )
     t_closure = time.monotonic()
-    specs_by_pkg, cerr = await asyncio.to_thread(
+    specs_by_pkg, parsed_during_closure, cerr = await asyncio.to_thread(
         _expand_chain_spec_closure,
         root_packages,
         all_names,
@@ -675,7 +678,11 @@ async def compute_distgit_build_order_for_chain(
         time.monotonic() - t_closure,
     )
     err.extend(cerr)
-    parsed_by_source, perr = await _parse_specs_parallel_async(specs_by_pkg)
+    if parsed_during_closure and len(parsed_during_closure) >= len(specs_by_pkg):
+        parsed_by_source = parsed_during_closure
+        perr = []
+    else:
+        parsed_by_source, perr = await _parse_specs_parallel_async(specs_by_pkg)
     err.extend(perr)
     return _distgit_order_from_parsed(
         releasename=releasename,

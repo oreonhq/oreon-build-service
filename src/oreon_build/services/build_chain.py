@@ -505,6 +505,46 @@ def format_chain_repo_capability_still_missing_message(
     return "\n".join(lines)
 
 
+def _distgit_packages_in_layers_before(
+    order_layers: list[list[str]],
+    target_packages: list[str],
+    *,
+    user_lower: set[str],
+    already_in_chain_lower: set[str],
+    spec_names: set[str],
+) -> set[str]:
+    """
+    All distgit sources in topological layers strictly before the layer(s) holding
+    ``target_packages``. Ensures user-named targets (e.g. kernel-headers) are not
+    stage 0 when the spec tree has predecessors, regardless of published-repo checks.
+    """
+    target_lower = {str(p).lower() for p in target_packages if str(p).strip()}
+    if not order_layers or not target_lower:
+        return set()
+
+    target_layer_idx = -1
+    for idx, layer in enumerate(order_layers):
+        if any(str(p).lower() in target_lower for p in layer if p):
+            target_layer_idx = max(target_layer_idx, idx)
+
+    if target_layer_idx <= 0:
+        return set()
+
+    out: set[str] = set()
+    for layer in order_layers[:target_layer_idx]:
+        for p in layer:
+            pn = str(p).strip()
+            if not pn:
+                continue
+            pl = pn.lower()
+            if pl in user_lower or pl in already_in_chain_lower:
+                continue
+            if pn not in spec_names:
+                continue
+            out.add(pn)
+    return out
+
+
 def _layers_for_package_subset(
     needed: set[str],
     order_layers: list[list[str]],
@@ -598,6 +638,7 @@ async def _package_ids_still_needing_chain_build(
     architectures: list[str],
     preferred_mock_environment_id: int | None,
     version_by_package: dict[int, int | None],
+    jobs_created_on_or_after: datetime | None = None,
 ) -> set[int]:
     """package_ids that do not yet have SUCCESS on every chain architecture for pinned spec versions."""
     ids = [int(p) for p in package_ids if p]
@@ -615,7 +656,7 @@ async def _package_ids_still_needing_chain_build(
         release_id=chain.release_id,
         target_ids=target_ids,
         version_by_package=version_by_package,
-        jobs_created_on_or_after=None,
+        jobs_created_on_or_after=jobs_created_on_or_after,
     )
     return {pid for pid in ids if pid not in complete_ids}
 
@@ -668,8 +709,8 @@ async def _batch_chain_packages_still_needing_build(
 ) -> set[str]:
     """Package names that still need a chain build (repo + spec version + DB success)."""
     from oreon_build.services.chain_satisfaction import (
+        chain_sources_missing_from_repo_for_consumers,
         chain_target_needs_build,
-        source_published_at_least_spec,
     )
 
     still: set[str] = set()
@@ -683,8 +724,27 @@ async def _batch_chain_packages_still_needing_build(
         order.spec_evrs if order is not None and isinstance(getattr(order, "spec_evrs", None), dict) else {}
     )
     user_targets = _chain_user_target_names(chain)
+    chain_consumers = {
+        str(p).strip()
+        for stage in (chain.stages_json if isinstance(chain.stages_json, list) else [])
+        for p in stage
+        if str(p).strip()
+    }
+    repo_still_needed: set[str] | None = None
+    if repo_sat is not None and order is not None and chain_consumers:
+
+        def _repo_needed_sync() -> set[str]:
+            return chain_sources_missing_from_repo_for_consumers(
+                chain_consumers, order, repo_sat
+            )
+
+        repo_still_needed = await asyncio.to_thread(_repo_needed_sync)
     name_to_id = await batch_package_ids_by_name(db, to_lookup)
     pv_by_name = await _batch_package_version_ids_for_spec(db, name_to_id, spec_evrs)
+
+    chain_start = getattr(chain, "created_at", None)
+    if chain_start is not None and chain_start.tzinfo is None:
+        chain_start = chain_start.replace(tzinfo=timezone.utc)
 
     check_ids: list[int] = []
     id_to_name: dict[int, str] = {}
@@ -694,8 +754,8 @@ async def _batch_chain_packages_still_needing_build(
             continue
         pid = name_to_id[name]
         is_user = name.lower() in user_targets
-        if repo_sat is not None and spec_evrs and not is_user:
-            if source_published_at_least_spec(name, spec_evrs, repo_sat):
+        if repo_still_needed is not None and not is_user:
+            if name not in repo_still_needed:
                 continue
         if is_user and repo_sat is not None and spec_evrs:
             if not chain_target_needs_build(name, spec_evrs, repo_sat):
@@ -724,6 +784,7 @@ async def _batch_chain_packages_still_needing_build(
         architectures=architectures,
         preferred_mock_environment_id=preferred_mock_environment_id,
         version_by_package=version_by_package,
+        jobs_created_on_or_after=chain_start,
     )
     for pid in lacking_ids:
         still.add(id_to_name[pid])
@@ -805,34 +866,35 @@ async def _build_chain_expand_context(
     from oreon_build.services.distgit_order import compute_distgit_build_order_for_chain
 
     roots = _chain_root_package_names(chain)
-    logger.info("chain_id=%s prepare: distgit order (download + BR closure)", chain.id)
-    t0 = time.monotonic()
-    order = await compute_distgit_build_order_for_chain(
-        releasename=releasename,
-        distgit_url=dg_url,
-        distgit_branch=dg_br,
-        root_packages=roots,
-    )
-    logger.info(
-        "chain_id=%s distgit order done: %s specs from %s root(s) in %.1fs",
-        chain.id,
-        len(order.package_names or []),
-        len(roots),
-        time.monotonic() - t0,
-    )
-
     target = RepoTarget(
         releasename=releasename,
         branch=publish_branch,
         arch=canon_arch,
         prefix=f"{releasename}/{publish_branch}/{canon_arch}",
     )
-    logger.info("chain_id=%s prepare: repo primary.xml", chain.id)
-    t1 = time.monotonic()
-    repo_sat, sat_err = await asyncio.to_thread(load_repo_satisfaction_index, target)
+    logger.info(
+        "chain_id=%s prepare: distgit order + repo primary.xml (parallel)",
+        chain.id,
+    )
+    t0 = time.monotonic()
+    order, (repo_sat, sat_err) = await asyncio.gather(
+        compute_distgit_build_order_for_chain(
+            releasename=releasename,
+            distgit_url=dg_url,
+            distgit_branch=dg_br,
+            root_packages=roots,
+        ),
+        asyncio.to_thread(load_repo_satisfaction_index, target),
+    )
     if sat_err:
         logger.warning("chain_id=%s repo satisfaction: %s", chain.id, sat_err)
-    logger.info("chain_id=%s repo primary.xml done in %.1fs", chain.id, time.monotonic() - t1)
+    logger.info(
+        "chain_id=%s distgit+repo done: %s specs, %s sources in repo index, %.1fs",
+        chain.id,
+        len(order.package_names or []),
+        len(repo_sat.known_sources) if repo_sat else 0,
+        time.monotonic() - t0,
+    )
 
     spec_caps = order.capability_providers if isinstance(order.capability_providers, dict) else {}
     runtime_analysis: dict[str, Any] = {}
@@ -1133,15 +1195,19 @@ async def _expand_chain_stages_dependencies(
     stage_index: int,
     *,
     ctx: _ChainExpandContext | None = None,
+    max_rounds: int | None = None,
 ) -> bool:
     """Repeat distgit + repo-runtime injection until the stage list stops growing."""
-    for round_n in range(_chain_expand_max_rounds()):
-        before = json.dumps(chain.stages_json if isinstance(chain.stages_json, list) else [])
+    rounds = max_rounds if max_rounds is not None else _chain_expand_max_rounds()
+    for round_n in range(max(1, rounds)):
+        stages_before = chain.stages_json if isinstance(chain.stages_json, list) else []
+        pkg_count_before = sum(len(s) for s in stages_before)
         ok = await _inject_missing_dep_layers_before(db, chain, stage_index, ctx=ctx)
         if not ok:
             return False
-        after = json.dumps(chain.stages_json if isinstance(chain.stages_json, list) else [])
-        if after == before:
+        stages_after = chain.stages_json if isinstance(chain.stages_json, list) else []
+        pkg_count_after = sum(len(s) for s in stages_after)
+        if pkg_count_after == pkg_count_before and len(stages_after) == len(stages_before):
             return True
         logger.info(
             "chain_id=%s dependency expand round %s grew stages before index %s",
@@ -1284,18 +1350,22 @@ async def _inject_missing_dep_layers_before(
     order_layers = order.layers if isinstance(order.layers, list) else []
     spec_names = {str(n) for n in (order.package_names or []) if n}
 
-    proactive_roots, repo_unmapped = await _proactive_extra_roots_from_repo_runtime(
-        db,
-        chain,
-        release,
-        order,
-        architectures=arches,
-        preferred_mock_environment_id=pref_pm,
-        repo_pi=repo_pi,
-        repo_known=repo_known,
-        repo_sat=repo_sat_index,
-        analysis=analysis,
-    )
+    # Prepare already has fresh distgit+repo in ctx; skip slow proactive runtime scan there.
+    if ctx is not None and not _chain_proactive_repo_runtime_on_prepare():
+        proactive_roots, repo_unmapped = set(), []
+    else:
+        proactive_roots, repo_unmapped = await _proactive_extra_roots_from_repo_runtime(
+            db,
+            chain,
+            release,
+            order,
+            architectures=arches,
+            preferred_mock_environment_id=pref_pm,
+            repo_pi=repo_pi,
+            repo_known=repo_known,
+            repo_sat=repo_sat_index,
+            analysis=analysis,
+        )
     if repo_unmapped:
         ctx = (
             "A package in your chain spec has a published runtime dependency that no "
@@ -1317,6 +1387,7 @@ async def _inject_missing_dep_layers_before(
     all_chain_pkg_names: set[str] = {str(p).lower() for stage in stages for p in stage if p}
 
     from oreon_build.services.chain_satisfaction import (
+        ChainDependencyPlan,
         compute_chain_dependency_build_set,
         format_chain_version_conflict_message,
     )
@@ -1325,12 +1396,36 @@ async def _inject_missing_dep_layers_before(
     if merged_extra:
         roots.extend(sorted(merged_extra))
     user_targets = _chain_user_target_names(chain)
-    dep_plan = compute_chain_dependency_build_set(
-        roots,
-        order,
-        repo_sat_index,
-        user_targets,
-    )
+    user_lower = {str(u).lower() for u in user_targets if u}
+    roots_clean = [str(r).strip() for r in roots if str(r).strip()]
+
+    def _plan_inject_sync() -> tuple[set[str], ChainDependencyPlan, int]:
+        dep_plan = compute_chain_dependency_build_set(
+            roots_clean,
+            order,
+            repo_sat_index,
+            user_targets,
+        )
+        stage_targets = [str(p).strip() for p in pkgs if str(p).strip()]
+        from_layers = _distgit_packages_in_layers_before(
+            order_layers,
+            stage_targets or roots_clean,
+            user_lower=user_lower,
+            already_in_chain_lower=all_chain_pkg_names,
+            spec_names=spec_names,
+        )
+        filtered = set(from_layers)
+        filtered.update(
+            p
+            for p in dep_plan.sources_to_build
+            if p in spec_names
+            and p.lower() not in all_chain_pkg_names
+            and p.lower() not in user_lower
+        )
+        return filtered, dep_plan, len(from_layers)
+
+    t_inject = time.monotonic()
+    to_inject, dep_plan, from_layer_count = await asyncio.to_thread(_plan_inject_sync)
     if dep_plan.conflicts:
         chain.status = BuildChainStatus.FAILED
         chain.error_message = format_chain_version_conflict_message(
@@ -1346,31 +1441,16 @@ async def _inject_missing_dep_layers_before(
         )
         return False
 
-    candidate_list = sorted(
-        p for p in dep_plan.sources_to_build if str(p).lower() not in all_chain_pkg_names
+    logger.info(
+        "chain_id=%s inject scan: %s to inject before stage %s "
+        "(%s from distgit layers, %s from repo BR walk) in %.2fs",
+        chain.id,
+        len(to_inject),
+        stage_index,
+        from_layer_count,
+        max(0, len(to_inject) - from_layer_count),
+        time.monotonic() - t_inject,
     )
-    to_inject: set[str] = set()
-    still_needing = await _batch_chain_packages_still_needing_build(
-        db,
-        chain,
-        candidate_list,
-        architectures=arches,
-        preferred_mock_environment_id=pref_pm,
-        republish_needed=republish_needed,
-        order=order,
-        repo_sat=repo_sat_index,
-    )
-    for pred in candidate_list:
-        pred_lower = pred.lower()
-        # Already listed on this chain (even if not built yet). Do not insert duplicate
-        # stages each expand round; enqueue/rewind handles packages that still need builds.
-        if pred_lower in all_chain_pkg_names:
-            continue
-        if pred not in spec_names:
-            continue
-        if pred not in still_needing:
-            continue
-        to_inject.add(pred)
 
     layers_to_insert = _layers_for_package_subset(to_inject, order_layers)
     if not layers_to_insert:
@@ -2451,7 +2531,7 @@ async def _complete_chain_prepare(
                     except (TypeError, ValueError):
                         pref_pm = None
                 logger.info("chain_id=%s prepare: build expand context", chain.id)
-                t_expand = time.monotonic()
+                t_ctx = time.monotonic()
                 expand_ctx = await _build_chain_expand_context(
                     db,
                     chain,
@@ -2461,12 +2541,20 @@ async def _complete_chain_prepare(
                     arches=arches,
                     pref_pm=pref_pm,
                 )
+                logger.info(
+                    "chain_id=%s expand context ready in %.1fs",
+                    chain.id,
+                    time.monotonic() - t_ctx,
+                )
                 logger.info("chain_id=%s prepare: inject dependency stages", chain.id)
-                ok = await _expand_chain_stages_dependencies(db, chain, 0, ctx=expand_ctx)
+                t_inject = time.monotonic()
+                ok = await _expand_chain_stages_dependencies(
+                    db, chain, 0, ctx=expand_ctx, max_rounds=1
+                )
                 logger.info(
                     "chain_id=%s dependency inject finished in %.1fs",
                     chain.id,
-                    time.monotonic() - t_expand,
+                    time.monotonic() - t_inject,
                 )
             else:
                 ok = await _expand_chain_stages_dependencies(db, chain, 0)
