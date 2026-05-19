@@ -72,6 +72,109 @@ def _predecessor_names_in_tree(order_edges: list[dict[str, str]], consumer: str)
     return {str(e["to"]) for e in order_edges if str(e.get("from")) == consumer}
 
 
+def _deps_map_from_edges(order_edges: list[dict[str, str]]) -> dict[str, set[str]]:
+    deps: dict[str, set[str]] = {}
+    for e in order_edges:
+        cons = str(e.get("from") or "")
+        prov = str(e.get("to") or "")
+        if cons and prov:
+            deps.setdefault(cons, set()).add(prov)
+    return deps
+
+
+def _transitive_spec_predecessors(
+    deps_map: dict[str, set[str]],
+    roots: list[str],
+    spec_names: set[str],
+) -> set[str]:
+    """All distgit spec providers needed by roots, walking BuildRequires transitively."""
+    needed: set[str] = set()
+    stack = [str(r) for r in roots if r]
+    seen: set[str] = set()
+    while stack:
+        pkg = stack.pop()
+        for pred in deps_map.get(pkg, set()):
+            if pred not in spec_names:
+                continue
+            if pred in seen:
+                continue
+            seen.add(pred)
+            needed.add(pred)
+            stack.append(pred)
+    return needed
+
+
+def _layers_for_package_subset(
+    needed: set[str],
+    order_layers: list[list[str]],
+) -> list[list[str]]:
+    """Topological layers for ``needed``, preserving distgit layer order."""
+    if not needed:
+        return []
+    out: list[list[str]] = []
+    placed: set[str] = set()
+    for layer in order_layers:
+        sub = sorted(p for p in layer if p in needed)
+        if sub:
+            out.append(sub)
+            placed.update(sub)
+    leftover = sorted(needed - placed)
+    if leftover:
+        out.insert(0, leftover)
+    return out
+
+
+def _parse_skip_jobs_not_before(chain: BuildChain) -> datetime | None:
+    opt = _options_dict(chain)
+    raw = opt.get("skip_jobs_not_before")
+    if not raw:
+        ca = getattr(chain, "created_at", None)
+        if ca is not None:
+            return ca if ca.tzinfo else ca.replace(tzinfo=timezone.utc)
+        return None
+    try:
+        ref = datetime.fromisoformat(str(raw))
+        if ref.tzinfo is None:
+            ref = ref.replace(tzinfo=timezone.utc)
+        return ref
+    except ValueError:
+        return None
+
+
+async def _package_id_for_name(db: Any, name: str) -> int | None:
+    prow = await db.execute(select(Package.id).where(Package.name == name).limit(1))
+    pid = prow.scalar_one_or_none()
+    return int(pid) if pid is not None else None
+
+
+async def _chain_has_successful_build_all_arches(
+    db: Any,
+    chain: BuildChain,
+    package_id: int,
+    *,
+    architectures: list[str],
+    preferred_mock_environment_id: int | None,
+    skip_jobs_not_before: datetime | None,
+) -> bool:
+    """True when every chain architecture already has a successful build for this package."""
+    if not architectures:
+        return False
+    pv_id = await latest_package_version_id(db, package_id)
+    for arch in architectures:
+        canon = normalize_machine_arch(arch)
+        target = await get_or_create_build_target(db, chain.release_id, canon, preferred_mock_environment_id)
+        if not await has_successful_build_for_target(
+            db,
+            package_id,
+            chain.release_id,
+            target.id,
+            pv_id,
+            jobs_created_on_or_after=skip_jobs_not_before,
+        ):
+            return False
+    return True
+
+
 async def _cached_distgit_build_order(releasename: str, distgit_url: str, distgit_branch: str) -> Any:
     from oreon_build.services.distgit_order import compute_distgit_build_order
 
@@ -86,30 +189,31 @@ async def _cached_distgit_build_order(releasename: str, distgit_url: str, distgi
     return order
 
 
-async def _inject_missing_deps_for_stage(db: Any, chain: BuildChain, next_stage_index: int) -> bool:
+async def _inject_missing_dep_layers_before(
+    db: Any,
+    chain: BuildChain,
+    stage_index: int,
+) -> bool:
     """
-    Before advancing into next_stage_index, find any distgit predecessors of its
-    packages that have never been attempted for this release and inject them as a
-    new stage immediately before next_stage_index so they get built first.
+    Insert distgit dependency stages immediately before ``stage_index``.
 
-    Rules:
-    - Only inject packages that ARE in our Package table (i.e., managed by us).
-    - Only inject if they have ZERO build jobs for this release (completely absent
-      from the repo). If a dep was previously attempted (even if it failed), we
-      let the chain proceed -- the consumer build may fail, but the user can see
-      it and react. This also prevents infinite injection loops.
-    - Deps already present anywhere in the chain stages are skipped (handled by
-      the chain itself).
-    - If a dep is in a PAST stage of this chain (should already be built) but has
-      no successful build AND has no build jobs at all, something went wrong with
-      the chain itself -- hard-fail with a clear error.
-    - On hard-fail: set chain.status=failed + chain.error_message and return False.
+  * Walks BuildRequires transitively (not only direct deps).
+  * Only injects packages that exist in the distgit spec tree for this release.
+  * Skips deps already listed anywhere in the chain spec stages.
+  * Skips deps that already have a successful build on every chain architecture.
+  * If a dep was in an earlier chain stage but still has no success, hard-fail
+    (user must fix that job or resume the chain).
+
+    Returns False when ``chain`` is marked failed.
     """
-    stages: list[list[str]] = chain.stages_json if isinstance(chain.stages_json, list) else []
-    if next_stage_index <= 0 or next_stage_index >= len(stages):
+    if not _chain_use_distgit_dep_gate():
         return True
 
-    pkgs = [str(p) for p in stages[next_stage_index] if p]
+    stages: list[list[str]] = chain.stages_json if isinstance(chain.stages_json, list) else []
+    if stage_index < 0 or stage_index >= len(stages):
+        return True
+
+    pkgs = [str(p) for p in stages[stage_index] if p]
     if not pkgs:
         return True
 
@@ -125,77 +229,175 @@ async def _inject_missing_deps_for_stage(db: Any, chain: BuildChain, next_stage_
     if not releasename:
         return True
 
+    arches = [str(x) for x in opt.get("architectures") or DEFAULT_ARCH]
+    pm = opt.get("preferred_mock_environment_id")
+    if pm is None or pm == "":
+        pref_pm = None
+    else:
+        try:
+            pref_pm = int(pm)
+        except (TypeError, ValueError):
+            pref_pm = None
+    skip_not_before = _parse_skip_jobs_not_before(chain) if bool(opt.get("skip_complete_arches", True)) else None
+
     order = await _cached_distgit_build_order(releasename, dg_url, dg_br)
     edges = order.edges if isinstance(order.edges, list) else []
+    order_layers = order.layers if isinstance(order.layers, list) else []
+    spec_names = {str(n) for n in (order.package_names or []) if n}
 
-    # All packages across every stage of this chain (handled internally).
-    all_chain_pkg_names: set[str] = {
-        str(p).lower() for stage in stages for p in stage if p
-    }
+    deps_map = _deps_map_from_edges(edges)
+    all_chain_pkg_names: set[str] = {str(p).lower() for stage in stages for p in stage if p}
     past_stage_pkg_names: set[str] = {
-        str(p).lower() for stage in stages[:next_stage_index] for p in stage if p
+        str(p).lower() for stage in stages[:stage_index] for p in stage if p
     }
 
+    candidates = _transitive_spec_predecessors(deps_map, pkgs, spec_names)
     to_inject: set[str] = set()
 
-    for pkg in pkgs:
-        preds = _predecessor_names_in_tree(edges, pkg)
-        for pred in preds:
-            pred_lower = pred.lower()
-            if pred_lower in all_chain_pkg_names:
-                continue  # already in chain, handled by stage order
+    for pred in candidates:
+        pred_lower = pred.lower()
+        if pred_lower in all_chain_pkg_names:
+            continue
 
-            # Only care about packages we manage (in the Package table).
-            prow = await db.execute(select(Package.id).where(Package.name == pred).limit(1))
-            pid = prow.scalar_one_or_none()
-            if pid is None:
-                continue  # system/buildroot package, not managed by us
-
-            pid = int(pid)
-
-            # Check for any build attempt for this release.
-            any_job = await db.execute(
-                select(BuildJob.id)
-                .where(BuildJob.package_id == pid, BuildJob.release_id == chain.release_id)
-                .limit(1)
-            )
-            if any_job.scalar_one_or_none() is not None:
-                # Already attempted (success or failed). Don't inject; let the
-                # consumer build proceed and fail naturally if needed.
+        pid = await _package_id_for_name(db, pred)
+        if pid is None:
+            # No DB row yet; still inject if it is in distgit (enqueue will create Package).
+            if pred not in spec_names:
                 continue
+        elif await _chain_has_successful_build_all_arches(
+            db,
+            chain,
+            pid,
+            architectures=arches,
+            preferred_mock_environment_id=pref_pm,
+            skip_jobs_not_before=skip_not_before,
+        ):
+            continue
 
-            # The dep has never been attempted for this release.
-            # If it was supposed to appear in a past stage of THIS chain but
-            # somehow has zero jobs, that's a chain logic error -- hard-fail.
-            if pred_lower in past_stage_pkg_names:
-                msg = (
-                    f"Chain error: '{pred}' was in a previous stage of this chain "
-                    f"(before stage {next_stage_index}) but was never built. "
-                    f"This should not happen. Please cancel and re-submit the chain."
-                )
-                chain.status = BuildChainStatus.FAILED
-                chain.error_message = msg
-                logger.error("chain_id=%s hard-fail: %s", chain.id, msg)
-                return False
+        if pred_lower in past_stage_pkg_names:
+            if pid is not None and await _chain_has_successful_build_all_arches(
+                db,
+                chain,
+                pid,
+                architectures=arches,
+                preferred_mock_environment_id=pref_pm,
+                skip_jobs_not_before=skip_not_before,
+            ):
+                continue
+            msg = (
+                f"Chain blocked: dependency '{pred}' was in an earlier stage but has no "
+                f"successful build for this release on all chain architectures. "
+                f"Fix or rebuild '{pred}', then resume the chain."
+            )
+            chain.status = BuildChainStatus.FAILED
+            chain.error_message = msg
+            logger.error("chain_id=%s hard-fail: %s", chain.id, msg)
+            return False
 
-            to_inject.add(pred)
+        to_inject.add(pred)
 
-    if not to_inject:
+    layers_to_insert = _layers_for_package_subset(to_inject, order_layers)
+    if not layers_to_insert:
         return True
 
-    # Inject as a new parallel stage immediately before next_stage_index.
-    injected_list = sorted(to_inject)
     new_stages = list(stages)
-    new_stages.insert(next_stage_index, injected_list)
+    for offset, layer in enumerate(layers_to_insert):
+        new_stages.insert(stage_index + offset, layer)
     chain.stages_json = new_stages
     await db.flush()
 
     logger.info(
-        "chain_id=%s auto-injected missing deps %s as new stage %s before '%s'",
+        "chain_id=%s auto-injected %s dep stage(s) before index %s for %s",
         chain.id,
-        injected_list,
-        next_stage_index,
+        len(layers_to_insert),
+        stage_index,
         pkgs,
+    )
+    return True
+
+
+async def _cancel_chain_stage_active_jobs(
+    db: Any,
+    chain: BuildChain,
+    stage_index: int,
+    note: str,
+) -> None:
+    jres = await db.execute(
+        select(BuildJob).where(
+            BuildJob.chain_id == chain.id,
+            BuildJob.chain_stage_index == stage_index,
+            BuildJob.status.in_(
+                (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.RUNNING),
+            ),
+        )
+    )
+    for job in jres.scalars().all():
+        await _cancel_job_and_running_attempts(db, job, note)
+
+
+async def _try_recover_chain_after_failure(
+    db: Any,
+    chain: BuildChain,
+    failed_job: BuildJob,
+) -> bool:
+    """
+    On a stage failure, inject missing distgit deps before the active stage and
+    re-queue that stage instead of failing the whole chain.
+    """
+    if failed_job.chain_stage_index is None:
+        return False
+    stage_idx = int(failed_job.chain_stage_index)
+    stages_before = chain.stages_json if isinstance(chain.stages_json, list) else []
+    stage_count_before = len(stages_before)
+
+    ok = await _inject_missing_dep_layers_before(db, chain, stage_idx)
+    if not ok:
+        return False
+
+    stages_after = chain.stages_json if isinstance(chain.stages_json, list) else []
+    if len(stages_after) <= stage_count_before:
+        return False
+
+    await _cancel_chain_stage_active_jobs(
+        db,
+        chain,
+        stage_idx,
+        "Chain paused: building missing dependencies first",
+    )
+    chain.stage_expected_jobs = 0
+    chain.stage_skip_slots = 0
+    chain.stage_publish_done = 0
+    chain.stage_advance_after = None
+
+    opt = _options_dict(chain)
+    arches = [str(x) for x in opt.get("architectures") or DEFAULT_ARCH]
+    pm = opt.get("preferred_mock_environment_id")
+    if pm is None or pm == "":
+        pref_pm = None
+    else:
+        try:
+            pref_pm = int(pm)
+        except (TypeError, ValueError):
+            pref_pm = None
+
+    await _enqueue_chain_stage_jobs(
+        db,
+        chain,
+        stage_idx,
+        architectures=arches,
+        skip_complete_arches=bool(opt.get("skip_complete_arches", True)),
+        distgit_url=str(opt.get("distgit_url") or "https://github.com/oreonhq/rpm-specfiles.git"),
+        distgit_branch=str(opt.get("distgit_branch") or "main"),
+        preferred_mock_environment_id=pref_pm,
+        priority=int(opt.get("priority") or 0),
+        triggered_by_id=chain.triggered_by_id,
+        request=None,
+    )
+    logger.info(
+        "chain_id=%s recovered from job %s failure by injecting deps before stage %s",
+        chain.id,
+        failed_job.id,
+        stage_idx,
     )
     return True
 
@@ -320,6 +522,8 @@ async def on_build_job_failed_for_chain(db: Any, job: BuildJob, reason: str) -> 
         return
     if job.chain_stage_index is not None and job.chain_stage_index != chain.active_stage_index:
         return
+    if await _try_recover_chain_after_failure(db, chain, job):
+        return
     await fail_chain(db, chain, reason, terminal=BuildChainStatus.FAILED)
 
 
@@ -424,8 +628,8 @@ async def _advance_chain_after_stage_complete(db: Any, chain: BuildChain) -> Non
         chain.stage_advance_after = None
         return
 
-    if nxt > 0 and _chain_use_distgit_dep_gate():
-        ok = await _inject_missing_deps_for_stage(db, chain, nxt)
+    if _chain_use_distgit_dep_gate():
+        ok = await _inject_missing_dep_layers_before(db, chain, nxt)
         if not ok:
             # Hard-fail: chain.status and chain.error_message already set.
             await db.flush()
@@ -716,6 +920,15 @@ async def trigger_chain_build(
     )
     db.add(chain)
     await db.flush()
+
+    if _chain_use_distgit_dep_gate():
+        ok = await _inject_missing_dep_layers_before(db, chain, 0)
+        if not ok:
+            await db.flush()
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=chain.error_message or "Chain build could not resolve dependencies",
+            )
 
     await log_audit(
         db,
