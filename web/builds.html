@@ -33,7 +33,7 @@
       <a href="/promotions.html">Promotions</a>
       <a href="/dependencies.html">Dependencies</a>
       <form class="navbar-search" action="/search.html" method="get" style="display:inline-flex; margin-left:0.5rem;">
-        <input type="search" name="q" placeholder="Search…" style="padding:0.25rem 0.5rem; width:10rem;">
+        <input type="search" name="q" placeholder="Search" style="padding:0.25rem 0.5rem; width:10rem;">
         <button type="submit" class="btn" style="margin-left:0.25rem;">Go</button>
       </form>
       <span id="auth-section">
@@ -213,7 +213,7 @@
       <div id="chain-build-alert" role="alert"></div>
       <div class="form-group" style="margin-bottom:1rem;">
         <label>Filter</label>
-        <input type="text" id="builds-filter" placeholder="Filter by ID, package, release, arch, status…" style="padding:0.4rem; width:100%; max-width:20rem;">
+        <input type="text" id="builds-filter" placeholder="Filter by ID, package, release, arch, status" style="padding:0.4rem; width:100%; max-width:20rem;">
       </div>
       <div class="list-toolbar">
         <div class="bulk-selection-bar" id="builds-bulk-bar">
@@ -263,7 +263,11 @@
         api.get('/releases?limit=500').then(function(r) { releases = (r && r.items) ? r.items : []; renderReleaseList(); renderReleaseListNew(); }).catch(function() { releases = []; });
       }
       // (helper makeSearchableSelect was removed; selects are wired manually below)
-      function escapeHtml(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; }
+      function escapeHtml(s) {
+        var d = document.createElement('div');
+        d.textContent = s == null ? '' : String(s).replace(/\u2026/g, '');
+        return d.innerHTML;
+      }
       function escapeAttr(s) { return escapeHtml(s).replace(/"/g, '&quot;'); }
       var chainPollTimer = null;
       var watchedChainId = null;
