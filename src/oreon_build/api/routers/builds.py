@@ -578,7 +578,7 @@ async def trigger_build(
         existing_r = await db.execute(select(Package).where(Package.name == np.name))
         existing_pkg = existing_r.scalar_one_or_none()
         if existing_pkg:
-            # DistGit / UI often sends new_package even when the package already exists (e.g. second arch).
+            # DistGit/UI often sends new_package even when the package already exists (e.g. second arch).
             # Queue builds like a normal trigger instead of rejecting.
             package_id = existing_pkg.id
             preferred_mock_environment_id = (
@@ -763,6 +763,9 @@ async def trigger_chain_build_endpoint(
 async def _chain_to_status_response(db: DbSession, chain: BuildChain) -> ChainStatusResponse:
     from oreon_build.services.build_chain import _chain_options_preparing, _options_dict
 
+    # fail_chain/job cancels expire the row; refresh before reading scalar columns.
+    await db.refresh(chain)
+
     stages_raw = chain.stages_json if isinstance(chain.stages_json, list) else []
     stages: list[list[str]] = [[str(n) for n in grp] for grp in stages_raw if isinstance(grp, list)]
     opt = _options_dict(chain)
@@ -822,6 +825,19 @@ async def get_chain_status(chain_id: int, db: DbSession):
     chain = result.scalar_one_or_none()
     if not chain:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chain not found")
+    return await _chain_to_status_response(db, chain)
+
+
+@router.post("/chain/{chain_id}/cancel", response_model=ChainStatusResponse)
+async def cancel_chain_build_endpoint(
+    chain_id: int,
+    request: Request,
+    db: DbSession,
+    user: CurrentUser,
+):
+    from oreon_build.services.build_chain import cancel_chain_by_user
+
+    chain = await cancel_chain_by_user(db, request, user, chain_id=chain_id)
     return await _chain_to_status_response(db, chain)
 
 
