@@ -760,17 +760,27 @@ async def trigger_chain_build_endpoint(
     )
 
 
-@router.get("/chain/{chain_id}/status")
-async def get_chain_status(chain_id: int, db: DbSession):
-    result = await db.execute(select(BuildChain).where(BuildChain.id == chain_id))
-    chain = result.scalar_one_or_none()
-    if not chain:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chain not found")
+async def _chain_to_status_response(db: DbSession, chain: BuildChain) -> ChainStatusResponse:
+    from oreon_build.services.build_chain import _chain_options_preparing, _options_dict
+
     stages_raw = chain.stages_json if isinstance(chain.stages_json, list) else []
     stages: list[list[str]] = [[str(n) for n in grp] for grp in stages_raw if isinstance(grp, list)]
-    opt = chain.chain_options if isinstance(chain.chain_options, dict) else {}
-    from oreon_build.services.build_chain import _chain_options_preparing
-
+    opt = _options_dict(chain)
+    rel = await db.get(Release, chain.release_id)
+    job_n = await db.scalar(select(func.count()).select_from(BuildJob).where(BuildJob.chain_id == chain.id))
+    raw_unresolved = opt.get("unresolved_capabilities")
+    unresolved: list[str] = []
+    if isinstance(raw_unresolved, list):
+        unresolved = [str(x) for x in raw_unresolved if x]
+    stage0_raw = opt.get("prepare_stage0_jobs")
+    prepare_stage0_jobs: int | None
+    if stage0_raw is None or stage0_raw == "":
+        prepare_stage0_jobs = None
+    else:
+        try:
+            prepare_stage0_jobs = int(stage0_raw)
+        except (TypeError, ValueError):
+            prepare_stage0_jobs = None
     return ChainStatusResponse(
         chain_id=chain.id,
         status=chain.status.value,
@@ -779,7 +789,40 @@ async def get_chain_status(chain_id: int, db: DbSession):
         chain_spec=chain.chain_spec,
         error_message=chain.error_message,
         preparing=_chain_options_preparing(opt),
+        job_count=int(job_n or 0),
+        releasename=(rel.releasename if rel else None),
+        distgit_url=str(opt.get("distgit_url") or "") or None,
+        distgit_branch=str(opt.get("distgit_branch") or "") or None,
+        unresolved_capabilities=unresolved,
+        prepare_started_at=str(opt.get("prepare_started_at") or "") or None,
+        prepare_finished_at=str(opt.get("prepare_finished_at") or "") or None,
+        prepare_stage0_jobs=prepare_stage0_jobs,
+        created_at=chain.created_at,
+        updated_at=chain.updated_at,
     )
+
+
+@router.get("/chains", response_model=list[ChainStatusResponse])
+async def list_chains(
+    db: DbSession,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """Recent distgit chain builds (newest first) with full prepare/error details."""
+    result = await db.execute(
+        select(BuildChain).order_by(BuildChain.id.desc()).limit(limit).offset(offset)
+    )
+    chains = list(result.scalars().all())
+    return [await _chain_to_status_response(db, c) for c in chains]
+
+
+@router.get("/chain/{chain_id}/status", response_model=ChainStatusResponse)
+async def get_chain_status(chain_id: int, db: DbSession):
+    result = await db.execute(select(BuildChain).where(BuildChain.id == chain_id))
+    chain = result.scalar_one_or_none()
+    if not chain:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chain not found")
+    return await _chain_to_status_response(db, chain)
 
 
 @router.post("/chain-resume", response_model=ChainBuildTriggerResponse, status_code=status.HTTP_201_CREATED)
