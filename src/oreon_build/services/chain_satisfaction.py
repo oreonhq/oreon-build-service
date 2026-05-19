@@ -205,6 +205,35 @@ def chain_target_needs_build(
     return not source_published_at_least_spec(source, spec_evrs, repo)
 
 
+def sources_needing_chain_build(
+    sources: Iterable[str],
+    order: Any,
+    repo: RepoSatisfactionIndex,
+    *,
+    consumer_packages: Iterable[str],
+) -> set[str]:
+    """
+  Distgit sources that still need a chain build (not already in repo at spec EVR,
+  or still required because a consumer has an unsatisfied BuildRequires on them).
+    """
+    spec_evrs: dict[str, str] = (
+        order.spec_evrs if isinstance(getattr(order, "spec_evrs", None), dict) else {}
+    )
+    needed: set[str] = set()
+    for raw in sources:
+        name = str(raw).strip()
+        if not name:
+            continue
+        if not source_published_at_least_spec(name, spec_evrs, repo):
+            needed.add(name)
+            continue
+        if chain_source_still_required_for_consumers(
+            name, order, repo, consumer_packages
+        ):
+            needed.add(name)
+    return needed
+
+
 def chain_source_still_required_for_consumers(
     source: str,
     order: Any,

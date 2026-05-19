@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import logging
 import os
@@ -103,7 +104,21 @@ class _SpecParseResult:
     def evr_canonical(self) -> str:
         ver = (self.version or "0").strip() or "0"
         rel = (self.release or "0").strip() or "0"
-        return f"{int(self.epoch)}:{ver}-{rel}"
+        return db_safe_spec_evr(f"{int(self.epoch)}:{ver}-{rel}")
+
+
+def db_safe_spec_evr(evr: str, *, max_len: int = 64) -> str:
+    """Fit spec EVR into package_versions.version (varchar 64); hash unexpanded macros."""
+    s = (evr or "").strip() or "0:0-0"
+    if (
+        len(s) <= max_len
+        and "%" not in s
+        and "$(" not in s
+        and "${" not in s
+    ):
+        return s
+    digest = hashlib.sha256(s.encode("utf-8", errors="replace")).hexdigest()[:20]
+    return f"0:unexpanded-{digest}"
 
 
 def _github_owner_repo_from_git_url(url: str) -> tuple[str, str] | None:

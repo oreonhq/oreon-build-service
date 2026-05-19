@@ -34,6 +34,7 @@ from oreon_build.models import (
     Source,
     Worker,
 )
+from oreon_build.services.distgit_order import db_safe_spec_evr
 from oreon_build.services.build_target_util import (
     batch_latest_package_version_ids,
     batch_package_ids_by_name,
@@ -709,8 +710,10 @@ async def _batch_chain_packages_still_needing_build(
 ) -> set[str]:
     """Package names that still need a chain build (repo + spec version + DB success)."""
     from oreon_build.services.chain_satisfaction import (
+        chain_source_still_required_for_consumers,
         chain_sources_missing_from_repo_for_consumers,
         chain_target_needs_build,
+        source_published_at_least_spec,
     )
 
     still: set[str] = set()
@@ -754,9 +757,16 @@ async def _batch_chain_packages_still_needing_build(
             continue
         pid = name_to_id[name]
         is_user = name.lower() in user_targets
-        if repo_still_needed is not None and not is_user:
-            if name not in repo_still_needed:
-                continue
+        if not is_user and repo_sat is not None and spec_evrs:
+            if source_published_at_least_spec(name, spec_evrs, repo_sat):
+                still_required = (repo_still_needed is not None and name in repo_still_needed) or (
+                    order is not None
+                    and chain_source_still_required_for_consumers(
+                        name, order, repo_sat, chain_consumers
+                    )
+                )
+                if not still_required:
+                    continue
         if is_user and repo_sat is not None and spec_evrs:
             if not chain_target_needs_build(name, spec_evrs, repo_sat):
                 pv_id = pv_by_name.get(name)
@@ -898,7 +908,10 @@ async def _build_chain_expand_context(
 
     spec_caps = order.capability_providers if isinstance(order.capability_providers, dict) else {}
     runtime_analysis: dict[str, Any] = {}
-    if _chain_proactive_repo_runtime() and _chain_proactive_repo_runtime_on_prepare():
+    # Always load runtime Requires gaps during prepare so inject can stage deps before the
+    # user target. Recovery used to be the only path that ran this (PREPARE=0), so
+    # kernel-headers ran first and failed once before deps were injected.
+    if _chain_proactive_repo_runtime():
         t2 = time.monotonic()
         chain_sources = set(order.package_names or []) | set(roots)
         if _chain_proactive_repo_runtime_fast():
@@ -1360,8 +1373,20 @@ async def _inject_missing_dep_layers_before(
     order_layers = order.layers if isinstance(order.layers, list) else []
     spec_names = {str(n) for n in (order.package_names or []) if n}
 
-    # Prepare already has fresh distgit+repo in ctx; skip slow proactive runtime scan there.
-    if ctx is not None and not _chain_proactive_repo_runtime_on_prepare():
+    if ctx is not None and ctx.runtime_analysis:
+        proactive_roots, repo_unmapped = await _proactive_extra_roots_from_repo_runtime(
+            db,
+            chain,
+            release,
+            order,
+            architectures=arches,
+            preferred_mock_environment_id=pref_pm,
+            repo_pi=repo_pi,
+            repo_known=repo_known,
+            repo_sat=repo_sat_index,
+            analysis=ctx.runtime_analysis,
+        )
+    elif ctx is not None and not _chain_proactive_repo_runtime_on_prepare():
         proactive_roots, repo_unmapped = set(), []
     else:
         proactive_roots, repo_unmapped = await _proactive_extra_roots_from_repo_runtime(
@@ -1416,29 +1441,17 @@ async def _inject_missing_dep_layers_before(
             repo_sat_index,
             user_targets,
         )
-        # Full distgit layer prepend only when expanding before a user-named target.
-        # Later rounds hit dependency stages (stage 0 = fonts, etc.); re-running layer
-        # inject there would prepend forever and never converge.
-        stage_has_user = any(str(p).lower() in user_lower for p in pkgs if p)
-        from_layers: set[str] = set()
-        if stage_has_user:
-            user_pkg_names = [u for u in user_targets if u]
-            from_layers = _distgit_packages_in_layers_before(
-                order_layers,
-                user_pkg_names,
-                user_lower=user_lower,
-                already_in_chain_lower=all_chain_pkg_names,
-                spec_names=spec_names,
-            )
-        filtered = set(from_layers)
-        filtered.update(
+        # Only inject distgit sources the published repo cannot satisfy (BR walk).
+        # Prepending full topological layers before the user target queued 60+ builds
+        # that were already in the repo (chain 168: 66 "layer" injects, 0 repo-missing).
+        filtered = {
             p
             for p in dep_plan.sources_to_build
             if p in spec_names
             and p.lower() not in all_chain_pkg_names
             and p.lower() not in user_lower
-        )
-        return filtered, dep_plan, len(from_layers)
+        }
+        return filtered, dep_plan, 0
 
     t_inject = time.monotonic()
     to_inject, dep_plan, from_layer_count = await asyncio.to_thread(_plan_inject_sync)
@@ -1458,13 +1471,10 @@ async def _inject_missing_dep_layers_before(
         return False
 
     logger.info(
-        "chain_id=%s inject scan: %s to inject before stage %s "
-        "(%s from distgit layers, %s from repo BR walk) in %.2fs",
+        "chain_id=%s inject scan: %s to inject before stage %s (repo-missing BR closure) in %.2fs",
         chain.id,
         len(to_inject),
         stage_index,
-        from_layer_count,
-        max(0, len(to_inject) - from_layer_count),
         time.monotonic() - t_inject,
     )
 
@@ -1902,7 +1912,7 @@ def distgit_new_package_dict(
         "source_urls": None,
         "source_branch": distgit_branch,
         "source_path": spec_rel,
-        "version": (spec_version or "0.0.1").strip() or "0.0.1",
+        "version": db_safe_spec_evr((spec_version or "0.0.1").strip() or "0.0.1"),
     }
 
 
@@ -1914,6 +1924,7 @@ async def _ensure_spec_package_version(
     """Return PackageVersion id for distgit spec EVR, creating a row when the spec was bumped."""
     if not spec_canonical:
         return await latest_package_version_id(db, package_id)
+    spec_canonical = db_safe_spec_evr(spec_canonical)
     row = await db.execute(
         select(PackageVersion.id)
         .where(
@@ -2028,6 +2039,7 @@ async def fail_chain(
         return
     chain.status = terminal
     chain.error_message = (message or "")[:4000]
+    _clear_chain_prepare_flags(chain)
     jres = await db.execute(
         select(BuildJob).where(
             BuildJob.chain_id == chain.id,
@@ -2078,20 +2090,21 @@ async def cancel_chain_by_user(
     chain = result.scalar_one_or_none()
     if not chain:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chain not found")
+    opt = dict(_options_dict(chain))
     if chain.status in (
         BuildChainStatus.SUCCESS,
         BuildChainStatus.FAILED,
         BuildChainStatus.CANCELLED,
     ):
+        if _chain_options_preparing(opt, chain_status=chain.status):
+            _clear_chain_prepare_flags(chain)
+            await db.commit()
+            return chain
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Chain is already {chain.status.value}",
         )
-    opt = dict(_options_dict(chain))
-    opt.pop("prepare_pending", None)
-    opt.pop("prepare_running", None)
-    opt.pop("prepare_started_at", None)
-    _set_chain_options(chain, opt)
+    _clear_chain_prepare_flags(chain)
     _chain_prepare_inflight.discard(chain_id)
     await fail_chain(db, chain, "Cancelled by user", terminal=BuildChainStatus.CANCELLED)
     await log_audit(
@@ -2221,6 +2234,18 @@ def _set_chain_options(chain: BuildChain, options: dict[str, Any]) -> None:
     """Persist chain_options (SQLAlchemy does not track in-place JSON dict mutation)."""
     chain.chain_options = dict(options)
     flag_modified(chain, "chain_options")
+
+
+def _clear_chain_prepare_flags(chain: BuildChain) -> None:
+    """Drop in-flight prepare markers so terminal chains never show as preparing."""
+    opt = dict(_options_dict(chain))
+    changed = False
+    for key in ("prepare_pending", "prepare_running", "prepare_started_at"):
+        if key in opt:
+            opt.pop(key, None)
+            changed = True
+    if changed:
+        _set_chain_options(chain, opt)
 
 
 def _chain_prepare_stale_seconds() -> int:
@@ -2502,7 +2527,15 @@ async def _enqueue_chain_stage_jobs(
     return jobs_created
 
 
-def _chain_options_preparing(opt: dict[str, Any]) -> bool:
+def _chain_options_preparing(
+    opt: dict[str, Any],
+    *,
+    chain_status: BuildChainStatus | str | None = None,
+) -> bool:
+    if chain_status is not None:
+        st = chain_status.value if isinstance(chain_status, BuildChainStatus) else str(chain_status)
+        if st.lower() not in ("pending", "running"):
+            return False
     return bool(opt.get("prepare_pending") or opt.get("prepare_running"))
 
 
@@ -2718,6 +2751,10 @@ async def _run_one_chain_prepare(chain_id: int) -> None:
             )
             chain = result.scalar_one_or_none()
             if not chain:
+                return
+            if chain.status != BuildChainStatus.PENDING:
+                _clear_chain_prepare_flags(chain)
+                await db.commit()
                 return
             opt = dict(_options_dict(chain))
             opt.pop("prepare_running", None)
