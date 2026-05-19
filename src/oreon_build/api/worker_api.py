@@ -599,7 +599,7 @@ _RPM_QUIET_TIMEOUT_SEC = 600
 
 def _rpm_subproc_timeout_sec(path: Path) -> int:
     """
-    Large SRPMs (e.g. linux-firmware) need a longer ``rpm -qp`` window or nevra / sig probes time out and
+    Large SRPMs (e.g. linux-firmware) need a longer ``rpm -qp`` window or nevra/sig probes time out and
     idempotent complete retries falsely fail with HTTP 400.
     """
     try:
@@ -1889,8 +1889,8 @@ async def report_result(
     await db.flush()
     await sync_worker_state_after_attempt_finished(db, worker)
     # Critical durability boundary.
-    # Final status transitions must survive failures in artifact insert / repo publish enqueue /
-    # promotion creation / R2 cleanup during large autobuild bursts.
+    # Final status transitions must survive failures in artifact insert/repo publish enqueue /
+    # promotion creation/R2 cleanup during large autobuild bursts.
     await db.commit()
 
     # Burst VM lifecycle: stop the GCP instance if this was a burst worker and
