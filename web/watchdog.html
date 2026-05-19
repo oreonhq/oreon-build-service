@@ -262,7 +262,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           h += '<button type="button" class="btn' + (isCur ? ' primary' : '') + '" data-watchdog-pg="' + navId + '" data-goto="' + n + '"' + (isCur ? ' disabled' : '') + '>' + n + '</button>';
         }
         h += '<button type="button" class="btn" data-watchdog-pg="' + navId + '" data-goto="next"' + (page >= totalPages ? ' disabled' : '') + '>Next</button>';
-        h += '<span style="color:var(--text-muted);font-size:0.88rem;margin-left:0.4rem;">Page ' + page + ' of ' + totalPages + ' · ' + total + ' rows</span>';
+        h += '<span style="color:var(--text-muted);font-size:0.88rem;margin-left:0.4rem;">Page ' + page + ' of ' + totalPages + ', ' + total + ' rows</span>';
         h += '</div>';
         el.innerHTML = h;
       }
