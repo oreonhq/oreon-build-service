@@ -857,6 +857,12 @@ async def _inject_missing_dep_layers_before(
 
     for pred in candidates:
         pred_lower = pred.lower()
+        # Already listed on this chain (even if not built yet). Do not insert duplicate
+        # stages each expand round; enqueue/rewind handles packages that still need builds.
+        if pred_lower in all_chain_pkg_names:
+            continue
+        if pred not in spec_names:
+            continue
         still_needs = await _chain_package_still_needs_build(
             db,
             chain,
@@ -866,10 +872,6 @@ async def _inject_missing_dep_layers_before(
             skip_jobs_not_before=skip_not_before,
             republish_needed=republish_needed,
         )
-        if pred_lower in all_chain_pkg_names and not still_needs:
-            continue
-        if pred not in spec_names:
-            continue
         if not still_needs:
             continue
         to_inject.add(pred)

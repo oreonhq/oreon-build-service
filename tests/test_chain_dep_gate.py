@@ -225,6 +225,47 @@ async def test_inject_before_stage_zero_for_single_package_chain():
 
 
 @pytest.mark.asyncio
+async def test_inject_does_not_duplicate_packages_already_on_chain():
+    from oreon_build.services.build_chain import _inject_missing_dep_layers_before
+
+    chain = _make_chain([["libbar"], ["firefox"]], active_stage=0)
+    release = MagicMock()
+    release.releasename = "oreon-11-rp1"
+    order = _make_order(
+        edges=[{"from": "firefox", "to": "libbar"}],
+        layers=[["libbar"], ["firefox"]],
+        package_names=["libbar", "firefox"],
+    )
+
+    db = AsyncMock()
+    db.execute.return_value.scalar_one_or_none = MagicMock(return_value=release)
+
+    with patch(
+        "oreon_build.services.build_chain._cached_distgit_build_order",
+        new=AsyncMock(return_value=order),
+    ), patch(
+        "oreon_build.services.build_chain._cached_repo_provides_index",
+        new=AsyncMock(return_value=({}, set())),
+    ), patch(
+        "oreon_build.services.build_chain._proactive_extra_roots_from_repo_runtime",
+        new=AsyncMock(return_value=(set(), [])),
+    ), patch(
+        "oreon_build.services.build_chain._package_id_for_name",
+        new=AsyncMock(return_value=99),
+    ), patch(
+        "oreon_build.services.build_chain._chain_package_still_needs_build",
+        new=AsyncMock(return_value=True),
+    ), patch(
+        "oreon_build.services.build_chain._chain_use_distgit_dep_gate",
+        return_value=True,
+    ):
+        ok = await _inject_missing_dep_layers_before(db, chain, 0)
+
+    assert ok is True
+    assert chain.stages_json == [["libbar"], ["firefox"]]
+
+
+@pytest.mark.asyncio
 async def test_inject_skips_chain_internal_packages():
     from oreon_build.services.build_chain import _inject_missing_dep_layers_before
 
