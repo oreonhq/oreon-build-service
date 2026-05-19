@@ -112,6 +112,36 @@ def test_chain_sources_missing_from_repo_for_consumers():
     assert "kactivities" in needed
 
 
+def test_sources_needing_chain_build_skips_repo_satisfied_predecessors():
+    from oreon_build.services.chain_satisfaction import sources_needing_chain_build
+
+    order = MagicMock()
+    order.package_names = ["acl", "bash", "kernel-headers"]
+    order.spec_evrs = {
+        "acl": "0:2.3.1-1.fc43",
+        "bash": "0:5.2-1.fc43",
+        "kernel-headers": "0:6.8-1.fc43",
+    }
+    order.build_requires_raw = {"kernel-headers": ["acl"]}
+    order.capability_providers = {"acl": ["acl"]}
+
+    acl_evr = RpmEvr(0, "2.3.1", "1.fc43")
+    bash_evr = RpmEvr(0, "5.2", "1.fc43")
+    repo = RepoSatisfactionIndex(
+        provides_index={"acl": {"acl"}, "bash": {"bash"}},
+        known_sources={"acl", "bash"},
+        provide_best_evr={"acl": acl_evr, "bash": bash_evr},
+        source_best_evr={"acl": acl_evr, "bash": bash_evr},
+    )
+    got = sources_needing_chain_build(
+        {"acl", "bash"},
+        order,
+        repo,
+        consumer_packages=["kernel-headers"],
+    )
+    assert got == set()
+
+
 def test_chain_source_required_when_devel_br_missing():
     from oreon_build.services.chain_satisfaction import chain_source_still_required_for_consumers
 
