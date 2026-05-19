@@ -123,9 +123,9 @@
       }
 
       function statusRowClass(status, preparing) {
-        if (preparing) return 'chain-row-preparing';
         var s = (status || '').toLowerCase();
         if (s === 'failed' || s === 'cancelled') return 'chain-row-failed';
+        if (preparing) return 'chain-row-preparing';
         if (s === 'success') return 'chain-row-success';
         return 'chain-row-preparing';
       }
@@ -144,7 +144,9 @@
         var err = (c.error_message || '').trim();
         var caps = c.unresolved_capabilities || [];
         var parts = [];
-        if (c.preparing) {
+        var st = (c.status || '').toLowerCase();
+        var terminal = st === 'failed' || st === 'cancelled' || st === 'success';
+        if (c.preparing && !terminal) {
           parts.push('<p><strong>Preparing</strong> Dependency expand and stage-0 enqueue are running in the API background. Refresh this page in a minute.</p>');
           if (c.prepare_started_at) {
             parts.push('<p class="chains-hint">Started: ' + escapeHtml(c.prepare_started_at) + '</p>');
@@ -188,7 +190,10 @@
             var s = (r.status || '').toLowerCase();
             return s === 'failed' || s === 'cancelled';
           }).length;
-          var prepN = rows.filter(function(r) { return r.preparing; }).length;
+          var prepN = rows.filter(function(r) {
+            var s = (r.status || '').toLowerCase();
+            return r.preparing && s !== 'failed' && s !== 'cancelled' && s !== 'success';
+          }).length;
           statusEl.textContent = rows.length
             ? (rows.length + ' chain(s)' + (failedN ? ', ' + failedN + ' failed/cancelled' : '') + (prepN ? ', ' + prepN + ' preparing' : ''))
             : 'No chain builds yet.';
@@ -202,7 +207,8 @@
             var id = c.chain_id;
             var st = (c.status || 'unknown').toLowerCase();
             var pill = '<span class="chain-status-pill ' + escapeHtml(st) + '">' + escapeHtml(st) + '</span>';
-            if (c.preparing) {
+            var terminal = st === 'failed' || st === 'cancelled' || st === 'success';
+            if (c.preparing && !terminal) {
               pill += ' <span class="chain-status-pill pending">preparing</span>';
             }
             var created = c.created_at ? String(c.created_at).slice(0, 19).replace('T', ' ') : '-';
