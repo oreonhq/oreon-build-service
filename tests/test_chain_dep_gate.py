@@ -88,6 +88,34 @@ def test_resolve_capability_via_spec_provide_only():
     assert resolve_distgit_sources_for_capability(order, "libfoo-plugin-wheel") == []
 
 
+def test_parse_versioned_provides_capability_name():
+    from oreon_build.services.distgit_order import _parse_spec_text, _provider_map_from_specs
+
+    spec = """
+Name: libfoo
+%package wheel
+Provides: libfoo-missing-cap = 1.0-1
+"""
+    parsed = _parse_spec_text(spec, "libfoo.spec")
+    assert "libfoo-missing-cap" in parsed.provided_binary_names
+    pm = _provider_map_from_specs({"libfoo": parsed})
+    assert "libfoo" in pm.get("libfoo-missing-cap", [])
+
+
+def test_sources_missing_repo_capabilities():
+    from oreon_build.services.build_chain import _sources_missing_repo_capabilities
+
+    order = _make_order(
+        edges=[],
+        layers=[],
+        package_names=["libfoo"],
+        capability_providers={"libfoo-missing-cap": ["libfoo"]},
+    )
+    repo_pi: dict[str, set[str]] = {}
+    got = _sources_missing_repo_capabilities(order, repo_pi, ["libfoo-missing-cap"])
+    assert got == {"libfoo"}
+
+
 def test_parse_spec_macro_expanded_subpackage_is_capability():
     from oreon_build.services.distgit_order import _parse_spec_text
 

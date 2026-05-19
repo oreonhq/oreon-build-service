@@ -149,6 +149,10 @@ def _extract_br_tokens_from_tag_value(value: str) -> list[str]:
         token = chunk.strip()
         if not token:
             continue
+        if "=" in token:
+            token = token.split("=", 1)[0].strip()
+        if not token:
+            continue
         m = _BR_NAME.match(token)
         if not m:
             continue

@@ -485,6 +485,32 @@ async def _package_id_for_name(db: Any, name: str) -> int | None:
     return int(pid) if pid is not None else None
 
 
+async def _chain_package_still_needs_build(
+    db: Any,
+    chain: BuildChain,
+    package_name: str,
+    *,
+    architectures: list[str],
+    preferred_mock_environment_id: int | None,
+    skip_jobs_not_before: datetime | None,
+    republish_needed: set[str] | None = None,
+) -> bool:
+    """True when this chain still needs to build ``package_name`` (failed, never built, or repo lacks Provides)."""
+    if republish_needed and package_name in republish_needed:
+        return True
+    pid = await _package_id_for_name(db, package_name)
+    if pid is None:
+        return True
+    return not await _chain_has_successful_build_all_arches(
+        db,
+        chain,
+        pid,
+        architectures=architectures,
+        preferred_mock_environment_id=preferred_mock_environment_id,
+        skip_jobs_not_before=skip_jobs_not_before,
+    )
+
+
 async def _chain_has_successful_build_all_arches(
     db: Any,
     chain: BuildChain,
@@ -513,18 +539,64 @@ async def _chain_has_successful_build_all_arches(
     return True
 
 
-async def _cached_distgit_build_order(releasename: str, distgit_url: str, distgit_branch: str) -> Any:
+def invalidate_distgit_order_cache(
+    releasename: str,
+    distgit_url: str,
+    distgit_branch: str,
+) -> None:
+    """Drop cached spec-tree order so the next chain step sees fresh distgit specs."""
+    k = (releasename.strip(), distgit_url.strip(), distgit_branch.strip())
+    _chain_distgit_order_cache.pop(k, None)
+
+
+def invalidate_repo_chain_caches(releasename: str, branch: str, arch: str) -> None:
+    """Drop cached repodata indexes after a publish or spec Provides change."""
+    k = (releasename.strip(), branch.strip(), normalize_machine_arch(arch))
+    _chain_repo_provides_cache.pop(k, None)
+    _chain_repo_runtime_cache.pop(k, None)
+
+
+async def _cached_distgit_build_order(
+    releasename: str,
+    distgit_url: str,
+    distgit_branch: str,
+    *,
+    force_refresh: bool = False,
+) -> Any:
     from oreon_build.services.distgit_order import compute_distgit_build_order
 
     k = (releasename.strip(), distgit_url.strip(), distgit_branch.strip())
     now = time.monotonic()
     ttl = _chain_distgit_order_cache_ttl_sec()
-    hit = _chain_distgit_order_cache.get(k)
-    if hit is not None and (now - hit[0]) < ttl:
-        return hit[1]
+    if not force_refresh:
+        hit = _chain_distgit_order_cache.get(k)
+        if hit is not None and (now - hit[0]) < ttl:
+            return hit[1]
     order = await compute_distgit_build_order(releasename=k[0], distgit_url=k[1], distgit_branch=k[2])
     _chain_distgit_order_cache[k] = (now, order)
     return order
+
+
+def _sources_missing_repo_capabilities(
+    order: Any,
+    repo_pi: dict[str, set[str]],
+    capabilities: list[str],
+) -> set[str]:
+    """Source packages that should Provide a capability but published repo metadata does not yet."""
+    from oreon_build.services.distgit_order import resolve_distgit_sources_for_capability
+
+    need_rebuild: set[str] = set()
+    for cap in capabilities:
+        c = (cap or "").strip()
+        if not c or _capability_in_repo_provides(c, repo_pi):
+            continue
+        for src in resolve_distgit_sources_for_capability(
+            order,
+            c,
+            repo_provides_index=repo_pi or None,
+        ):
+            need_rebuild.add(src)
+    return need_rebuild
 
 
 async def _cached_repo_runtime_analysis(releasename: str, branch: str, arch: str) -> dict[str, Any]:
@@ -570,6 +642,7 @@ async def _proactive_extra_roots_from_repo_runtime(
 
     branch = r2_publish_branch(release)
     canon_arch = normalize_machine_arch(architectures[0] if architectures else "x86_64")
+    repo_pi, _ = await _cached_repo_provides_index(releasename, branch, canon_arch)
     analysis = await _cached_repo_runtime_analysis(releasename, branch, canon_arch)
     if analysis.get("error"):
         logger.info(
@@ -615,6 +688,7 @@ async def _proactive_extra_roots_from_repo_runtime(
                 if src not in spec_names:
                     continue
                 pid = await _package_id_for_name(db, src)
+                cap_to_check = req or candidate
                 if pid is not None and await _chain_has_successful_build_all_arches(
                     db,
                     chain,
@@ -623,6 +697,8 @@ async def _proactive_extra_roots_from_repo_runtime(
                     preferred_mock_environment_id=preferred_mock_environment_id,
                     skip_jobs_not_before=skip_jobs_not_before,
                 ):
+                    if cap_to_check and not _capability_in_repo_provides(cap_to_check, repo_pi):
+                        sources.add(src)
                     continue
                 sources.add(src)
     if sources:
@@ -680,6 +756,7 @@ async def _inject_missing_dep_layers_before(
     stage_index: int,
     *,
     extra_roots: set[str] | None = None,
+    required_capabilities: list[str] | None = None,
 ) -> bool:
     """
     Insert distgit dependency stages immediately before ``stage_index``.
@@ -726,8 +803,14 @@ async def _inject_missing_dep_layers_before(
         except (TypeError, ValueError):
             pref_pm = None
     skip_not_before = _parse_skip_jobs_not_before(chain) if bool(opt.get("skip_complete_arches", True)) else None
+    publish_branch = r2_publish_branch(release)
+    canon_arch = normalize_machine_arch(arches[0] if arches else "x86_64")
 
     order = await _cached_distgit_build_order(releasename, dg_url, dg_br)
+    repo_pi, _repo_known = await _cached_repo_provides_index(releasename, publish_branch, canon_arch)
+    caps_needed = list(required_capabilities or [])
+    republish_needed = _sources_missing_repo_capabilities(order, repo_pi, caps_needed)
+
     edges = order.edges if isinstance(order.edges, list) else []
     order_layers = order.layers if isinstance(order.layers, list) else []
     spec_names = {str(n) for n in (order.package_names or []) if n}
@@ -774,44 +857,21 @@ async def _inject_missing_dep_layers_before(
 
     for pred in candidates:
         pred_lower = pred.lower()
-        if pred_lower in all_chain_pkg_names:
-            continue
-
-        pid = await _package_id_for_name(db, pred)
-        if pid is None:
-            # No DB row yet; still inject if it is in distgit (enqueue will create Package).
-            if pred not in spec_names:
-                continue
-        elif await _chain_has_successful_build_all_arches(
+        still_needs = await _chain_package_still_needs_build(
             db,
-            chain,
-            pid,
+            pred,
+            chain=chain,
             architectures=arches,
             preferred_mock_environment_id=pref_pm,
             skip_jobs_not_before=skip_not_before,
-        ):
+            republish_needed=republish_needed,
+        )
+        if pred_lower in all_chain_pkg_names and not still_needs:
             continue
-
-        if pred_lower in past_stage_pkg_names:
-            if pid is not None and await _chain_has_successful_build_all_arches(
-                db,
-                chain,
-                pid,
-                architectures=arches,
-                preferred_mock_environment_id=pref_pm,
-                skip_jobs_not_before=skip_not_before,
-            ):
-                continue
-            msg = (
-                f"Chain blocked: dependency '{pred}' was in an earlier stage but has no "
-                f"successful build for this release on all chain architectures. "
-                f"Fix or rebuild '{pred}', then resume the chain."
-            )
-            chain.status = BuildChainStatus.FAILED
-            chain.error_message = msg
-            logger.error("chain_id=%s hard-fail: %s", chain.id, msg)
-            return False
-
+        if pred not in spec_names:
+            continue
+        if not still_needs:
+            continue
         to_inject.add(pred)
 
     layers_to_insert = _layers_for_package_subset(to_inject, order_layers)
@@ -842,9 +902,16 @@ async def _chain_sources_lacking_success(
     architectures: list[str],
     preferred_mock_environment_id: int | None,
     skip_jobs_not_before: datetime | None,
+    order: Any | None = None,
+    repo_pi: dict[str, set[str]] | None = None,
+    required_capabilities: list[str] | None = None,
 ) -> set[str]:
     lacking: set[str] = set()
+    if order is not None and repo_pi is not None and required_capabilities:
+        lacking |= _sources_missing_repo_capabilities(order, repo_pi, required_capabilities)
     for name in sorted(source_names):
+        if name in lacking:
+            continue
         pid = await _package_id_for_name(db, name)
         if pid is None:
             lacking.add(name)
@@ -981,7 +1048,11 @@ async def _try_recover_chain_after_failure(
                     r2_publish_branch(release) if release else str(opt.get("branch") or "dev")
                 )
                 if providers:
-                    order = await _cached_distgit_build_order(releasename, dg_url, dg_br)
+                    invalidate_distgit_order_cache(releasename, dg_url, dg_br)
+                    invalidate_repo_chain_caches(releasename, repo_branch, canon_arch)
+                    order = await _cached_distgit_build_order(
+                        releasename, dg_url, dg_br, force_refresh=True
+                    )
                     missing_in_distgit = await unresolved_chain_capabilities(
                         db,
                         order,
@@ -1032,7 +1103,11 @@ async def _try_recover_chain_after_failure(
                         )
 
     ok = await _inject_missing_dep_layers_before(
-        db, chain, stage_idx, extra_roots=extra_roots or None
+        db,
+        chain,
+        stage_idx,
+        extra_roots=extra_roots or None,
+        required_capabilities=providers or None,
     )
     if not ok:
         return False
@@ -1074,6 +1149,10 @@ async def _try_recover_chain_after_failure(
                     stage_idx,
                 )
 
+        order_for_check = await _cached_distgit_build_order(releasename, dg_url, dg_br)
+        repo_pi: dict[str, set[str]] = {}
+        if releasename and repo_branch:
+            repo_pi, _ = await _cached_repo_provides_index(releasename, repo_branch, canon_arch)
         lacking = await _chain_sources_lacking_success(
             db,
             chain,
@@ -1081,6 +1160,9 @@ async def _try_recover_chain_after_failure(
             architectures=arches,
             preferred_mock_environment_id=pref_pm,
             skip_jobs_not_before=skip_not_before,
+            order=order_for_check,
+            repo_pi=repo_pi,
+            required_capabilities=providers,
         )
         if lacking:
             rewind = _earliest_stage_index_for_packages(stages_now, lacking)
@@ -1102,27 +1184,49 @@ async def _try_recover_chain_after_failure(
             return True
 
         if providers and releasename and repo_branch:
-            repo_pi, _ = await _cached_repo_provides_index(releasename, repo_branch, canon_arch)
             still_missing = [c for c in providers if not _capability_in_repo_provides(c, repo_pi)]
             if still_missing:
-                pkg_r = await db.execute(
-                    select(Package.name).where(Package.id == failed_job.package_id)
-                )
-                pkg_name = pkg_r.scalar_one_or_none()
-                await fail_chain(
-                    db,
-                    chain,
-                    format_chain_repo_capability_still_missing_message(
+                if not extra_roots:
+                    pkg_r = await db.execute(
+                        select(Package.name).where(Package.id == failed_job.package_id)
+                    )
+                    pkg_name = pkg_r.scalar_one_or_none() or "?"
+                    ctx = (
+                        f"Build of {pkg_name} failed in mock; no distgit spec Provides "
+                        f"{still_missing[0]}."
+                    )
+                    await fail_chain(
+                        db,
+                        chain,
+                        format_chain_unresolved_providers_message(
+                            still_missing,
+                            releasename=releasename,
+                            distgit_url=dg_url,
+                            distgit_branch=dg_br,
+                            context=ctx,
+                        ),
+                        terminal=BuildChainStatus.FAILED,
+                    )
+                    return True
+                fallback = _sources_missing_repo_capabilities(
+                    order_for_check, repo_pi, still_missing
+                ) or extra_roots
+                rewind = _earliest_stage_index_for_packages(stages_now, fallback)
+                if rewind is not None:
+                    await _rewind_chain_to_stage(
+                        db,
+                        chain,
+                        rewind,
+                        note="Chain rewinding to republish dependency with updated Provides",
+                    )
+                    logger.info(
+                        "chain_id=%s republish rewind stage %s for %s (capabilities %s)",
+                        chain.id,
+                        rewind,
+                        sorted(fallback),
                         still_missing,
-                        sorted(extra_roots),
-                        releasename=releasename,
-                        distgit_url=dg_url,
-                        distgit_branch=dg_br,
-                        failed_package=str(pkg_name) if pkg_name else None,
-                    ),
-                    terminal=BuildChainStatus.FAILED,
-                )
-                return True
+                    )
+                    return True
         return False
 
     await _cancel_chain_stage_active_jobs(
@@ -1689,6 +1793,9 @@ async def trigger_chain_build(
     await db.flush()
 
     if _chain_use_distgit_dep_gate():
+        reln = (release.releasename or "").strip()
+        if reln:
+            invalidate_distgit_order_cache(reln, dg_url, dg_branch)
         ok = await _expand_chain_stages_dependencies(db, chain, 0)
         if not ok:
             await db.flush()
