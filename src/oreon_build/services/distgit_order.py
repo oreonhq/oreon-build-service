@@ -8,6 +8,7 @@ import os
 import re
 import tempfile
 import tarfile
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache
@@ -45,7 +46,7 @@ class DistgitBuildOrderResult:
     package_names: list[str]
     edges: list[dict[str, str]]  # { "from": consumer, "to": provider } consumer needs provider
     layers: list[list[str]]  # topological levels (parallel groups)
-    # Capability name (Provides / subpackage / source name) -> distgit source packages that provide it.
+    # Capability name (Provides/subpackage/source name) -> distgit source packages that provide it.
     capability_providers: dict[str, list[str]]
     spec_evrs: dict[str, str]
     build_requires_raw: dict[str, list[str]]
@@ -374,6 +375,281 @@ def _kahn_layers(
     return layers, cycle
 
 
+async def _download_distgit_tarball(
+    *,
+    owner: str,
+    repo: str,
+    distgit_branch: str,
+    headers: dict[str, str],
+) -> tuple[bytes | None, str | None]:
+    u = f"https://codeload.github.com/{owner}/{repo}/tar.gz/refs/heads/{distgit_branch}"
+    async with httpx.AsyncClient(timeout=180, headers=headers, follow_redirects=True) as client:
+        r = await client.get(u)
+    if r.status_code != 200:
+        return None, f"Tarball fetch failed HTTP {r.status_code}: {u}"
+    return r.content, None
+
+
+def _tarball_spec_package_names(tarball: bytes, releasename: str) -> set[str]:
+    names: set[str] = set()
+    with tarfile.open(fileobj=io.BytesIO(tarball), mode="r:gz") as tf:
+        for m in tf.getmembers():
+            if not m.isfile():
+                continue
+            parts = m.name.split("/")
+            if len(parts) < 4 or parts[1] != releasename:
+                continue
+            pkg, fn = parts[2], parts[3]
+            if fn == f"{pkg}.spec":
+                names.add(pkg)
+    return names
+
+
+def _read_specs_from_tarball(
+    tarball: bytes,
+    releasename: str,
+    packages: set[str],
+) -> dict[str, str]:
+    """Read only ``packages`` spec files from an already-downloaded tarball."""
+    want = set(packages)
+    if not want:
+        return {}
+    specs: dict[str, str] = {}
+    with tarfile.open(fileobj=io.BytesIO(tarball), mode="r:gz") as tf:
+        for m in tf.getmembers():
+            if not m.isfile():
+                continue
+            parts = m.name.split("/")
+            if len(parts) < 4 or parts[1] != releasename:
+                continue
+            pkg, fn = parts[2], parts[3]
+            if pkg not in want or fn != f"{pkg}.spec":
+                continue
+            f = tf.extractfile(m)
+            if f is None:
+                continue
+            specs[pkg] = f.read().decode("utf-8", errors="replace")
+            if len(specs) >= len(want):
+                break
+    return specs
+
+
+def _chain_distgit_max_parse() -> int:
+    raw = (os.getenv("OREON_CHAIN_DISTGIT_MAX_PARSE") or "4096").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 4096
+    return max(64, min(n, 20000))
+
+
+async def _parse_specs_parallel_async(
+    specs_by_pkg: dict[str, str],
+) -> tuple[dict[str, _SpecParseResult], list[str]]:
+    err: list[str] = []
+    parsed_by_source: dict[str, _SpecParseResult] = {}
+    if not specs_by_pkg:
+        return parsed_by_source, err
+    loop = asyncio.get_running_loop()
+    pool = _distgit_spec_parse_executor()
+    items = list(specs_by_pkg.items())
+    tasks = [
+        loop.run_in_executor(pool, _parse_spec_text, spec_text, f"{pkg}.spec")
+        for pkg, spec_text in items
+    ]
+    parse_results = await asyncio.gather(*tasks, return_exceptions=True)
+    for (pkg, _spec_text), parsed_or_exc in zip(items, parse_results, strict=False):
+        if isinstance(parsed_or_exc, Exception):
+            err.append(f"{pkg}: parse failed ({type(parsed_or_exc).__name__}: {parsed_or_exc})")
+            parsed_by_source[pkg] = _SpecParseResult(
+                source_name=pkg,
+                build_requires=[],
+                provided_binary_names={pkg},
+                build_requires_raw=[],
+            )
+        else:
+            parsed_by_source[pkg] = parsed_or_exc
+    return parsed_by_source, err
+
+
+def _distgit_order_from_parsed(
+    *,
+    releasename: str,
+    distgit_url: str,
+    distgit_branch: str,
+    parsed_by_source: dict[str, _SpecParseResult],
+    err: list[str],
+) -> DistgitBuildOrderResult:
+    names_set: set[str] = set(parsed_by_source.keys())
+    edges: list[dict[str, str]] = []
+    deps: dict[str, set[str]] = {n: set() for n in names_set}
+    rdeps: dict[str, set[str]] = {n: set() for n in names_set}
+    provider_map = _provider_map_from_specs(parsed_by_source)
+
+    for cons, parsed in parsed_by_source.items():
+        for br in parsed.build_requires:
+            providers = provider_map.get(br) or set()
+            for prov in sorted(providers):
+                if prov not in names_set or prov == cons:
+                    continue
+                deps[cons].add(prov)
+                rdeps[prov].add(cons)
+                edges.append(
+                    {
+                        "from": cons,
+                        "to": prov,
+                        "requirement": br,
+                        "satisfied": False,
+                        "type": "distgit_br",
+                    }
+                )
+
+    layers, cyc = _kahn_layers(names_set, deps, rdeps)
+    if cyc:
+        err.append("Warning: a cycle exists in distgit BuildRequires; some parallel layers may be conservative.")
+
+    capability_providers = {cap: sorted(srcs) for cap, srcs in sorted(provider_map.items())}
+    spec_evrs = {src: parsed.evr_canonical() for src, parsed in parsed_by_source.items()}
+    build_requires_raw = {src: list(parsed.build_requires_raw) for src, parsed in parsed_by_source.items()}
+
+    return DistgitBuildOrderResult(
+        releasename=releasename,
+        distgit_url=distgit_url,
+        distgit_branch=distgit_branch,
+        package_names=sorted(names_set),
+        edges=edges,
+        layers=layers,
+        capability_providers=capability_providers,
+        spec_evrs=spec_evrs,
+        build_requires_raw=build_requires_raw,
+        errors=err,
+        cycle_warning=cyc,
+    )
+
+
+def _expand_chain_spec_closure(
+    roots: list[str],
+    all_names: set[str],
+    tarball: bytes,
+    releasename: str,
+) -> tuple[dict[str, str], list[str]]:
+    """
+    Incrementally read/parse specs along BuildRequires from ``roots`` (not the full distgit tree).
+    """
+    err: list[str] = []
+    names_set = set(all_names)
+    specs: dict[str, str] = {}
+    provider_map: dict[str, set[str]] = {}
+    needed: set[str] = set()
+    queue: deque[str] = deque()
+
+    for r in roots:
+        rn = (r or "").strip()
+        if not rn:
+            continue
+        if rn not in names_set:
+            err.append(f"chain root {rn!r} not found under {releasename}/ in distgit")
+            continue
+        needed.add(rn)
+        queue.append(rn)
+
+    max_parse = _chain_distgit_max_parse()
+    while queue and len(needed) <= max_parse:
+        pkg = queue.popleft()
+        if pkg in specs:
+            continue
+        batch = _read_specs_from_tarball(tarball, releasename, {pkg})
+        if pkg not in batch:
+            err.append(f"spec missing in tarball for {pkg}")
+            continue
+        specs[pkg] = batch[pkg]
+        parsed = _parse_spec_text(specs[pkg], f"{pkg}.spec")
+        for cap, srcs in _provider_map_from_specs({pkg: parsed}).items():
+            provider_map.setdefault(cap, set()).update(srcs)
+        for br in parsed.build_requires:
+            provs = set(provider_map.get(br) or set())
+            if br in names_set:
+                provs.add(br)
+            for prov in provs:
+                if prov not in names_set or prov == pkg:
+                    continue
+                if prov not in needed:
+                    needed.add(prov)
+                    queue.append(prov)
+
+    if len(needed) > max_parse:
+        err.append(
+            f"Chain distgit closure exceeded OREON_CHAIN_DISTGIT_MAX_PARSE ({max_parse}); narrow the chain spec."
+        )
+    return specs, err
+
+
+async def compute_distgit_build_order_for_chain(
+    *,
+    releasename: str,
+    distgit_url: str = "https://github.com/oreonhq/rpm-specfiles.git",
+    distgit_branch: str = "main",
+    root_packages: list[str],
+) -> DistgitBuildOrderResult:
+    """
+    Fresh distgit metadata for a chain: one tarball fetch, parse only specs reachable from ``root_packages``.
+    """
+    err: list[str] = []
+    gr = _github_owner_repo_from_git_url(distgit_url)
+    if not gr:
+        return DistgitBuildOrderResult(
+            releasename=releasename,
+            distgit_url=distgit_url,
+            distgit_branch=distgit_branch,
+            package_names=[],
+            edges=[],
+            layers=[],
+            capability_providers={},
+            spec_evrs={},
+            build_requires_raw={},
+            errors=[f"distgit_url is not a supported github.com URL: {distgit_url!r}"],
+            cycle_warning=False,
+        )
+    owner, repo = gr
+    settings = get_settings()
+    token = (getattr(settings, "github_token", None) or os.environ.get("GITHUB_TOKEN") or "").strip() or None
+    headers: dict[str, str] = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    tarball, t_err = await _download_distgit_tarball(
+        owner=owner, repo=repo, distgit_branch=distgit_branch, headers=headers
+    )
+    if t_err:
+        err.append(t_err)
+        return _distgit_order_from_parsed(
+            releasename=releasename,
+            distgit_url=distgit_url,
+            distgit_branch=distgit_branch,
+            parsed_by_source={},
+            err=err,
+        )
+
+    all_names = await asyncio.to_thread(_tarball_spec_package_names, tarball, releasename)
+    specs_by_pkg, cerr = await asyncio.to_thread(
+        _expand_chain_spec_closure,
+        root_packages,
+        all_names,
+        tarball,
+        releasename,
+    )
+    err.extend(cerr)
+    parsed_by_source, perr = await _parse_specs_parallel_async(specs_by_pkg)
+    err.extend(perr)
+    return _distgit_order_from_parsed(
+        releasename=releasename,
+        distgit_url=distgit_url,
+        distgit_branch=distgit_branch,
+        parsed_by_source=parsed_by_source,
+        err=err,
+    )
+
+
 async def _fetch_specs_by_tarball(
     *,
     owner: str,
@@ -382,35 +658,18 @@ async def _fetch_specs_by_tarball(
     distgit_branch: str,
     headers: dict[str, str],
 ) -> tuple[dict[str, str], list[str]]:
-    """Download branch tarball once, extract `<releasename>/<pkg>/<pkg>.spec` entries."""
+    """Download branch tarball once, extract every ``<releasename>/<pkg>/<pkg>.spec`` (full tree)."""
     errs: list[str] = []
-    u = f"https://codeload.github.com/{owner}/{repo}/tar.gz/refs/heads/{distgit_branch}"
-    async with httpx.AsyncClient(timeout=180, headers=headers, follow_redirects=True) as client:
-        r = await client.get(u)
-    if r.status_code != 200:
-        return {}, [f"Tarball fetch failed HTTP {r.status_code}: {u}"]
-    specs: dict[str, str] = {}
+    tarball, t_err = await _download_distgit_tarball(
+        owner=owner, repo=repo, distgit_branch=distgit_branch, headers=headers
+    )
+    if t_err:
+        return {}, [t_err]
     try:
-        with tarfile.open(fileobj=io.BytesIO(r.content), mode="r:gz") as tf:
-            for m in tf.getmembers():
-                if not m.isfile():
-                    continue
-                parts = m.name.split("/")
-                if len(parts) < 4:
-                    continue
-                # <repo>-<branch>/<releasename>/<pkg>/<pkg>.spec
-                if parts[1] != releasename:
-                    continue
-                pkg = parts[2]
-                fn = parts[3]
-                if fn != f"{pkg}.spec":
-                    continue
-                f = tf.extractfile(m)
-                if f is None:
-                    continue
-                specs[pkg] = f.read().decode("utf-8", errors="replace")
+        names = _tarball_spec_package_names(tarball, releasename)
+        specs = _read_specs_from_tarball(tarball, releasename, names)
     except Exception as exc:
-        errs.append(f"tarball parse failed: {type(exc).__name__}: {exc}")
+        return {}, [f"tarball parse failed: {type(exc).__name__}: {exc}"]
     return specs, errs
 
 
@@ -478,72 +737,14 @@ async def compute_distgit_build_order(
     if not specs_by_pkg and not err:
         err.append(f"No packages with specs found under {releasename}/ on branch {distgit_branch}")
 
-    names_set: set[str] = set(specs_by_pkg.keys())
-    parsed_by_source: dict[str, _SpecParseResult] = {}
-    loop = asyncio.get_running_loop()
-    pool = _distgit_spec_parse_executor()
-    tasks = [
-        loop.run_in_executor(pool, _parse_spec_text, spec_text, f"{pkg}.spec")
-        for pkg, spec_text in specs_by_pkg.items()
-    ]
-    parse_results = await asyncio.gather(*tasks, return_exceptions=True)
-    for (pkg, _spec_text), parsed_or_exc in zip(specs_by_pkg.items(), parse_results, strict=False):
-        if isinstance(parsed_or_exc, Exception):
-            err.append(f"{pkg}: parse failed ({type(parsed_or_exc).__name__}: {parsed_or_exc})")
-            parsed_by_source[pkg] = _SpecParseResult(
-                source_name=pkg,
-                build_requires=[],
-                provided_binary_names={pkg},
-                build_requires_raw=[],
-            )
-        else:
-            parsed_by_source[pkg] = parsed_or_exc
-
-    edges: list[dict[str, str]] = []
-    deps: dict[str, set[str]] = {n: set() for n in names_set}
-    rdeps: dict[str, set[str]] = {n: set() for n in names_set}
-    provider_map = _provider_map_from_specs(parsed_by_source)
-
-    for cons, parsed in parsed_by_source.items():
-        for br in parsed.build_requires:
-            providers = provider_map.get(br) or set()
-            for prov in sorted(providers):
-                if prov not in names_set or prov == cons:
-                    continue
-                # cons depends on provider source package
-                deps[cons].add(prov)
-                rdeps[prov].add(cons)
-                edges.append(
-                    {
-                        "from": cons,
-                        "to": prov,
-                        "requirement": br,
-                        "satisfied": False,
-                        "type": "distgit_br",
-                    }
-                )
-
-    # Transitive trim for layer sort only
-    layers, cyc = _kahn_layers(names_set, deps, rdeps)
-    if cyc:
-        err.append("Warning: a cycle exists in distgit BuildRequires; some parallel layers may be conservative.")
-
-    capability_providers = {cap: sorted(srcs) for cap, srcs in sorted(provider_map.items())}
-    spec_evrs = {src: parsed.evr_canonical() for src, parsed in parsed_by_source.items()}
-    build_requires_raw = {src: list(parsed.build_requires_raw) for src, parsed in parsed_by_source.items()}
-
-    return DistgitBuildOrderResult(
+    parsed_by_source, perr = await _parse_specs_parallel_async(specs_by_pkg)
+    err.extend(perr)
+    return _distgit_order_from_parsed(
         releasename=releasename,
         distgit_url=distgit_url,
         distgit_branch=distgit_branch,
-        package_names=sorted(names_set),
-        edges=edges,
-        layers=layers,
-        capability_providers=capability_providers,
-        spec_evrs=spec_evrs,
-        build_requires_raw=build_requires_raw,
-        errors=err,
-        cycle_warning=cyc,
+        parsed_by_source=parsed_by_source,
+        err=err,
     )
 
 

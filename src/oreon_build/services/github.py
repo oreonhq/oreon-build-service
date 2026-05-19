@@ -84,7 +84,7 @@ class GitHubClient:
         return r.json()
 
     async def compare_refs(self, owner: str, repo: str, base: str, head: str) -> Optional[dict[str, Any]]:
-        """GET repos/compare/{base}...{head} . Returns None on 404/422 (unrelated / missing)."""
+        """GET repos/compare/{base}...{head} . Returns None on 404/422 (unrelated/missing)."""
         spec = f"{quote(base, safe='')}...{quote(head, safe='')}"
         r = await self._client.get(f"/repos/{owner}/{repo}/compare/{spec}")
         if r.status_code in (404, 422):

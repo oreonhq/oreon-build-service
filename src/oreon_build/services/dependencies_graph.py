@@ -818,6 +818,116 @@ def _analyze_repo(
     }
 
 
+def analyze_repo_runtime_primary_only(
+    target: RepoTarget,
+    *,
+    external_provides: set[str] | None = None,
+    spec_capability_providers: dict[str, list[str]] | None = None,
+) -> dict[str, Any]:
+    """
+    Fast chain prepare path: runtime Requires from primary.xml only (no SRPM header scans).
+    """
+    _empty: dict[str, Any] = {
+        "repo": target,
+        "packages": {},
+        "missing": [],
+        "edges": [],
+        "runtime_missing": [],
+        "runtime_edges": [],
+    }
+    r2 = get_r2_client()
+    repomd_key = f"{target.prefix}/repodata/repomd.xml"
+    repomd = r2.get_object(repomd_key)
+    if not repomd:
+        return {**_empty, "error": "repomd_missing"}
+    primary_key = _resolve_primary_key(target.prefix, repomd)
+    if not primary_key:
+        return {**_empty, "error": "primary_missing_in_repomd"}
+    primary_raw = r2.get_object(primary_key)
+    if not primary_raw:
+        return {**_empty, "error": "primary_blob_missing"}
+    try:
+        primary_xml = _decompress_if_needed(primary_raw, primary_key)
+        provides_index, known_built_sources = _build_provides_index(primary_xml)
+    except Exception as exc:
+        return {**_empty, "error": f"primary_parse_failed:{type(exc).__name__}:{exc}"}
+
+    src_candidates = set(known_built_sources)
+    runtime_edges: list[dict[str, Any]] = []
+    runtime_missing: list[dict[str, Any]] = []
+    try:
+        root = ET.fromstring(primary_xml)
+    except ET.ParseError:
+        root = None
+    if root is not None:
+        for pkg in root.findall(".//{*}package"):
+            pkg_arch = _safe_text(pkg.find("{*}arch"))
+            if pkg_arch == "src":
+                continue
+            src_name = _source_name_from_sourcerpm(_safe_text(pkg.find("{*}format/{*}sourcerpm")))
+            if not src_name:
+                continue
+            seen_runtime_req: set[str] = set()
+            for e in pkg.findall(f".//{RPM_NS}requires/{RPM_NS}entry"):
+                req_raw = (e.attrib.get("name") or "").strip()
+                req = _parse_runtime_req_name(req_raw)
+                if not req or req in seen_runtime_req:
+                    continue
+                seen_runtime_req.add(req)
+                if external_provides and req in external_provides:
+                    continue
+                providers = _providers_for_requirement(
+                    req,
+                    provides_index,
+                    src_candidates,
+                    known_built_sources,
+                    spec_capability_providers,
+                )
+                if providers is None:
+                    continue
+                is_satisfied = _requirement_satisfied_in_repo(
+                    req, providers, known_built_sources, provides_index
+                )
+                for prov_src in sorted(providers):
+                    if prov_src == src_name:
+                        continue
+                    runtime_edges.append(
+                        {
+                            "release": target.releasename,
+                            "branch": target.branch,
+                            "arch": target.arch,
+                            "from": src_name,
+                            "to": prov_src,
+                            "requirement": req,
+                            "missing": not is_satisfied,
+                        }
+                    )
+                if not is_satisfied:
+                    for prov_src in sorted(providers):
+                        if prov_src == src_name:
+                            continue
+                        runtime_missing.append(
+                            {
+                                "release": target.releasename,
+                                "branch": target.branch,
+                                "arch": target.arch,
+                                "package": src_name,
+                                "requirement": req,
+                                "provider": prov_src,
+                            }
+                        )
+
+    return {
+        "repo": target,
+        "packages": {},
+        "missing": [],
+        "edges": [],
+        "runtime_missing": runtime_missing,
+        "runtime_edges": runtime_edges,
+        "error": None,
+    }
+
+
 async def _collect_repo_targets(db: AsyncSession) -> list[RepoTarget]:
     targets: dict[tuple[str, str, str], RepoTarget] = {}
 

@@ -50,7 +50,7 @@ class RpmEvr:
 
 @dataclass
 class RepoSatisfactionIndex:
-    """Published repo metadata for chain skip / conflict checks."""
+    """Published repo metadata for chain skip/conflict checks."""
 
     provides_index: dict[str, set[str]]
     known_sources: set[str]
@@ -85,7 +85,7 @@ def _vercmp(a: RpmEvr, b: RpmEvr) -> int:
             return int((proc.stdout or "0").strip())
     except (FileNotFoundError, subprocess.TimeoutExpired, ValueError, OSError):
         pass
-    # Fallback when rpm(8) is unavailable (tests / minimal hosts).
+    # Fallback when rpm(8) is unavailable (tests/minimal hosts).
     ta = (a.epoch, a.version, a.release)
     tb = (b.epoch, b.version, b.release)
     if ta < tb:

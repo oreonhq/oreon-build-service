@@ -372,7 +372,7 @@ def _createrepo_timeout_sec() -> int:
 
 def _r2_etag_strong_content_md5(etag: str) -> bool:
     """
-    S3 / R2 single-part object ETag is the MD5 hex. Multipart and other forms are not; do not
+    S3/R2 single-part object ETag is the MD5 hex. Multipart and other forms are not; do not
     use those for a local file comparison.
     """
     t = (etag or "").strip()

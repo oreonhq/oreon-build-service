@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""RPM signing: GPG (rpm header) and optional pesign (PE / kernel modules inside payload)."""
+"""RPM signing: GPG (rpm header) and optional pesign (PE/kernel modules inside payload)."""
 from __future__ import annotations
 
 import json
@@ -254,7 +254,7 @@ def resolve_pesign_nickname(package_name: str, arch: str, settings: PesignConfig
 def package_name_matches_pesign_pattern(
     package_name: str, settings: PesignConfig, arch: str = "x86_64"
 ) -> bool:
-    """True if a signing nickname would be chosen for this name/arch (tests / diagnostics)."""
+    """True if a signing nickname would be chosen for this name/arch (tests/diagnostics)."""
     return resolve_pesign_nickname(package_name, arch, settings) is not None
 
 
@@ -311,8 +311,7 @@ def pesign_rpm_if_configured(rpm_path: Path, settings: Optional[PesignConfig] = 
 
     Requires: pesign, rpmrebuild, rpm, file, bash, find on PATH.
 
-    Returns True if pesign repack ran and succeeded. False if skipped (not configured / no match /
-    tools missing when not strict). Raises PesignRepackError when strict and signing must apply
+    Returns True if pesign repack ran and succeeded. False if skipped (not configured/no match/tools missing when not strict). Raises PesignRepackError when strict and signing must apply
     but fails.
     """
     s = settings or get_settings()

@@ -61,8 +61,8 @@ async def send_discord_message(text: str) -> None:
 DISCORD_COLOR_SUCCESS  = 0x16A34A  # green
 DISCORD_COLOR_FAILED   = 0xDC2626  # red
 DISCORD_COLOR_CANCELLED = 0x6B7280  # gray
-DISCORD_COLOR_WARNING  = 0xD97706  # amber / stale / timeout
-DISCORD_COLOR_INFO     = 0x2563EB  # blue (default, trigger / create / update)
+DISCORD_COLOR_WARNING  = 0xD97706  # amber/stale/timeout
+DISCORD_COLOR_INFO     = 0x2563EB  # blue (default, trigger/create/update)
 DISCORD_COLOR_PROMOTE  = 0x7C3AED  # purple (promotions)
 DISCORD_COLOR_RETRY    = 0xF59E0B  # yellow-orange
 
