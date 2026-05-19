@@ -19,9 +19,10 @@
 <body>
   <header class="header">
     <a href="/" class="header-logo-link"><img src="/static/obslogo.png" alt="Oreon Build Service" class="header-logo" /></a>
-    <nav>
+    <nav><!-- filled by app.js oreonInitNavbar; fallback matches index.html -->
       <a href="/">Dashboard</a>
       <a href="/builds.html">Builds</a>
+      <a href="/chains.html">Chains</a>
       <a href="/failures.html">Failures</a>
       <a href="/packages.html">Packages</a>
       <a href="/releases.html">Releases</a>
@@ -30,8 +31,9 @@
       <a href="/repos.html">Repositories</a>
       <a href="/promotions.html">Promotions</a>
       <a href="/dependencies.html">Dependencies</a>
+      <a href="/admin.html">Administration</a>
       <form class="navbar-search" action="/search.html" method="get" style="display:inline-flex; margin-left:0.5rem;">
-        <input type="search" name="q" placeholder="Search" style="padding:0.25rem 0.5rem; width:10rem;">
+        <input type="search" name="q" id="nav-search-q" placeholder="Search" style="padding:0.25rem 0.5rem; width:10rem;">
         <button type="submit" class="btn" style="margin-left:0.25rem;">Go</button>
       </form>
       <span id="auth-section">
@@ -67,7 +69,7 @@
     </section>
   </main>
   <footer class="footer">Oreon Build Service</footer>
-  <script src="/static/app.js?v=10"></script>
+  <script src="/static/app.js?v=11"></script>
   <script>
     (function() {
       var api = window.oreonApi;
