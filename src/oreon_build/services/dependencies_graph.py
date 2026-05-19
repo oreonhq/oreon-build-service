@@ -400,8 +400,85 @@ def _map_br_to_source(
         best = max(prefix_matches, key=len)
         return {best}
 
-    # Step 4: not our package.
+    # Step 4: built source that owns a subpackage-style capability name but repodata lacks it
+    # (e.g. old build without a Provides: alias consumers still Require).
+    if br not in provides_index:
+        built_prefix = [
+            s for s in src_candidates
+            if s in known_built_sources and (br == s or br.startswith(s + "-"))
+        ]
+        if built_prefix:
+            return {max(built_prefix, key=len)}
+
+    # Step 5: not our package.
     return None
+
+
+def _providers_from_spec_capability_map(
+    requirement: str,
+    spec_capability_providers: dict[str, list[str]] | None,
+) -> set[str] | None:
+    """Map a capability to distgit source package(s) from parsed spec Provides metadata."""
+    if not spec_capability_providers:
+        return None
+    cap = (requirement or "").strip()
+    if not cap:
+        return None
+    for key in (cap, cap.lower()):
+        hit = spec_capability_providers.get(key)
+        if hit:
+            return {str(s) for s in hit if s}
+    cap_low = cap.lower()
+    for key, srcs in spec_capability_providers.items():
+        if key.lower() == cap_low and srcs:
+            return {str(s) for s in srcs if s}
+    return None
+
+
+def _providers_for_requirement(
+    requirement: str,
+    provides_index: dict[str, set[str]],
+    src_candidates: set[str],
+    known_built_sources: set[str],
+    spec_capability_providers: dict[str, list[str]] | None = None,
+) -> set[str] | None:
+    """
+    Resolve who provides a BuildRequires or runtime Requires name.
+
+    Uses published-repo src/ layout first, then distgit spec Provides (packages may
+    exist in specs but have never been built to R2 yet).
+    """
+    providers = _map_br_to_source(requirement, provides_index, src_candidates, known_built_sources)
+    if providers is not None:
+        return providers
+    return _providers_from_spec_capability_map(requirement, spec_capability_providers)
+
+
+def _capability_listed_in_provides_index(capability: str, provides_index: dict[str, set[str]]) -> bool:
+    cap = (capability or "").strip()
+    if not cap:
+        return True
+    if provides_index.get(cap):
+        return True
+    cap_low = cap.lower()
+    for key in provides_index:
+        if key.lower() == cap_low and provides_index[key]:
+            return True
+    return False
+
+
+def _requirement_satisfied_in_repo(
+    requirement: str,
+    providers: set[str],
+    known_built_sources: set[str],
+    provides_index: dict[str, set[str]],
+) -> bool:
+    """Built providers are not enough; the requirement name must appear in repodata Provides."""
+    if not providers:
+        return True
+    if not all(p in known_built_sources for p in providers):
+        return False
+    return _capability_listed_in_provides_index(requirement, provides_index)
 
 
 def _collect_srpm_keys(r2_client: Any, src_prefix: str) -> dict[str, str]:
@@ -433,6 +510,7 @@ def _collect_srpm_keys(r2_client: Any, src_prefix: str) -> dict[str, str]:
 def _analyze_repo(
     target: RepoTarget,
     external_provides: set[str] | None = None,
+    spec_capability_providers: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     r2 = get_r2_client()
 
@@ -527,15 +605,21 @@ def _analyze_repo(
             if external_provides and br in external_provides:
                 continue
 
-            providers = _map_br_to_source(br, provides_index, src_candidates, known_built_sources)
+            providers = _providers_for_requirement(
+                br,
+                provides_index,
+                src_candidates,
+                known_built_sources,
+                spec_capability_providers,
+            )
 
             if providers is None:
                 # Not attributable to any Oreon source (base repos, unknown). Skip.
                 continue
 
-            # Determine if this BR is actually satisfied (all providers are built
-            # and their binaries are in the repo), or if it's missing.
-            is_satisfied = all(p in known_built_sources for p in providers)
+            is_satisfied = _requirement_satisfied_in_repo(
+                br, providers, known_built_sources, provides_index
+            )
 
             for prov_src in sorted(providers):
                 if prov_src == src_name:
@@ -582,9 +666,6 @@ def _analyze_repo(
             src_name = _source_name_from_sourcerpm(_safe_text(pkg.find("{*}format/{*}sourcerpm")))
             if not src_name:
                 continue
-            # Restrict graph to source packages known from the distgit src/ tree.
-            if src_name not in src_candidates:
-                continue
 
             seen_runtime_req: set[str] = set()
             for e in pkg.findall(f".//{RPM_NS}requires/{RPM_NS}entry"):
@@ -598,10 +679,18 @@ def _analyze_repo(
                 if external_provides and req in external_provides:
                     continue
 
-                providers = _map_br_to_source(req, provides_index, src_candidates, known_built_sources)
+                providers = _providers_for_requirement(
+                    req,
+                    provides_index,
+                    src_candidates,
+                    known_built_sources,
+                    spec_capability_providers,
+                )
                 if providers is None:
                     continue
-                is_satisfied = all(p in known_built_sources for p in providers)
+                is_satisfied = _requirement_satisfied_in_repo(
+                    req, providers, known_built_sources, provides_index
+                )
                 for prov_src in sorted(providers):
                     if prov_src == src_name:
                         continue
