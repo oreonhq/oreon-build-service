@@ -31,7 +31,7 @@
       <a href="/promotions.html">Promotions</a>
       <a href="/dependencies.html">Dependencies</a>
       <form class="navbar-search" action="/search.html" method="get" style="display:inline-flex; margin-left:0.5rem;">
-        <input type="search" name="q" placeholder="Search…" style="padding:0.25rem 0.5rem; width:10rem;">
+        <input type="search" name="q" placeholder="Search" style="padding:0.25rem 0.5rem; width:10rem;">
         <button type="submit" class="btn" style="margin-left:0.25rem;">Go</button>
       </form>
       <span id="auth-section">
@@ -48,7 +48,7 @@
       <p style="margin-top:0.75rem;">
         <button type="button" class="btn" id="btn-refresh-failures">Refresh</button>
       </p>
-      <div id="failures-status" class="failures-hint">Loading…</div>
+      <div id="failures-status" class="failures-hint">Loading</div>
       <div id="failures-table-wrap" style="display:none;">
         <table class="failures-table" id="failures-table">
           <thead>
@@ -80,7 +80,7 @@
         var statusEl = document.getElementById('failures-status');
         var wrap = document.getElementById('failures-table-wrap');
         var tbody = document.getElementById('failures-tbody');
-        statusEl.textContent = 'Loading…';
+        statusEl.textContent = 'Loading';
         wrap.style.display = 'none';
         tbody.innerHTML = '';
         api.get('/builds/current-failures').then(function(rows) {
