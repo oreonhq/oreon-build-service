@@ -60,6 +60,22 @@ def test_format_chain_unresolved_providers_message():
     assert "lookaside" in msg.lower()
 
 
+def test_format_chain_unresolved_lists_all_capabilities():
+    from oreon_build.services.build_chain import format_chain_unresolved_providers_message
+
+    caps = [f"cap-{i}" for i in range(25)]
+    msg = format_chain_unresolved_providers_message(
+        caps,
+        releasename="oreon-11-rp1",
+        distgit_url="https://github.com/oreonhq/rpm-specfiles.git",
+        distgit_branch="main",
+    )
+    assert "cap-0" in msg
+    assert "cap-24" in msg
+    assert "and 10 more" not in msg
+    assert "…" not in msg
+
+
 @pytest.mark.asyncio
 async def test_unresolved_chain_capabilities():
     from oreon_build.services.build_chain import unresolved_chain_capabilities
