@@ -1147,8 +1147,12 @@
             return api.post('/builds/chain-trigger', chainBody)
               .then(function(data) {
                 render();
-                var n = (data && data.jobs && data.jobs.length) ? data.jobs.length : 0;
                 var cid = data && data.chain_id;
+                if (data && data.preparing) {
+                  alert('Chain ' + cid + ' created. Dependency prep runs in the background (can take a few minutes on large chains). Refresh this page to see stage 0 jobs.');
+                  return;
+                }
+                var n = (data && data.jobs && data.jobs.length) ? data.jobs.length : 0;
                 var tip = n ? 'Queued ' + n + ' job(s) for the first stage. Later stages start after the repo repodata updates.' : 'No new jobs in stage 0 (arches may already be built, or there are no workers).';
                 alert('Chain ' + cid + ' started. ' + tip + ' On failure other chain jobs are cancelled, then fix and use Resume with from_chain_id=' + cid + ' if you need a new chain.');
               })
