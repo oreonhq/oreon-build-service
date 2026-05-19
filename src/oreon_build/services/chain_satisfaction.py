@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import subprocess
 from collections import deque
@@ -72,6 +73,15 @@ class ChainDependencyPlan:
 
 
 def _vercmp(a: RpmEvr, b: RpmEvr) -> int:
+    """Compare EVRs. Default is a fast lexical/tuple path; set OREON_CHAIN_USE_RPM_VERCMP=1 for rpm vercmp."""
+    ta = (a.epoch, a.version, a.release)
+    tb = (b.epoch, b.version, b.release)
+    if ta < tb:
+        return -1
+    if ta > tb:
+        return 1
+    if (os.getenv("OREON_CHAIN_USE_RPM_VERCMP") or "").strip().lower() not in ("1", "true", "yes"):
+        return 0
     sa, sb = a.canonical(), b.canonical()
     try:
         proc = subprocess.run(
@@ -85,13 +95,6 @@ def _vercmp(a: RpmEvr, b: RpmEvr) -> int:
             return int((proc.stdout or "0").strip())
     except (FileNotFoundError, subprocess.TimeoutExpired, ValueError, OSError):
         pass
-    # Fallback when rpm(8) is unavailable (tests/minimal hosts).
-    ta = (a.epoch, a.version, a.release)
-    tb = (b.epoch, b.version, b.release)
-    if ta < tb:
-        return -1
-    if ta > tb:
-        return 1
     return 0
 
 

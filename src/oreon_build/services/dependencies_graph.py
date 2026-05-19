@@ -173,6 +173,53 @@ def _merge_best_evr(current: Any | None, candidate: Any) -> Any:
     return candidate if _vercmp(candidate, current) > 0 else current
 
 
+_repo_sat_load_cache: dict[tuple[str, str], tuple[float, Any]] = {}
+
+
+def _build_repo_satisfaction_from_primary(primary_xml: bytes) -> Any:
+    """Single pass over primary.xml for chain repo satisfaction (was triple-parse before)."""
+    from oreon_build.services.chain_satisfaction import RepoSatisfactionIndex, RpmEvr
+
+    provides_index: dict[str, set[str]] = {}
+    known_sources: set[str] = set()
+    provide_best: dict[str, RpmEvr] = {}
+    source_best: dict[str, RpmEvr] = {}
+
+    try:
+        root = ET.fromstring(primary_xml)
+    except ET.ParseError as exc:
+        logger.warning("primary.xml parse error: %s", exc)
+        return RepoSatisfactionIndex({}, set(), {}, {})
+
+    for pkg in root.findall(".//{*}package"):
+        arch = _safe_text(pkg.find("{*}arch"))
+        if arch == "src":
+            continue
+        bin_name = _safe_text(pkg.find("{*}name"))
+        if not bin_name:
+            continue
+        src_name = _source_name_from_sourcerpm(_safe_text(pkg.find("{*}format/{*}sourcerpm")))
+        if not src_name:
+            src_name = bin_name
+        known_sources.add(src_name)
+        evr = _evr_from_primary_version(pkg)
+        source_best[src_name] = _merge_best_evr(source_best.get(src_name), evr)
+        provide_best[bin_name] = _merge_best_evr(provide_best.get(bin_name), evr)
+        provides_index.setdefault(bin_name, set()).add(src_name)
+        for e in pkg.findall(f".//{RPM_NS}provides/{RPM_NS}entry"):
+            pname = (e.attrib.get("name") or "").strip()
+            if pname:
+                provides_index.setdefault(pname, set()).add(src_name)
+                provide_best[pname] = _merge_best_evr(provide_best.get(pname), evr)
+
+    return RepoSatisfactionIndex(
+        provides_index=provides_index,
+        known_sources=known_sources,
+        provide_best_evr=provide_best,
+        source_best_evr=source_best,
+    )
+
+
 def load_repo_satisfaction_index(
     target: RepoTarget,
 ) -> tuple[Any, str | None]:
@@ -181,54 +228,62 @@ def load_repo_satisfaction_index(
 
     Returns ``(RepoSatisfactionIndex, error)``.
     """
-    from oreon_build.services.chain_satisfaction import RepoSatisfactionIndex
+    ttl = float((os.getenv("OREON_CHAIN_REPO_SAT_INDEX_CACHE_SEC") or "300").strip() or "300")
+    ttl = max(30.0, min(ttl, 3600.0))
 
     r2 = get_r2_client()
     repomd_key = f"{target.prefix}/repodata/repomd.xml"
+    t0 = time.monotonic()
     repomd = r2.get_object(repomd_key)
     if not repomd:
-        return RepoSatisfactionIndex({}, set(), {}, {}), "repomd_missing"
+        return _build_repo_satisfaction_from_primary(b""), "repomd_missing"
+    repomd_token = hashlib.sha256(repomd).hexdigest()[:20]
+    cache_key = (target.prefix, repomd_token)
+    now = time.monotonic()
+    hit = _repo_sat_load_cache.get(cache_key)
+    if hit is not None and (now - hit[0]) < ttl:
+        logger.info(
+            "repo satisfaction index cache hit for %s (%d sources)",
+            target.prefix,
+            len(hit[1].known_sources),
+        )
+        return hit[1], None
+
     primary_key = _resolve_primary_key(target.prefix, repomd)
     if not primary_key:
-        return RepoSatisfactionIndex({}, set(), {}, {}), "primary_missing_in_repomd"
+        empty = _build_repo_satisfaction_from_primary(b"")
+        return empty, "primary_missing_in_repomd"
+    t_dl = time.monotonic()
     primary_raw = r2.get_object(primary_key)
     if not primary_raw:
-        return RepoSatisfactionIndex({}, set(), {}, {}), "primary_blob_missing"
+        empty = _build_repo_satisfaction_from_primary(b"")
+        return empty, "primary_blob_missing"
+    logger.info(
+        "repo primary.xml download %s (%.1f MiB) in %.1fs",
+        primary_key,
+        len(primary_raw) / (1024 * 1024),
+        time.monotonic() - t_dl,
+    )
     try:
+        t_parse = time.monotonic()
         primary_xml = _decompress_if_needed(primary_raw, primary_key)
-        provides_index, known_sources = _build_provides_index(primary_xml)
-        provide_best: dict[str, Any] = {}
-        source_best: dict[str, Any] = {}
-        root = ET.fromstring(primary_xml)
-        for pkg in root.findall(".//{*}package"):
-            arch = _safe_text(pkg.find("{*}arch"))
-            if arch == "src":
-                continue
-            src_name = _source_name_from_sourcerpm(_safe_text(pkg.find("{*}format/{*}sourcerpm")))
-            if not src_name:
-                src_name = _safe_text(pkg.find("{*}name"))
-            if not src_name:
-                continue
-            evr = _evr_from_primary_version(pkg)
-            source_best[src_name] = _merge_best_evr(source_best.get(src_name), evr)
-            bin_name = _safe_text(pkg.find("{*}name"))
-            if bin_name:
-                provide_best[bin_name] = _merge_best_evr(provide_best.get(bin_name), evr)
-            for e in pkg.findall(f".//{RPM_NS}provides/{RPM_NS}entry"):
-                pname = (e.attrib.get("name") or "").strip()
-                if pname:
-                    provide_best[pname] = _merge_best_evr(provide_best.get(pname), evr)
-        return (
-            RepoSatisfactionIndex(
-                provides_index=provides_index,
-                known_sources=known_sources,
-                provide_best_evr=provide_best,
-                source_best_evr=source_best,
-            ),
-            None,
+        logger.info(
+            "repo primary.xml decompressed to %.1f MiB",
+            len(primary_xml) / (1024 * 1024),
         )
+        index = _build_repo_satisfaction_from_primary(primary_xml)
+        logger.info(
+            "repo satisfaction index built for %s: %d sources, %d provides in %.1fs (total %.1fs)",
+            target.prefix,
+            len(index.known_sources),
+            len(index.provides_index),
+            time.monotonic() - t_parse,
+            time.monotonic() - t0,
+        )
+        _repo_sat_load_cache[cache_key] = (now, index)
+        return index, None
     except Exception as exc:
-        return RepoSatisfactionIndex({}, set(), {}, {}), f"primary_parse_failed:{type(exc).__name__}:{exc}"
+        return _build_repo_satisfaction_from_primary(b""), f"primary_parse_failed:{type(exc).__name__}:{exc}"
 
 
 def load_repo_provides_index(

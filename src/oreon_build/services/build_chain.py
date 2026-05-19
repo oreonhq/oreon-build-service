@@ -84,6 +84,15 @@ def _chain_proactive_repo_runtime() -> bool:
     )
 
 
+def _chain_proactive_repo_runtime_on_prepare() -> bool:
+    """Proactive runtime scan during background chain prepare (off by default; primary.xml is huge)."""
+    return (os.getenv("OREON_CHAIN_PROACTIVE_REPO_RUNTIME_PREPARE") or "0").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+
+
 def _chain_proactive_repo_runtime_fast() -> bool:
     """Use primary.xml only for proactive runtime scan (skip per-SRPM rpm -qp scans)."""
     return (os.getenv("OREON_CHAIN_PROACTIVE_REPO_RUNTIME_FAST") or "1").strip().lower() not in (
@@ -827,7 +836,7 @@ async def _build_chain_expand_context(
 
     spec_caps = order.capability_providers if isinstance(order.capability_providers, dict) else {}
     runtime_analysis: dict[str, Any] = {}
-    if _chain_proactive_repo_runtime():
+    if _chain_proactive_repo_runtime() and _chain_proactive_repo_runtime_on_prepare():
         t2 = time.monotonic()
         chain_sources = set(order.package_names or []) | set(roots)
         if _chain_proactive_repo_runtime_fast():
