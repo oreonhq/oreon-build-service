@@ -117,7 +117,7 @@ class BuildAttempt(Base):
     log_r2_key: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    #: Set when mock --rebuild reported success (before RPM upload / POST result).
+    #: Set when mock --rebuild reported success (before RPM upload/POST result).
     mock_succeeded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     #: Post-mock pipeline on the controller (GPG, R2, repodata). Worker calls mock-complete when mock ends.
     #: Values: ``not_started`` | ``running`` | ``signed`` | ``failed`` (legacy ``uploading`` treated as running).
