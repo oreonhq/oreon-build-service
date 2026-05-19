@@ -542,6 +542,9 @@ def create_app() -> FastAPI:
         @app.get("/builds.html")
         def _builds():
             return FileResponse(web_dir / "builds.html")
+        @app.get("/chains.html")
+        def _chains():
+            return FileResponse(web_dir / "chains.html")
         @app.get("/failures.html")
         def _failures():
             return FileResponse(web_dir / "failures.html")

@@ -399,6 +399,16 @@ class ChainStatusResponse(BaseModel):
     chain_spec: str
     error_message: Optional[str] = None
     preparing: bool = False
+    job_count: int = 0
+    releasename: Optional[str] = None
+    distgit_url: Optional[str] = None
+    distgit_branch: Optional[str] = None
+    unresolved_capabilities: List[str] = Field(default_factory=list)
+    prepare_started_at: Optional[str] = None
+    prepare_finished_at: Optional[str] = None
+    prepare_stage0_jobs: Optional[int] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
 
 class RpmbuildPlanCreate(BaseModel):
