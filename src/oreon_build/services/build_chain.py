@@ -1201,13 +1201,23 @@ async def _expand_chain_stages_dependencies(
     rounds = max_rounds if max_rounds is not None else _chain_expand_max_rounds()
     for round_n in range(max(1, rounds)):
         stages_before = chain.stages_json if isinstance(chain.stages_json, list) else []
+        stage_count_before = len(stages_before)
         pkg_count_before = sum(len(s) for s in stages_before)
         ok = await _inject_missing_dep_layers_before(db, chain, stage_index, ctx=ctx)
         if not ok:
             return False
         stages_after = chain.stages_json if isinstance(chain.stages_json, list) else []
+        stage_count_after = len(stages_after)
         pkg_count_after = sum(len(s) for s in stages_after)
-        if pkg_count_after == pkg_count_before and len(stages_after) == len(stages_before):
+        if stage_count_after == stage_count_before and pkg_count_after == pkg_count_before:
+            return True
+        if round_n + 1 >= rounds:
+            logger.info(
+                "chain_id=%s dependency expand done after round %s (%s stages)",
+                chain.id,
+                round_n + 1,
+                stage_count_after,
+            )
             return True
         logger.info(
             "chain_id=%s dependency expand round %s grew stages before index %s",
@@ -1406,14 +1416,20 @@ async def _inject_missing_dep_layers_before(
             repo_sat_index,
             user_targets,
         )
-        stage_targets = [str(p).strip() for p in pkgs if str(p).strip()]
-        from_layers = _distgit_packages_in_layers_before(
-            order_layers,
-            stage_targets or roots_clean,
-            user_lower=user_lower,
-            already_in_chain_lower=all_chain_pkg_names,
-            spec_names=spec_names,
-        )
+        # Full distgit layer prepend only when expanding before a user-named target.
+        # Later rounds hit dependency stages (stage 0 = fonts, etc.); re-running layer
+        # inject there would prepend forever and never converge.
+        stage_has_user = any(str(p).lower() in user_lower for p in pkgs if p)
+        from_layers: set[str] = set()
+        if stage_has_user:
+            user_pkg_names = [u for u in user_targets if u]
+            from_layers = _distgit_packages_in_layers_before(
+                order_layers,
+                user_pkg_names,
+                user_lower=user_lower,
+                already_in_chain_lower=all_chain_pkg_names,
+                spec_names=spec_names,
+            )
         filtered = set(from_layers)
         filtered.update(
             p
