@@ -733,7 +733,7 @@ async def trigger_chain_build_endpoint(
 ):
     from oreon_build.services.build_chain import trigger_chain_build as run_chain_build
 
-    chain, jobs = await run_chain_build(
+    chain, jobs, preparing = await run_chain_build(
         db,
         request,
         user,
@@ -756,6 +756,7 @@ async def trigger_chain_build_endpoint(
         stages=stages,
         chain_spec=chain.chain_spec,
         jobs=job_responses,
+        preparing=preparing,
     )
 
 
@@ -767,6 +768,9 @@ async def get_chain_status(chain_id: int, db: DbSession):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chain not found")
     stages_raw = chain.stages_json if isinstance(chain.stages_json, list) else []
     stages: list[list[str]] = [[str(n) for n in grp] for grp in stages_raw if isinstance(grp, list)]
+    opt = chain.chain_options if isinstance(chain.chain_options, dict) else {}
+    from oreon_build.services.build_chain import _chain_options_preparing
+
     return ChainStatusResponse(
         chain_id=chain.id,
         status=chain.status.value,
@@ -774,6 +778,7 @@ async def get_chain_status(chain_id: int, db: DbSession):
         stages=stages,
         chain_spec=chain.chain_spec,
         error_message=chain.error_message,
+        preparing=_chain_options_preparing(opt),
     )
 
 
@@ -786,7 +791,7 @@ async def resume_chain_build_endpoint(
 ):
     from oreon_build.services.build_chain import resume_chain_from_previous
 
-    chain, jobs = await resume_chain_from_previous(
+    chain, jobs, preparing = await resume_chain_from_previous(
         db, request, user, from_chain_id=data.from_chain_id
     )
     att_map = await _latest_attempt_by_job_ids(db, [j.id for j in jobs])
@@ -799,6 +804,7 @@ async def resume_chain_build_endpoint(
         stages=stages,
         chain_spec=chain.chain_spec,
         jobs=job_responses,
+        preparing=preparing,
     )
 
 
