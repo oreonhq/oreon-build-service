@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chain builds - Oreon Build Service</title>
+  <link rel="stylesheet" href="/static/style.css?v=3">
+  <style>
+    .chains-hint { color: var(--text-muted); font-size: 0.9rem; margin-top: 0.25rem; }
+    #chains-table-wrap { overflow-x: auto; margin-top: 1rem; }
+    table.chains-table { width: 100%; border-collapse: collapse; }
+    table.chains-table th, table.chains-table td { text-align: left; padding: 0.5rem 0.6rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+    table.chains-table th { color: var(--text-muted); font-weight: 600; font-size: 0.85rem; }
+    tr.chain-row-highlight { background: rgba(220, 53, 69, 0.08); }
+    tr.chain-row-failed td:first-child { border-left: 3px solid #dc3545; }
+    tr.chain-row-preparing td:first-child { border-left: 3px solid #0d6efd; }
+    tr.chain-row-success td:first-child { border-left: 3px solid #198754; }
+    .chain-status-pill { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.82rem; font-weight: 600; text-transform: lowercase; }
+    .chain-status-pill.failed, .chain-status-pill.cancelled { background: rgba(220,53,69,0.15); color: #b02a37; }
+    .chain-status-pill.pending, .chain-status-pill.running { background: rgba(13,110,253,0.12); color: #084298; }
+    .chain-status-pill.success { background: rgba(25,135,84,0.12); color: #146c43; }
+    .chain-error-box { background: rgba(220,53,69,0.06); border: 1px solid rgba(220,53,69,0.35); border-radius: 6px; padding: 0.75rem 1rem; margin: 0.5rem 0; }
+    .chain-error-box h4 { margin: 0 0 0.5rem 0; color: #b02a37; font-size: 0.95rem; }
+    .chain-error-summary { white-space: pre-wrap; font-size: 0.88rem; margin: 0 0 0.75rem 0; color: var(--text); }
+    .chain-cap-list { background: #1e1e1e; color: #f0f0f0; padding: 0.75rem 1rem; border-radius: 4px; max-height: 22rem; overflow: auto; font-family: ui-monospace, monospace; font-size: 12px; margin: 0; white-space: pre; }
+    .chain-cap-list li { margin: 0.15rem 0; }
+    .chain-cap-count { font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.35rem; }
+    .chain-detail-expand td { background: var(--surface-alt, rgba(0,0,0,0.03)); border-bottom: 1px solid var(--border); }
+    .chain-actions { display: flex; flex-wrap: wrap; gap: 0.35rem; align-items: center; }
+    .chain-spec-preview { max-width: 14rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, monospace; font-size: 0.85rem; }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <a href="/" class="header-logo-link"><img src="/static/obslogo.png" alt="Oreon Build Service" class="header-logo" /></a>
+    <nav>
+      <a href="/">Dashboard</a>
+      <a href="/builds.html">Builds</a>
+      <a href="/chains.html">Chains</a>
+      <a href="/failures.html">Failures</a>
+      <a href="/packages.html">Packages</a>
+      <a href="/releases.html">Releases</a>
+      <a href="/workers.html">Workers</a>
+      <a href="/mock-environments.html">Mock Environments</a>
+      <a href="/repos.html">Repositories</a>
+      <a href="/promotions.html">Promotions</a>
+      <a href="/dependencies.html">Dependencies</a>
+      <form class="navbar-search" action="/search.html" method="get" style="display:inline-flex; margin-left:0.5rem;">
+        <input type="search" name="q" placeholder="Search..." style="padding:0.25rem 0.5rem; width:10rem;">
+        <button type="submit" class="btn" style="margin-left:0.25rem;">Go</button>
+      </form>
+      <span id="auth-section">
+        <span id="user-info"></span>
+        <button id="btn-login" type="button">Login</button>
+        <button id="btn-logout" type="button" style="display:none">Logout</button>
+      </span>
+    </nav>
+  </header>
+  <main class="main">
+    <section class="card">
+      <h2>Chain builds</h2>
+      <p class="chains-hint">
+        Distgit chain triggers run dependency prep in the background. Failures (missing Provides, unresolved repo runtime deps)
+        show here with the <strong>full</strong> capability list. Trigger new chains from
+        <a href="/builds.html">Builds</a>, Chain build tab.
+      </p>
+      <p style="margin-top:0.75rem;">
+        <button type="button" class="btn primary" id="btn-refresh-chains">Refresh</button>
+        <label style="margin-left:1rem; font-size:0.9rem;">
+          <input type="checkbox" id="chains-auto-refresh" checked> Auto-refresh every 8s
+        </label>
+        <span id="chains-last-updated" class="chains-hint" style="margin-left:0.75rem;"></span>
+      </p>
+      <div id="chains-status" class="chains-hint">Loading...</div>
+      <div id="chains-table-wrap" style="display:none;">
+        <table class="chains-table" id="chains-table">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Status</th>
+              <th>Spec</th>
+              <th>Release</th>
+              <th>Stage</th>
+              <th>Jobs</th>
+              <th>Created</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="chains-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+  <footer class="footer">Oreon Build Service</footer>
+  <script src="/static/app.js?v=6"></script>
+  <script>
+    (function() {
+      var api = window.oreonApi;
+      var refreshTimer = null;
+      var highlightId = null;
+      var openDetailIds = {};
+      var didAutoOpenHighlight = false;
+
+      function escapeHtml(s) {
+        var d = document.createElement('div');
+        d.textContent = s == null ? '' : String(s);
+        return d.innerHTML;
+      }
+
+      function parseQueryHighlight() {
+        var params = new URLSearchParams(window.location.search);
+        var h = params.get('chain_id') || params.get('highlight');
+        if (h) {
+          var n = parseInt(h, 10);
+          if (n > 0) highlightId = n;
+        }
+      }
+
+      function statusRowClass(status, preparing) {
+        if (preparing) return 'chain-row-preparing';
+        var s = (status || '').toLowerCase();
+        if (s === 'failed' || s === 'cancelled') return 'chain-row-failed';
+        if (s === 'success') return 'chain-row-success';
+        return 'chain-row-preparing';
+      }
+
+      function renderUnresolvedList(caps) {
+        if (!caps || !caps.length) return '';
+        var items = caps.map(function(c) {
+          return '<li>' + escapeHtml(c) + '</li>';
+        }).join('');
+        return '<p class="chain-cap-count">' + caps.length + ' unresolved capabilit' +
+          (caps.length === 1 ? 'y' : 'ies') + '</p>' +
+          '<ul class="chain-cap-list">' + items + '</ul>';
+      }
+
+      function renderDetailRow(c) {
+        var err = (c.error_message || '').trim();
+        var caps = c.unresolved_capabilities || [];
+        var parts = [];
+        if (c.preparing) {
+          parts.push('<p><strong>Preparing</strong> Dependency expand and stage-0 enqueue are running in the API background. Refresh this page in a minute.</p>');
+          if (c.prepare_started_at) {
+            parts.push('<p class="chains-hint">Started: ' + escapeHtml(c.prepare_started_at) + '</p>');
+          }
+        }
+        if (err || caps.length) {
+          parts.push('<div class="chain-error-box">');
+          parts.push('<h4>Chain stopped</h4>');
+          if (err) {
+            parts.push('<pre class="chain-error-summary">' + escapeHtml(err) + '</pre>');
+          }
+          if (caps.length) {
+            parts.push(renderUnresolvedList(caps));
+          } else if (err && err.indexOf('Capabilities not Provided') >= 0) {
+            parts.push('<p class="chains-hint">Full capability list was not stored on this chain (trigger before the latest fix). Re-trigger after deploy or read the summary above.</p>');
+          }
+          parts.push('</div>');
+        }
+        var stages = c.stages || [];
+        if (stages.length) {
+          var stageLines = stages.map(function(s, i) {
+            var mark = i === c.active_stage_index ? ' (active)' : '';
+            return 'Stage ' + i + ': ' + (s || []).join(', ') + mark;
+          }).join('\n');
+          parts.push('<p style="margin-top:0.75rem;"><strong>Stages</strong></p><pre class="chain-cap-list" style="max-height:10rem;">' + escapeHtml(stageLines) + '</pre>');
+        }
+        if (!parts.length) {
+          parts.push('<p class="chains-hint">No extra detail.</p>');
+        }
+        return parts.join('');
+      }
+
+      function loadChains() {
+        var statusEl = document.getElementById('chains-status');
+        var wrap = document.getElementById('chains-table-wrap');
+        var tbody = document.getElementById('chains-tbody');
+        return api.get('/builds/chains?limit=80').then(function(rows) {
+          if (!Array.isArray(rows)) rows = [];
+          document.getElementById('chains-last-updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
+          var failedN = rows.filter(function(r) {
+            var s = (r.status || '').toLowerCase();
+            return s === 'failed' || s === 'cancelled';
+          }).length;
+          var prepN = rows.filter(function(r) { return r.preparing; }).length;
+          statusEl.textContent = rows.length
+            ? (rows.length + ' chain(s)' + (failedN ? ', ' + failedN + ' failed/cancelled' : '') + (prepN ? ', ' + prepN + ' preparing' : ''))
+            : 'No chain builds yet.';
+          if (!rows.length) {
+            wrap.style.display = 'none';
+            tbody.innerHTML = '';
+            return;
+          }
+          wrap.style.display = 'block';
+          tbody.innerHTML = rows.map(function(c) {
+            var id = c.chain_id;
+            var st = (c.status || 'unknown').toLowerCase();
+            var pill = '<span class="chain-status-pill ' + escapeHtml(st) + '">' + escapeHtml(st) + '</span>';
+            if (c.preparing) {
+              pill += ' <span class="chain-status-pill pending">preparing</span>';
+            }
+            var created = c.created_at ? String(c.created_at).slice(0, 19).replace('T', ' ') : '-';
+            var rowCls = statusRowClass(st, c.preparing);
+            if (highlightId && id === highlightId) rowCls += ' chain-row-highlight';
+            var resumeBtn = api.token
+              ? '<button type="button" class="btn chain-resume-btn" data-chain-id="' + id + '">Resume</button>'
+              : '';
+            return '<tr class="chain-main ' + rowCls + '" data-chain-id="' + id + '">' +
+              '<td><strong>' + id + '</strong></td>' +
+              '<td>' + pill + '</td>' +
+              '<td class="chain-spec-preview" title="' + escapeHtml(c.chain_spec || '') + '">' + escapeHtml(c.chain_spec || '') + '</td>' +
+              '<td>' + escapeHtml(c.releasename || '-') + '</td>' +
+              '<td>' + escapeHtml(String(c.active_stage_index)) + ' / ' + Math.max(0, (c.stages || []).length - 1) + '</td>' +
+              '<td>' + escapeHtml(String(c.job_count != null ? c.job_count : 0)) + '</td>' +
+              '<td>' + escapeHtml(created) + '</td>' +
+              '<td><div class="chain-actions">' +
+              '<button type="button" class="btn chain-detail-btn" data-chain-id="' + id + '">Details</button>' +
+              '<a href="/builds.html?chain_id=' + id + '">Builds</a>' +
+              resumeBtn +
+              '</div></td></tr>' +
+              '<tr class="chain-detail-expand" data-chain-id="' + id + '" style="display:none"><td colspan="8">' +
+              renderDetailRow(c) + '</td></tr>';
+          }).join('');
+
+          function restoreOpenDetails() {
+            Object.keys(openDetailIds).forEach(function(cid) {
+              if (!openDetailIds[cid]) return;
+              var expand = tbody.querySelector('tr.chain-detail-expand[data-chain-id="' + cid + '"]');
+              var main = tbody.querySelector('tr.chain-main[data-chain-id="' + cid + '"]');
+              if (!expand || !main) {
+                delete openDetailIds[cid];
+                return;
+              }
+              expand.style.display = 'table-row';
+              var b = main.querySelector('.chain-detail-btn');
+              if (b) b.textContent = 'Hide';
+            });
+          }
+
+          tbody.querySelectorAll('.chain-detail-btn').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+              var cid = btn.getAttribute('data-chain-id');
+              var expand = tbody.querySelector('tr.chain-detail-expand[data-chain-id="' + cid + '"]');
+              if (!expand) return;
+              var open = expand.style.display !== 'none';
+              tbody.querySelectorAll('tr.chain-detail-expand').forEach(function(r) { r.style.display = 'none'; });
+              tbody.querySelectorAll('.chain-detail-btn').forEach(function(b) { b.textContent = 'Details'; });
+              openDetailIds = {};
+              if (!open) {
+                expand.style.display = 'table-row';
+                btn.textContent = 'Hide';
+                openDetailIds[cid] = true;
+              }
+            });
+          });
+
+          restoreOpenDetails();
+
+          tbody.querySelectorAll('.chain-resume-btn').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+              if (!api.token) { alert('Log in to resume.'); return; }
+              var fromId = parseInt(btn.getAttribute('data-chain-id'), 10);
+              oreonWithLoading(btn, function() {
+                return api.post('/builds/chain-resume', { from_chain_id: fromId })
+                  .then(function(data) {
+                    loadChains();
+                    var cid = data && data.chain_id;
+                    if (cid) {
+                      window.location.href = '/chains.html?chain_id=' + cid;
+                    }
+                  })
+                  .catch(function(e) { alert('Resume failed: ' + (e.message || 'error')); });
+              });
+            });
+          });
+
+          if (highlightId && !didAutoOpenHighlight) {
+            didAutoOpenHighlight = true;
+            openDetailIds[String(highlightId)] = true;
+            restoreOpenDetails();
+            var hi = tbody.querySelector('tr.chain-main[data-chain-id="' + highlightId + '"]');
+            if (hi) hi.scrollIntoView({ block: 'center', behavior: 'smooth' });
+          }
+        }).catch(function(e) {
+          statusEl.textContent = 'Failed to load: ' + (e.message || 'error');
+          wrap.style.display = 'none';
+        });
+      }
+
+      function scheduleRefresh() {
+        if (refreshTimer) clearInterval(refreshTimer);
+        if (document.getElementById('chains-auto-refresh').checked) {
+          refreshTimer = setInterval(loadChains, 8000);
+        }
+      }
+
+      document.getElementById('btn-refresh-chains').addEventListener('click', loadChains);
+      document.getElementById('chains-auto-refresh').addEventListener('change', scheduleRefresh);
+
+      parseQueryHighlight();
+      loadChains().then(scheduleRefresh);
+    })();
+  </script>
+</body>
+</html>
