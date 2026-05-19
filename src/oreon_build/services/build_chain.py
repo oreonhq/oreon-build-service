@@ -859,8 +859,8 @@ async def _inject_missing_dep_layers_before(
         pred_lower = pred.lower()
         still_needs = await _chain_package_still_needs_build(
             db,
+            chain,
             pred,
-            chain=chain,
             architectures=arches,
             preferred_mock_environment_id=pref_pm,
             skip_jobs_not_before=skip_not_before,
