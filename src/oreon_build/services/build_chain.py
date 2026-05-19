@@ -11,7 +11,8 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from fastapi import HTTPException, Request, status
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.orm.attributes import flag_modified
 
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
 from oreon_build.core.chain_build_spec import parse_chain_build_spec
@@ -296,10 +297,8 @@ def format_chain_unresolved_providers_message(
         lines.append("No capability name was recorded.")
     else:
         lines.append("Capabilities not Provided by any spec in this release tree:")
-        for cap in caps[:15]:
+        for cap in caps:
             lines.append(f"  - {cap}")
-        if len(caps) > 15:
-            lines.append(f"  … and {len(caps) - 15} more")
     lines.append("")
     lines.append(
         "Chain resolution scans every spec for Provides: tags and %package subpackage names "
@@ -308,6 +307,29 @@ def format_chain_unresolved_providers_message(
         "that source package earlier. Dependencies only in Fedora need mock lookaside repos."
     )
     return "\n".join(lines)
+
+
+def record_chain_unresolved_capabilities(
+    chain: BuildChain,
+    capabilities: list[str],
+    *,
+    releasename: str,
+    distgit_url: str,
+    distgit_branch: str,
+    context: str | None = None,
+) -> str:
+    """Store the full capability list on the chain and return the formatted error message."""
+    caps = sorted({(c or "").strip() for c in capabilities if (c or "").strip()})
+    opt = dict(_options_dict(chain))
+    opt["unresolved_capabilities"] = caps
+    _set_chain_options(chain, opt)
+    return format_chain_unresolved_providers_message(
+        caps,
+        releasename=releasename,
+        distgit_url=distgit_url,
+        distgit_branch=distgit_branch,
+        context=context,
+    )
 
 
 def _chain_dep_poll_sec() -> int:
@@ -437,10 +459,8 @@ def format_chain_repo_capability_still_missing_message(
             lines.append(f"  - {s}")
         lines.append("")
     lines.append("Capabilities still missing from published repo metadata:")
-    for cap in caps[:12]:
+    for cap in caps:
         lines.append(f"  - {cap}")
-    if len(caps) > 12:
-        lines.append(f"  … and {len(caps) - 12} more")
     lines.append("")
     lines.append(
         "The built RPM likely does not Provide the capability name dnf requested. Add a "
@@ -985,13 +1005,14 @@ async def _inject_missing_dep_layers_before(
             f"distgit spec Provides (example missing capability: {repo_unmapped[0]})."
         )
         chain.status = BuildChainStatus.FAILED
-        chain.error_message = format_chain_unresolved_providers_message(
+        chain.error_message = record_chain_unresolved_capabilities(
+            chain,
             repo_unmapped,
             releasename=releasename,
             distgit_url=dg_url,
             distgit_branch=dg_br,
             context=ctx,
-        )[:4000]
+        )[:8000]
         logger.error("chain_id=%s unmapped repo runtime deps: %s", chain.id, repo_unmapped)
         return False
     merged_extra = set(extra_roots or set()) | proactive_roots
@@ -1224,13 +1245,14 @@ async def _try_recover_chain_after_failure(
                         await fail_chain(
                             db,
                             chain,
-                            format_chain_unresolved_providers_message(
+                            record_chain_unresolved_capabilities(
+                                chain,
                                 missing_in_distgit,
                                 releasename=releasename,
                                 distgit_url=dg_url,
                                 distgit_branch=dg_br,
                                 context=ctx,
-                            ),
+                            )[:8000],
                             terminal=BuildChainStatus.FAILED,
                         )
                         return True
@@ -1245,7 +1267,7 @@ async def _try_recover_chain_after_failure(
                     if extra_roots:
                         opt = dict(opt)
                         opt["dnf_recovery_count"] = recovery_n + 1
-                        chain.chain_options = opt
+                        _set_chain_options(chain, opt)
                         logger.info(
                             "chain_id=%s dnf recovery: providers %s -> distgit sources %s",
                             chain.id,
@@ -1349,13 +1371,14 @@ async def _try_recover_chain_after_failure(
                     await fail_chain(
                         db,
                         chain,
-                        format_chain_unresolved_providers_message(
+                        record_chain_unresolved_capabilities(
+                            chain,
                             still_missing,
                             releasename=releasename,
                             distgit_url=dg_url,
                             distgit_branch=dg_br,
                             context=ctx,
-                        ),
+                        )[:8000],
                         terminal=BuildChainStatus.FAILED,
                     )
                     return True
@@ -1637,6 +1660,36 @@ async def on_repo_publish_failed_for_chain(attempt_id: int, err: str) -> None:
 def _options_dict(chain: BuildChain) -> dict[str, Any]:
     raw = chain.chain_options
     return raw if isinstance(raw, dict) else {}
+
+
+def _set_chain_options(chain: BuildChain, options: dict[str, Any]) -> None:
+    """Persist chain_options (SQLAlchemy does not track in-place JSON dict mutation)."""
+    chain.chain_options = dict(options)
+    flag_modified(chain, "chain_options")
+
+
+def _chain_prepare_stale_seconds() -> int:
+    raw = (os.getenv("OREON_CHAIN_PREPARE_STALE_SEC") or "900").strip()
+    try:
+        sec = int(raw)
+    except ValueError:
+        sec = 900
+    return max(120, min(sec, 7200))
+
+
+def _parse_iso_datetime(raw: Any) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return None
+
+
+_chain_prepare_inflight: set[int] = set()
 
 
 async def _advance_chain_after_stage_complete(db: Any, chain: BuildChain) -> None:
@@ -1921,93 +1974,136 @@ async def _complete_chain_prepare(
     )
 
 
-async def prepare_pending_chains() -> None:
-    """Background worker: finish chains that returned HTTP 201 before distgit/repo prep completed."""
+async def _discover_chains_needing_prepare(db: Any) -> list[int]:
+    """Chains that still need background distgit expand + stage-0 enqueue."""
+    if not (_chain_prepare_async() and _chain_use_distgit_dep_gate()):
+        return []
+    now = datetime.now(timezone.utc)
+    stale_sec = _chain_prepare_stale_seconds()
+    result = await db.execute(select(BuildChain).where(BuildChain.status == BuildChainStatus.PENDING))
+    out: list[int] = []
+    for chain in result.scalars():
+        opt = _options_dict(chain)
+        if opt.get("prepare_finished_at"):
+            continue
+        if opt.get("prepare_running"):
+            started = _parse_iso_datetime(opt.get("prepare_started_at"))
+            if started and (now - started).total_seconds() > stale_sec:
+                out.append(chain.id)
+            continue
+        if opt.get("prepare_pending"):
+            out.append(chain.id)
+            continue
+        job_n = await db.scalar(
+            select(func.count()).select_from(BuildJob).where(BuildJob.chain_id == chain.id)
+        )
+        if int(job_n or 0) == 0:
+            out.append(chain.id)
+    return out
+
+
+async def _run_one_chain_prepare(chain_id: int) -> None:
     from oreon_build.db.session import async_session_maker
 
-    async with async_session_maker() as db:
-        result = await db.execute(select(BuildChain).where(BuildChain.status == BuildChainStatus.PENDING))
-        candidate_ids: list[int] = []
-        for chain in result.scalars():
-            opt = _options_dict(chain)
-            if opt.get("prepare_pending") and not opt.get("prepare_running"):
-                candidate_ids.append(chain.id)
-    if not candidate_ids:
-        return
-
-    for chain_id in candidate_ids:
+    try:
         async with async_session_maker() as db:
             result = await db.execute(
                 select(BuildChain).where(BuildChain.id == chain_id).with_for_update()
             )
             chain = result.scalar_one_or_none()
             if not chain or chain.status != BuildChainStatus.PENDING:
-                continue
-            opt = _options_dict(chain)
-            if not opt.get("prepare_pending") or opt.get("prepare_running"):
-                continue
-            opt = dict(opt)
+                return
+            opt = dict(_options_dict(chain))
+            if opt.get("prepare_finished_at"):
+                return
+            now_iso = datetime.now(timezone.utc).isoformat()
+            if opt.get("prepare_running"):
+                started = _parse_iso_datetime(opt.get("prepare_started_at"))
+                stale = (
+                    started is None
+                    or (datetime.now(timezone.utc) - started).total_seconds()
+                    > _chain_prepare_stale_seconds()
+                )
+                if not stale:
+                    return
+                logger.warning(
+                    "chain_id=%s prepare_running stale, retrying background prepare",
+                    chain_id,
+                )
+            opt["prepare_pending"] = True
             opt["prepare_running"] = True
-            opt["prepare_started_at"] = datetime.now(timezone.utc).isoformat()
-            chain.chain_options = opt
+            opt["prepare_started_at"] = now_iso
+            _set_chain_options(chain, opt)
             await db.commit()
 
-        try:
-            async with async_session_maker() as db:
-                result = await db.execute(
-                    select(BuildChain).where(BuildChain.id == chain_id).with_for_update()
+        logger.info("chain_id=%s background prepare started", chain_id)
+        async with async_session_maker() as db:
+            result = await db.execute(
+                select(BuildChain).where(BuildChain.id == chain_id).with_for_update()
+            )
+            chain = result.scalar_one_or_none()
+            if not chain:
+                return
+            jobs = await _complete_chain_prepare(db, chain, triggered_by_id=chain.triggered_by_id)
+            opt = dict(_options_dict(chain))
+            opt.pop("prepare_pending", None)
+            opt.pop("prepare_running", None)
+            opt["prepare_finished_at"] = datetime.now(timezone.utc).isoformat()
+            opt["prepare_stage0_jobs"] = len(jobs)
+            _set_chain_options(chain, opt)
+            await log_audit(
+                db,
+                "build.chain_prepare_done",
+                account_id=chain.triggered_by_id,
+                resource_type="build_chain",
+                resource_id=str(chain.id),
+                details=f"stage0_jobs={len(jobs)}",
+                ip_address=None,
+                user_agent="chain-prepare-loop",
+            )
+            if chain.status == BuildChainStatus.FAILED:
+                logger.warning(
+                    "chain_id=%s background prepare failed: %s",
+                    chain.id,
+                    chain.error_message,
                 )
-                chain = result.scalar_one_or_none()
-                if not chain:
-                    continue
-                jobs = await _complete_chain_prepare(
-                    db, chain, triggered_by_id=chain.triggered_by_id
+            else:
+                logger.info(
+                    "chain_id=%s background prepare done (%s stage-0 job(s))",
+                    chain.id,
+                    len(jobs),
                 )
-                opt = dict(_options_dict(chain))
-                opt.pop("prepare_pending", None)
-                opt.pop("prepare_running", None)
-                opt["prepare_finished_at"] = datetime.now(timezone.utc).isoformat()
-                opt["prepare_stage0_jobs"] = len(jobs)
-                chain.chain_options = opt
-                await log_audit(
-                    db,
-                    "build.chain_prepare_done",
-                    account_id=chain.triggered_by_id,
-                    resource_type="build_chain",
-                    resource_id=str(chain.id),
-                    details=f"stage0_jobs={len(jobs)}",
-                    ip_address=None,
-                    user_agent="chain-prepare-loop",
-                )
-                if chain.status == BuildChainStatus.FAILED:
-                    logger.warning(
-                        "chain_id=%s background prepare failed: %s",
-                        chain.id,
-                        chain.error_message,
-                    )
-                else:
-                    logger.info(
-                        "chain_id=%s background prepare done (%s stage-0 job(s))",
-                        chain.id,
-                        len(jobs),
-                    )
-                await db.commit()
-        except Exception as exc:
-            logger.exception("chain_id=%s background prepare error", chain_id)
-            async with async_session_maker() as db:
-                result = await db.execute(
-                    select(BuildChain).where(BuildChain.id == chain_id).with_for_update()
-                )
-                chain = result.scalar_one_or_none()
-                if not chain:
-                    continue
-                opt = dict(_options_dict(chain))
-                opt.pop("prepare_running", None)
-                chain.chain_options = opt
-                if not opt.get("prepare_pending"):
-                    chain.status = BuildChainStatus.FAILED
-                    chain.error_message = f"Chain prepare failed: {exc!s}"[:2000]
-                await db.commit()
+            await db.commit()
+    except Exception as exc:
+        logger.exception("chain_id=%s background prepare error", chain_id)
+        async with async_session_maker() as db:
+            result = await db.execute(
+                select(BuildChain).where(BuildChain.id == chain_id).with_for_update()
+            )
+            chain = result.scalar_one_or_none()
+            if not chain:
+                return
+            opt = dict(_options_dict(chain))
+            opt.pop("prepare_running", None)
+            opt["prepare_pending"] = True
+            opt["prepare_last_error"] = f"{exc!s}"[:500]
+            _set_chain_options(chain, opt)
+            await db.commit()
+    finally:
+        _chain_prepare_inflight.discard(chain_id)
+
+
+async def prepare_pending_chains() -> None:
+    """Queue background tasks for chains that need distgit expand + stage-0 enqueue."""
+    from oreon_build.db.session import async_session_maker
+
+    async with async_session_maker() as db:
+        candidate_ids = await _discover_chains_needing_prepare(db)
+    for chain_id in candidate_ids:
+        if chain_id in _chain_prepare_inflight:
+            continue
+        _chain_prepare_inflight.add(chain_id)
+        asyncio.create_task(_run_one_chain_prepare(chain_id), name=f"chain-prepare-{chain_id}")
 
 
 async def trigger_chain_build(
@@ -2103,7 +2199,7 @@ async def trigger_chain_build(
 
     if _chain_use_distgit_dep_gate() and _chain_prepare_async():
         chain_options["prepare_pending"] = True
-        chain.chain_options = chain_options
+        _set_chain_options(chain, chain_options)
         await db.flush()
         logger.info(
             "chain_id=%s queued for background prepare (async chain-trigger)",
