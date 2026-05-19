@@ -31,7 +31,7 @@
       <a href="/promotions.html">Promotions</a>
       <a href="/dependencies.html">Dependencies</a>
       <form class="navbar-search" action="/search.html" method="get" style="display:inline-flex; margin-left:0.5rem;">
-        <input type="search" name="q" placeholder="Search…" style="padding:0.25rem 0.5rem; width:10rem;">
+        <input type="search" name="q" placeholder="Search" style="padding:0.25rem 0.5rem; width:10rem;">
         <button type="submit" class="btn" style="margin-left:0.25rem;">Go</button>
       </form>
       <span id="auth-section"><span id="user-info"></span><button id="btn-login" type="button">Login</button><button id="btn-logout" type="button" style="display:none">Logout</button></span>
@@ -40,7 +40,7 @@
   <main class="main">
     <section class="card">
       <h2>Build <span id="job-id">—</span></h2>
-      <div id="build-loading" class="build-meta">Loading…</div>
+      <div id="build-loading" class="build-meta">Loading</div>
       <div id="build-meta" class="build-meta" style="display:none;"></div>
       <div id="build-error" style="display:none; color: var(--danger, #c00);"></div>
       <h3 style="margin-top:1.5rem;">Attempts</h3>
@@ -75,7 +75,7 @@
       }
       function fetchAttemptLogTail(attemptId, pre) {
         pre.style.display = 'block';
-        pre.textContent = 'Loading…';
+        pre.textContent = 'Loading';
         return api.get('/logs/attempts/' + attemptId + '/tail?lines=2000').then(function(r) {
           var lines = (r && r.lines) ? r.lines : [];
           pre.textContent = lines.join('\n') || '(empty log)';
@@ -173,7 +173,7 @@
               workerLine +
               '<div class="attempt-elapsed-live" style="color:var(--text-muted);"></div>' +
               '<div><small>Started: ' + (a.started_at ? a.started_at.slice(0, 19) : '—') + ' &nbsp; Finished: ' + (a.finished_at ? a.finished_at.slice(0, 19) : '—') + '</small></div>' +
-              '<div class="artifacts" id="artifacts-' + a.id + '" style="margin-top:0.5rem; font-size:0.9rem; color:var(--text-muted);">Artifacts: loading…</div>' +
+              '<div class="artifacts" id="artifacts-' + a.id + '" style="margin-top:0.5rem; font-size:0.9rem; color:var(--text-muted);">Artifacts: loading</div>' +
               '<div style="margin-top:0.5rem;display:flex;gap:0.35rem;flex-wrap:wrap;align-items:center;">' +
               '<button type="button" class="btn load-log" data-attempt-id="' + a.id + '">View log</button>' +
               '<button type="button" class="btn refresh-log" data-attempt-id="' + a.id + '">Refresh log</button></div>' +
