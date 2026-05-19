@@ -232,7 +232,7 @@ async def delete_package(
         except Exception as e:
             logger.exception("R2 client or delete failed during package delete (package_id=%s): %s", package_id, e)
 
-    # Rows that FK to build_jobs / build_attempts must go before attempts and jobs (see migrations 012, 014).
+    # Rows that FK to build_jobs/build_attempts must go before attempts and jobs (see migrations 012, 014).
     if job_ids:
         await db.execute(delete(PublishTask).where(PublishTask.build_job_id.in_(job_ids)))
     if attempt_ids:
@@ -241,7 +241,7 @@ async def delete_package(
         )
         await db.execute(delete(RpmCompleteLock).where(RpmCompleteLock.attempt_id.in_(attempt_ids)))
 
-    # Delete dependent rows explicitly to satisfy NOT NULL / FK constraints
+    # Delete dependent rows explicitly to satisfy NOT NULL/FK constraints
     # 1) build_attempts -> build_jobs (artifacts are deleted via cascade or we must delete them first)
     await db.execute(
         delete(Artifact).where(
