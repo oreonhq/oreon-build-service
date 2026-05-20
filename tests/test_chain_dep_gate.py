@@ -20,7 +20,18 @@ def _make_chain(stages_json, active_stage=0, chain_options=None):
         "preferred_mock_environment_id": None,
         "skip_complete_arches": True,
     }
+    chain.chain_spec = ""
     return chain
+
+
+def _build_requires_raw_from_edges(edges: list[dict[str, str]]) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    for e in edges:
+        fr = str(e.get("from") or "").strip()
+        to = str(e.get("to") or "").strip()
+        if fr and to:
+            out.setdefault(fr, []).append(to)
+    return out
 
 
 def _make_order(*, edges, layers, package_names, capability_providers=None, spec_evrs=None, build_requires_raw=None):
@@ -28,9 +39,15 @@ def _make_order(*, edges, layers, package_names, capability_providers=None, spec
     r.edges = edges
     r.layers = layers
     r.package_names = package_names
-    r.capability_providers = capability_providers if capability_providers is not None else {}
+    if capability_providers is not None:
+        r.capability_providers = capability_providers
+    else:
+        r.capability_providers = {str(n): [str(n)] for n in package_names if n}
     r.spec_evrs = spec_evrs if spec_evrs is not None else {}
-    r.build_requires_raw = build_requires_raw if build_requires_raw is not None else {}
+    if build_requires_raw is not None:
+        r.build_requires_raw = build_requires_raw
+    else:
+        r.build_requires_raw = _build_requires_raw_from_edges(edges)
     return r
 
 
@@ -89,6 +106,9 @@ async def test_unresolved_chain_capabilities():
         capability_providers={"libfoo-plugin": ["libfoo"]},
     )
     db = AsyncMock()
+    row = MagicMock()
+    row.scalar_one_or_none.return_value = None
+    db.execute = AsyncMock(return_value=row)
     assert await unresolved_chain_capabilities(db, order, ["libfoo-plugin"]) == []
     assert await unresolved_chain_capabilities(db, order, ["not-in-tree"]) == ["not-in-tree"]
 
@@ -272,15 +292,19 @@ async def test_inject_before_stage_zero_for_single_package_chain():
     db = AsyncMock()
     db.execute.return_value.scalar_one_or_none = MagicMock(return_value=release)
 
+    from oreon_build.services.chain_satisfaction import RepoSatisfactionIndex
+
+    empty_repo = RepoSatisfactionIndex({}, set(), {}, {})
+
+    def _fake_repo_prepare(*_a, **_kw):
+        return empty_repo, {"runtime_missing": []}, None, None
+
     with patch(
-        "oreon_build.services.build_chain._cached_distgit_build_order",
+        "oreon_build.services.distgit_order.compute_distgit_build_order_for_chain",
         new=AsyncMock(return_value=order),
     ), patch(
-        "oreon_build.services.build_chain._cached_repo_provides_index",
-        new=AsyncMock(return_value=({}, set())),
-    ), patch(
-        "oreon_build.services.build_chain._cached_repo_runtime_analysis",
-        new=AsyncMock(return_value={"runtime_missing": []}),
+        "oreon_build.services.dependencies_graph.load_chain_repo_prepare",
+        side_effect=_fake_repo_prepare,
     ), patch(
         "oreon_build.services.build_chain._proactive_extra_roots_from_repo_runtime",
         new=AsyncMock(return_value=(set(), [])),
@@ -313,18 +337,22 @@ async def test_inject_does_not_duplicate_packages_already_on_chain():
     db = AsyncMock()
     db.execute.return_value.scalar_one_or_none = MagicMock(return_value=release)
 
+    from oreon_build.services.chain_satisfaction import RepoSatisfactionIndex
+
+    empty_repo = RepoSatisfactionIndex({}, set(), {}, {})
+
+    def _fake_repo_prepare(*_a, **_kw):
+        return empty_repo, {"runtime_missing": []}, None, None
+
     with patch(
-        "oreon_build.services.build_chain._cached_distgit_build_order",
+        "oreon_build.services.distgit_order.compute_distgit_build_order_for_chain",
         new=AsyncMock(return_value=order),
     ), patch(
-        "oreon_build.services.build_chain._cached_repo_provides_index",
-        new=AsyncMock(return_value=({}, set())),
+        "oreon_build.services.dependencies_graph.load_chain_repo_prepare",
+        side_effect=_fake_repo_prepare,
     ), patch(
         "oreon_build.services.build_chain._proactive_extra_roots_from_repo_runtime",
         new=AsyncMock(return_value=(set(), [])),
-    ), patch(
-        "oreon_build.services.build_chain._cached_repo_runtime_analysis",
-        new=AsyncMock(return_value={"runtime_missing": []}),
     ), patch(
         "oreon_build.services.build_chain._batch_chain_packages_still_needing_build",
         new=AsyncMock(return_value=set()),
@@ -357,15 +385,19 @@ async def test_inject_skips_chain_internal_packages():
     db = AsyncMock()
     db.execute.return_value.scalar_one_or_none = MagicMock(return_value=release)
 
+    from oreon_build.services.chain_satisfaction import RepoSatisfactionIndex
+
+    empty_repo = RepoSatisfactionIndex({}, set(), {}, {})
+
+    def _fake_repo_prepare(*_a, **_kw):
+        return empty_repo, {"runtime_missing": []}, None, None
+
     with patch(
-        "oreon_build.services.build_chain._cached_distgit_build_order",
+        "oreon_build.services.distgit_order.compute_distgit_build_order_for_chain",
         new=AsyncMock(return_value=order),
     ), patch(
-        "oreon_build.services.build_chain._cached_repo_provides_index",
-        new=AsyncMock(return_value=({}, set())),
-    ), patch(
-        "oreon_build.services.build_chain._cached_repo_runtime_analysis",
-        new=AsyncMock(return_value={"runtime_missing": []}),
+        "oreon_build.services.dependencies_graph.load_chain_repo_prepare",
+        side_effect=_fake_repo_prepare,
     ), patch(
         "oreon_build.services.build_chain._proactive_extra_roots_from_repo_runtime",
         new=AsyncMock(return_value=(set(), [])),
@@ -406,13 +438,13 @@ def test_chain_user_targets_from_options():
 def test_distgit_packages_in_layers_before_skips_when_target_at_layer_zero():
     from oreon_build.services.build_chain import _distgit_packages_in_layers_before
 
-    layers = [["kernel-headers"], ["other"]]
+    layers = [["target-pkg"], ["other"]]
     got = _distgit_packages_in_layers_before(
         layers,
-        ["kernel-headers"],
-        user_lower={"kernel-headers"},
+        ["target-pkg"],
+        user_lower={"target-pkg"},
         already_in_chain_lower=set(),
-        spec_names={"kernel-headers", "other"},
+        spec_names={"target-pkg", "other"},
     )
     assert got == set()
 
@@ -420,13 +452,13 @@ def test_distgit_packages_in_layers_before_skips_when_target_at_layer_zero():
 def test_distgit_packages_in_layers_before_user_target():
     from oreon_build.services.build_chain import _distgit_packages_in_layers_before
 
-    layers = [["a", "b"], ["c"], ["kernel-headers"]]
+    layers = [["a", "b"], ["c"], ["target-pkg"]]
     got = _distgit_packages_in_layers_before(
         layers,
-        ["kernel-headers"],
-        user_lower={"kernel-headers"},
+        ["target-pkg"],
+        user_lower={"target-pkg"},
         already_in_chain_lower=set(),
-        spec_names={"a", "b", "c", "kernel-headers"},
+        spec_names={"a", "b", "c", "target-pkg"},
     )
     assert got == {"a", "b", "c"}
 

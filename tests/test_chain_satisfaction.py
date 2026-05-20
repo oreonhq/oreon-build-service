@@ -116,28 +116,28 @@ def test_sources_needing_chain_build_skips_repo_satisfied_predecessors():
     from oreon_build.services.chain_satisfaction import sources_needing_chain_build
 
     order = MagicMock()
-    order.package_names = ["acl", "bash", "kernel-headers"]
+    order.package_names = ["dep-a", "dep-b", "target"]
     order.spec_evrs = {
-        "acl": "0:2.3.1-1.fc43",
-        "bash": "0:5.2-1.fc43",
-        "kernel-headers": "0:6.8-1.fc43",
+        "dep-a": "0:2.3.1-1.fc43",
+        "dep-b": "0:5.2-1.fc43",
+        "target": "0:6.8-1.fc43",
     }
-    order.build_requires_raw = {"kernel-headers": ["acl"]}
-    order.capability_providers = {"acl": ["acl"]}
+    order.build_requires_raw = {"target": ["dep-a"]}
+    order.capability_providers = {"dep-a": ["dep-a"]}
 
-    acl_evr = RpmEvr(0, "2.3.1", "1.fc43")
-    bash_evr = RpmEvr(0, "5.2", "1.fc43")
+    dep_a_evr = RpmEvr(0, "2.3.1", "1.fc43")
+    dep_b_evr = RpmEvr(0, "5.2", "1.fc43")
     repo = RepoSatisfactionIndex(
-        provides_index={"acl": {"acl"}, "bash": {"bash"}},
-        known_sources={"acl", "bash"},
-        provide_best_evr={"acl": acl_evr, "bash": bash_evr},
-        source_best_evr={"acl": acl_evr, "bash": bash_evr},
+        provides_index={"dep-a": {"dep-a"}, "dep-b": {"dep-b"}},
+        known_sources={"dep-a", "dep-b"},
+        provide_best_evr={"dep-a": dep_a_evr, "dep-b": dep_b_evr},
+        source_best_evr={"dep-a": dep_a_evr, "dep-b": dep_b_evr},
     )
     got = sources_needing_chain_build(
-        {"acl", "bash"},
+        {"dep-a", "dep-b"},
         order,
         repo,
-        consumer_packages=["kernel-headers"],
+        consumer_packages=["target"],
     )
     assert got == set()
 
