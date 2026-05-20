@@ -11,7 +11,7 @@ import tempfile
 import tarfile
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -468,6 +468,15 @@ def _chain_distgit_max_parse() -> int:
     return max(64, min(n, 20000))
 
 
+def _chain_distgit_parse_wave_size() -> int:
+    raw = (os.getenv("OREON_CHAIN_DISTGIT_PARSE_WAVE") or "48").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 48
+    return max(8, min(n, 128))
+
+
 async def _parse_specs_parallel_async(
     specs_by_pkg: dict[str, str],
 ) -> tuple[dict[str, _SpecParseResult], list[str]]:
@@ -563,7 +572,7 @@ def _expand_chain_spec_closure(
     """
     Incrementally read/parse specs along BuildRequires from ``roots`` (not the full distgit tree).
 
-    Uses a pre-built tarball member index so we do not rescan the archive once per package.
+    Parses each BFS wave in parallel (IO batch read, then thread-pool spec parse).
     """
     err: list[str] = []
     names_set = set(all_names)
@@ -586,22 +595,43 @@ def _expand_chain_spec_closure(
         queue.append(rn)
 
     max_parse = _chain_distgit_max_parse()
-    with tarfile.open(fileobj=io.BytesIO(tarball), mode="r:gz") as tf:
-        while queue and len(needed) <= max_parse:
+    wave_size = _chain_distgit_parse_wave_size()
+    pool = _distgit_spec_parse_executor()
+
+    while queue and len(needed) <= max_parse:
+        wave: list[str] = []
+        while queue and len(wave) < wave_size:
             pkg = queue.popleft()
-            if pkg in specs:
+            if pkg in parsed_by_source:
                 continue
-            m = members.get(pkg)
-            if m is None:
+            wave.append(pkg)
+        if not wave:
+            break
+
+        batch_specs = _read_specs_from_tarball(
+            tarball, releasename, set(wave), members=members
+        )
+        for pkg in wave:
+            if pkg not in batch_specs:
                 err.append(f"spec missing in tarball for {pkg}")
-                continue
-            f = tf.extractfile(m)
-            if f is None:
-                err.append(f"spec missing in tarball for {pkg}")
-                continue
-            spec_text = f.read().decode("utf-8", errors="replace")
-            specs[pkg] = spec_text
-            parsed = _parse_spec_text(spec_text, f"{pkg}.spec")
+
+        futures = {
+            pool.submit(_parse_spec_text, batch_specs[pkg], f"{pkg}.spec"): pkg
+            for pkg in batch_specs
+        }
+        for fut in as_completed(futures):
+            pkg = futures[fut]
+            try:
+                parsed = fut.result()
+            except Exception as exc:
+                err.append(f"{pkg}: parse failed ({type(exc).__name__}: {exc})")
+                parsed = _SpecParseResult(
+                    source_name=pkg,
+                    build_requires=[],
+                    provided_binary_names={pkg},
+                    build_requires_raw=[],
+                )
+            specs[pkg] = batch_specs[pkg]
             parsed_by_source[pkg] = parsed
             for cap, srcs in _provider_map_from_specs({pkg: parsed}).items():
                 provider_map.setdefault(cap, set()).update(srcs)
@@ -661,6 +691,9 @@ async def compute_distgit_build_order_for_chain(
     )
     if t_err:
         err.append(t_err)
+    if not tarball:
+        if not err:
+            err.append("distgit tarball fetch returned no data")
         return _distgit_order_from_parsed(
             releasename=releasename,
             distgit_url=distgit_url,
@@ -670,7 +703,9 @@ async def compute_distgit_build_order_for_chain(
         )
 
     t_index = time.monotonic()
-    all_names, members = await asyncio.to_thread(_tarball_spec_member_index, tarball, releasename)
+    all_names, members = await asyncio.to_thread(
+        _tarball_spec_member_index, tarball, releasename
+    )
     logger.info(
         "distgit tarball index: %s packages under %s in %.1fs",
         len(all_names),

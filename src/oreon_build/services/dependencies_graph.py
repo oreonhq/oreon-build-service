@@ -173,23 +173,14 @@ def _merge_best_evr(current: Any | None, candidate: Any) -> Any:
     return candidate if _vercmp(candidate, current) > 0 else current
 
 
-_repo_sat_load_cache: dict[tuple[str, str], tuple[float, Any]] = {}
-
-
-def _build_repo_satisfaction_from_primary(primary_xml: bytes) -> Any:
-    """Single pass over primary.xml for chain repo satisfaction (was triple-parse before)."""
+def _build_repo_satisfaction_from_primary_element(root: ET.Element) -> Any:
+    """Build repo satisfaction index from an already-parsed primary.xml root."""
     from oreon_build.services.chain_satisfaction import RepoSatisfactionIndex, RpmEvr
 
     provides_index: dict[str, set[str]] = {}
     known_sources: set[str] = set()
     provide_best: dict[str, RpmEvr] = {}
     source_best: dict[str, RpmEvr] = {}
-
-    try:
-        root = ET.fromstring(primary_xml)
-    except ET.ParseError as exc:
-        logger.warning("primary.xml parse error: %s", exc)
-        return RepoSatisfactionIndex({}, set(), {}, {})
 
     for pkg in root.findall(".//{*}package"):
         arch = _safe_text(pkg.find("{*}arch"))
@@ -220,6 +211,227 @@ def _build_repo_satisfaction_from_primary(primary_xml: bytes) -> Any:
     )
 
 
+def _build_repo_satisfaction_from_primary(primary_xml: bytes) -> Any:
+    """Single pass over primary.xml for chain repo satisfaction."""
+    from oreon_build.services.chain_satisfaction import RepoSatisfactionIndex
+
+    try:
+        root = ET.fromstring(primary_xml)
+    except ET.ParseError as exc:
+        logger.warning("primary.xml parse error: %s", exc)
+        return RepoSatisfactionIndex({}, set(), {}, {})
+    return _build_repo_satisfaction_from_primary_element(root)
+
+
+def _runtime_gaps_from_primary_element(
+    root: ET.Element,
+    target: RepoTarget,
+    *,
+    provides_index: dict[str, set[str]],
+    known_built_sources: set[str],
+    consumer_sources: set[str] | None = None,
+    spec_capability_providers: dict[str, list[str]] | None = None,
+    external_provides: set[str] | None = None,
+) -> dict[str, Any]:
+    """Runtime Requires gaps for chain prepare (same semantics as analyze_repo_runtime_primary_only)."""
+    runtime_edges: list[dict[str, Any]] = []
+    runtime_missing: list[dict[str, Any]] = []
+    src_candidates = set(known_built_sources or ())
+    for pkg in root.findall(".//{*}package"):
+        pkg_arch = _safe_text(pkg.find("{*}arch"))
+        if pkg_arch == "src":
+            continue
+        src_name = _source_name_from_sourcerpm(_safe_text(pkg.find("{*}format/{*}sourcerpm")))
+        if not src_name:
+            continue
+        if consumer_sources is not None and src_name not in consumer_sources:
+            continue
+        seen_runtime_req: set[str] = set()
+        for e in pkg.findall(f".//{RPM_NS}requires/{RPM_NS}entry"):
+            req_raw = (e.attrib.get("name") or "").strip()
+            req = _parse_runtime_req_name(req_raw)
+            if not req or req in seen_runtime_req:
+                continue
+            seen_runtime_req.add(req)
+            if external_provides and req in external_provides:
+                continue
+            providers = _providers_for_requirement(
+                req,
+                provides_index,
+                src_candidates,
+                known_built_sources,
+                spec_capability_providers,
+            )
+            if providers is None:
+                continue
+            is_satisfied = _requirement_satisfied_in_repo(
+                req, providers, known_built_sources, provides_index
+            )
+            for prov_src in sorted(providers):
+                if prov_src == src_name:
+                    continue
+                runtime_edges.append(
+                    {
+                        "release": target.releasename,
+                        "branch": target.branch,
+                        "arch": target.arch,
+                        "from": src_name,
+                        "to": prov_src,
+                        "requirement": req,
+                        "missing": not is_satisfied,
+                    }
+                )
+            if not is_satisfied:
+                for prov_src in sorted(providers):
+                    if prov_src == src_name:
+                        continue
+                    runtime_missing.append(
+                        {
+                            "release": target.releasename,
+                            "branch": target.branch,
+                            "arch": target.arch,
+                            "package": src_name,
+                            "requirement": req,
+                            "provider": prov_src,
+                        }
+                    )
+
+    return {
+        "repo": target,
+        "packages": {},
+        "missing": [],
+        "edges": [],
+        "runtime_missing": runtime_missing,
+        "runtime_edges": runtime_edges,
+        "error": None,
+    }
+
+
+def load_chain_repo_prepare(
+    target: RepoTarget,
+    *,
+    consumer_sources: set[str] | None = None,
+    spec_capability_providers: dict[str, list[str]] | None = None,
+    external_provides: set[str] | None = None,
+    include_runtime: bool = True,
+) -> tuple[Any, dict[str, Any], str | None, bytes | None]:
+    """
+    One repodata fetch and one primary.xml parse for chain prepare (satisfaction + optional runtime scan).
+
+    Returns ``(index, runtime_analysis, error, primary_xml_bytes)``. ``primary_xml_bytes`` is set on
+  success so the same request can run a scoped runtime scan after distgit closure without re-downloading.
+    """
+    from oreon_build.services.chain_satisfaction import RepoSatisfactionIndex
+
+    _empty_runtime: dict[str, Any] = {
+        "repo": target,
+        "packages": {},
+        "missing": [],
+        "edges": [],
+        "runtime_missing": [],
+        "runtime_edges": [],
+        "error": None,
+    }
+    t0 = time.monotonic()
+    r2 = get_r2_client()
+    repomd_key = f"{target.prefix}/repodata/repomd.xml"
+    repomd = r2.get_object(repomd_key)
+    if not repomd:
+        empty = RepoSatisfactionIndex({}, set(), {}, {})
+        return empty, {**_empty_runtime, "error": "repomd_missing"}, "repomd_missing", None
+    primary_key = _resolve_primary_key(target.prefix, repomd)
+    if not primary_key:
+        empty = RepoSatisfactionIndex({}, set(), {}, {})
+        return (
+            empty,
+            {**_empty_runtime, "error": "primary_missing_in_repomd"},
+            "primary_missing_in_repomd",
+            None,
+        )
+    primary_raw = r2.get_object(primary_key)
+    if not primary_raw:
+        empty = RepoSatisfactionIndex({}, set(), {}, {})
+        return empty, {**_empty_runtime, "error": "primary_blob_missing"}, "primary_blob_missing", None
+    try:
+        t_parse = time.monotonic()
+        primary_xml = _decompress_if_needed(primary_raw, primary_key)
+        root = ET.fromstring(primary_xml)
+        index = _build_repo_satisfaction_from_primary_element(root)
+        runtime: dict[str, Any] = _empty_runtime
+        if include_runtime:
+            runtime = _runtime_gaps_from_primary_element(
+                root,
+                target,
+                provides_index=index.provides_index,
+                known_built_sources=index.known_sources,
+                consumer_sources=consumer_sources,
+                spec_capability_providers=spec_capability_providers,
+                external_provides=external_provides,
+            )
+        logger.info(
+            "chain repo prepare for %s: %d sources, %d runtime gaps in %.1fs",
+            target.prefix,
+            len(index.known_sources),
+            len(runtime.get("runtime_missing") or []),
+            time.monotonic() - t_parse,
+        )
+        logger.info(
+            "chain repo prepare total for %s: %.1fs",
+            target.prefix,
+            time.monotonic() - t0,
+        )
+        return index, runtime, None, primary_xml
+    except ET.ParseError as exc:
+        empty = RepoSatisfactionIndex({}, set(), {}, {})
+        return (
+            empty,
+            {**_empty_runtime, "error": f"primary_parse_failed:ParseError:{exc}"},
+            f"primary_parse_failed:ParseError:{exc}",
+            None,
+        )
+    except Exception as exc:
+        empty = RepoSatisfactionIndex({}, set(), {}, {})
+        return (
+            empty,
+            {**_empty_runtime, "error": f"primary_parse_failed:{type(exc).__name__}:{exc}"},
+            f"primary_parse_failed:{type(exc).__name__}:{exc}",
+            None,
+        )
+
+
+def chain_repo_runtime_from_primary(
+    primary_xml: bytes,
+    target: RepoTarget,
+    *,
+    repo_sat: Any,
+    consumer_sources: set[str] | None,
+    spec_capability_providers: dict[str, list[str]] | None = None,
+    external_provides: set[str] | None = None,
+) -> dict[str, Any]:
+    """Scoped runtime Requires scan using primary.xml already fetched in this prepare request."""
+    _empty: dict[str, Any] = {
+        "repo": target,
+        "packages": {},
+        "missing": [],
+        "edges": [],
+        "runtime_missing": [],
+        "runtime_edges": [],
+    }
+    try:
+        root = ET.fromstring(primary_xml)
+    except ET.ParseError as exc:
+        return {**_empty, "error": f"primary_parse_failed:ParseError:{exc}"}
+    return _runtime_gaps_from_primary_element(
+        root,
+        target,
+        provides_index=repo_sat.provides_index,
+        known_built_sources=repo_sat.known_sources,
+        consumer_sources=consumer_sources,
+        spec_capability_providers=spec_capability_providers,
+        external_provides=external_provides,
+    )
+
+
 def load_repo_satisfaction_index(
     target: RepoTarget,
 ) -> tuple[Any, str | None]:
@@ -228,26 +440,12 @@ def load_repo_satisfaction_index(
 
     Returns ``(RepoSatisfactionIndex, error)``.
     """
-    ttl = float((os.getenv("OREON_CHAIN_REPO_SAT_INDEX_CACHE_SEC") or "300").strip() or "300")
-    ttl = max(30.0, min(ttl, 3600.0))
-
     r2 = get_r2_client()
     repomd_key = f"{target.prefix}/repodata/repomd.xml"
     t0 = time.monotonic()
     repomd = r2.get_object(repomd_key)
     if not repomd:
         return _build_repo_satisfaction_from_primary(b""), "repomd_missing"
-    repomd_token = hashlib.sha256(repomd).hexdigest()[:20]
-    cache_key = (target.prefix, repomd_token)
-    now = time.monotonic()
-    hit = _repo_sat_load_cache.get(cache_key)
-    if hit is not None and (now - hit[0]) < ttl:
-        logger.info(
-            "repo satisfaction index cache hit for %s (%d sources)",
-            target.prefix,
-            len(hit[1].known_sources),
-        )
-        return hit[1], None
 
     primary_key = _resolve_primary_key(target.prefix, repomd)
     if not primary_key:
@@ -280,7 +478,6 @@ def load_repo_satisfaction_index(
             time.monotonic() - t_parse,
             time.monotonic() - t0,
         )
-        _repo_sat_load_cache[cache_key] = (now, index)
         return index, None
     except Exception as exc:
         return _build_repo_satisfaction_from_primary(b""), f"primary_parse_failed:{type(exc).__name__}:{exc}"
@@ -879,6 +1076,9 @@ def analyze_repo_runtime_primary_only(
     external_provides: set[str] | None = None,
     spec_capability_providers: dict[str, list[str]] | None = None,
     consumer_sources: set[str] | None = None,
+    primary_xml: bytes | None = None,
+    provides_index: dict[str, set[str]] | None = None,
+    known_built_sources: set[str] | None = None,
 ) -> dict[str, Any]:
     """
     Fast chain prepare path: runtime Requires from primary.xml only (no SRPM header scans).
@@ -894,99 +1094,45 @@ def analyze_repo_runtime_primary_only(
         "runtime_missing": [],
         "runtime_edges": [],
     }
-    r2 = get_r2_client()
-    repomd_key = f"{target.prefix}/repodata/repomd.xml"
-    repomd = r2.get_object(repomd_key)
-    if not repomd:
-        return {**_empty, "error": "repomd_missing"}
-    primary_key = _resolve_primary_key(target.prefix, repomd)
-    if not primary_key:
-        return {**_empty, "error": "primary_missing_in_repomd"}
-    primary_raw = r2.get_object(primary_key)
-    if not primary_raw:
-        return {**_empty, "error": "primary_blob_missing"}
-    try:
-        primary_xml = _decompress_if_needed(primary_raw, primary_key)
-        provides_index, known_built_sources = _build_provides_index(primary_xml)
-    except Exception as exc:
-        return {**_empty, "error": f"primary_parse_failed:{type(exc).__name__}:{exc}"}
+    if primary_xml is None:
+        r2 = get_r2_client()
+        repomd_key = f"{target.prefix}/repodata/repomd.xml"
+        repomd = r2.get_object(repomd_key)
+        if not repomd:
+            return {**_empty, "error": "repomd_missing"}
+        primary_key = _resolve_primary_key(target.prefix, repomd)
+        if not primary_key:
+            return {**_empty, "error": "primary_missing_in_repomd"}
+        primary_raw = r2.get_object(primary_key)
+        if not primary_raw:
+            return {**_empty, "error": "primary_blob_missing"}
+        try:
+            primary_xml = _decompress_if_needed(primary_raw, primary_key)
+        except Exception as exc:
+            return {**_empty, "error": f"primary_parse_failed:{type(exc).__name__}:{exc}"}
 
-    src_candidates = set(known_built_sources)
-    runtime_edges: list[dict[str, Any]] = []
-    runtime_missing: list[dict[str, Any]] = []
+    if provides_index is None or known_built_sources is None:
+        try:
+            pi, known = _build_provides_index(primary_xml)
+            provides_index = pi if provides_index is None else provides_index
+            known_built_sources = known if known_built_sources is None else known_built_sources
+        except Exception as exc:
+            return {**_empty, "error": f"primary_parse_failed:{type(exc).__name__}:{exc}"}
+
     try:
         root = ET.fromstring(primary_xml)
-    except ET.ParseError:
-        root = None
-    if root is not None:
-        for pkg in root.findall(".//{*}package"):
-            pkg_arch = _safe_text(pkg.find("{*}arch"))
-            if pkg_arch == "src":
-                continue
-            src_name = _source_name_from_sourcerpm(_safe_text(pkg.find("{*}format/{*}sourcerpm")))
-            if not src_name:
-                continue
-            if consumer_sources is not None and src_name not in consumer_sources:
-                continue
-            seen_runtime_req: set[str] = set()
-            for e in pkg.findall(f".//{RPM_NS}requires/{RPM_NS}entry"):
-                req_raw = (e.attrib.get("name") or "").strip()
-                req = _parse_runtime_req_name(req_raw)
-                if not req or req in seen_runtime_req:
-                    continue
-                seen_runtime_req.add(req)
-                if external_provides and req in external_provides:
-                    continue
-                providers = _providers_for_requirement(
-                    req,
-                    provides_index,
-                    src_candidates,
-                    known_built_sources,
-                    spec_capability_providers,
-                )
-                if providers is None:
-                    continue
-                is_satisfied = _requirement_satisfied_in_repo(
-                    req, providers, known_built_sources, provides_index
-                )
-                for prov_src in sorted(providers):
-                    if prov_src == src_name:
-                        continue
-                    runtime_edges.append(
-                        {
-                            "release": target.releasename,
-                            "branch": target.branch,
-                            "arch": target.arch,
-                            "from": src_name,
-                            "to": prov_src,
-                            "requirement": req,
-                            "missing": not is_satisfied,
-                        }
-                    )
-                if not is_satisfied:
-                    for prov_src in sorted(providers):
-                        if prov_src == src_name:
-                            continue
-                        runtime_missing.append(
-                            {
-                                "release": target.releasename,
-                                "branch": target.branch,
-                                "arch": target.arch,
-                                "package": src_name,
-                                "requirement": req,
-                                "provider": prov_src,
-                            }
-                        )
+    except ET.ParseError as exc:
+        return {**_empty, "error": f"primary_parse_failed:ParseError:{exc}"}
 
-    return {
-        "repo": target,
-        "packages": {},
-        "missing": [],
-        "edges": [],
-        "runtime_missing": runtime_missing,
-        "runtime_edges": runtime_edges,
-        "error": None,
-    }
+    return _runtime_gaps_from_primary_element(
+        root,
+        target,
+        provides_index=provides_index,
+        known_built_sources=known_built_sources,
+        consumer_sources=consumer_sources,
+        spec_capability_providers=spec_capability_providers,
+        external_provides=external_provides,
+    )
 
 
 async def _collect_repo_targets(db: AsyncSession) -> list[RepoTarget]:

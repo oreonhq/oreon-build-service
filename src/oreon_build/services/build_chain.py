@@ -50,15 +50,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_ARCH = ["x86_64", "aarch64"]
 
-# Cache distgit order for chain dep gating (GitHub + spec parse is expensive).
-_chain_distgit_order_cache: dict[tuple[str, str, str], tuple[float, Any]] = {}
-# Cache repo primary.xml analysis for proactive runtime Requires (R2 fetch).
-_chain_repo_runtime_cache: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
-# Cache provide_name -> source from repo primary.xml (shared by chain capability resolution).
-_chain_repo_provides_cache: dict[tuple[str, str, str], tuple[float, dict[str, set[str]], set[str]]] = {}
-_chain_repo_sat_cache: dict[tuple[str, str, str], tuple[float, Any]] = {}
-
-
 def _chain_use_distgit_dep_gate() -> bool:
     return (os.getenv("OREON_CHAIN_USE_DISTGIT_ORDER_GATE") or "1").strip().lower() not in ("0", "false", "no")
 
@@ -198,49 +189,20 @@ def resolve_distgit_sources_for_missing_providers(
     return sources
 
 
-async def _cached_repo_provides_index(
-    releasename: str,
-    branch: str,
-    arch: str,
-) -> tuple[dict[str, set[str]], set[str]]:
-    """Provides index from the same cached primary.xml parse as repo satisfaction."""
-    sat, err = await _cached_repo_satisfaction_index(releasename, branch, arch)
-    if err:
-        logger.info(
-            "repo provides index unavailable for %s/%s/%s: %s",
-            releasename,
-            branch,
-            arch,
-            err,
-        )
-        return {}, set()
-    return sat.provides_index, sat.known_sources
-
-
-async def _cached_repo_satisfaction_index(
+async def _load_repo_satisfaction_index(
     releasename: str,
     branch: str,
     arch: str,
 ) -> tuple[Any, str | None]:
     from oreon_build.services.dependencies_graph import RepoTarget, load_repo_satisfaction_index
 
-    k = (releasename.strip(), branch.strip(), normalize_machine_arch(arch))
-    now = time.monotonic()
-    ttl = float((os.getenv("OREON_CHAIN_REPO_RUNTIME_CACHE_SEC") or "120").strip() or "120")
-    ttl = max(30.0, min(ttl, 600.0))
-    hit = _chain_repo_sat_cache.get(k)
-    if hit is not None and (now - hit[0]) < ttl:
-        return hit[1], None
-
     target = RepoTarget(
-        releasename=k[0],
-        branch=k[1],
-        arch=k[2],
-        prefix=f"{k[0]}/{k[1]}/{k[2]}",
+        releasename=releasename.strip(),
+        branch=branch.strip(),
+        arch=normalize_machine_arch(arch),
+        prefix=f"{releasename.strip()}/{branch.strip()}/{normalize_machine_arch(arch)}",
     )
-    repo_sat, err = await asyncio.to_thread(load_repo_satisfaction_index, target)
-    _chain_repo_sat_cache[k] = (now, repo_sat)
-    return repo_sat, err
+    return await asyncio.to_thread(load_repo_satisfaction_index, target)
 
 
 async def resolve_chain_sources_for_missing_providers(
@@ -260,7 +222,11 @@ async def resolve_chain_sources_for_missing_providers(
     repo_pi: dict[str, set[str]] = {}
     repo_known: set[str] = set()
     if releasename and repo_branch and repo_arch:
-        repo_pi, repo_known = await _cached_repo_provides_index(releasename, repo_branch, repo_arch)
+        repo_sat, err = await _load_repo_satisfaction_index(releasename, repo_branch, repo_arch)
+        if err:
+            repo_pi, repo_known = {}, set()
+        else:
+            repo_pi, repo_known = repo_sat.provides_index, repo_sat.known_sources
 
     sources = resolve_distgit_sources_for_missing_providers(
         order,
@@ -375,15 +341,6 @@ def _chain_dep_poll_sec() -> int:
     except ValueError:
         n = 20
     return max(5, min(n, 600))
-
-
-def _chain_distgit_order_cache_ttl_sec() -> float:
-    raw = (os.getenv("OREON_CHAIN_DISTGIT_ORDER_CACHE_SEC") or "300").strip()
-    try:
-        n = float(raw)
-    except ValueError:
-        n = 300.0
-    return max(30.0, min(n, 3600.0))
 
 
 def _predecessor_names_in_tree(order_edges: list[dict[str, str]], consumer: str) -> set[str]:
@@ -516,8 +473,8 @@ def _distgit_packages_in_layers_before(
 ) -> set[str]:
     """
     All distgit sources in topological layers strictly before the layer(s) holding
-    ``target_packages``. Ensures user-named targets (e.g. kernel-headers) are not
-    stage 0 when the spec tree has predecessors, regardless of published-repo checks.
+    ``target_packages``. Ensures user-named targets are not stage 0 when the spec
+    tree has predecessors, regardless of published-repo checks.
     """
     target_lower = {str(p).lower() for p in target_packages if str(p).strip()}
     if not order_layers or not target_lower:
@@ -834,6 +791,19 @@ def _chain_root_package_names(chain: BuildChain) -> list[str]:
     return roots
 
 
+def _chain_runtime_consumer_sources(chain: BuildChain, order: Any) -> set[str]:
+    """Packages in this chain (stages + distgit BR predecessors). Never a fixed name list."""
+    stages = chain.stages_json if isinstance(chain.stages_json, list) else []
+    chain_names = {str(p).strip() for stage in stages for p in stage if str(p).strip()}
+    spec_names = {str(n) for n in (order.package_names or []) if n}
+    deps_map = _deps_map_from_edges(order.edges if isinstance(order.edges, list) else [])
+    related = chain_names | _transitive_spec_predecessors(deps_map, list(chain_names), spec_names)
+    for r in _chain_root_package_names(chain):
+        if r:
+            related.add(r)
+    return related
+
+
 @dataclass
 class _ChainExpandContext:
     """Fresh distgit + repo metadata loaded once per prepare (shared across expand rounds)."""
@@ -870,8 +840,8 @@ async def _build_chain_expand_context(
 
     from oreon_build.services.dependencies_graph import (
         RepoTarget,
-        analyze_repo_runtime_primary_only,
-        load_repo_satisfaction_index,
+        chain_repo_runtime_from_primary,
+        load_chain_repo_prepare,
     )
     from oreon_build.services.distgit_order import compute_distgit_build_order_for_chain
 
@@ -883,18 +853,25 @@ async def _build_chain_expand_context(
         prefix=f"{releasename}/{publish_branch}/{canon_arch}",
     )
     logger.info(
-        "chain_id=%s prepare: distgit order + repo primary.xml (parallel)",
+        "chain_id=%s prepare: distgit closure + repo primary.xml (parallel)",
         chain.id,
     )
     t0 = time.monotonic()
-    order, (repo_sat, sat_err) = await asyncio.gather(
+
+    def _repo_sat_only() -> tuple[Any, str | None, bytes | None]:
+        sat, _runtime, err, primary_xml = load_chain_repo_prepare(
+            target, include_runtime=False
+        )
+        return sat, err, primary_xml
+
+    order, (repo_sat, sat_err, primary_xml) = await asyncio.gather(
         compute_distgit_build_order_for_chain(
             releasename=releasename,
             distgit_url=dg_url,
             distgit_branch=dg_br,
             root_packages=roots,
         ),
-        asyncio.to_thread(load_repo_satisfaction_index, target),
+        asyncio.to_thread(_repo_sat_only),
     )
     if sat_err:
         logger.warning("chain_id=%s repo satisfaction: %s", chain.id, sat_err)
@@ -908,20 +885,32 @@ async def _build_chain_expand_context(
 
     spec_caps = order.capability_providers if isinstance(order.capability_providers, dict) else {}
     runtime_analysis: dict[str, Any] = {}
-    # Always load runtime Requires gaps during prepare so inject can stage deps before the
-    # user target. Recovery used to be the only path that ran this (PREPARE=0), so
-    # kernel-headers ran first and failed once before deps were injected.
     if _chain_proactive_repo_runtime():
         t2 = time.monotonic()
-        chain_sources = set(order.package_names or []) | set(roots)
-        if _chain_proactive_repo_runtime_fast():
+        chain_sources = _chain_runtime_consumer_sources(chain, order)
+        if _chain_proactive_repo_runtime_fast() and primary_xml:
             runtime_analysis = await asyncio.to_thread(
-                analyze_repo_runtime_primary_only,
+                chain_repo_runtime_from_primary,
+                primary_xml,
                 target,
-                spec_capability_providers=spec_caps,
+                repo_sat=repo_sat,
                 consumer_sources=chain_sources,
+                spec_capability_providers=spec_caps,
             )
             mode = "fast-primary"
+        elif _chain_proactive_repo_runtime_fast():
+            repo_sat2, runtime_analysis, sat_err2, _ = await asyncio.to_thread(
+                load_chain_repo_prepare,
+                target,
+                consumer_sources=chain_sources,
+                spec_capability_providers=spec_caps,
+                include_runtime=True,
+            )
+            if sat_err2:
+                logger.warning("chain_id=%s repo runtime: %s", chain.id, sat_err2)
+            if repo_sat2 is not None:
+                repo_sat = repo_sat2
+            mode = "fast-primary-fetch"
         else:
             from oreon_build.services.dependencies_graph import _analyze_repo
 
@@ -933,7 +922,7 @@ async def _build_chain_expand_context(
             )
             mode = "full-srpm"
         logger.info(
-            "chain_id=%s proactive runtime scan (%s, fresh) in %.1fs",
+            "chain_id=%s proactive runtime scan (%s) in %.1fs",
             chain.id,
             mode,
             time.monotonic() - t2,
@@ -953,45 +942,6 @@ async def _build_chain_expand_context(
         repo_sat=repo_sat,
         runtime_analysis=runtime_analysis,
     )
-
-
-def invalidate_distgit_order_cache(
-    releasename: str,
-    distgit_url: str,
-    distgit_branch: str,
-) -> None:
-    """Drop cached spec-tree order so the next chain step sees fresh distgit specs."""
-    k = (releasename.strip(), distgit_url.strip(), distgit_branch.strip())
-    _chain_distgit_order_cache.pop(k, None)
-
-
-def invalidate_repo_chain_caches(releasename: str, branch: str, arch: str) -> None:
-    """Drop cached repodata indexes after a publish or spec Provides change."""
-    k = (releasename.strip(), branch.strip(), normalize_machine_arch(arch))
-    _chain_repo_provides_cache.pop(k, None)
-    _chain_repo_sat_cache.pop(k, None)
-    _chain_repo_runtime_cache.pop(k, None)
-
-
-async def _cached_distgit_build_order(
-    releasename: str,
-    distgit_url: str,
-    distgit_branch: str,
-    *,
-    force_refresh: bool = False,
-) -> Any:
-    from oreon_build.services.distgit_order import compute_distgit_build_order
-
-    k = (releasename.strip(), distgit_url.strip(), distgit_branch.strip())
-    now = time.monotonic()
-    ttl = _chain_distgit_order_cache_ttl_sec()
-    if not force_refresh:
-        hit = _chain_distgit_order_cache.get(k)
-        if hit is not None and (now - hit[0]) < ttl:
-            return hit[1]
-    order = await compute_distgit_build_order(releasename=k[0], distgit_url=k[1], distgit_branch=k[2])
-    _chain_distgit_order_cache[k] = (now, order)
-    return order
 
 
 def _sources_missing_repo_capabilities(
@@ -1014,52 +964,6 @@ def _sources_missing_repo_capabilities(
         ):
             need_rebuild.add(src)
     return need_rebuild
-
-
-async def _cached_repo_runtime_analysis(
-    releasename: str,
-    branch: str,
-    arch: str,
-    *,
-    spec_capability_providers: dict[str, list[str]] | None = None,
-    consumer_sources: set[str] | None = None,
-) -> dict[str, Any]:
-    from oreon_build.services.dependencies_graph import (
-        RepoTarget,
-        _analyze_repo,
-        analyze_repo_runtime_primary_only,
-    )
-
-    k = (releasename.strip(), branch.strip(), normalize_machine_arch(arch))
-    now = time.monotonic()
-    ttl = float((os.getenv("OREON_CHAIN_REPO_RUNTIME_CACHE_SEC") or "120").strip() or "120")
-    ttl = max(30.0, min(ttl, 600.0))
-    hit = _chain_repo_runtime_cache.get(k)
-    if hit is not None and (now - hit[0]) < ttl:
-        return hit[1]
-
-    target = RepoTarget(
-        releasename=k[0],
-        branch=k[1],
-        arch=k[2],
-        prefix=f"{k[0]}/{k[1]}/{k[2]}",
-    )
-    if _chain_proactive_repo_runtime_fast():
-        analysis = await asyncio.to_thread(
-            analyze_repo_runtime_primary_only,
-            target,
-            spec_capability_providers=spec_capability_providers or None,
-            consumer_sources=consumer_sources,
-        )
-    else:
-        analysis = await asyncio.to_thread(
-            _analyze_repo,
-            target,
-            None,
-            spec_capability_providers or None,
-        )
-    _chain_repo_runtime_cache[k] = (now, analysis)
-    return analysis
 
 
 async def _proactive_extra_roots_from_repo_runtime(
@@ -1089,21 +993,45 @@ async def _proactive_extra_roots_from_repo_runtime(
     branch = r2_publish_branch(release)
     canon_arch = normalize_machine_arch(architectures[0] if architectures else "x86_64")
     if repo_pi is None or repo_known is None:
-        repo_pi, repo_known = await _cached_repo_provides_index(releasename, branch, canon_arch)
+        repo_sat_load, err = await _load_repo_satisfaction_index(releasename, branch, canon_arch)
+        if err:
+            repo_pi, repo_known = {}, set()
+        else:
+            repo_pi = repo_sat_load.provides_index
+            repo_known = repo_sat_load.known_sources
     repo_known = repo_known or set()
     if repo_sat is None:
-        repo_sat, _ = await _cached_repo_satisfaction_index(releasename, branch, canon_arch)
+        repo_sat, _ = await _load_repo_satisfaction_index(releasename, branch, canon_arch)
     from oreon_build.services.chain_satisfaction import _requirement_status
+    from oreon_build.services.dependencies_graph import RepoTarget, load_chain_repo_prepare
+
     spec_caps = order.capability_providers if isinstance(order.capability_providers, dict) else {}
     spec_names = {str(n) for n in (order.package_names or []) if n}
+    runtime_consumers = _chain_runtime_consumer_sources(chain, order)
     if analysis is None:
-        analysis = await _cached_repo_runtime_analysis(
-            releasename,
-            branch,
-            canon_arch,
-            spec_capability_providers=spec_caps,
-            consumer_sources=spec_names,
+        target = RepoTarget(
+            releasename=releasename,
+            branch=branch,
+            arch=canon_arch,
+            prefix=f"{releasename}/{branch}/{canon_arch}",
         )
+        if _chain_proactive_repo_runtime_fast():
+            _sat, analysis, _err, _px = await asyncio.to_thread(
+                load_chain_repo_prepare,
+                target,
+                consumer_sources=runtime_consumers,
+                spec_capability_providers=spec_caps,
+                include_runtime=True,
+            )
+        else:
+            from oreon_build.services.dependencies_graph import _analyze_repo
+
+            analysis = await asyncio.to_thread(
+                _analyze_repo,
+                target,
+                None,
+                spec_caps,
+            )
     if analysis.get("error"):
         logger.info(
             "chain_id=%s proactive repo scan skipped (%s)",
@@ -1326,11 +1254,7 @@ async def _inject_missing_dep_layers_before(
         canon_arch = ctx.canon_arch
         pref_pm = ctx.pref_pm if ctx.pref_pm is not None else pref_pm
     else:
-        from oreon_build.services.dependencies_graph import (
-            RepoTarget,
-            analyze_repo_runtime_primary_only,
-            load_repo_satisfaction_index,
-        )
+        from oreon_build.services.dependencies_graph import RepoTarget, load_chain_repo_prepare
         from oreon_build.services.distgit_order import compute_distgit_build_order_for_chain
 
         publish_branch = r2_publish_branch(release)
@@ -1348,23 +1272,20 @@ async def _inject_missing_dep_layers_before(
             arch=canon_arch,
             prefix=f"{releasename}/{publish_branch}/{canon_arch}",
         )
-        repo_sat_index, _ = await asyncio.to_thread(load_repo_satisfaction_index, target)
+        inject_sources = (
+            _chain_runtime_consumer_sources(chain, order)
+            if _chain_proactive_repo_runtime()
+            else None
+        )
+        repo_sat_index, analysis, _sat_err, _px = await asyncio.to_thread(
+            load_chain_repo_prepare,
+            target,
+            consumer_sources=inject_sources,
+            spec_capability_providers=spec_caps,
+            include_runtime=_chain_proactive_repo_runtime(),
+        )
         repo_pi = repo_sat_index.provides_index
         repo_known = repo_sat_index.known_sources
-        analysis = {}
-        if _chain_proactive_repo_runtime():
-            inject_sources = set(order.package_names or [])
-            if _chain_proactive_repo_runtime_fast():
-                analysis = await asyncio.to_thread(
-                    analyze_repo_runtime_primary_only,
-                    target,
-                    spec_capability_providers=spec_caps,
-                    consumer_sources=inject_sources,
-                )
-            else:
-                from oreon_build.services.dependencies_graph import _analyze_repo
-
-                analysis = await asyncio.to_thread(_analyze_repo, target, None, spec_caps)
 
     caps_needed = list(required_capabilities or [])
     republish_needed = _sources_missing_repo_capabilities(order, repo_pi, caps_needed)
@@ -1442,8 +1363,6 @@ async def _inject_missing_dep_layers_before(
             user_targets,
         )
         # Only inject distgit sources the published repo cannot satisfy (BR walk).
-        # Prepending full topological layers before the user target queued 60+ builds
-        # that were already in the repo (chain 168: 66 "layer" injects, 0 repo-missing).
         filtered = {
             p
             for p in dep_plan.sources_to_build
@@ -1647,10 +1566,12 @@ async def _try_recover_chain_after_failure(
                     r2_publish_branch(release) if release else str(opt.get("branch") or "dev")
                 )
                 if providers:
-                    invalidate_distgit_order_cache(releasename, dg_url, dg_br)
-                    invalidate_repo_chain_caches(releasename, repo_branch, canon_arch)
-                    order = await _cached_distgit_build_order(
-                        releasename, dg_url, dg_br, force_refresh=True
+                    from oreon_build.services.distgit_order import compute_distgit_build_order
+
+                    order = await compute_distgit_build_order(
+                        releasename=releasename,
+                        distgit_url=dg_url,
+                        distgit_branch=dg_br,
                     )
                     missing_in_distgit = await unresolved_chain_capabilities(
                         db,
@@ -1746,14 +1667,21 @@ async def _try_recover_chain_after_failure(
                     stage_idx,
                 )
 
-        order_for_check = await _cached_distgit_build_order(releasename, dg_url, dg_br)
+        from oreon_build.services.distgit_order import compute_distgit_build_order
+
+        order_for_check = await compute_distgit_build_order(
+            releasename=releasename,
+            distgit_url=dg_url,
+            distgit_branch=dg_br,
+        )
         repo_pi: dict[str, set[str]] = {}
         repo_sat_check = None
         if releasename and repo_branch:
-            repo_pi, _ = await _cached_repo_provides_index(releasename, repo_branch, canon_arch)
-            repo_sat_check, _ = await _cached_repo_satisfaction_index(
+            repo_sat_check, err = await _load_repo_satisfaction_index(
                 releasename, repo_branch, canon_arch
             )
+            if not err and repo_sat_check is not None:
+                repo_pi = repo_sat_check.provides_index
         lacking = await _chain_sources_lacking_success(
             db,
             chain,
@@ -2221,7 +2149,7 @@ def _skip_jobs_not_before_for_package(
     Chain-start skip window applies only to user-named targets.
 
     Auto-injected dependencies use any prior successful build on all arches so we do
-    not queue kernel (etc.) again when it was built before this chain started.
+    not queue the same source again when it was built before this chain started.
     """
     if skip_jobs_not_before is None:
         return None
@@ -2883,14 +2811,6 @@ async def trigger_chain_build(
         return chain, [], True
 
     if _chain_use_distgit_dep_gate():
-        reln = (release.releasename or "").strip()
-        if reln:
-            invalidate_distgit_order_cache(reln, dg_url, dg_branch)
-            invalidate_repo_chain_caches(
-                reln,
-                r2_publish_branch(release),
-                normalize_machine_arch(arches[0] if arches else "x86_64"),
-            )
         ok = await _expand_chain_stages_dependencies(db, chain, 0)
         if not ok:
             await db.flush()

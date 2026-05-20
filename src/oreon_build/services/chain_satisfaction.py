@@ -242,7 +242,7 @@ def chain_source_still_required_for_consumers(
 ) -> bool:
     """
     True when some chain consumer still has an unsatisfied BuildRequires line that
-    resolves to ``source`` (e.g. kde-workspace needs kactivities-devel -> kactivities).
+    resolves to ``source`` (e.g. consumer needs foo-devel -> foo).
     """
     br_by_src: dict[str, list[str]] = (
         order.build_requires_raw
