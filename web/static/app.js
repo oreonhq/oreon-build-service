@@ -341,6 +341,17 @@ function updateAuthUI() {
   }
 }
 
+/** Drop legacy Chains link (stale cached HTML/JS). */
+function oreonStripChainsNavLink() {
+  try {
+    document.querySelectorAll('header.header nav a').forEach(function(a) {
+      var href = (a.getAttribute('href') || '');
+      var label = (a.textContent || '').trim();
+      if (href.indexOf('chains.html') >= 0 || /^chains$/i.test(label)) a.remove();
+    });
+  } catch (_) {}
+}
+
 /** Canonical OBS top nav (single source of truth for all build-service pages). */
 var OREON_NAV_ITEMS = [
   { href: '/', label: 'Dashboard', match: function(p) { return p === '/' || p === '/index.html'; } },
@@ -376,6 +387,7 @@ function oreonNavbarSearchQuery() {
 }
 
 function oreonInitNavbar() {
+  oreonStripChainsNavLink();
   var header = document.querySelector('header.header');
   if (!header || oreonNavbarShouldSkip(header)) return;
   var nav = header.querySelector('nav');
@@ -386,6 +398,7 @@ function oreonInitNavbar() {
   var parts = [];
   for (var i = 0; i < OREON_NAV_ITEMS.length; i++) {
     var item = OREON_NAV_ITEMS[i];
+    if (item.href === '/chains.html' || item.label === 'Chains') continue;
     var active = item.match(path);
     parts.push(
       '<a href="' + item.href + '"' +
@@ -471,6 +484,12 @@ function oreonControllerKeyHtml(signingStatus) {
 window.oreonSigningKeyHtml = oreonSigningKeyHtml;
 window.oreonControllerKeyHtml = oreonControllerKeyHtml;
 window.oreonJobDisplayStatus = oreonJobDisplayStatus;
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', oreonStripChainsNavLink);
+} else {
+  oreonStripChainsNavLink();
+}
 
 document.addEventListener('DOMContentLoaded', function() {
   oreonInitNavbar();
