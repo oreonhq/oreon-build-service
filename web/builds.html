@@ -23,7 +23,6 @@
     <nav>
       <a href="/">Dashboard</a>
       <a href="/builds.html">Builds</a>
-      <a href="/chains.html">Chains</a>
       <a href="/failures.html">Failures</a>
       <a href="/packages.html">Packages</a>
       <a href="/releases.html">Releases</a>
@@ -130,15 +129,14 @@
               </div>
             </div>
             <div id="source-chainbuild-panel" class="source-panel" style="display:none;">
-              <label>DistGit chain build</label>
+              <label>Chain build (manual stages)</label>
               <p style="color:var(--text-muted); font-size:0.85rem; margin-bottom:0.5rem;">
-                Uses <code>oreonhq/rpm-specfiles</code> and <code>&lt;release&gt;/&lt;package&gt;/&lt;package&gt;.spec</code> like DistGit.
-                A colon <code>:</code> marks parallel packages in the same stage (one segment before the next colon). It does not mean enqueue for later. The next stage only starts after RPMs from the previous stage are published.
-                If you omit colons, whitespace-separated names are strictly sequential (one package per stage, in order).
-                If any job in the current stage fails or is cancelled, other pending, queued, or running jobs in that chain are cancelled so you can fix and use Resume with the chain id.
+                You list every package and stage yourself. Uses distgit spec paths like the DistGit tab.
+                Colon <code>:</code> = parallel in one stage. Next stage starts after the previous stage is published.
+                No colon = one package per stage in order.
+                If a job in the current stage fails or is cancelled, the rest of that stage is cancelled. Fix specs and Resume with the chain id.
               </p>
-              <textarea id="chainbuild-spec" class="form-control" rows="4" placeholder="Example (parallel then next):&#10;libwidget libaselib : libgizmo&#10;&#10;Sequential only:&#10;bash grep coreutils"></textarea>
-              <p style="margin-top:0.5rem; font-size:0.88rem;"><a href="/chains.html">Chain builds log</a> shows prepare progress, failures, and the full unresolved capability list.</p>
+              <textarea id="chainbuild-spec" class="form-control" rows="4" placeholder="Example (parallel then next):&#10;kactivities kdelibs : kde-workspace&#10;&#10;Sequential only:&#10;bash grep coreutils"></textarea>
               <div style="margin-top:0.75rem; padding-top:0.75rem; border-top:1px solid var(--border-color,#e5e5e5);">
                 <span style="font-size:0.9rem; font-weight:500;">Resume from a previous chain</span>
                 <p style="color:var(--text-muted); font-size:0.82rem; margin:0.3rem 0 0.45rem 0;">Starts a new chain with the same spec and options as the old one, skipping arches that already have a successful build. Use after a failed or cancelled chain once specs are fixed.</p>
@@ -279,9 +277,9 @@
         if (!el) return;
         el.style.display = 'block';
         el.className = 'chain-alert-' + (kind || 'info');
-        var logHref = '/chains.html' + (watchedChainId ? ('?chain_id=' + encodeURIComponent(watchedChainId)) : '');
+        var buildsHref = '/builds.html' + (watchedChainId ? ('?chain_id=' + encodeURIComponent(watchedChainId)) : '');
         el.innerHTML = '<h3>' + escapeHtml(title) + '</h3>' + bodyHtml +
-          '<div class="chain-alert-actions"><a class="btn primary" href="' + logHref + '">Open chain builds log</a>' +
+          '<div class="chain-alert-actions"><a class="btn primary" href="' + buildsHref + '">View chain jobs</a>' +
           '<button type="button" class="btn" id="chain-alert-dismiss">Dismiss</button></div>';
         var dismiss = document.getElementById('chain-alert-dismiss');
         if (dismiss) dismiss.onclick = function() { el.style.display = 'none'; stopChainPoll(); };
@@ -290,21 +288,10 @@
         if (!data) return;
         watchedChainId = data.chain_id;
         var st = (data.status || '').toLowerCase();
-        if (data.preparing) {
-          showChainAlert('info', 'Chain ' + data.chain_id + ' preparing',
-            '<p>Background dependency prep is running. Stage 0 jobs will show on Builds when it finishes.</p>');
-          return;
-        }
         if (st === 'failed' || st === 'cancelled') {
-          var caps = data.unresolved_capabilities || [];
-          var capHtml = '';
-          if (caps.length) {
-            capHtml = '<p><strong>' + caps.length + ' unresolved capabilities</strong> (full list):</p><ul class="chain-cap-scroll">' +
-              caps.map(function(c) { return '<li>' + escapeHtml(c) + '</li>'; }).join('') + '</ul>';
-          }
           var err = (data.error_message || '').trim();
           showChainAlert('error', 'Chain ' + data.chain_id + ' failed',
-            (err ? '<pre style="white-space:pre-wrap;font-size:0.88rem;margin:0 0 0.75rem 0;background:transparent;color:inherit;">' + escapeHtml(err) + '</pre>' : '') + capHtml);
+            (err ? '<pre style="white-space:pre-wrap;font-size:0.88rem;margin:0 0 0.75rem 0;background:transparent;color:inherit;">' + escapeHtml(err) + '</pre>' : ''));
           stopChainPoll();
           return;
         }
@@ -322,7 +309,7 @@
         function tick() {
           api.get('/builds/chain/' + chainId + '/status').then(function(data) {
             renderChainAlertFromStatus(data);
-            if (!data.preparing && (data.status === 'failed' || data.status === 'cancelled' || data.status === 'success')) {
+            if (data.status === 'failed' || data.status === 'cancelled' || data.status === 'success') {
               render();
             }
           }).catch(function() {});
@@ -940,7 +927,7 @@
               var resumeChainBtn = canAct
                 ? '<button type="button" class="btn chain-resume-row" data-chain-id="' + escapeAttr(chainIdStr) + '" title="New chain, same spec, skip arches already built" style="padding:0.2rem 0.5rem; font-size:0.8rem; margin-left:0.2rem; vertical-align:middle;">Resume chain</button>'
                 : '';
-              var chainLogLink = ' <a href="/chains.html?chain_id=' + encodeURIComponent(chainIdStr) + '" title="Chain log and errors" style="font-size:0.8rem;">Log</a>';
+              var chainLogLink = '';
               chainPart = chainIdStr + stgNote + copyChainBtn + chainLogLink + resumeChainBtn;
             }
             return '<tr data-id="' + j.id + '" data-status="' + escapeAttr(j.status || '') + '"><td class="col-checkbox"><input type="checkbox" class="build-row-cb" data-id="' + j.id + '"></td><td>' + j.id + '</td><td>' + packageLabel(j) + '</td><td>' + releaseLabel(j) + '</td><td>' + arch + '</td><td><span class="' + statusClass(sd) + '">' + escapeHtml(sd) + '</span></td><td>' + signCell + '</td><td style="white-space:normal; max-width:16rem;">' + chainPart + '</td><td>' + (j.created_at || '').slice(0,19) + '</td><td><a href="/build.html?job_id=' + j.id + '">View</a>' + retryBtn + cancelBtn + '</td></tr>';
@@ -1211,20 +1198,14 @@
                 render();
                 var cid = data && data.chain_id;
                 if (cid) {
-                  if (data.preparing) {
-                    pollChainStatus(cid);
-                    if (window.history && window.history.replaceState) {
-                      window.history.replaceState({}, '', '/builds.html?chain_id=' + cid);
-                    }
-                    return;
+                  pollChainStatus(cid);
+                  if (window.history && window.history.replaceState) {
+                    window.history.replaceState({}, '', '/builds.html?chain_id=' + cid);
                   }
-                  api.get('/builds/chain/' + cid + '/status').then(renderChainAlertFromStatus).catch(function() {});
                 }
                 var n = (data && data.jobs && data.jobs.length) ? data.jobs.length : 0;
-                if (!data || !data.preparing) {
-                  var tip = n ? 'Queued ' + n + ' job(s) for stage 0.' : 'No new jobs in stage 0 yet.';
-                  showChainAlert('success', 'Chain ' + cid + ' started', '<p>' + escapeHtml(tip) + '</p>');
-                }
+                var tip = n ? 'Queued ' + n + ' job(s) for stage 0.' : 'No new jobs in stage 0 (architectures may already be built).';
+                if (cid) showChainAlert('success', 'Chain ' + cid + ' started', '<p>' + escapeHtml(tip) + '</p>');
               })
               .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
           });
