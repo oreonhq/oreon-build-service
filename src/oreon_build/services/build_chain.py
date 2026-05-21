@@ -792,16 +792,38 @@ def _chain_root_package_names(chain: BuildChain) -> list[str]:
 
 
 def _chain_runtime_consumer_sources(chain: BuildChain, order: Any) -> set[str]:
-    """Packages in this chain (stages + distgit BR predecessors). Never a fixed name list."""
+    """Packages listed on the chain spec stages only (not the full distgit BR closure)."""
     stages = chain.stages_json if isinstance(chain.stages_json, list) else []
-    chain_names = {str(p).strip() for stage in stages for p in stage if str(p).strip()}
-    spec_names = {str(n) for n in (order.package_names or []) if n}
-    deps_map = _deps_map_from_edges(order.edges if isinstance(order.edges, list) else [])
-    related = chain_names | _transitive_spec_predecessors(deps_map, list(chain_names), spec_names)
-    for r in _chain_root_package_names(chain):
-        if r:
-            related.add(r)
-    return related
+    names = {str(p).strip() for stage in stages for p in stage if str(p).strip()}
+    if names:
+        return names
+    return set(_chain_root_package_names(chain))
+
+
+def _chain_inject_max_waves() -> int:
+    raw = (os.getenv("OREON_CHAIN_INJECT_MAX_WAVES") or "48").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 48
+    return max(4, min(n, 128))
+
+
+def _chain_packages_from_stage_index(
+    chain: BuildChain,
+    stage_index: int,
+) -> set[str]:
+    """Source packages on the chain at or after ``stage_index`` (inject scope)."""
+    stages: list[list[str]] = chain.stages_json if isinstance(chain.stages_json, list) else []
+    out: set[str] = set()
+    for idx, stage in enumerate(stages):
+        if idx < stage_index:
+            continue
+        for p in stage:
+            n = str(p).strip()
+            if n:
+                out.add(n)
+    return out
 
 
 @dataclass
@@ -1040,9 +1062,7 @@ async def _proactive_extra_roots_from_repo_runtime(
         )
         return set(), []
     stages: list[list[str]] = chain.stages_json if isinstance(chain.stages_json, list) else []
-    chain_names = {str(p) for stage in stages for p in stage if p}
-    deps_map = _deps_map_from_edges(order.edges if isinstance(order.edges, list) else [])
-    related = chain_names | _transitive_spec_predecessors(deps_map, list(chain_names), spec_names)
+    chain_names = {str(p).strip() for stage in stages for p in stage if str(p).strip()}
     scope = (os.getenv("OREON_CHAIN_PROACTIVE_REPO_RUNTIME_SCOPE") or "chain").strip().lower()
 
     items: list[tuple[str, str, str, str]] = []
@@ -1053,7 +1073,7 @@ async def _proactive_extra_roots_from_repo_runtime(
         consumer = str(item.get("package") or "")
         req = str(item.get("requirement") or "")
         prov = str(item.get("provider") or "")
-        if scope == "chain" and consumer and consumer not in related:
+        if scope == "chain" and consumer and consumer not in chain_names:
             continue
         req_line = req or prov
         if req_line and _requirement_status(req_line, repo_sat)[0] == "satisfied":
@@ -1343,8 +1363,8 @@ async def _inject_missing_dep_layers_before(
     all_chain_pkg_names: set[str] = {str(p).lower() for stage in stages for p in stage if p}
 
     from oreon_build.services.chain_satisfaction import (
-        ChainDependencyPlan,
-        compute_chain_dependency_build_set,
+        ChainVersionConflict,
+        chain_sources_missing_from_repo_for_consumers,
         format_chain_version_conflict_message,
     )
 
@@ -1355,46 +1375,75 @@ async def _inject_missing_dep_layers_before(
     user_lower = {str(u).lower() for u in user_targets if u}
     roots_clean = [str(r).strip() for r in roots if str(r).strip()]
 
-    def _plan_inject_sync() -> tuple[set[str], ChainDependencyPlan, int]:
-        from oreon_build.services.chain_satisfaction import sources_needing_chain_build
+    def _plan_inject_sync() -> tuple[set[str], list[ChainVersionConflict], int]:
+        """
+        Walk repo-missing BuildRequires only for packages on this chain.
 
-        dep_plan = compute_chain_dependency_build_set(
-            roots_clean,
-            order,
-            repo_sat_index,
-            user_targets,
+        Each wave adds providers for unsatisfied BR lines of current consumers, then
+        treats those providers as consumers for the next wave. Stops when a BR is
+        already satisfied in the published repo (so gcc/kernel in oreon are not queued).
+        """
+        br_by_src: dict[str, list[str]] = (
+            order.build_requires_raw
+            if isinstance(getattr(order, "build_requires_raw", None), dict)
+            else {}
         )
-        # Repo-missing BuildRequires from the BR walk (scoped to distgit closure from chain roots).
-        repo_missing = {
-            p
-            for p in dep_plan.sources_to_build
-            if p in spec_names
-            and p.lower() not in all_chain_pkg_names
-            and p.lower() not in user_lower
-        }
-        # Transitive distgit BR predecessors of this stage that still need a chain build
-        # (e.g. -devel caps). Not whole topological layers (that would queue kernel/gcc/etc.).
-        deps_map = _deps_map_from_edges(order.edges if isinstance(order.edges, list) else [])
-        preds: set[str] = set()
-        for r in roots_clean:
-            preds |= _transitive_spec_predecessors(deps_map, [r], spec_names)
-        topo_need = sources_needing_chain_build(
-            preds,
-            order,
-            repo_sat_index,
-            consumer_packages=roots_clean,
-        )
-        topo_missing = {
-            p
-            for p in topo_need
-            if p in spec_names
-            and p.lower() not in all_chain_pkg_names
-            and p.lower() not in user_lower
-        }
-        return repo_missing | topo_missing, dep_plan, len(repo_missing), len(topo_missing)
+        from oreon_build.services.chain_satisfaction import _requirement_status
+
+        consumers = _chain_packages_from_stage_index(chain, stage_index) or set(roots_clean)
+        conflicts: list[ChainVersionConflict] = []
+        candidates: set[str] = set()
+        max_waves = _chain_inject_max_waves()
+        for _wave in range(max_waves):
+            for cons in sorted(consumers):
+                for br_line in br_by_src.get(cons, []):
+                    status, detail = _requirement_status(br_line, repo_sat_index)
+                    if status == "conflict":
+                        conflicts.append(
+                            ChainVersionConflict(
+                                consumer=cons,
+                                requirement=br_line,
+                                detail=detail,
+                            )
+                        )
+            if conflicts:
+                break
+            wave = chain_sources_missing_from_repo_for_consumers(
+                consumers,
+                order,
+                repo_sat_index,
+                spec_names=spec_names,
+            )
+            wave = {
+                p
+                for p in wave
+                if p in spec_names
+                and p.lower() not in all_chain_pkg_names
+                and p.lower() not in user_lower
+            }
+            if not wave:
+                break
+            candidates |= wave
+            consumers |= wave
+        return candidates, conflicts, len(candidates)
 
     t_inject = time.monotonic()
-    candidates, dep_plan, n_repo, n_topo = await asyncio.to_thread(_plan_inject_sync)
+    candidates, conflicts, n_candidates = await asyncio.to_thread(_plan_inject_sync)
+    if conflicts:
+        chain.status = BuildChainStatus.FAILED
+        chain.error_message = format_chain_version_conflict_message(
+            conflicts,
+            releasename=releasename,
+            distgit_url=dg_url,
+            distgit_branch=dg_br,
+        )[:8000]
+        logger.error(
+            "chain_id=%s version conflicts: %s",
+            chain.id,
+            [c.requirement for c in conflicts[:5]],
+        )
+        return False
+
     to_inject: set[str] = set()
     if candidates:
         to_inject = await _batch_chain_packages_still_needing_build(
@@ -1407,29 +1456,14 @@ async def _inject_missing_dep_layers_before(
             order=order,
             repo_sat=repo_sat_index,
         )
-    if dep_plan.conflicts:
-        chain.status = BuildChainStatus.FAILED
-        chain.error_message = format_chain_version_conflict_message(
-            dep_plan.conflicts,
-            releasename=releasename,
-            distgit_url=dg_url,
-            distgit_branch=dg_br,
-        )[:8000]
-        logger.error(
-            "chain_id=%s version conflicts: %s",
-            chain.id,
-            [c.requirement for c in dep_plan.conflicts[:5]],
-        )
-        return False
 
     logger.info(
         "chain_id=%s inject scan: %s to inject before stage %s "
-        "(repo-missing=%s br-predecessors=%s, after still-need filter) in %.2fs",
+        "(repo-missing waves=%s, after still-need filter) in %.2fs",
         chain.id,
         len(to_inject),
         stage_index,
-        n_repo,
-        n_topo,
+        n_candidates,
         time.monotonic() - t_inject,
     )
 
