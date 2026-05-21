@@ -345,7 +345,6 @@ function updateAuthUI() {
 var OREON_NAV_ITEMS = [
   { href: '/', label: 'Dashboard', match: function(p) { return p === '/' || p === '/index.html'; } },
   { href: '/builds.html', label: 'Builds', match: function(p) { return p === '/builds.html' || p === '/build.html'; } },
-  { href: '/chains.html', label: 'Chains', match: function(p) { return p === '/chains.html'; } },
   { href: '/failures.html', label: 'Failures', match: function(p) { return p === '/failures.html'; } },
   { href: '/packages.html', label: 'Packages', match: function(p) { return p === '/packages.html'; } },
   { href: '/releases.html', label: 'Releases', match: function(p) { return p === '/releases.html'; } },
