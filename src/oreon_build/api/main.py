@@ -25,7 +25,7 @@ from pathlib import Path
 import asyncpg
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
@@ -515,47 +515,56 @@ def create_app() -> FastAPI:
     app.include_router(worker_router, prefix="/api")
     # api/main.py -> oreon_build -> src -> repo root
     web_dir = Path(__file__).resolve().parent.parent.parent.parent / "web"
+    _no_cache_html = {"Cache-Control": "no-cache, must-revalidate"}
+
+    def _html(path: Path) -> FileResponse:
+        return FileResponse(path, headers=_no_cache_html)
+
     if web_dir.exists():
         app.mount("/static", StaticFiles(directory=str(web_dir / "static")), name="static")
         @app.get("/")
         def _index():
-            return FileResponse(web_dir / "index.html")
+            return _html(web_dir / "index.html")
         @app.get("/builds.html")
         def _builds():
-            return FileResponse(web_dir / "builds.html")
+            return _html(web_dir / "builds.html")
         @app.get("/failures.html")
         def _failures():
-            return FileResponse(web_dir / "failures.html")
+            return _html(web_dir / "failures.html")
         @app.get("/build.html")
         def _build():
-            return FileResponse(web_dir / "build.html")
+            return _html(web_dir / "build.html")
         @app.get("/packages.html")
         def _packages():
-            return FileResponse(web_dir / "packages.html")
+            return _html(web_dir / "packages.html")
         @app.get("/releases.html")
         def _releases():
-            return FileResponse(web_dir / "releases.html")
+            return _html(web_dir / "releases.html")
         @app.get("/workers.html")
         def _workers():
-            return FileResponse(web_dir / "workers.html")
+            return _html(web_dir / "workers.html")
         @app.get("/mock-environments.html")
         def _mock_envs():
-            return FileResponse(web_dir / "mock-environments.html")
+            return _html(web_dir / "mock-environments.html")
         @app.get("/admin.html")
         def _admin():
-            return FileResponse(web_dir / "admin.html")
+            return _html(web_dir / "admin.html")
         @app.get("/repos.html")
         def _repos():
-            return FileResponse(web_dir / "repos.html")
+            return _html(web_dir / "repos.html")
         @app.get("/promotions.html")
         def _promotions():
-            return FileResponse(web_dir / "promotions.html")
+            return _html(web_dir / "promotions.html")
         @app.get("/search.html")
         def _search():
-            return FileResponse(web_dir / "search.html")
+            return _html(web_dir / "search.html")
         @app.get("/dependencies.html")
         def _dependencies():
-            return FileResponse(web_dir / "dependencies.html")
+            return _html(web_dir / "dependencies.html")
+
+        @app.get("/chains.html")
+        def _chains_removed():
+            return RedirectResponse(url="/builds.html", status_code=302)
     return app
 
 
