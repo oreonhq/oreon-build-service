@@ -1356,24 +1356,57 @@ async def _inject_missing_dep_layers_before(
     roots_clean = [str(r).strip() for r in roots if str(r).strip()]
 
     def _plan_inject_sync() -> tuple[set[str], ChainDependencyPlan, int]:
+        from oreon_build.services.chain_satisfaction import sources_needing_chain_build
+
         dep_plan = compute_chain_dependency_build_set(
             roots_clean,
             order,
             repo_sat_index,
             user_targets,
         )
-        # Only inject distgit sources the published repo cannot satisfy (BR walk).
-        filtered = {
+        # Repo-missing BuildRequires from the BR walk (scoped to distgit closure from chain roots).
+        repo_missing = {
             p
             for p in dep_plan.sources_to_build
             if p in spec_names
             and p.lower() not in all_chain_pkg_names
             and p.lower() not in user_lower
         }
-        return filtered, dep_plan, 0
+        # Transitive distgit BR predecessors of this stage that still need a chain build
+        # (e.g. -devel caps). Not whole topological layers (that would queue kernel/gcc/etc.).
+        deps_map = _deps_map_from_edges(order.edges if isinstance(order.edges, list) else [])
+        preds: set[str] = set()
+        for r in roots_clean:
+            preds |= _transitive_spec_predecessors(deps_map, [r], spec_names)
+        topo_need = sources_needing_chain_build(
+            preds,
+            order,
+            repo_sat_index,
+            consumer_packages=roots_clean,
+        )
+        topo_missing = {
+            p
+            for p in topo_need
+            if p in spec_names
+            and p.lower() not in all_chain_pkg_names
+            and p.lower() not in user_lower
+        }
+        return repo_missing | topo_missing, dep_plan, len(repo_missing), len(topo_missing)
 
     t_inject = time.monotonic()
-    to_inject, dep_plan, from_layer_count = await asyncio.to_thread(_plan_inject_sync)
+    candidates, dep_plan, n_repo, n_topo = await asyncio.to_thread(_plan_inject_sync)
+    to_inject: set[str] = set()
+    if candidates:
+        to_inject = await _batch_chain_packages_still_needing_build(
+            db,
+            chain,
+            sorted(candidates),
+            architectures=arches,
+            preferred_mock_environment_id=pref_pm,
+            republish_needed=republish_needed,
+            order=order,
+            repo_sat=repo_sat_index,
+        )
     if dep_plan.conflicts:
         chain.status = BuildChainStatus.FAILED
         chain.error_message = format_chain_version_conflict_message(
@@ -1390,10 +1423,13 @@ async def _inject_missing_dep_layers_before(
         return False
 
     logger.info(
-        "chain_id=%s inject scan: %s to inject before stage %s (repo-missing BR closure) in %.2fs",
+        "chain_id=%s inject scan: %s to inject before stage %s "
+        "(repo-missing=%s br-predecessors=%s, after still-need filter) in %.2fs",
         chain.id,
         len(to_inject),
         stage_index,
+        n_repo,
+        n_topo,
         time.monotonic() - t_inject,
     )
 
@@ -2525,9 +2561,7 @@ async def _complete_chain_prepare(
                 )
                 logger.info("chain_id=%s prepare: inject dependency stages", chain.id)
                 t_inject = time.monotonic()
-                ok = await _expand_chain_stages_dependencies(
-                    db, chain, 0, ctx=expand_ctx, max_rounds=1
-                )
+                ok = await _expand_chain_stages_dependencies(db, chain, 0, ctx=expand_ctx)
                 logger.info(
                     "chain_id=%s dependency inject finished in %.1fs",
                     chain.id,
