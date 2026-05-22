@@ -4,7 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import select
 
-from oreon_build.api.deps import DbSession
+from oreon_build.api.deps import CurrentUser, DbSession
 from oreon_build.models import Package, Release
 from oreon_build.services.dependencies_graph import build_dependencies_graph
 from oreon_build.services.distgit_order import (
@@ -19,6 +19,7 @@ router = APIRouter(prefix="/dependencies", tags=["dependencies"])
 @router.get("/graph", response_model=dict)
 async def dependencies_graph(
     db: DbSession,
+    _: CurrentUser,
     refresh: bool = Query(False, description="Bypass in-process graph cache and rebuild"),
 ) -> dict:
     try:
@@ -30,6 +31,7 @@ async def dependencies_graph(
 @router.get("/distgit-build-order", response_model=dict)
 async def distgit_build_order(
     db: DbSession,
+    _: CurrentUser,
     release_id: int = Query(..., ge=1, description="Release id (releasename selects distgit path)"),
     distgit_url: str | None = Query(
         None,
@@ -66,6 +68,7 @@ async def distgit_build_order(
 
 @router.get("/spec-tree-resolve", response_model=dict)
 async def spec_tree_resolve(
+    _: CurrentUser,
     releasename: str = Query(..., min_length=1, max_length=128, description="Release name folder in rpm-specfiles and R2"),
     repo_branch: str = Query("dev", min_length=1, max_length=64, description="R2 repo branch to compare source RPMs against (dev/testing/stable)"),
     existing_only: bool = Query(
@@ -121,6 +124,7 @@ async def spec_tree_resolve(
 @router.get("/unbuilt-list", response_model=dict)
 async def unbuilt_list(
     db: DbSession,
+    _: CurrentUser,
     releasename: str = Query(..., min_length=1, max_length=128, description="Release name folder in rpm-specfiles"),
     distgit_url: str | None = Query(
         None,

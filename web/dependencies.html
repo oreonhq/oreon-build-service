@@ -119,6 +119,12 @@
     <nav></nav>
   </header>
   <main class="main">
+    <section id="deps-login-gate" class="card deps-card" style="display:none;">
+      <h2>Dependencies</h2>
+      <p class="deps-lead">Log in to view the dependency graph and missing-requirement diagnostics.</p>
+      <button type="button" class="btn primary" id="btn-deps-login">Login</button>
+    </section>
+    <div id="deps-authed-content" style="display:none;">
     <section class="card deps-card">
       <h2>Dependencies</h2>
       <p class="deps-lead">
@@ -229,12 +235,14 @@
       </div>
       <div id="edges-table" class="deps-table-wrap"></div>
     </section>
+    </div>
   </main>
 
   <script src="/static/app.js?v=13"></script>
   <script>
     (function() {
       var api = window.oreonApi;
+      var depsGraphLoaded = false;
       var graph = null;
       var releaseSel = new Set();
       var branchSel = new Set();
@@ -511,9 +519,23 @@
         byId('edges-next').disabled = edgesPage >= edgesPages;
       }
 
+      function updateDepsAccess() {
+        var authed = !!(api.token);
+        var gate = byId('deps-login-gate');
+        var panel = byId('deps-authed-content');
+        if (gate) gate.style.display = authed ? 'none' : 'block';
+        if (panel) panel.style.display = authed ? 'block' : 'none';
+        if (authed && !depsGraphLoaded) loadGraph();
+      }
+
       function loadGraph() {
+        if (!api.token) {
+          updateDepsAccess();
+          return Promise.resolve();
+        }
         byId('deps-status').textContent = 'Loading dependency graph...';
         return api.get('/dependencies/graph').then(function(data) {
+          depsGraphLoaded = true;
           graph = data || {};
           packageUniverse = [];
           releaseSel = new Set(graph.releases || []);
@@ -525,6 +547,12 @@
           renderFilterBoxes();
           applyFilters();
         }).catch(function(e) {
+          if ((e.message || '').toLowerCase().indexOf('authentication') >= 0) {
+            api.setToken(null);
+            depsGraphLoaded = false;
+            updateDepsAccess();
+            return;
+          }
           byId('deps-status').textContent = 'Failed to load graph: ' + (e.message || e);
           byId('missing-table').innerHTML = '';
           byId('edges-table').innerHTML = '';
@@ -579,7 +607,17 @@
       byId('runtime-missing-page-size').addEventListener('change', function() { runtimeMissingPage = 1; applyFilters(); });
       byId('edges-page-size').addEventListener('change', function() { edgesPage = 1; applyFilters(); });
 
-      loadGraph();
+      var btnDepsLogin = byId('btn-deps-login');
+      if (btnDepsLogin) {
+        btnDepsLogin.addEventListener('click', function() {
+          if (window.oreonUI && window.oreonUI.openLogin) window.oreonUI.openLogin();
+        });
+      }
+      window.addEventListener('auth-change', function() {
+        if (!api.token) depsGraphLoaded = false;
+        updateDepsAccess();
+      });
+      updateDepsAccess();
     })();
   </script>
 </body>
