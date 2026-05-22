@@ -122,7 +122,6 @@
     <section id="deps-login-gate" class="card deps-card" style="display:none;">
       <h2>Dependencies</h2>
       <p class="deps-lead">Log in to view the dependency graph and missing-requirement diagnostics.</p>
-      <button type="button" class="btn primary" id="btn-deps-login">Login</button>
     </section>
     <div id="deps-authed-content" style="display:none;">
     <section class="card deps-card">
@@ -607,12 +606,6 @@
       byId('runtime-missing-page-size').addEventListener('change', function() { runtimeMissingPage = 1; applyFilters(); });
       byId('edges-page-size').addEventListener('change', function() { edgesPage = 1; applyFilters(); });
 
-      var btnDepsLogin = byId('btn-deps-login');
-      if (btnDepsLogin) {
-        btnDepsLogin.addEventListener('click', function() {
-          if (window.oreonUI && window.oreonUI.openLogin) window.oreonUI.openLogin();
-        });
-      }
       window.addEventListener('auth-change', function() {
         if (!api.token) depsGraphLoaded = false;
         updateDepsAccess();
