@@ -336,10 +336,6 @@ class ChainBuildTrigger(BaseModel):
         default=["x86_64", "aarch64"],
         description="Architectures to build for (same as single trigger)",
     )
-    skip_complete_arches: bool = Field(
-        default=True,
-        description="If true, skip arches that already have a successful build for that package and target.",
-    )
     preferred_mock_environment_id: Optional[int] = Field(
         None, description="Mock env for new distgit packages (must belong to the release)"
     )
@@ -353,7 +349,7 @@ class ChainBuildTrigger(BaseModel):
 
 
 class ChainResumeRequest(BaseModel):
-    """Re-submit the same chain as a new chain, skipping packages that already built successfully."""
+    """Re-submit the same chain as a new chain with the same spec and options."""
 
     from_chain_id: int = Field(..., ge=1, description="Previous build chain id (failed, cancelled, or success)")
 

@@ -531,12 +531,6 @@ def cmd_build(
     help="Poll until each first-stage job reaches a terminal state",
 )
 @click.option(
-    "--skip-complete/--no-skip-complete",
-    "skip_complete",
-    default=True,
-    help="Skip arches that already have a successful build (API default)",
-)
-@click.option(
     "--distgit-url",
     envvar="ORBSCLI_DISTGIT_URL",
     default="https://github.com/oreonhq/rpm-specfiles.git",
@@ -554,7 +548,6 @@ def cmd_chain_build(
     arch: str,
     log_dir: str | None,
     wait: bool,
-    skip_complete: bool,
     distgit_url: str,
     distgit_branch: str,
 ) -> None:
@@ -576,7 +569,6 @@ def cmd_chain_build(
         "chain_spec": chain_spec,
         "release_id": rid,
         "architectures": arches,
-        "skip_complete_arches": skip_complete,
         "distgit_url": distgit_url,
         "distgit_branch": distgit_branch,
     }

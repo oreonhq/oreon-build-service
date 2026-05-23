@@ -740,7 +740,6 @@ async def trigger_chain_build_endpoint(
         chain_spec=data.chain_spec,
         release_id=data.release_id,
         architectures=data.architectures,
-        skip_complete_arches=data.skip_complete_arches,
         preferred_mock_environment_id=data.preferred_mock_environment_id,
         distgit_url=data.distgit_url,
         distgit_branch=data.distgit_branch,

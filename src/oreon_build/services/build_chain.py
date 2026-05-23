@@ -32,10 +32,8 @@ from oreon_build.models import (
 )
 from oreon_build.services.distgit_order import db_safe_spec_evr
 from oreon_build.services.build_target_util import (
-    batch_package_ids_by_name,
     get_or_create_build_target,
     latest_package_version_id,
-    package_ids_with_success_on_all_targets,
 )
 
 if TYPE_CHECKING:
@@ -63,118 +61,6 @@ def _options_dict(chain: BuildChain) -> dict[str, Any]:
 def _set_chain_options(chain: BuildChain, options: dict[str, Any]) -> None:
     chain.chain_options = options
     flag_modified(chain, "chain_options")
-
-
-def _parse_skip_jobs_not_before(chain: BuildChain) -> datetime | None:
-    opt = _options_dict(chain)
-    raw = opt.get("skip_jobs_not_before")
-    if not raw:
-        ca = getattr(chain, "created_at", None)
-        if ca is not None:
-            return ca if ca.tzinfo else ca.replace(tzinfo=timezone.utc)
-        return None
-    try:
-        ref = datetime.fromisoformat(str(raw))
-        if ref.tzinfo is None:
-            ref = ref.replace(tzinfo=timezone.utc)
-        return ref
-    except ValueError:
-        return None
-
-
-async def _chain_build_target_ids(
-    db: Any,
-    chain: BuildChain,
-    *,
-    architectures: list[str],
-    preferred_mock_environment_id: int | None,
-) -> list[int]:
-    target_ids: list[int] = []
-    for arch in architectures:
-        canon = normalize_machine_arch(arch)
-        target = await get_or_create_build_target(
-            db, chain.release_id, canon, preferred_mock_environment_id
-        )
-        target_ids.append(target.id)
-    return target_ids
-
-
-async def _package_ids_still_needing_chain_build(
-    db: Any,
-    chain: BuildChain,
-    package_ids: list[int],
-    *,
-    architectures: list[str],
-    preferred_mock_environment_id: int | None,
-    version_by_package: dict[int, int | None],
-    jobs_created_on_or_after: datetime | None = None,
-) -> set[int]:
-    ids = [int(p) for p in package_ids if p]
-    if not ids or not architectures:
-        return set(ids)
-    target_ids = await _chain_build_target_ids(
-        db,
-        chain,
-        architectures=architectures,
-        preferred_mock_environment_id=preferred_mock_environment_id,
-    )
-    complete_ids = await package_ids_with_success_on_all_targets(
-        db,
-        package_ids=ids,
-        release_id=chain.release_id,
-        target_ids=target_ids,
-        version_by_package=version_by_package,
-        jobs_created_on_or_after=jobs_created_on_or_after,
-    )
-    return {pid for pid in ids if pid not in complete_ids}
-
-
-async def _batch_chain_packages_still_needing_build(
-    db: Any,
-    chain: BuildChain,
-    package_names: list[str],
-    *,
-    architectures: list[str],
-    preferred_mock_environment_id: int | None,
-) -> set[str]:
-    """Package names that still need a chain build (DB success on all arches since chain start)."""
-    still: set[str] = set()
-    to_lookup = [n for n in package_names if n]
-    if not to_lookup:
-        return still
-
-    name_to_id = await batch_package_ids_by_name(db, to_lookup)
-    chain_start = _parse_skip_jobs_not_before(chain)
-
-    check_ids: list[int] = []
-    id_to_name: dict[int, str] = {}
-    version_by_package: dict[int, int | None] = {}
-
-    for name in to_lookup:
-        if name not in name_to_id:
-            still.add(name)
-            continue
-        pid = name_to_id[name]
-        pv_id = await latest_package_version_id(db, pid)
-        version_by_package[pid] = pv_id
-        check_ids.append(pid)
-        id_to_name[pid] = name
-
-    if not check_ids:
-        return still
-
-    lacking_ids = await _package_ids_still_needing_chain_build(
-        db,
-        chain,
-        check_ids,
-        architectures=architectures,
-        preferred_mock_environment_id=preferred_mock_environment_id,
-        version_by_package=version_by_package,
-        jobs_created_on_or_after=chain_start,
-    )
-    for pid in lacking_ids:
-        still.add(id_to_name[pid])
-    return still
 
 
 def distgit_new_package_dict(
@@ -405,7 +291,6 @@ async def _advance_chain_after_stage_complete(db: Any, chain: BuildChain) -> Non
         chain,
         nxt,
         architectures=arches,
-        skip_complete_arches=bool(opt.get("skip_complete_arches", True)),
         distgit_url=str(opt.get("distgit_url") or "https://github.com/oreonhq/rpm-specfiles.git"),
         distgit_branch=str(opt.get("distgit_branch") or "main"),
         preferred_mock_environment_id=pref_pm,
@@ -421,7 +306,6 @@ async def _enqueue_chain_stage_jobs(
     stage_index: int,
     *,
     architectures: list[str],
-    skip_complete_arches: bool,
     distgit_url: str,
     distgit_branch: str,
     preferred_mock_environment_id: int | None,
@@ -449,19 +333,8 @@ async def _enqueue_chain_stage_jobs(
 
     jobs_created: list[BuildJob] = []
     expected_jobs = 0
-    skip_slots = 0
     publish_branch = r2_publish_branch(release)
     releasename = (release.releasename or "").strip()
-
-    still_need_names: set[str] = set()
-    if skip_complete_arches:
-        still_need_names = await _batch_chain_packages_still_needing_build(
-            db,
-            chain,
-            pkgs,
-            architectures=architectures,
-            preferred_mock_environment_id=preferred_mock_environment_id,
-        )
 
     for pkg_name in pkgs:
         existing_r = await db.execute(select(Package).where(Package.name == pkg_name))
@@ -527,9 +400,6 @@ async def _enqueue_chain_stage_jobs(
             if not workers_by_arch.get(canon, False):
                 continue
             target = await get_or_create_build_target(db, chain.release_id, canon, pref_mock)
-            if skip_complete_arches and pkg_name not in still_need_names:
-                skip_slots += 1
-                continue
             expected_jobs += 1
             job = BuildJob(
                 package_id=package_id,
@@ -559,19 +429,16 @@ async def _enqueue_chain_stage_jobs(
                 )
 
     chain.stage_expected_jobs = expected_jobs
-    chain.stage_skip_slots = skip_slots
+    chain.stage_skip_slots = 0
     chain.stage_publish_done = 0
 
     if expected_jobs == 0:
-        if skip_slots == 0:
-            await fail_chain(
-                db,
-                chain,
-                "No jobs queued for this chain stage (no workers for selected arches or empty stage).",
-                terminal=BuildChainStatus.FAILED,
-            )
-        else:
-            await _advance_chain_after_stage_complete(db, chain)
+        await fail_chain(
+            db,
+            chain,
+            "No jobs queued for this chain stage (no workers for selected arches or empty stage).",
+            terminal=BuildChainStatus.FAILED,
+        )
 
     return jobs_created
 
@@ -584,7 +451,6 @@ async def trigger_chain_build(
     chain_spec: str,
     release_id: int,
     architectures: list[str] | None,
-    skip_complete_arches: bool,
     preferred_mock_environment_id: int | None,
     distgit_url: str | None,
     distgit_branch: str | None,
@@ -635,12 +501,10 @@ async def trigger_chain_build(
 
     chain_options: dict[str, Any] = {
         "architectures": arches,
-        "skip_complete_arches": skip_complete_arches,
         "distgit_url": dg_url,
         "distgit_branch": dg_branch,
         "preferred_mock_environment_id": preferred_mock_environment_id,
         "priority": priority,
-        "skip_jobs_not_before": datetime.now(timezone.utc).isoformat(),
     }
     chain = BuildChain(
         release_id=release_id,
@@ -670,7 +534,6 @@ async def trigger_chain_build(
         chain,
         0,
         architectures=arches,
-        skip_complete_arches=skip_complete_arches,
         distgit_url=dg_url,
         distgit_branch=dg_branch,
         preferred_mock_environment_id=preferred_mock_environment_id,
@@ -799,7 +662,6 @@ async def resume_chain_from_previous(
     if not spec:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Source chain has no chain_spec")
     opt = _options_dict(old)
-    opt.setdefault("skip_complete_arches", True)
     _pm = opt.get("preferred_mock_environment_id")
     if _pm is not None and _pm != "":
         try:
@@ -815,7 +677,6 @@ async def resume_chain_from_previous(
         chain_spec=spec,
         release_id=old.release_id,
         architectures=list(opt.get("architectures") or DEFAULT_ARCH),
-        skip_complete_arches=bool(opt.get("skip_complete_arches", True)),
         preferred_mock_environment_id=_pm,
         distgit_url=opt.get("distgit_url"),
         distgit_branch=opt.get("distgit_branch"),
