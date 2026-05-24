@@ -119,7 +119,7 @@
               <textarea id="chainbuild-spec" class="form-control" rows="4" placeholder="Example (parallel then next):&#10;kactivities kdelibs : kde-workspace&#10;&#10;Sequential only:&#10;bash grep coreutils"></textarea>
               <div style="margin-top:0.75rem; padding-top:0.75rem; border-top:1px solid var(--border-color,#e5e5e5);">
                 <span style="font-size:0.9rem; font-weight:500;">Resume from a previous chain</span>
-                <p style="color:var(--text-muted); font-size:0.82rem; margin:0.3rem 0 0.45rem 0;">Starts a new chain with the same spec and options as the old one. Use after a failed or cancelled chain once specs are fixed.</p>
+                <p style="color:var(--text-muted); font-size:0.82rem; margin:0.3rem 0 0.45rem 0;">Starts a new chain with the same spec and picks up from the first stage that did not fully finish. Slots that already built and published in the old chain are not re-queued.</p>
                 <div style="display:flex; flex-wrap:wrap; gap:0.5rem; align-items:center;">
                   <input type="number" id="chain-resume-from-id" class="form-control" style="width:7rem; min-width:0;" min="1" step="1" placeholder="chain id">
                   <button type="button" class="btn" id="btn-chain-resume">Resume as new chain</button>
@@ -905,7 +905,7 @@
                 : '';
               var copyChainBtn = '<button type="button" class="btn copy-chain-id" data-chain-id="' + escapeAttr(chainIdStr) + '" title="Copy chain id" style="padding:0.2rem 0.45rem; font-size:0.8rem; margin-left:0.3rem; vertical-align:middle;">Copy</button>';
               var resumeChainBtn = canAct
-                ? '<button type="button" class="btn chain-resume-row" data-chain-id="' + escapeAttr(chainIdStr) + '" title="New chain, same spec" style="padding:0.2rem 0.5rem; font-size:0.8rem; margin-left:0.2rem; vertical-align:middle;">Resume chain</button>'
+                ? '<button type="button" class="btn chain-resume-row" data-chain-id="' + escapeAttr(chainIdStr) + '" title="Resume from last incomplete stage" style="padding:0.2rem 0.5rem; font-size:0.8rem; margin-left:0.2rem; vertical-align:middle;">Resume chain</button>'
                 : '';
               var chainLogLink = '';
               chainPart = chainIdStr + stgNote + copyChainBtn + chainLogLink + resumeChainBtn;
@@ -960,7 +960,7 @@
                     render();
                     var n = (data && data.jobs && data.jobs.length) ? data.jobs.length : 0;
                     var newCid = data && data.chain_id;
-                    alert('New chain ' + newCid + ' from chain ' + fromId + '. Queued ' + n + ' job(s).');
+                    alert('New chain ' + newCid + ' from chain ' + fromId + '. Queued ' + n + ' job(s) from the last incomplete stage.');
                   })
                   .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
               });
@@ -1203,7 +1203,7 @@
               render();
               var n = (data && data.jobs && data.jobs.length) ? data.jobs.length : 0;
               var cid = data && data.chain_id;
-              alert('New chain ' + cid + ' from chain ' + fromId + '. Queued ' + n + ' job(s).');
+              alert('New chain ' + cid + ' from chain ' + fromId + '. Queued ' + n + ' job(s) from the last incomplete stage.');
             })
             .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
         });

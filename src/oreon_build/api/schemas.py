@@ -349,7 +349,7 @@ class ChainBuildTrigger(BaseModel):
 
 
 class ChainResumeRequest(BaseModel):
-    """Re-submit the same chain as a new chain with the same spec and options."""
+    """Re-submit the same chain as a new chain, starting from the first incomplete stage."""
 
     from_chain_id: int = Field(..., ge=1, description="Previous build chain id (failed, cancelled, or success)")
 

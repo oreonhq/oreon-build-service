@@ -63,6 +63,86 @@ def _set_chain_options(chain: BuildChain, options: dict[str, Any]) -> None:
     flag_modified(chain, "chain_options")
 
 
+def _stages_list(chain: BuildChain) -> list[list[str]]:
+    raw = chain.stages_json if isinstance(chain.stages_json, list) else []
+    out: list[list[str]] = []
+    for grp in raw:
+        if isinstance(grp, list):
+            out.append([str(p) for p in grp if p])
+    return out
+
+
+async def _job_has_chain_publish_receipt(db: Any, chain_id: int, job: BuildJob) -> bool:
+    att_r = await db.execute(
+        select(BuildAttempt.id).where(
+            BuildAttempt.build_job_id == job.id,
+            BuildAttempt.status == BuildStatus.SUCCESS,
+        )
+    )
+    attempt_ids = [int(a) for a in att_r.scalars().all()]
+    if not attempt_ids:
+        return False
+    rec_r = await db.execute(
+        select(BuildChainPublishReceipt.id)
+        .where(
+            BuildChainPublishReceipt.build_chain_id == chain_id,
+            BuildChainPublishReceipt.build_attempt_id.in_(attempt_ids),
+        )
+        .limit(1)
+    )
+    return rec_r.scalar_one_or_none() is not None
+
+
+def first_incomplete_stage_index_from_states(
+    stage_count: int,
+    jobs_by_stage: dict[int, list[tuple[bool, bool]]],
+) -> int:
+    for idx in range(stage_count):
+        jobs = jobs_by_stage.get(idx, [])
+        if not jobs:
+            return idx
+        if not all(build_ok and published for build_ok, published in jobs):
+            return idx
+    return stage_count
+
+
+async def _first_incomplete_stage_index(db: Any, chain: BuildChain) -> int:
+    stages = _stages_list(chain)
+    if not stages:
+        return 0
+    jobs_r = await db.execute(select(BuildJob).where(BuildJob.chain_id == chain.id))
+    by_stage: dict[int, list[tuple[bool, bool]]] = {}
+    for job in jobs_r.scalars().all():
+        if job.chain_stage_index is None:
+            continue
+        idx = int(job.chain_stage_index)
+        build_ok = job.status == BuildStatus.SUCCESS
+        published = build_ok and await _job_has_chain_publish_receipt(db, chain.id, job)
+        by_stage.setdefault(idx, []).append((build_ok, published))
+    return first_incomplete_stage_index_from_states(len(stages), by_stage)
+
+
+async def _old_chain_success_slots(
+    db: Any,
+    chain_id: int,
+    stage_index: int,
+) -> set[tuple[int, int]]:
+    jobs_r = await db.execute(
+        select(BuildJob).where(
+            BuildJob.chain_id == chain_id,
+            BuildJob.chain_stage_index == stage_index,
+            BuildJob.status == BuildStatus.SUCCESS,
+        )
+    )
+    out: set[tuple[int, int]] = set()
+    for job in jobs_r.scalars().all():
+        if job.package_id is None or job.target_id is None:
+            continue
+        if await _job_has_chain_publish_receipt(db, chain_id, job):
+            out.add((int(job.package_id), int(job.target_id)))
+    return out
+
+
 def distgit_new_package_dict(
     pkg: str,
     releasename: str,
@@ -312,6 +392,8 @@ async def _enqueue_chain_stage_jobs(
     priority: int,
     triggered_by_id: int | None,
     request: Request | None,
+    skip_package_target_slots: set[tuple[int, int]] | None = None,
+    advance_if_stage_satisfied_by_skips: bool = False,
 ) -> list[BuildJob]:
     stages: list[list[str]] = chain.stages_json if isinstance(chain.stages_json, list) else []
     if stage_index < 0 or stage_index >= len(stages):
@@ -333,8 +415,10 @@ async def _enqueue_chain_stage_jobs(
 
     jobs_created: list[BuildJob] = []
     expected_jobs = 0
+    skip_slots = 0
     publish_branch = r2_publish_branch(release)
     releasename = (release.releasename or "").strip()
+    skip_slots_set = skip_package_target_slots or set()
 
     for pkg_name in pkgs:
         existing_r = await db.execute(select(Package).where(Package.name == pkg_name))
@@ -400,6 +484,9 @@ async def _enqueue_chain_stage_jobs(
             if not workers_by_arch.get(canon, False):
                 continue
             target = await get_or_create_build_target(db, chain.release_id, canon, pref_mock)
+            if (package_id, target.id) in skip_slots_set:
+                skip_slots += 1
+                continue
             expected_jobs += 1
             job = BuildJob(
                 package_id=package_id,
@@ -429,16 +516,19 @@ async def _enqueue_chain_stage_jobs(
                 )
 
     chain.stage_expected_jobs = expected_jobs
-    chain.stage_skip_slots = 0
+    chain.stage_skip_slots = skip_slots
     chain.stage_publish_done = 0
 
     if expected_jobs == 0:
-        await fail_chain(
-            db,
-            chain,
-            "No jobs queued for this chain stage (no workers for selected arches or empty stage).",
-            terminal=BuildChainStatus.FAILED,
-        )
+        if skip_slots > 0 and advance_if_stage_satisfied_by_skips:
+            await _advance_chain_after_stage_complete(db, chain)
+        else:
+            await fail_chain(
+                db,
+                chain,
+                "No jobs queued for this chain stage (no workers for selected arches or empty stage).",
+                terminal=BuildChainStatus.FAILED,
+            )
 
     return jobs_created
 
@@ -658,9 +748,25 @@ async def resume_chain_from_previous(
     old = old_r.scalar_one_or_none()
     if not old:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chain not found")
+    if old.status in (BuildChainStatus.PENDING, BuildChainStatus.RUNNING):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="That chain is still running. Cancel it or wait for it to finish before resuming.",
+        )
     spec = (old.chain_spec or "").strip()
     if not spec:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Source chain has no chain_spec")
+    stages = _stages_list(old)
+    if not stages:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Source chain has no stages")
+
+    resume_stage = await _first_incomplete_stage_index(db, old)
+    if resume_stage >= len(stages):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="That chain already finished every stage successfully.",
+        )
+
     opt = _options_dict(old)
     _pm = opt.get("preferred_mock_environment_id")
     if _pm is not None and _pm != "":
@@ -670,18 +776,121 @@ async def resume_chain_from_previous(
             _pm = None
     else:
         _pm = None
-    return await trigger_chain_build(
-        db,
-        request,
-        user,
-        chain_spec=spec,
+
+    rr = await db.execute(select(Release).where(Release.id == old.release_id))
+    release = rr.scalar_one_or_none()
+    if not release:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Release not found")
+
+    if _pm:
+        me_r = await db.execute(select(MockEnvironment).where(MockEnvironment.id == _pm))
+        me = me_r.scalar_one_or_none()
+        if not me or me.release_id != old.release_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Mock environment not found or does not belong to the selected release.",
+            )
+
+    arches = list(opt.get("architectures") or DEFAULT_ARCH)
+    arches = [(a or "").strip() for a in arches if (a or "").strip()]
+    if not arches:
+        arches = DEFAULT_ARCH
+
+    workers_result = await db.execute(select(Worker))
+    workers = list(workers_result.scalars().all())
+    workers_by_arch: dict[str, bool] = {}
+    for w in workers:
+        workers_by_arch[normalize_machine_arch(w.architecture)] = True
+    saw_worker = any(workers_by_arch.get(normalize_machine_arch(a), False) for a in arches)
+    if not saw_worker:
+        req_norm = sorted({normalize_machine_arch(a) for a in arches})
+        avail_norm = sorted(workers_by_arch.keys())
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "No worker enrolled for any selected architecture. "
+                f"Requested: {', '.join(req_norm)}. "
+                f"Workers cover: {', '.join(avail_norm) if avail_norm else '(no workers)'}. "
+            ),
+        )
+
+    dg_url = str(opt.get("distgit_url") or "https://github.com/oreonhq/rpm-specfiles.git").strip()
+    dg_branch = str(opt.get("distgit_branch") or "main").strip()
+    priority = int(opt.get("priority") or 0)
+    resume_start = resume_stage
+
+    chain_options: dict[str, Any] = {
+        "architectures": arches,
+        "distgit_url": dg_url,
+        "distgit_branch": dg_branch,
+        "preferred_mock_environment_id": _pm,
+        "priority": priority,
+        "resumed_from_chain_id": from_chain_id,
+        "resume_start_stage_index": resume_start,
+    }
+    chain = BuildChain(
         release_id=old.release_id,
-        architectures=list(opt.get("architectures") or DEFAULT_ARCH),
-        preferred_mock_environment_id=_pm,
-        distgit_url=opt.get("distgit_url"),
-        distgit_branch=opt.get("distgit_branch"),
-        priority=int(opt.get("priority") or 0),
+        triggered_by_id=user.id,
+        status=BuildChainStatus.PENDING,
+        chain_spec=spec,
+        chain_options=chain_options,
+        stages_json=stages,
+        active_stage_index=resume_stage,
     )
+    db.add(chain)
+    await db.flush()
+
+    await log_audit(
+        db,
+        "build.chain_resume",
+        account_id=user.id,
+        resource_type="build_chain",
+        resource_id=str(chain.id),
+        details=f"from_chain_id={from_chain_id} stage={resume_stage}",
+        ip_address=get_client_ip(request),
+        user_agent=get_user_agent(request),
+    )
+
+    stage = resume_stage
+    while stage < len(stages) and chain.status not in (
+        BuildChainStatus.FAILED,
+        BuildChainStatus.SUCCESS,
+        BuildChainStatus.CANCELLED,
+    ):
+        skip_set = await _old_chain_success_slots(db, from_chain_id, stage) if stage == resume_start else set()
+        await _enqueue_chain_stage_jobs(
+            db,
+            chain,
+            stage,
+            architectures=arches,
+            distgit_url=dg_url,
+            distgit_branch=dg_branch,
+            preferred_mock_environment_id=_pm,
+            priority=priority,
+            triggered_by_id=user.id,
+            request=request,
+            skip_package_target_slots=skip_set,
+            advance_if_stage_satisfied_by_skips=True,
+        )
+        if chain.status in (BuildChainStatus.FAILED, BuildChainStatus.SUCCESS, BuildChainStatus.CANCELLED):
+            break
+        if chain.active_stage_index > stage:
+            if chain.status == BuildChainStatus.SUCCESS or chain.stage_expected_jobs > 0:
+                break
+            stage = chain.active_stage_index
+            continue
+        break
+
+    if chain.status == BuildChainStatus.FAILED:
+        await db.flush()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=chain.error_message or "Chain resume could not start",
+        )
+
+    jobs_r = await db.execute(select(BuildJob).where(BuildJob.chain_id == chain.id))
+    jobs = list(jobs_r.scalars().all())
+    return chain, jobs, False
 
 
 async def notify_chain_job_terminal_after_result(
