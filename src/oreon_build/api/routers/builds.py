@@ -15,11 +15,13 @@ from oreon_build.api.schemas import (
     BuildAttemptResponse,
     BuildJobResponse,
     BuildTrigger,
+    BuildTriggerAccepted,
     ChainBuildTrigger,
     ChainBuildTriggerResponse,
     ChainResumeRequest,
     ChainStatusResponse,
     CurrentFailureItem,
+    DistgitBatchTrigger,
     PaginatedResponse,
     RpmbuildPlanCreate,
     RpmbuildPlanResponse,
@@ -550,178 +552,73 @@ def _infer_github_html_url_from_new_package(np) -> str | None:
     return base
 
 
-@router.post("/trigger", response_model=list[BuildJobResponse], status_code=status.HTTP_201_CREATED)
+@router.post("/trigger", status_code=status.HTTP_201_CREATED)
 async def trigger_build(
     data: BuildTrigger,
     request: Request,
     db: DbSession,
     user: CurrentUser,
+    background: bool = Query(
+        True,
+        description="If true, return immediately and queue jobs in the background.",
+    ),
 ):
-    from datetime import datetime, timezone
-    from oreon_build.models import Package, PackageVersion, Release, Source
+    from oreon_build.services.build_trigger_bg import run_single_trigger, spawn
+    from oreon_build.services.build_trigger_exec import execute_build_trigger
 
-    package_id: int
-    package_version_id: int | None = data.package_version_id
-    preferred_mock_environment_id: int | None = None
-
-    if data.new_package:
-        np = data.new_package
-        from oreon_build.models import MockEnvironment as MockEnv
-        if np.preferred_mock_environment_id:
-            me_r = await db.execute(select(MockEnv).where(MockEnv.id == np.preferred_mock_environment_id))
-            me = me_r.scalar_one_or_none()
-            if not me or me.release_id != data.release_id:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Mock environment not found or does not belong to the selected release.",
-                )
-        existing_r = await db.execute(select(Package).where(Package.name == np.name))
-        existing_pkg = existing_r.scalar_one_or_none()
-        if existing_pkg:
-            # DistGit/UI often sends new_package even when the package already exists (e.g. second arch).
-            # Queue builds like a normal trigger instead of rejecting.
-            package_id = existing_pkg.id
-            preferred_mock_environment_id = (
-                existing_pkg.preferred_mock_environment_id
-                if existing_pkg.preferred_mock_environment_id
-                else None
+    if background:
+        await db.commit()
+        spawn(
+            run_single_trigger(
+                data.model_dump(mode="json"),
+                user.id,
+                get_client_ip(request),
+                get_user_agent(request),
             )
-        else:
-            gh_url = np.github_html_url or _infer_github_html_url_from_new_package(np)
-            pkg = Package(
-                name=np.name,
-                description=np.description,
-                preferred_mock_environment_id=np.preferred_mock_environment_id,
-                github_repository_id=np.github_repository_id,
-                github_html_url=gh_url,
-            )
-            db.add(pkg)
-            await db.flush()
-            package_id = pkg.id
-
-            pv = PackageVersion(
-                package_id=pkg.id,
-                version=np.version or "0.0.1",
-            )
-            db.add(pv)
-            await db.flush()
-            package_version_id = pv.id
-
-            primary_url = _source_url_from_new_package(np)
-            if primary_url:
-                db.add(Source(package_version_id=pv.id, kind=np.source_type.value, url=primary_url))
-            for u in (np.source_urls or [])[1:]:
-                db.add(Source(package_version_id=pv.id, kind="url", url=u))
-            await db.flush()
-
-            await log_audit(
-                db,
-                "package.create",
-                account_id=user.id,
-                resource_type="package",
-                resource_id=str(pkg.id),
-                details=np.name,
-                ip_address=get_client_ip(request),
-                user_agent=get_user_agent(request),
-            )
-            preferred_mock_environment_id = np.preferred_mock_environment_id
-    else:
-        package_id = data.package_id
-        rp = await db.execute(
-            select(Package).where(Package.id == package_id).options(selectinload(Package.preferred_mock_environment))
         )
-        pkg = rp.scalar_one_or_none()
-        if not pkg:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Package not found")
-        preferred_mock_environment_id = pkg.preferred_mock_environment_id if pkg.preferred_mock_environment_id else None
-
-    rr = await db.execute(select(Release).where(Release.id == data.release_id))
-    release_for_job = rr.scalar_one_or_none()
-    if not release_for_job:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Release not found")
-    publish_branch = r2_publish_branch(release_for_job)
-
-    # Fall back to the release-level default mock env if neither the build
-    # request nor the package carries a preference.
-    if preferred_mock_environment_id is None and release_for_job.default_mock_environment_id:
-        preferred_mock_environment_id = release_for_job.default_mock_environment_id
-
-    if package_version_id is None:
-        package_version_id = await latest_package_version_id(db, package_id)
-
-    architectures = data.architectures or DEFAULT_ARCHITECTURES
-    if not architectures:
-        architectures = DEFAULT_ARCHITECTURES
-
-    workers_result = await db.execute(select(Worker))
-    workers = list(workers_result.scalars().all())
-    workers_by_arch: dict[str, bool] = {}
-    for w in workers:
-        workers_by_arch[normalize_machine_arch(w.architecture)] = True
-
-    jobs_created: list[BuildJob] = []
-    saw_worker_for_requested = False
-    for arch in architectures:
-        arch = (arch or "").strip()
-        if not arch:
-            continue
-        canon = normalize_machine_arch(arch)
-        has_worker = workers_by_arch.get(canon, False)
-        if not has_worker:
-            continue  # Skip arch with no worker; only create jobs that can run
-        saw_worker_for_requested = True
-        target = await get_or_create_build_target(db, data.release_id, canon, preferred_mock_environment_id)
-        if data.skip_complete_arches and await has_successful_build_for_target(
-            db, package_id, data.release_id, target.id, package_version_id
-        ):
-            continue
-        job = BuildJob(
-            package_id=package_id,
-            release_id=data.release_id,
-            target_id=target.id,
-            package_version_id=package_version_id,
-            status=BuildStatus.PENDING,
-            priority=data.priority,
-            triggered_by_id=user.id,
-            branch=publish_branch,
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content=BuildTriggerAccepted(
+                status="accepted",
+                message="Build trigger accepted. Jobs are being queued in the background.",
+            ).model_dump(mode="json"),
         )
-        db.add(job)
-        await db.flush()
-        jobs_created.append(job)
 
-    if not jobs_created:
-        req_norm = sorted(
-            {normalize_machine_arch(a) for a in architectures if (a or "").strip()}
-        )
-        avail_norm = sorted(workers_by_arch.keys())
-        if not saw_worker_for_requested:
-            detail = (
-                "No worker enrolled for any selected architecture. "
-                f"Requested: {', '.join(req_norm) if req_norm else '(none)'}. "
-                f"Workers cover: {', '.join(avail_norm) if avail_norm else '(no workers)'}. "
-                "Enroll a worker for at least one selected arch or fix its architecture field."
-            )
-            logger.warning("build.trigger rejected release_id=%s package_id=%s %s", data.release_id, package_id, detail)
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
-        logger.info(
-            "build.trigger skip_all_already_ok release_id=%s package_id=%s requested=%s",
-            data.release_id,
-            package_id,
-            req_norm,
-        )
-    for job in jobs_created:
-        await log_audit(
-            db,
-            "build.trigger",
-            account_id=user.id,
-            resource_type="build_job",
-            resource_id=str(job.id),
-            details=f"package_id={package_id} release_id={data.release_id}",
-            ip_address=get_client_ip(request),
-            user_agent=get_user_agent(request),
-        )
+    jobs_created = await execute_build_trigger(db, user, data, request=request)
     att_map = await _latest_attempt_by_job_ids(db, [j.id for j in jobs_created])
     return [await _job_to_response(db, j, att_map.get(j.id)) for j in jobs_created]
+
+
+@router.post("/trigger-batch", status_code=status.HTTP_202_ACCEPTED, response_model=BuildTriggerAccepted)
+async def trigger_distgit_batch(
+    data: DistgitBatchTrigger,
+    request: Request,
+    db: DbSession,
+    user: CurrentUser,
+):
+    from oreon_build.services.build_trigger_bg import run_distgit_batch, spawn
+
+    names = sorted({(p.name or "").strip() for p in data.packages if (p.name or "").strip()})
+    if not names:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No package names provided")
+    rr = await db.execute(select(Release).where(Release.id == data.release_id))
+    if not rr.scalar_one_or_none():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Release not found")
+    payload = data.model_dump(mode="json")
+    await db.commit()
+    spawn(
+        run_distgit_batch(
+            payload,
+            user.id,
+            get_client_ip(request),
+            get_user_agent(request),
+        )
+    )
+    return BuildTriggerAccepted(
+        status="accepted",
+        message="DistGit batch accepted. Packages are being queued in the background.",
+        package_count=len(data.packages),
+    )
 
 
 @router.post("/chain-trigger", response_model=ChainBuildTriggerResponse, status_code=status.HTTP_201_CREATED)
@@ -732,8 +629,9 @@ async def trigger_chain_build_endpoint(
     user: CurrentUser,
 ):
     from oreon_build.services.build_chain import trigger_chain_build as run_chain_build
+    from oreon_build.services.build_trigger_bg import run_chain_trigger_enqueue, spawn
 
-    chain, jobs, _preparing = await run_chain_build(
+    chain, _, _ = await run_chain_build(
         db,
         request,
         user,
@@ -744,9 +642,10 @@ async def trigger_chain_build_endpoint(
         distgit_url=data.distgit_url,
         distgit_branch=data.distgit_branch,
         priority=data.priority,
+        defer_enqueue=True,
     )
-    att_map = await _latest_attempt_by_job_ids(db, [j.id for j in jobs])
-    job_responses = [await _job_to_response(db, j, att_map.get(j.id)) for j in jobs]
+    await db.commit()
+    spawn(run_chain_trigger_enqueue(chain.id))
     stages_raw = chain.stages_json if isinstance(chain.stages_json, list) else []
     stages: list[list[str]] = [[str(n) for n in grp] for grp in stages_raw if isinstance(grp, list)]
     return ChainBuildTriggerResponse(
@@ -754,7 +653,39 @@ async def trigger_chain_build_endpoint(
         chain_status=chain.status.value,
         stages=stages,
         chain_spec=chain.chain_spec,
-        jobs=job_responses,
+        jobs=[],
+        accepted=True,
+        message="Chain accepted. Stage jobs are being queued in the background.",
+    )
+
+
+@router.post("/chain-resume", response_model=ChainBuildTriggerResponse, status_code=status.HTTP_201_CREATED)
+async def resume_chain_build_endpoint(
+    data: ChainResumeRequest,
+    request: Request,
+    db: DbSession,
+    user: CurrentUser,
+):
+    from oreon_build.services.build_chain import resume_chain_from_previous
+    from oreon_build.services.build_trigger_bg import run_chain_resume_enqueue, spawn
+
+    chain, _, _ = await resume_chain_from_previous(
+        db, request, user, from_chain_id=data.from_chain_id, defer_enqueue=True
+    )
+    await db.commit()
+    spawn(run_chain_resume_enqueue(chain.id, data.from_chain_id))
+    stages_raw = chain.stages_json if isinstance(chain.stages_json, list) else []
+    stages: list[list[str]] = [[str(n) for n in grp] for grp in stages_raw if isinstance(grp, list)]
+    opt = chain.chain_options if isinstance(chain.chain_options, dict) else {}
+    resume_stage = int(opt.get("resume_start_stage_index") or chain.active_stage_index or 0)
+    return ChainBuildTriggerResponse(
+        chain_id=chain.id,
+        chain_status=chain.status.value,
+        stages=stages,
+        chain_spec=chain.chain_spec,
+        jobs=[],
+        accepted=True,
+        message=f"Chain resume accepted. Continuing from stage {resume_stage} in the background.",
     )
 
 
@@ -798,31 +729,6 @@ async def cancel_chain_build_endpoint(
 
     chain = await cancel_chain_by_user(db, request, user, chain_id=chain_id)
     return await _chain_to_status_response(db, chain)
-
-
-@router.post("/chain-resume", response_model=ChainBuildTriggerResponse, status_code=status.HTTP_201_CREATED)
-async def resume_chain_build_endpoint(
-    data: ChainResumeRequest,
-    request: Request,
-    db: DbSession,
-    user: CurrentUser,
-):
-    from oreon_build.services.build_chain import resume_chain_from_previous
-
-    chain, jobs, preparing = await resume_chain_from_previous(
-        db, request, user, from_chain_id=data.from_chain_id
-    )
-    att_map = await _latest_attempt_by_job_ids(db, [j.id for j in jobs])
-    job_responses = [await _job_to_response(db, j, att_map.get(j.id)) for j in jobs]
-    stages_raw = chain.stages_json if isinstance(chain.stages_json, list) else []
-    stages: list[list[str]] = [[str(n) for n in grp] for grp in stages_raw if isinstance(grp, list)]
-    return ChainBuildTriggerResponse(
-        chain_id=chain.id,
-        chain_status=chain.status.value,
-        stages=stages,
-        chain_spec=chain.chain_spec,
-        jobs=job_responses,
-    )
 
 
 @router.post("/mass-rebuild/run", response_model=dict)
