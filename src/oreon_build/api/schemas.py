@@ -384,7 +384,35 @@ class ChainBuildTriggerResponse(BaseModel):
     chain_status: str
     stages: List[List[str]]
     chain_spec: str
-    jobs: List[BuildJobResponse]
+    jobs: List[BuildJobResponse] = Field(default_factory=list)
+    accepted: bool = Field(
+        default=False,
+        description="True when job enqueue continues in the background after this response.",
+    )
+    message: Optional[str] = None
+
+
+class BuildTriggerAccepted(BaseModel):
+    status: str = "accepted"
+    message: str
+    chain_id: Optional[int] = None
+    package_count: Optional[int] = None
+
+
+class DistgitBatchPackageItem(BaseModel):
+    name: str = Field(..., max_length=256)
+    spec_path: Optional[str] = Field(None, max_length=512, description="Defaults to releasename/name/name.spec")
+
+
+class DistgitBatchTrigger(BaseModel):
+    release_id: int = Field(..., ge=1)
+    packages: List[DistgitBatchPackageItem] = Field(..., min_length=1)
+    architectures: List[str] = Field(default_factory=lambda: ["x86_64", "aarch64"])
+    preferred_mock_environment_id: Optional[int] = None
+    distgit_url: Optional[str] = Field(None, max_length=1024)
+    distgit_branch: Optional[str] = Field(None, max_length=128)
+    priority: int = 0
+    skip_complete_arches: bool = True
 
 
 class ChainStatusResponse(BaseModel):
