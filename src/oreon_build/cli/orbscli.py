@@ -477,6 +477,28 @@ def cmd_build(
         log_path.mkdir(parents=True, exist_ok=True)
 
     jobs_out: list[dict[str, Any]] = []
+    if len(names) > 1:
+        batch_body: dict[str, Any] = {
+            "release_id": rid,
+            "packages": [{"name": n} for n in names],
+            "architectures": arches,
+            "skip_complete_arches": skip_complete,
+            "distgit_url": distgit_url,
+            "distgit_branch": distgit_branch,
+        }
+        out = http_json(
+            "POST",
+            api_base,
+            "/api/builds/trigger-batch",
+            token=token,
+            json_body=batch_body,
+            timeout=60.0,
+        )
+        msg = (out or {}).get("message") if isinstance(out, dict) else None
+        n = (out or {}).get("package_count") if isinstance(out, dict) else len(names)
+        click.echo(msg or ("distgit batch accepted for %s packages" % n))
+        return
+
     for pkg in names:
         existing = find_package_by_name(api_base, token, pkg)
         if existing:
@@ -495,7 +517,14 @@ def cmd_build(
                 "architectures": arches,
                 "skip_complete_arches": skip_complete,
             }
-        created = http_json("POST", api_base, "/api/builds/trigger", token=token, json_body=body, timeout=300.0)
+        created = http_json(
+            "POST",
+            api_base,
+            "/api/builds/trigger?background=false",
+            token=token,
+            json_body=body,
+            timeout=300.0,
+        )
         if not isinstance(created, list):
             click.echo("Unexpected trigger response", err=True)
             sys.exit(1)
@@ -578,6 +607,8 @@ def cmd_chain_build(
         sys.exit(1)
     cid = data.get("chain_id")
     click.echo("chain_id=%s status=%s" % (cid, data.get("chain_status") or ""))
+    if data.get("accepted"):
+        click.echo(data.get("message") or "Chain accepted; jobs queue in the background.")
     jobs = data.get("jobs") or []
     if not isinstance(jobs, list):
         jobs = []
@@ -919,7 +950,14 @@ def builds_fix_current(
                 "architectures": arcs,
                 "skip_complete_arches": True,
             }
-        created = http_json("POST", api_base, "/api/builds/trigger", token=token, json_body=body, timeout=300.0)
+        created = http_json(
+            "POST",
+            api_base,
+            "/api/builds/trigger?background=false",
+            token=token,
+            json_body=body,
+            timeout=300.0,
+        )
         if not isinstance(created, list):
             click.echo("Unexpected trigger response for %s" % pkg, err=True)
             sys.exit(1)
