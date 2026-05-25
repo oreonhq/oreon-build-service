@@ -709,45 +709,29 @@
         var branch = currentSourceType === 'layers' && layersDistgit.branch
           ? layersDistgit.branch
           : 'main';
-        var tasks = selected.map(function(cb) {
-          var pkgName = cb.dataset.name;
-          var specPath = cb.dataset.spec;
-          var combinedUrl = repoUrl + '#' + branch + ':' + specPath;
-          var np = {
-            name: pkgName,
-            description: null,
-            preferred_mock_environment_id: mockIdVal ? parseInt(mockIdVal, 10) : null,
-            source_type: 'distgit',
-            source_url: combinedUrl,
-            source_branch: branch,
-            source_path: specPath
-          };
-          return api.post('/builds/trigger', { new_package: np, release_id: selectedReleaseIdNew, architectures: arches })
-            .then(function(data) {
-              var jobs = Array.isArray(data) ? data : (data ? [data] : []);
-              return { ok: true, name: pkgName, jobCount: jobs.length };
-            })
-            .catch(function(e) {
-              return { ok: false, name: pkgName, err: (e && e.message) ? e.message : String(e) };
-            });
-        });
+        var batchBody = {
+          release_id: selectedReleaseIdNew,
+          architectures: arches,
+          packages: selected.map(function(cb) {
+            return { name: cb.dataset.name, spec_path: cb.dataset.spec || '' };
+          })
+        };
+        if (mockIdVal) batchBody.preferred_mock_environment_id = parseInt(mockIdVal, 10);
+        if (repoUrl !== 'https://github.com/oreonhq/rpm-specfiles.git') batchBody.distgit_url = repoUrl;
+        if (branch !== 'main') batchBody.distgit_branch = branch;
         oreonWithLoading(_clBtn, function() {
-          return Promise.all(tasks).then(function(results) {
-            render();
-            var bad = results.filter(function(r) { return !r.ok; });
-            var ok = results.filter(function(r) { return r.ok; });
-            var queued = ok.reduce(function(n, r) { return n + (r.jobCount || 0); }, 0);
-            if (bad.length) {
-              alert(ok.length + ' triggered, ' + bad.length + ' failed:\n' + bad.slice(0, 10).map(function(b) { return b.name + ': ' + b.err; }).join('\n'));
-            } else {
-              alert(ok.length + ' package(s) queued for build (' + queued + ' job(s) created).');
-            }
-            if (currentSourceType === 'checklist' && checklistLoaded) {
-              document.getElementById('btn-load-checklist').click();
-            } else if (currentSourceType === 'layers' && layersLoaded) {
-              document.getElementById('btn-load-layers').click();
-            }
-          });
+          return api.post('/builds/trigger-batch', batchBody)
+            .then(function(data) {
+              render();
+              var n = (data && data.package_count) ? data.package_count : selected.length;
+              alert(buildAcceptedMessage(data, 'Queued ' + n + ' package(s) in the background.'));
+              if (currentSourceType === 'checklist' && checklistLoaded) {
+                document.getElementById('btn-load-checklist').click();
+              } else if (currentSourceType === 'layers' && layersLoaded) {
+                document.getElementById('btn-load-layers').click();
+              }
+            })
+            .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
         });
       });
       (function initReleaseNewSelect() {
@@ -960,7 +944,7 @@
                     render();
                     var n = (data && data.jobs && data.jobs.length) ? data.jobs.length : 0;
                     var newCid = data && data.chain_id;
-                    alert('New chain ' + newCid + ' from chain ' + fromId + '. Queued ' + n + ' job(s) from the last incomplete stage.');
+                    alert(buildAcceptedMessage(data, 'New chain ' + newCid + ' from chain ' + fromId + '. Continuing in the background.'));
                   })
                   .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
               });
@@ -1011,6 +995,11 @@
         if (document.getElementById('arch-aarch64-new') && document.getElementById('arch-aarch64-new').checked) arch.push('aarch64');
         return arch.length ? arch : ['x86_64', 'aarch64'];
       }
+      function buildAcceptedMessage(data, fallback) {
+        if (data && data.status === 'accepted' && data.message) return data.message;
+        if (data && data.accepted && data.message) return data.message;
+        return fallback;
+      }
       document.getElementById('btn-trigger-build').addEventListener('click', function() {
         if (!selectedPackageId || !selectedReleaseId) { alert('Select a package and a release.'); return; }
         var btn = this;
@@ -1019,6 +1008,10 @@
           return api.post('/builds/trigger', { package_id: selectedPackageId, release_id: selectedReleaseId, architectures: architectures })
             .then(function(data) {
               render();
+              if (data && data.status === 'accepted') {
+                alert(buildAcceptedMessage(data, 'Build trigger accepted.'));
+                return;
+              }
               var jobs = Array.isArray(data) ? data : (data ? [data] : []);
               if (jobs.length) alert('Builds triggered for ' + jobs.length + ' architecture(s).');
               else alert('No new jobs queued. Every selected architecture that has a worker already has a successful build for this package and release.');
@@ -1048,6 +1041,10 @@
             return api.post('/builds/trigger', { new_package: newPackage, release_id: selectedReleaseIdNew, architectures: arches })
               .then(function(data) {
                 render();
+                if (data && data.status === 'accepted') {
+                  alert(buildAcceptedMessage(data, 'Build trigger accepted.'));
+                  return;
+                }
                 var jobs = Array.isArray(data) ? data : (data ? [data] : []);
                 if (jobs.length) alert('Build triggered for ' + jobs.length + ' architecture(s).');
                 else alert('No new jobs queued. All selected arches already built for this package and release.');
@@ -1099,6 +1096,10 @@
             return api.post('/builds/trigger', { new_package: newPackage, release_id: selectedReleaseIdNew, architectures: arches })
               .then(function(data) {
                 render();
+                if (data && data.status === 'accepted') {
+                  alert(buildAcceptedMessage(data, 'Build trigger accepted.'));
+                  return;
+                }
                 var jobs = Array.isArray(data) ? data : (data ? [data] : []);
                 if (jobs.length) alert('Build triggered for ' + jobs.length + ' architecture(s).');
                 else alert('No new jobs queued. All selected arches already built for this package and release.');
@@ -1115,50 +1116,23 @@
           var rel = releases.find(function(r) { return r.id === selectedReleaseIdNew; });
           var releasename = rel && rel.releasename ? rel.releasename.trim() : '';
           if (!releasename) { alert('Selected release is missing a releasename.'); return; }
-          var tasks = pkgNames.map(function(pkgName) {
-            var specPath = releasename + '/' + pkgName + '/' + pkgName + '.spec';
-            var repoUrl = 'https://github.com/oreonhq/rpm-specfiles.git';
-            var branch = 'main';
-            var combinedUrl = repoUrl + '#' + branch + ':' + specPath;
-            var np = {
-              name: pkgName,
-              description: null,
-              preferred_mock_environment_id: mockIdVal ? parseInt(mockIdVal, 10) : null,
-              source_type: 'distgit',
-              source_url: combinedUrl,
-              source_branch: branch,
-              source_path: specPath
-            };
-            var body = { new_package: np, release_id: selectedReleaseIdNew, architectures: arches };
-            return api.post('/builds/trigger', body)
-              .then(function(data) {
-                var jobs = Array.isArray(data) ? data : (data ? [data] : []);
-                return { ok: true, name: pkgName, jobCount: jobs.length };
-              })
-              .catch(function(e) {
-                console.error('DistGit trigger failed for package', pkgName, e);
-                return { ok: false, name: pkgName, err: (e && e.message) ? e.message : String(e) };
-              });
-          });
-          oreonWithLoading(_btn, function() {
-            return Promise.all(tasks).then(function(results) {
+        var batchBody = {
+          release_id: selectedReleaseIdNew,
+          architectures: arches,
+          packages: pkgNames.map(function(pkgName) {
+            return { name: pkgName, spec_path: releasename + '/' + pkgName + '/' + pkgName + '.spec' };
+          })
+        };
+        if (mockIdVal) batchBody.preferred_mock_environment_id = parseInt(mockIdVal, 10);
+        oreonWithLoading(_btn, function() {
+          return api.post('/builds/trigger-batch', batchBody)
+            .then(function(data) {
               render();
-              var bad = (results || []).filter(function(r) { return r && !r.ok; });
-              var okRows = (results || []).filter(function(r) { return r && r.ok; });
-              var jobsQueued = okRows.reduce(function(n, r) { return n + (r.jobCount || 0); }, 0);
-              var allSkipped = okRows.length && okRows.every(function(r) { return (r.jobCount || 0) === 0; });
-              if (bad.length) {
-                alert('Some DistGit triggers failed (' + bad.length + '/' + pkgNames.length + '):\n' +
-                  bad.map(function(b) { return b.name + ': ' + (b.err || 'error'); }).join('\n'));
-              } else {
-                var parts = [];
-                if (okRows.length) parts.push(okRows.length + ' package(s) triggered via DistGit');
-                if (jobsQueued) parts.push(jobsQueued + ' build job(s) queued');
-                if (allSkipped) parts.push('no new jobs (all requested arches already built where applicable)');
-                alert(parts.length ? parts.join('. ') + '.' : 'Trigger requested for ' + pkgNames.length + ' DistGit package(s).');
-              }
-            });
-          });
+              var n = (data && data.package_count) ? data.package_count : pkgNames.length;
+              alert(buildAcceptedMessage(data, 'Queued ' + n + ' DistGit package(s) in the background.'));
+            })
+            .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
+        });
           return;
         } else if (currentSourceType === 'chainbuild') {
           if (!selectedReleaseIdNew) { alert('Select a release.'); return; }
@@ -1182,9 +1156,9 @@
                     window.history.replaceState({}, '', '/builds.html?chain_id=' + cid);
                   }
                 }
-                var n = (data && data.jobs && data.jobs.length) ? data.jobs.length : 0;
-                var tip = n ? 'Queued ' + n + ' job(s) for stage 0.' : 'No new jobs in stage 0 (architectures may already be built).';
+                var tip = buildAcceptedMessage(data, 'Chain started. Jobs queue in the background.');
                 if (cid) showChainAlert('success', 'Chain ' + cid + ' started', '<p>' + escapeHtml(tip) + '</p>');
+                else alert(tip);
               })
               .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
           });
@@ -1203,7 +1177,8 @@
               render();
               var n = (data && data.jobs && data.jobs.length) ? data.jobs.length : 0;
               var cid = data && data.chain_id;
-              alert('New chain ' + cid + ' from chain ' + fromId + '. Queued ' + n + ' job(s) from the last incomplete stage.');
+              var msg = buildAcceptedMessage(data, 'New chain ' + cid + ' from chain ' + fromId + '. Continuing in the background.');
+              alert(msg);
             })
             .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
         });
