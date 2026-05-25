@@ -545,6 +545,7 @@ async def trigger_chain_build(
     distgit_url: str | None,
     distgit_branch: str | None,
     priority: int,
+    defer_enqueue: bool = False,
 ) -> tuple[BuildChain, list[BuildJob], bool]:
     stages = parse_chain_build_spec(chain_spec)
     rr = await db.execute(select(Release).where(Release.id == release_id))
@@ -619,27 +620,66 @@ async def trigger_chain_build(
         user_agent=get_user_agent(request),
     )
 
-    jobs = await _enqueue_chain_stage_jobs(
+    jobs: list[BuildJob] = []
+    if not defer_enqueue:
+        jobs = await _enqueue_chain_stage_jobs(
+            db,
+            chain,
+            0,
+            architectures=arches,
+            distgit_url=dg_url,
+            distgit_branch=dg_branch,
+            preferred_mock_environment_id=preferred_mock_environment_id,
+            priority=priority,
+            triggered_by_id=user.id,
+            request=request,
+        )
+        if chain.status == BuildChainStatus.FAILED:
+            await db.flush()
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=chain.error_message or "Chain build could not start",
+            )
+
+    return chain, jobs, defer_enqueue
+
+
+async def enqueue_chain_jobs_after_create(db: Any, chain_id: int) -> None:
+    chain_r = await db.execute(select(BuildChain).where(BuildChain.id == chain_id).with_for_update())
+    chain = chain_r.scalar_one_or_none()
+    if not chain:
+        logger.error("chain enqueue: chain_id=%s not found", chain_id)
+        return
+    opt = _options_dict(chain)
+    arches = [str(x) for x in opt.get("architectures") or DEFAULT_ARCH]
+    pm = opt.get("preferred_mock_environment_id")
+    if pm is None or pm == "":
+        pref_pm = None
+    else:
+        try:
+            pref_pm = int(pm)
+        except (TypeError, ValueError):
+            pref_pm = None
+    dg_url = str(opt.get("distgit_url") or "https://github.com/oreonhq/rpm-specfiles.git").strip()
+    dg_branch = str(opt.get("distgit_branch") or "main").strip()
+    await _enqueue_chain_stage_jobs(
         db,
         chain,
         0,
         architectures=arches,
         distgit_url=dg_url,
         distgit_branch=dg_branch,
-        preferred_mock_environment_id=preferred_mock_environment_id,
-        priority=priority,
-        triggered_by_id=user.id,
-        request=request,
+        preferred_mock_environment_id=pref_pm,
+        priority=int(opt.get("priority") or 0),
+        triggered_by_id=chain.triggered_by_id,
+        request=None,
     )
-
     if chain.status == BuildChainStatus.FAILED:
-        await db.flush()
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=chain.error_message or "Chain build could not start",
+        logger.warning(
+            "chain_id=%s failed during background enqueue: %s",
+            chain_id,
+            chain.error_message,
         )
-
-    return chain, jobs, False
 
 
 async def on_repo_publish_success_for_chain(attempt_id: int) -> None:
@@ -743,6 +783,7 @@ async def resume_chain_from_previous(
     user: "Account",
     *,
     from_chain_id: int,
+    defer_enqueue: bool = False,
 ) -> tuple[BuildChain, list[BuildJob], bool]:
     old_r = await db.execute(select(BuildChain).where(BuildChain.id == from_chain_id))
     old = old_r.scalar_one_or_none()
@@ -851,7 +892,43 @@ async def resume_chain_from_previous(
         user_agent=get_user_agent(request),
     )
 
-    stage = resume_stage
+    if defer_enqueue:
+        return chain, [], True
+
+    await enqueue_resumed_chain_stages(db, chain.id, from_chain_id)
+    if chain.status == BuildChainStatus.FAILED:
+        await db.flush()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=chain.error_message or "Chain resume could not start",
+        )
+    jobs_r = await db.execute(select(BuildJob).where(BuildJob.chain_id == chain.id))
+    return chain, list(jobs_r.scalars().all()), False
+
+
+async def enqueue_resumed_chain_stages(db: Any, chain_id: int, from_chain_id: int) -> None:
+    chain_r = await db.execute(select(BuildChain).where(BuildChain.id == chain_id).with_for_update())
+    chain = chain_r.scalar_one_or_none()
+    if not chain:
+        logger.error("chain resume enqueue: chain_id=%s not found", chain_id)
+        return
+    stages = _stages_list(chain)
+    opt = _options_dict(chain)
+    resume_start = int(opt.get("resume_start_stage_index") or chain.active_stage_index or 0)
+    arches = [str(x) for x in opt.get("architectures") or DEFAULT_ARCH]
+    _pm = opt.get("preferred_mock_environment_id")
+    if _pm is None or _pm == "":
+        pref_pm = None
+    else:
+        try:
+            pref_pm = int(_pm)
+        except (TypeError, ValueError):
+            pref_pm = None
+    dg_url = str(opt.get("distgit_url") or "https://github.com/oreonhq/rpm-specfiles.git").strip()
+    dg_branch = str(opt.get("distgit_branch") or "main").strip()
+    priority = int(opt.get("priority") or 0)
+
+    stage = resume_start
     while stage < len(stages) and chain.status not in (
         BuildChainStatus.FAILED,
         BuildChainStatus.SUCCESS,
@@ -865,10 +942,10 @@ async def resume_chain_from_previous(
             architectures=arches,
             distgit_url=dg_url,
             distgit_branch=dg_branch,
-            preferred_mock_environment_id=_pm,
+            preferred_mock_environment_id=pref_pm,
             priority=priority,
-            triggered_by_id=user.id,
-            request=request,
+            triggered_by_id=chain.triggered_by_id,
+            request=None,
             skip_package_target_slots=skip_set,
             advance_if_stage_satisfied_by_skips=True,
         )
@@ -880,17 +957,12 @@ async def resume_chain_from_previous(
             stage = chain.active_stage_index
             continue
         break
-
     if chain.status == BuildChainStatus.FAILED:
-        await db.flush()
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=chain.error_message or "Chain resume could not start",
+        logger.warning(
+            "chain_id=%s resume failed during background enqueue: %s",
+            chain_id,
+            chain.error_message,
         )
-
-    jobs_r = await db.execute(select(BuildJob).where(BuildJob.chain_id == chain.id))
-    jobs = list(jobs_r.scalars().all())
-    return chain, jobs, False
 
 
 async def notify_chain_job_terminal_after_result(
