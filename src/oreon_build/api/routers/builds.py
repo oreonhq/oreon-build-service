@@ -2,7 +2,7 @@
 import logging
 import uuid
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import JSONResponse
 
 from oreon_build.utils.spec import name_from_srpm_filename, parse_spec_content
@@ -29,7 +29,7 @@ from oreon_build.api.schemas import (
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
 from oreon_build.core.machine_arch import normalize_machine_arch
 from oreon_build.core.repo_branch import r2_publish_branch
-from oreon_build.models import BuildAttempt, BuildChain, BuildJob, BuildStatus, BuildTarget, Package, Release, RpmbuildPlan, Worker
+from oreon_build.models import BuildAttempt, BuildChain, BuildChainStatus, BuildJob, BuildStatus, BuildTarget, Package, Release, RpmbuildPlan, Worker
 from oreon_build.services.build_target_util import (
     get_or_create_build_target,
     has_successful_build_for_target,
@@ -627,9 +627,10 @@ async def trigger_chain_build_endpoint(
     request: Request,
     db: DbSession,
     user: CurrentUser,
+    background_tasks: BackgroundTasks,
 ):
     from oreon_build.services.build_chain import trigger_chain_build as run_chain_build
-    from oreon_build.services.build_trigger_bg import run_chain_trigger_enqueue, spawn
+    from oreon_build.services.build_trigger_bg import run_chain_trigger_enqueue
 
     chain, _, _ = await run_chain_build(
         db,
@@ -644,8 +645,7 @@ async def trigger_chain_build_endpoint(
         priority=data.priority,
         defer_enqueue=True,
     )
-    await db.commit()
-    spawn(run_chain_trigger_enqueue(chain.id))
+    background_tasks.add_task(run_chain_trigger_enqueue, chain.id)
     stages_raw = chain.stages_json if isinstance(chain.stages_json, list) else []
     stages: list[list[str]] = [[str(n) for n in grp] for grp in stages_raw if isinstance(grp, list)]
     return ChainBuildTriggerResponse(
@@ -667,25 +667,37 @@ async def resume_chain_build_endpoint(
     user: CurrentUser,
 ):
     from oreon_build.services.build_chain import resume_chain_from_previous
-    from oreon_build.services.build_trigger_bg import run_chain_resume_enqueue, spawn
 
-    chain, _, _ = await resume_chain_from_previous(
-        db, request, user, from_chain_id=data.from_chain_id, defer_enqueue=True
+    chain, jobs, _ = await resume_chain_from_previous(
+        db, request, user, from_chain_id=data.from_chain_id, defer_enqueue=False
     )
-    await db.commit()
-    spawn(run_chain_resume_enqueue(chain.id, data.from_chain_id))
+    att_map = await _latest_attempt_by_job_ids(db, [j.id for j in jobs])
+    job_responses = [await _job_to_response(db, j, att_map.get(j.id)) for j in jobs]
     stages_raw = chain.stages_json if isinstance(chain.stages_json, list) else []
     stages: list[list[str]] = [[str(n) for n in grp] for grp in stages_raw if isinstance(grp, list)]
     opt = chain.chain_options if isinstance(chain.chain_options, dict) else {}
     resume_stage = int(opt.get("resume_start_stage_index") or chain.active_stage_index or 0)
+    if chain.status == BuildChainStatus.FAILED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=chain.error_message or "Chain resume could not start",
+        )
+    n = len(jobs)
+    tip = (
+        f"Resumed as chain {chain.id} from chain {data.from_chain_id} at stage {resume_stage}. "
+        f"Queued {n} job(s)."
+        if n
+        else f"Resumed as chain {chain.id} from chain {data.from_chain_id} at stage {resume_stage}. "
+        "No new jobs queued (check workers for selected arches)."
+    )
     return ChainBuildTriggerResponse(
         chain_id=chain.id,
         chain_status=chain.status.value,
         stages=stages,
         chain_spec=chain.chain_spec,
-        jobs=[],
-        accepted=True,
-        message=f"Chain resume accepted. Continuing from stage {resume_stage} in the background.",
+        jobs=job_responses,
+        accepted=False,
+        message=tip,
     )
 
 

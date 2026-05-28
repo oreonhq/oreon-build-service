@@ -942,9 +942,8 @@
                 return api.post('/builds/chain-resume', { from_chain_id: fromId })
                   .then(function(data) {
                     render();
-                    var n = (data && data.jobs && data.jobs.length) ? data.jobs.length : 0;
-                    var newCid = data && data.chain_id;
-                    alert(buildAcceptedMessage(data, 'New chain ' + newCid + ' from chain ' + fromId + '. Continuing in the background.'));
+                    followNewChain(data);
+                    alert(buildAcceptedMessage(data, 'Resumed as chain ' + (data && data.chain_id) + '.'));
                   })
                   .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
               });
@@ -998,7 +997,16 @@
       function buildAcceptedMessage(data, fallback) {
         if (data && data.status === 'accepted' && data.message) return data.message;
         if (data && data.accepted && data.message) return data.message;
+        if (data && data.message) return data.message;
         return fallback;
+      }
+      function followNewChain(data) {
+        var cid = data && data.chain_id;
+        if (!cid) return;
+        pollChainStatus(cid);
+        if (window.history && window.history.replaceState) {
+          window.history.replaceState({}, '', '/builds.html?chain_id=' + cid);
+        }
       }
       document.getElementById('btn-trigger-build').addEventListener('click', function() {
         if (!selectedPackageId || !selectedReleaseId) { alert('Select a package and a release.'); return; }
@@ -1150,12 +1158,7 @@
               .then(function(data) {
                 render();
                 var cid = data && data.chain_id;
-                if (cid) {
-                  pollChainStatus(cid);
-                  if (window.history && window.history.replaceState) {
-                    window.history.replaceState({}, '', '/builds.html?chain_id=' + cid);
-                  }
-                }
+                if (cid) followNewChain(data);
                 var tip = buildAcceptedMessage(data, 'Chain started. Jobs queue in the background.');
                 if (cid) showChainAlert('success', 'Chain ' + cid + ' started', '<p>' + escapeHtml(tip) + '</p>');
                 else alert(tip);
@@ -1175,10 +1178,8 @@
           return api.post('/builds/chain-resume', { from_chain_id: fromId })
             .then(function(data) {
               render();
-              var n = (data && data.jobs && data.jobs.length) ? data.jobs.length : 0;
-              var cid = data && data.chain_id;
-              var msg = buildAcceptedMessage(data, 'New chain ' + cid + ' from chain ' + fromId + '. Continuing in the background.');
-              alert(msg);
+              followNewChain(data);
+              alert(buildAcceptedMessage(data, 'Resumed as chain ' + (data && data.chain_id) + ' from chain ' + fromId + '.'));
             })
             .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
         });

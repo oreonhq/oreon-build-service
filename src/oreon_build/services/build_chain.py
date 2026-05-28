@@ -802,6 +802,9 @@ async def resume_chain_from_previous(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Source chain has no stages")
 
     resume_stage = await _first_incomplete_stage_index(db, old)
+    active_idx = int(old.active_stage_index or 0)
+    if old.status in (BuildChainStatus.FAILED, BuildChainStatus.CANCELLED):
+        resume_stage = max(resume_stage, active_idx)
     if resume_stage >= len(stages):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
