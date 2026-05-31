@@ -92,7 +92,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         var handled = !!ad.is_handled;
         statusBadge.style.display = 'inline-block';
         statusBadge.className = 'badge ' + (handled ? 'success' : 'pending');
-        statusBadge.textContent = handled ? 'Resolved' : 'Precautionary';
+        statusBadge.textContent = handled ? 'Resolved' : 'Unresolved';
 
         var releases = (ad.affected_releases || []).map(function(r) {
           return r.releasename || ('#' + r.release_id);
