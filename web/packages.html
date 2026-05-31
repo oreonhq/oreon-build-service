@@ -216,13 +216,9 @@
             ).then(function(ok) {
               if (!ok) return;
               return api.post('/packages/purge-dead', {}).then(function(res) {
-                var n = (res && res.deleted) ? res.deleted : 0;
-                var failed = (res && res.failed) ? res.failed : [];
-                if (failed.length) {
-                  alert('Deleted ' + n + '. Failed ' + failed.length + ':\n' + failed.slice(0, 8).join('\n'));
-                } else {
-                  alert('Purged ' + n + ' dead package(s).');
-                }
+                var n = (res && res.package_count) ? res.package_count : list.length;
+                var msg = (res && res.message) ? res.message : ('Purge accepted for ' + n + ' package(s).');
+                alert(msg);
                 load();
               });
             });

@@ -18,7 +18,7 @@
 """Packages - list public; create/update require maintainer or admin; delete requires admin."""
 import logging
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, status
 from sqlalchemy import func, or_, select
 
 from oreon_build.api.deps import CurrentAdmin, CurrentUser, DbSession
@@ -28,11 +28,12 @@ from oreon_build.api.schemas import (
     PackageResponse,
     PackageUpdate,
     PaginatedResponse,
+    PurgeDeadPackagesAccepted,
     PurgeDeadPackagesResponse,
 )
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
 from oreon_build.models import Package
-from oreon_build.services.package_delete import delete_package_record, find_dead_packages
+from oreon_build.services.package_delete import delete_package_record, find_dead_packages, purge_dead_packages_job
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/packages", tags=["packages"])
@@ -75,29 +76,27 @@ async def list_dead_packages(db: DbSession, user: CurrentAdmin):
     return [DeadPackageItem.model_validate(r) for r in rows]
 
 
-@router.post("/purge-dead", response_model=PurgeDeadPackagesResponse)
+@router.post("/purge-dead", status_code=status.HTTP_202_ACCEPTED, response_model=PurgeDeadPackagesAccepted)
 async def purge_dead_packages(
     request: Request,
     db: DbSession,
     user: CurrentAdmin,
+    background_tasks: BackgroundTasks,
 ):
     dead = await find_dead_packages(db)
-    deleted = 0
-    failed: list[str] = []
-    for row in dead:
-        pkg_r = await db.execute(select(Package).where(Package.id == row["id"]))
-        pkg = pkg_r.scalar_one_or_none()
-        if not pkg:
-            continue
-        name = pkg.name
-        try:
-            await delete_package_record(db, pkg, user=user, request=request)
-            await db.flush()
-            deleted += 1
-        except Exception as e:
-            logger.exception("purge dead package_id=%s failed", row["id"])
-            failed.append(f"{name}: {e}")
-    return PurgeDeadPackagesResponse(deleted=deleted, failed=failed)
+    if not dead:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No dead packages to purge")
+    background_tasks.add_task(
+        purge_dead_packages_job,
+        user_id=user.id,
+        ip_address=get_client_ip(request),
+        user_agent=get_user_agent(request),
+    )
+    return PurgeDeadPackagesAccepted(
+        status="accepted",
+        message="Purge accepted. Dead packages are being deleted in the background.",
+        package_count=len(dead),
+    )
 
 
 @router.get("/{package_id}", response_model=PackageResponse)

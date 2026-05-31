@@ -280,6 +280,12 @@ class PurgeDeadPackagesResponse(BaseModel):
     failed: List[str] = Field(default_factory=list)
 
 
+class PurgeDeadPackagesAccepted(BaseModel):
+    status: str = "accepted"
+    message: str
+    package_count: int
+
+
 class PackageVersionResponse(BaseModel):
     id: int
     package_id: int

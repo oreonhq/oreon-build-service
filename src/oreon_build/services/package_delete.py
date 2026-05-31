@@ -188,3 +188,46 @@ async def delete_package_record(
         ip_address=ip,
         user_agent=ua,
     )
+
+
+async def purge_dead_packages_job(
+    *,
+    user_id: int,
+    ip_address: str | None,
+    user_agent: str | None,
+) -> tuple[int, list[str]]:
+    from oreon_build.db.session import async_session_maker
+    from oreon_build.models import Account
+
+    deleted = 0
+    failed: list[str] = []
+    async with async_session_maker() as db:
+        user = await db.get(Account, user_id)
+        if user is None:
+            logger.error("purge dead: user_id=%s not found", user_id)
+            return 0, ["user not found"]
+        dead = await find_dead_packages(db)
+        for row in dead:
+            pkg_r = await db.execute(select(Package).where(Package.id == row["id"]))
+            pkg = pkg_r.scalar_one_or_none()
+            if not pkg:
+                continue
+            name = pkg.name
+            try:
+                await delete_package_record(
+                    db,
+                    pkg,
+                    user=user,
+                    request=None,
+                    ip_address=ip_address,
+                    user_agent=user_agent,
+                )
+                await db.commit()
+                deleted += 1
+            except Exception as e:
+                await db.rollback()
+                logger.exception("purge dead package_id=%s failed", row["id"])
+                failed.append(f"{name}: {e}")
+    if deleted or failed:
+        logger.info("purge dead finished deleted=%s failed=%s", deleted, len(failed))
+    return deleted, failed
