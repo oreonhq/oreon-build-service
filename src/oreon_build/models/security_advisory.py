@@ -19,7 +19,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from oreon_build.db.base import Base
@@ -44,6 +44,7 @@ class SecurityAdvisory(Base):
 
     package_name: Mapped[Optional[str]] = mapped_column(String(256), nullable=True, index=True)
     package_version: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    packages_json: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
 
     upstream_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
