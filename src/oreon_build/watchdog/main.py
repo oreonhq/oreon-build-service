@@ -260,7 +260,7 @@ async def _discord_notify_advisory_resolved(
     d.pop("_handled_at", None)
     d.pop("_sort_ts", None)
     fields: list[tuple[str, str]] = [
-        ("Type", "CVE match" if kind == "cve" else "Custom advisory"),
+        ("Type", "CVE match" if kind == "cve" else "Advisory"),
         ("ORSA id", str(d.get("errata_id") or "-")),
         ("Advisory title", str(d.get("bulletin_title") or "-")),
         ("Platform", str(d.get("platform_display") or "-")),
@@ -350,7 +350,13 @@ def create_app() -> FastAPI:
         return FileResponse(web_dir / "advisory-cve.html")
 
     @app.get("/advisories/custom/{advisory_id}")
-    async def _advisory_custom(advisory_id: int):
+    async def _advisory_custom_legacy(advisory_id: int):
+        from fastapi.responses import RedirectResponse
+
+        return RedirectResponse(url=f"/advisories/{advisory_id}", status_code=307)
+
+    @app.get("/advisories/{advisory_id}")
+    async def _advisory_detail(advisory_id: int):
         return FileResponse(web_dir / "advisory-custom.html")
 
     @app.get("/api/security/advisories")
@@ -766,6 +772,7 @@ def create_app() -> FastAPI:
     @app.get("/api/security/tracked-packages")
     async def list_tracked_packages(
         package_name: str | None = Query(None),
+        search: str | None = Query(None, max_length=128, description="Prefix search on package name"),
         omit_subpackages: bool = Query(True),
         limit: int = Query(200, ge=1, le=500),
         offset: int = Query(0, ge=0),
@@ -794,6 +801,9 @@ def create_app() -> FastAPI:
             total_q = select(func.count()).select_from(TrackedRpm)
             if package_name:
                 total_q = total_q.where(TrackedRpm.package_name == package_name)
+            elif search:
+                esc = search.strip().replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+                total_q = total_q.where(TrackedRpm.package_name.ilike(f"{esc}%", escape="\\"))
             if sp_pred is not None:
                 total_q = total_q.where(sp_pred)
             total = int((await db.execute(total_q)).scalar() or 0)
@@ -809,6 +819,9 @@ def create_app() -> FastAPI:
             )
             if package_name:
                 q = q.where(TrackedRpm.package_name == package_name)
+            elif search:
+                esc = search.strip().replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+                q = q.where(TrackedRpm.package_name.ilike(f"{esc}%", escape="\\"))
             if sp_pred is not None:
                 q = q.where(sp_pred)
             q = q.order_by(TrackedRpm.package_name, TrackedRpm.rpm_version, TrackedRpm.rpm_release).offset(
@@ -959,7 +972,7 @@ def create_app() -> FastAPI:
 
             row = (await db.execute(q)).one_or_none()
             if not row:
-                return JSONResponse(content={"detail": "Custom advisory not found"}, status_code=404)
+                return JSONResponse(content={"detail": "Advisory not found"}, status_code=404)
 
             (
                 aid,
@@ -1030,7 +1043,7 @@ def create_app() -> FastAPI:
             res = await db.execute(select(SecurityAdvisory).where(SecurityAdvisory.id == advisory_id))
             adv = res.scalar_one_or_none()
             if not adv:
-                return JSONResponse(content={"detail": "Custom advisory not found"}, status_code=404)
+                return JSONResponse(content={"detail": "Advisory not found"}, status_code=404)
 
             if "title" in data.model_fields_set:
                 adv.title = data.title
@@ -1174,7 +1187,7 @@ def create_app() -> FastAPI:
                 releases_text = ", ".join([rel_name_map.get(rid) or str(rid) for rid in sorted(expected_ids)])
 
                 fields = [
-                    ("Type", "custom"),
+                    ("Type", "Advisory"),
                     ("Title", data.title),
                     ("CVE (optional)", data.cve_id or "-"),
                     ("Package", f"{data.package_name}-{data.package_version}"),
@@ -1281,7 +1294,7 @@ def create_app() -> FastAPI:
             res = await db.execute(q)
             adv = res.scalar_one_or_none()
             if not adv:
-                return JSONResponse(content={"detail": "Custom advisory not found"}, status_code=404)
+                return JSONResponse(content={"detail": "Advisory not found"}, status_code=404)
             if adv.is_handled:
                 return JSONResponse(content={"ok": True, "already_resolved": True})
             rel_rows = await db.execute(
