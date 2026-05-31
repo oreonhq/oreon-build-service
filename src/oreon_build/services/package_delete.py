@@ -1,0 +1,190 @@
+"""Shared package deletion (DB cascade + R2 cleanup)."""
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING, Any
+
+from sqlalchemy import delete, select
+
+from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
+from oreon_build.core.repo_branch import default_repo_branch_segment
+from oreon_build.models import (
+    Artifact,
+    BuildAttempt,
+    BuildAttemptFinalization,
+    BuildJob,
+    BuildTarget,
+    Package,
+    PackageVersion,
+    PublishTask,
+    Release,
+    RpmCompleteLock,
+    Source,
+)
+from oreon_build.services.r2 import get_r2_client, repo_rpms_key, src_r2_key
+
+if TYPE_CHECKING:
+    from fastapi import Request
+    from oreon_build.models import Account
+
+logger = logging.getLogger(__name__)
+
+SPEC_NOT_FOUND_MARKER = "Spec not found:"
+
+
+async def find_dead_packages(db: Any) -> list[dict[str, Any]]:
+    from oreon_build.models import BuildStatus
+
+    rows = await db.execute(
+        select(BuildJob.package_id, BuildAttempt.error_message)
+        .join(BuildAttempt, BuildAttempt.build_job_id == BuildJob.id)
+        .where(
+            BuildAttempt.status == BuildStatus.FAILED,
+            BuildAttempt.error_message.isnot(None),
+            BuildAttempt.error_message.ilike(f"%{SPEC_NOT_FOUND_MARKER}%"),
+        )
+        .order_by(BuildAttempt.id.desc())
+    )
+    seen: set[int] = set()
+    out: list[dict[str, Any]] = []
+    for package_id, err in rows.all():
+        if package_id is None:
+            continue
+        pid = int(package_id)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        pkg_r = await db.execute(select(Package.id, Package.name).where(Package.id == pid))
+        row = pkg_r.one_or_none()
+        if not row:
+            continue
+        sample = (err or "").strip()
+        if len(sample) > 512:
+            sample = sample[:509] + "..."
+        out.append({"id": pid, "name": row[1], "sample_error": sample or None})
+    out.sort(key=lambda x: (x["name"] or "").lower())
+    return out
+
+
+async def delete_package_record(
+    db: Any,
+    pkg: Package,
+    *,
+    user: "Account",
+    request: "Request | None" = None,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+) -> None:
+    package_id = pkg.id
+    ip = ip_address if ip_address is not None else (get_client_ip(request) if request else None)
+    ua = user_agent if user_agent is not None else (get_user_agent(request) if request else "api")
+
+    job_ids_result = await db.execute(select(BuildJob.id).where(BuildJob.package_id == package_id))
+    job_ids = [r[0] for r in job_ids_result.all()]
+    attempt_ids: list[int] = []
+    if job_ids:
+        attempt_ids_result = await db.execute(
+            select(BuildAttempt.id).where(BuildAttempt.build_job_id.in_(job_ids))
+        )
+        attempt_ids = [r[0] for r in attempt_ids_result.all()]
+
+    artifact_keys = []
+    repo_keys_to_delete = set()
+    if job_ids:
+        if attempt_ids:
+            art_result = await db.execute(
+                select(Artifact.r2_key).where(
+                    Artifact.build_attempt_id.in_(attempt_ids),
+                    Artifact.r2_key.isnot(None),
+                    Artifact.r2_key != "",
+                )
+            )
+            artifact_keys = [r[0] for r in art_result.all()]
+            art_with_job = await db.execute(
+                select(
+                    Artifact.filename,
+                    Release.releasename,
+                    Release.default_repo_branch,
+                    BuildTarget.architecture,
+                )
+                .join(BuildAttempt, BuildAttempt.id == Artifact.build_attempt_id)
+                .join(BuildJob, BuildJob.id == BuildAttempt.build_job_id)
+                .join(Release, Release.id == BuildJob.release_id)
+                .outerjoin(BuildTarget, BuildTarget.id == BuildJob.target_id)
+                .where(BuildJob.package_id == package_id)
+            )
+            for row in art_with_job.all():
+                filename, releasename, drb, arch = row[0], row[1], row[2], row[3] or "x86_64"
+                branch = default_repo_branch_segment(drb)
+                if filename.endswith(".src.rpm"):
+                    repo_keys_to_delete.add(src_r2_key(releasename, branch, filename))
+                else:
+                    repo_keys_to_delete.add(repo_rpms_key(releasename, branch, arch, filename))
+    pv_ids_result = await db.execute(select(PackageVersion.id).where(PackageVersion.package_id == package_id))
+    pv_ids = [r[0] for r in pv_ids_result.all()]
+    source_keys = []
+    if pv_ids:
+        src_result = await db.execute(
+            select(Source.r2_key).where(
+                Source.package_version_id.in_(pv_ids),
+                Source.r2_key.isnot(None),
+                Source.r2_key != "",
+            )
+        )
+        source_keys = [r[0] for r in src_result.all()]
+    all_keys = list(set(artifact_keys + list(repo_keys_to_delete) + source_keys))
+    if all_keys:
+        try:
+            r2 = get_r2_client()
+            for key in all_keys:
+                try:
+                    r2.delete_object(key)
+                except Exception as e:
+                    logger.warning("Failed to delete R2 object %s: %s", key, e)
+        except Exception as e:
+            logger.exception("R2 client or delete failed during package delete (package_id=%s): %s", package_id, e)
+
+    if job_ids:
+        await db.execute(delete(PublishTask).where(PublishTask.build_job_id.in_(job_ids)))
+    if attempt_ids:
+        await db.execute(
+            delete(BuildAttemptFinalization).where(BuildAttemptFinalization.attempt_id.in_(attempt_ids))
+        )
+        await db.execute(delete(RpmCompleteLock).where(RpmCompleteLock.attempt_id.in_(attempt_ids)))
+
+    await db.execute(
+        delete(Artifact).where(
+            Artifact.build_attempt_id.in_(
+                select(BuildAttempt.id).where(
+                    BuildAttempt.build_job_id.in_(
+                        select(BuildJob.id).where(BuildJob.package_id == package_id)
+                    )
+                )
+            )
+        )
+    )
+    await db.execute(
+        delete(BuildAttempt).where(
+            BuildAttempt.build_job_id.in_(select(BuildJob.id).where(BuildJob.package_id == package_id))
+        )
+    )
+    await db.execute(
+        delete(Source).where(
+            Source.package_version_id.in_(
+                select(PackageVersion.id).where(PackageVersion.package_id == package_id)
+            )
+        )
+    )
+    await db.execute(delete(BuildJob).where(BuildJob.package_id == package_id))
+    await db.execute(delete(PackageVersion).where(PackageVersion.package_id == package_id))
+    await db.delete(pkg)
+    await log_audit(
+        db,
+        "package.delete",
+        account_id=user.id,
+        resource_type="package",
+        resource_id=str(package_id),
+        details=pkg.name,
+        ip_address=ip,
+        user_agent=ua,
+    )
