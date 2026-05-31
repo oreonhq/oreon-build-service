@@ -76,6 +76,8 @@ async def delete_package_record(
     user_agent: str | None = None,
 ) -> None:
     package_id = pkg.id
+    package_name = pkg.name
+    account_id = user.id
     ip = ip_address if ip_address is not None else (get_client_ip(request) if request else None)
     ua = user_agent if user_agent is not None else (get_user_agent(request) if request else "api")
 
@@ -181,10 +183,10 @@ async def delete_package_record(
     await log_audit(
         db,
         "package.delete",
-        account_id=user.id,
+        account_id=account_id,
         resource_type="package",
         resource_id=str(package_id),
-        details=pkg.name,
+        details=package_name,
         ip_address=ip,
         user_agent=ua,
     )
