@@ -43,6 +43,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     </section>
   </main>
 
+  <script src="/static/watchdog-advisory-packages.js?v=1"></script>
   <script src="/static/app.js?v=13"></script>
   <script>
     (function() {
@@ -139,12 +140,17 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           '<input type="text" id="edit-title" class="form-control" value="' + esc(ad.title || '') + '"></div>' +
           '<div class="form-group"><label>CVE ID (optional)</label>' +
           '<input type="text" id="edit-cve-id" class="form-control" value="' + esc(ad.cve_id || '') + '"></div>' +
+          '<div class="form-group"><label>Package search</label>' +
+          '<input type="text" id="edit-package-search" class="form-control" placeholder="Type to search monitored RPMs"></div>' +
           '<div style="display:flex; gap:1rem; flex-wrap:wrap;">' +
-          '<div class="form-group" style="flex:1; min-width:200px;"><label>Package name</label>' +
-          '<input type="text" id="edit-package-name" class="form-control" value="' + esc(ad.package_name || '') + '"></div>' +
-          '<div class="form-group" style="flex:1; min-width:200px;"><label>Package version</label>' +
-          '<input type="text" id="edit-package-version" class="form-control" value="' + esc(ad.package_version || '') + '"></div>' +
+          '<div class="form-group" style="flex:1; min-width:200px;"><label>Package</label>' +
+          '<select id="edit-package-name-select" class="form-control" size="6"></select>' +
+          '<input type="hidden" id="edit-package-name" value="' + esc(ad.package_name || '') + '"></div>' +
+          '<div class="form-group" style="flex:1; min-width:200px;"><label>Version</label>' +
+          '<select id="edit-package-version-select" class="form-control" size="6"></select>' +
+          '<input type="hidden" id="edit-package-version" value="' + esc(ad.package_version || '') + '"></div>' +
           '</div>' +
+          '<div id="edit-package-picker-status" style="color:var(--text-muted); font-size:0.85rem; margin-bottom:0.75rem;"></div>' +
           '<div class="form-group"><label>Severity (optional)</label>' +
           '<input type="text" id="edit-severity" class="form-control" value="' + esc(ad.severity || '') + '"></div>' +
           '<div class="form-group"><label>Upstream URL (optional)</label>' +
@@ -158,6 +164,17 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           '<div id="edit-status" style="color:var(--text-muted); font-size:0.9rem; margin-top:0.5rem;"></div>';
 
         renderActions(ad);
+        if (window.oreonAdvisoryPackagePicker) {
+          window.oreonAdvisoryPackagePicker({
+            api: api,
+            nameSearchEl: document.getElementById('edit-package-search'),
+            nameSelectEl: document.getElementById('edit-package-name-select'),
+            versionSelectEl: document.getElementById('edit-package-version-select'),
+            hiddenNameEl: document.getElementById('edit-package-name'),
+            hiddenVersionEl: document.getElementById('edit-package-version'),
+            statusEl: document.getElementById('edit-package-picker-status')
+          }).load(ad.package_name || '', ad.package_name || '', ad.package_version || '');
+        }
       }
 
       function renderActions(ad) {
@@ -212,8 +229,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         var statusEl = document.getElementById('edit-status');
         var title = (document.getElementById('edit-title').value || '').trim();
         var cveId = (document.getElementById('edit-cve-id').value || '').trim();
-        var packageName = (document.getElementById('edit-package-name').value || '').trim();
-        var packageVersion = (document.getElementById('edit-package-version').value || '').trim();
+        var packageName = (document.getElementById('edit-package-name') && document.getElementById('edit-package-name').value || '').trim();
+        var packageVersion = (document.getElementById('edit-package-version') && document.getElementById('edit-package-version').value || '').trim();
         var severity = (document.getElementById('edit-severity').value || '').trim();
         var upstreamUrl = (document.getElementById('edit-upstream-url').value || '').trim();
         var summary = (document.getElementById('edit-summary').value || '').trim();
