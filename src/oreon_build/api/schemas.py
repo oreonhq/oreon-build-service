@@ -269,6 +269,17 @@ class PackageResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class DeadPackageItem(BaseModel):
+    id: int
+    name: str
+    sample_error: Optional[str] = None
+
+
+class PurgeDeadPackagesResponse(BaseModel):
+    deleted: int
+    failed: List[str] = Field(default_factory=list)
+
+
 class PackageVersionResponse(BaseModel):
     id: int
     package_id: int
