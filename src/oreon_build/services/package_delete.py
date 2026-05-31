@@ -12,6 +12,7 @@ from oreon_build.models import (
     Artifact,
     BuildAttempt,
     BuildAttemptFinalization,
+    BuildChainPublishReceipt,
     BuildJob,
     BuildTarget,
     Package,
@@ -25,7 +26,6 @@ from oreon_build.services.r2 import get_r2_client, repo_rpms_key, src_r2_key
 
 if TYPE_CHECKING:
     from fastapi import Request
-    from oreon_build.models import Account
 
 logger = logging.getLogger(__name__)
 
@@ -68,16 +68,14 @@ async def find_dead_packages(db: Any) -> list[dict[str, Any]]:
 
 async def delete_package_record(
     db: Any,
-    pkg: Package,
     *,
-    user: "Account",
+    package_id: int,
+    package_name: str,
+    account_id: int,
     request: "Request | None" = None,
     ip_address: str | None = None,
     user_agent: str | None = None,
 ) -> None:
-    package_id = pkg.id
-    package_name = pkg.name
-    account_id = user.id
     ip = ip_address if ip_address is not None else (get_client_ip(request) if request else None)
     ua = user_agent if user_agent is not None else (get_user_agent(request) if request else "api")
 
@@ -153,6 +151,9 @@ async def delete_package_record(
             delete(BuildAttemptFinalization).where(BuildAttemptFinalization.attempt_id.in_(attempt_ids))
         )
         await db.execute(delete(RpmCompleteLock).where(RpmCompleteLock.attempt_id.in_(attempt_ids)))
+        await db.execute(
+            delete(BuildChainPublishReceipt).where(BuildChainPublishReceipt.build_attempt_id.in_(attempt_ids))
+        )
 
     await db.execute(
         delete(Artifact).where(
@@ -179,7 +180,7 @@ async def delete_package_record(
     )
     await db.execute(delete(BuildJob).where(BuildJob.package_id == package_id))
     await db.execute(delete(PackageVersion).where(PackageVersion.package_id == package_id))
-    await db.delete(pkg)
+    await db.execute(delete(Package).where(Package.id == package_id))
     await log_audit(
         db,
         "package.delete",
@@ -199,27 +200,19 @@ async def purge_dead_packages_job(
     user_agent: str | None,
 ) -> tuple[int, list[str]]:
     from oreon_build.db.session import async_session_maker
-    from oreon_build.models import Account
 
     deleted = 0
     failed: list[str] = []
     async with async_session_maker() as db:
-        user = await db.get(Account, user_id)
-        if user is None:
-            logger.error("purge dead: user_id=%s not found", user_id)
-            return 0, ["user not found"]
         dead = await find_dead_packages(db)
         for row in dead:
-            pkg_r = await db.execute(select(Package).where(Package.id == row["id"]))
-            pkg = pkg_r.scalar_one_or_none()
-            if not pkg:
-                continue
-            name = pkg.name
+            name = row["name"]
             try:
                 await delete_package_record(
                     db,
-                    pkg,
-                    user=user,
+                    package_id=row["id"],
+                    package_name=name,
+                    account_id=user_id,
                     request=None,
                     ip_address=ip_address,
                     user_agent=user_agent,

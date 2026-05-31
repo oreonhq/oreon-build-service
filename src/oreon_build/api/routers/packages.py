@@ -180,8 +180,14 @@ async def delete_package(
     db: DbSession,
     user: CurrentAdmin,
 ):
-    result = await db.execute(select(Package).where(Package.id == package_id))
-    pkg = result.scalar_one_or_none()
-    if not pkg:
+    result = await db.execute(select(Package.id, Package.name).where(Package.id == package_id))
+    row = result.one_or_none()
+    if not row:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Package not found")
-    await delete_package_record(db, pkg, user=user, request=request)
+    await delete_package_record(
+        db,
+        package_id=row[0],
+        package_name=row[1],
+        account_id=user.id,
+        request=request,
+    )
