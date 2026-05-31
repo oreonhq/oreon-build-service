@@ -92,7 +92,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       <pre id="diagnostics-out" style="display:none; margin-top:0.75rem; padding:0.75rem; background:var(--card-bg, #1a1a1a); border:1px solid var(--border, #333); border-radius:6px; font-size:0.8rem; overflow:auto; max-height:14rem;"></pre>
 
       <div id="custom-advisory-create-wrap" style="display:none; margin-top:1rem;">
-        <h3 style="margin:0 0 0.75rem;">Create custom advisory</h3>
+        <h3 style="margin:0 0 0.75rem;">Create advisory</h3>
 
         <div class="form-group">
           <label>Title</label>
@@ -103,16 +103,23 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           <input type="text" id="custom-cve-id" class="form-control" placeholder="e.g. CVE-YYYY-NNNN">
         </div>
 
+        <div class="form-group">
+          <label>Package search</label>
+          <input type="text" id="custom-package-search" class="form-control" placeholder="Type to search monitored RPMs">
+        </div>
         <div style="display:flex; gap:1rem; flex-wrap:wrap;">
           <div class="form-group" style="flex:1; min-width:240px;">
-            <label>Package name</label>
-            <input type="text" id="custom-package-name" class="form-control" placeholder="e.g. openssl">
+            <label>Package</label>
+            <select id="custom-package-name-select" class="form-control" size="6" disabled></select>
+            <input type="hidden" id="custom-package-name">
           </div>
           <div class="form-group" style="flex:1; min-width:240px;">
-            <label>Package version</label>
-            <input type="text" id="custom-package-version" class="form-control" placeholder="e.g. 1.1.1w-1">
+            <label>Version</label>
+            <select id="custom-package-version-select" class="form-control" size="6" disabled></select>
+            <input type="hidden" id="custom-package-version">
           </div>
         </div>
+        <div id="custom-package-picker-status" style="color:var(--text-muted); font-size:0.85rem; margin-bottom:0.75rem;"></div>
 
         <div class="form-group">
           <label>Severity (optional)</label>
@@ -187,6 +194,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     </section>
   </main>
 
+  <script src="/static/watchdog-advisory-packages.js?v=1"></script>
   <script src="/static/app.js?v=13"></script>
   <script>
     (function() {
@@ -457,7 +465,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             var advisoryTitle = esc(a.bulletin_title || ((a.package_name || '') + ' security update'));
             var plat = esc(a.platform_display || '-');
             var updated = esc(a.updated_at_display || '-');
-            var detailsUrl = a.kind === 'custom' ? ('/advisories/custom/' + a.id) : ('/advisories/cve/' + a.id);
+            var detailsUrl = a.kind === 'custom' ? ('/advisories/' + a.id) : ('/advisories/cve/' + a.id);
             var resolveBtn = '';
             if (!a.is_handled && adminNow) {
               resolveBtn = '<button type="button" class="btn primary" style="padding:0.2rem 0.45rem;font-size:0.8rem;" data-resolve-kind="' + esc(a.kind) + '" data-resolve-id="' + esc(a.id) + '">Resolve</button>';
@@ -566,14 +574,28 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         });
       }
 
+      var advisoryPackagePicker = null;
+      if (window.oreonAdvisoryPackagePicker) {
+        advisoryPackagePicker = window.oreonAdvisoryPackagePicker({
+          api: api,
+          nameSearchEl: document.getElementById('custom-package-search'),
+          nameSelectEl: document.getElementById('custom-package-name-select'),
+          versionSelectEl: document.getElementById('custom-package-version-select'),
+          hiddenNameEl: document.getElementById('custom-package-name'),
+          hiddenVersionEl: document.getElementById('custom-package-version'),
+          statusEl: document.getElementById('custom-package-picker-status')
+        });
+      }
+
       var btnCreate = document.getElementById('btn-create-custom-advisory');
       if (btnCreate) {
         btnCreate.addEventListener('click', function() {
           if (!isAuthed() || !isAdmin()) return;
           var title = (document.getElementById('custom-title').value || '').trim();
           var cveId = (document.getElementById('custom-cve-id').value || '').trim();
-          var packageName = (document.getElementById('custom-package-name').value || '').trim();
-          var packageVersion = (document.getElementById('custom-package-version').value || '').trim();
+          var picked = advisoryPackagePicker ? advisoryPackagePicker.getSelected() : {};
+          var packageName = picked.package_name || (document.getElementById('custom-package-name').value || '').trim();
+          var packageVersion = picked.package_version || (document.getElementById('custom-package-version').value || '').trim();
           var severity = (document.getElementById('custom-severity').value || '').trim();
           var upstreamUrl = (document.getElementById('custom-upstream-url').value || '').trim();
           var summary = (document.getElementById('custom-summary').value || '').trim();
@@ -619,7 +641,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         var createWrap = document.getElementById('custom-advisory-create-wrap');
         if (!createWrap) return;
         if (!isAuthed() || !isAdmin()) createWrap.style.display = 'none';
-        else createWrap.style.display = 'block';
+        else {
+          createWrap.style.display = 'block';
+          if (advisoryPackagePicker) advisoryPackagePicker.load('', '', '');
+        }
 
         var btnScan = document.getElementById('btn-scan-now');
         if (btnScan) btnScan.style.display = isAdmin() ? 'inline-block' : 'none';
