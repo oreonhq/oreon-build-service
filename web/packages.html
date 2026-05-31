@@ -29,7 +29,10 @@
           <span class="bulk-selection-count"></span>
           <span class="bulk-selection-buttons"></span>
         </div>
-        <div class="select-all-wrap"><label for="packages-select-all">Select all</label></div>
+        <div style="display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap;">
+          <button type="button" class="btn" id="btn-purge-dead" style="display:none; color:var(--danger);">Purge dead</button>
+          <div class="select-all-wrap"><label for="packages-select-all">Select all</label></div>
+        </div>
         <div class="pagination" id="packages-pagination">
           <button type="button" class="btn" id="packages-prev" disabled>Prev</button>
           <span class="page-info" id="packages-page-info">Page 1 of 1</span>
@@ -116,8 +119,10 @@
       });
       function updateUI() {
         var hint = document.getElementById('packages-hint');
+        var purgeBtn = document.getElementById('btn-purge-dead');
         if (api.token && hint) hint.innerHTML = 'Package list. Create packages from the <a href="/builds.html">Builds</a> page (New package + build). You can edit packages. Only admins can delete.';
         else if (hint) hint.innerHTML = 'Package list. Create packages from the <a href="/builds.html">Builds</a> page. Login to edit. Only admins can delete.';
+        if (purgeBtn) purgeBtn.style.display = (api.token && api.isAdmin()) ? 'inline-block' : 'none';
       }
       var packagesPage = 0, packagesPageSize = 25, packagesTotal = 0;
       function load() {
@@ -193,6 +198,37 @@
           });
         }).catch(function() {});
       }
+      document.getElementById('btn-purge-dead').addEventListener('click', function() {
+        if (!api.token || !api.isAdmin()) return;
+        var btn = this;
+        oreonWithLoading(btn, function() {
+          return api.get('/packages/dead').then(function(dead) {
+            var list = Array.isArray(dead) ? dead : [];
+            if (!list.length) {
+              alert('No dead packages found (nothing failed with Spec not found).');
+              return;
+            }
+            var preview = list.slice(0, 12).map(function(p) { return p.name; }).join(', ');
+            var more = list.length > 12 ? (' ... and ' + (list.length - 12) + ' more') : '';
+            return window.oreonUI.confirm(
+              'Delete ' + list.length + ' dead package(s)?\n\n' + preview + more + '\n\nThis cannot be undone.',
+              'Purge dead packages'
+            ).then(function(ok) {
+              if (!ok) return;
+              return api.post('/packages/purge-dead', {}).then(function(res) {
+                var n = (res && res.deleted) ? res.deleted : 0;
+                var failed = (res && res.failed) ? res.failed : [];
+                if (failed.length) {
+                  alert('Deleted ' + n + '. Failed ' + failed.length + ':\n' + failed.slice(0, 8).join('\n'));
+                } else {
+                  alert('Purged ' + n + ' dead package(s).');
+                }
+                load();
+              });
+            });
+          }).catch(function(e) { alert('Failed: ' + window.oreonErrorMessage(e)); });
+        });
+      });
       updateUI();
       window.addEventListener('auth-change', function() { updateUI(); load(); });
       fillMockEnvsForEdit();
