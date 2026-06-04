@@ -80,3 +80,16 @@ async def require_admin(
             detail="Admin role required",
         )
     return account
+
+
+async def require_maintainer_or_admin(
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> Account:
+    account = await require_account(request, db)
+    if not (account.is_admin or account.is_maintainer):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Maintainer or admin role required",
+        )
+    return account
