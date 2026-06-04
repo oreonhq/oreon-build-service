@@ -1709,7 +1709,7 @@ def advisory_create_custom(
     recommended_fix: str | None,
 ) -> None:
     token = require_auth(get_token())
-    require_admin(token)
+    require_maintainer(token)
     wd = get_watchdog_url()
     body = {
         "title": title,
@@ -1738,7 +1738,7 @@ def advisory_resolve_cve(
     notes: str | None,
 ) -> None:
     token = require_auth(get_token())
-    require_admin(token)
+    require_maintainer(token)
     wd = get_watchdog_url()
     body = {}
     if reason:
@@ -1760,7 +1760,7 @@ def advisory_resolve_cve(
 @click.pass_context
 def advisory_resolve_custom(ctx: click.Context, advisory_id: int) -> None:
     token = require_auth(get_token())
-    require_admin(token)
+    require_maintainer(token)
     wd = get_watchdog_url()
     out = http_json("POST", wd, f"/api/security/advisories/custom/{advisory_id}/resolve", token=token)
     click.echo(json.dumps(out, indent=2, default=str))
