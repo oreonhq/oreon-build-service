@@ -286,6 +286,12 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         return !!(p && p.role === 'admin');
       }
 
+      function canManageAdvisories() {
+        if (!api.token) return false;
+        var p = decodeJwt(api.token);
+        return !!(p && (p.role === 'admin' || p.role === 'maintainer'));
+      }
+
       function loadReleases() {
         api.get('/security/releases').then(function(res) {
           var sel = document.getElementById('advisories-release-id');
@@ -328,7 +334,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       }
 
       function loadAdvisories() {
-        var adminNow = isAdmin();
+        var canManageNow = canManageAdvisories();
         var releaseId = document.getElementById('advisories-release-id').value || '';
         var pageSize = getPageSize();
         var offset = (pgState.advisoriesPage - 1) * pageSize;
@@ -366,7 +372,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             var updated = esc(a.updated_at_display || '-');
             var detailsUrl = '/advisories/' + a.id;
             var resolveBtn = '';
-            if (!a.is_handled && adminNow) {
+            if (!a.is_handled && canManageNow) {
               resolveBtn = '<button type="button" class="btn primary" style="padding:0.2rem 0.45rem;font-size:0.8rem;" data-resolve-id="' + esc(a.id) + '">Resolve</button>';
             }
             return ''
@@ -444,7 +450,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       var btnCreate = document.getElementById('btn-create-custom-advisory');
       if (btnCreate) {
         btnCreate.addEventListener('click', function() {
-          if (!isAuthed() || !isAdmin()) return;
+          if (!isAuthed() || !canManageAdvisories()) return;
           var title = (document.getElementById('custom-title').value || '').trim();
           var cveId = (document.getElementById('custom-cve-id').value || '').trim();
           var severity = (document.getElementById('custom-severity').value || '').trim();
@@ -487,14 +493,14 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       function refreshAdminUI() {
         var createWrap = document.getElementById('custom-advisory-create-wrap');
         if (!createWrap) return;
-        if (!isAuthed() || !isAdmin()) createWrap.style.display = 'none';
+        if (!isAuthed() || !canManageAdvisories()) createWrap.style.display = 'none';
         else createWrap.style.display = 'block';
 
         var btnDiag = document.getElementById('btn-diagnostics');
         if (btnDiag) btnDiag.style.display = isAdmin() ? 'inline-block' : 'none';
 
         var actions = document.getElementById('watchdog-authed-actions');
-        if (actions) actions.style.display = isAdmin() ? 'flex' : 'none';
+        if (actions) actions.style.display = canManageAdvisories() ? 'flex' : 'none';
       }
 
       loadReleases();
