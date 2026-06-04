@@ -28,7 +28,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import selectinload
 from oreon_build.db.session import async_session_maker
-from oreon_build.core.auth import require_admin, require_account
+from oreon_build.core.auth import require_admin, require_account, require_maintainer_or_admin
 from oreon_build.api.routers.auth import router as auth_router
 from oreon_build.models import (
     CveMatch,
@@ -606,7 +606,7 @@ def create_app() -> FastAPI:
     async def update_custom_advisory(
         advisory_id: int,
         payload: dict = Body(...),
-        admin=Depends(require_admin),
+        _actor=Depends(require_maintainer_or_admin),
     ):
         from sqlalchemy import delete, select
 
@@ -685,7 +685,7 @@ def create_app() -> FastAPI:
     async def create_custom_advisory(
         request: Request,
         payload: dict = Body(...),
-        admin=Depends(require_admin),
+        actor=Depends(require_maintainer_or_admin),
     ):
         # Validate manually to avoid FastAPI/Pydantic ForwardRef issues
         # when this app defines models inside nested app factories.
@@ -713,7 +713,7 @@ def create_app() -> FastAPI:
                 summary=data.summary,
                 recommended_fix=data.recommended_fix,
                 is_handled=False,
-                created_by_account_id=admin.id,
+                created_by_account_id=actor.id,
             )
             db.add(adv)
             await db.flush()
@@ -756,7 +756,7 @@ def create_app() -> FastAPI:
     async def resolve_cve_advisory(
         cve_match_id: int,
         payload: CveResolveBody | None = Body(default=None),
-        admin=Depends(require_admin),
+        actor=Depends(require_maintainer_or_admin),
     ):
         from datetime import datetime, timezone
         from sqlalchemy import select
@@ -798,7 +798,7 @@ def create_app() -> FastAPI:
             handled_at = datetime.now(timezone.utc)
             m.is_handled = True
             m.handled_at = handled_at
-            m.handled_by_account_id = admin.id
+            m.handled_by_account_id = actor.id
             m.handled_reason = reason_val
             m.handled_notes = notes_val
             await db.commit()
@@ -818,7 +818,7 @@ def create_app() -> FastAPI:
                         "_created_at": m.created_at,
                         "_handled_at": handled_at,
                     },
-                    admin_username=admin.username,
+                    admin_username=actor.username,
                     extra_fields=[
                         ("CVE", m.cve_id or "-"),
                         ("Reason", reason_val or "-"),
@@ -830,7 +830,9 @@ def create_app() -> FastAPI:
             return JSONResponse(content={"ok": True})
 
     @app.post("/api/security/advisories/custom/{advisory_id}/resolve")
-    async def resolve_custom_advisory(advisory_id: int, admin=Depends(require_admin)):
+    async def resolve_custom_advisory(
+        advisory_id: int, actor=Depends(require_maintainer_or_admin)
+    ):
         from datetime import datetime, timezone
         from sqlalchemy import select
 
@@ -855,7 +857,7 @@ def create_app() -> FastAPI:
             handled_at = datetime.now(timezone.utc)
             adv.is_handled = True
             adv.handled_at = handled_at
-            adv.handled_by_account_id = admin.id
+            adv.handled_by_account_id = actor.id
             await db.commit()
             try:
                 await _discord_notify_advisory_resolved(
@@ -873,7 +875,7 @@ def create_app() -> FastAPI:
                         "_created_at": adv.created_at,
                         "_handled_at": handled_at,
                     },
-                    admin_username=admin.username,
+                    admin_username=actor.username,
                     extra_fields=[("CVE (optional)", adv.cve_id or "-")],
                 )
             except Exception:
