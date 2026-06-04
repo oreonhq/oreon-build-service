@@ -67,10 +67,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           return JSON.parse(atob(payload));
         } catch (e) { return null; }
       }
-      function isAdmin() {
+      function canManageAdvisories() {
         if (!api.token) return false;
         var p = decodeJwt(api.token);
-        return !!(p && p.role === 'admin');
+        return !!(p && (p.role === 'admin' || p.role === 'maintainer'));
       }
 
       function advisoryIdFromPath() {
@@ -154,7 +154,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
       function renderActions(ad) {
         actionsEl.innerHTML = '';
-        if (!isAdmin()) return;
+        if (!canManageAdvisories()) return;
 
         if (editing) {
           var saveBtn = document.createElement('button');
