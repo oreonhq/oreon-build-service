@@ -300,3 +300,36 @@ tr:hover td { background: rgba(0,0,0,0.04); }
   margin: 0;
   cursor: pointer;
 }
+.advisory-release-picks {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  max-height: 14rem;
+  overflow: auto;
+  padding: 0.5rem 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface, #fff);
+}
+.advisory-release-picks .advisory-release-option {
+  display: flex;
+  gap: 0.45rem;
+  align-items: center;
+  margin: 0;
+  cursor: pointer;
+  font-size: 0.92rem;
+}
+.advisory-release-picks .advisory-release-option input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+  flex-shrink: 0;
+}
+.advisory-release-picks .advisory-release-empty {
+  color: var(--text-muted);
+  font-size: 0.9rem;
+}
+.advisory-release-hint {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  margin: 0.25rem 0 0.35rem;
+}

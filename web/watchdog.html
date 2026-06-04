@@ -100,7 +100,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
         <div class="form-group">
           <label>Affected Oreon releases</label>
-          <select id="custom-advisory-releases" class="form-control" multiple size="6"></select>
+          <div class="advisory-release-hint">Tick every release this advisory applies to.</div>
+          <div id="custom-advisory-releases" class="advisory-release-picks" role="group" aria-label="Affected Oreon releases"></div>
         </div>
 
         <div class="form-group">
@@ -151,6 +152,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   </main>
 
   <script src="/static/app.js?v=13"></script>
+  <script src="/static/watchdog-release-checkboxes.js?v=1"></script>
   <script>
     (function() {
       const api = window.oreonApi || {};
@@ -297,19 +299,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           var sel = document.getElementById('advisories-release-id');
           if (!sel) return;
           var prev = sel.value;
-          var items = (res && res.items) ? res.items : [];
-          var seenId = {};
-          var seenName = {};
-          var deduped = [];
-          for (var i = 0; i < items.length; i++) {
-            var r = items[i];
-            var idStr = String(r.id);
-            var nameKey = ((r.releasename || '') + '').trim().toLowerCase();
-            if (!nameKey || seenId[idStr] || seenName[nameKey]) continue;
-            seenId[idStr] = true;
-            seenName[nameKey] = true;
-            deduped.push(r);
-          }
+          var deduped = window.oreonReleaseCheckboxes.dedupeReleases((res && res.items) ? res.items : []);
           sel.innerHTML = '';
           sel.appendChild(new Option('All releases', ''));
           deduped.forEach(function(r) {
@@ -323,12 +313,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             if (ok) sel.value = prev;
           }
 
-          var multi = document.getElementById('custom-advisory-releases');
-          if (multi) {
-            multi.innerHTML = '';
-            deduped.forEach(function(r) {
-              multi.appendChild(new Option(r.releasename, r.id));
-            });
+          var relBox = document.getElementById('custom-advisory-releases');
+          if (relBox) {
+            var prevIds = window.oreonReleaseCheckboxes.getSelectedIds(relBox);
+            window.oreonReleaseCheckboxes.render(relBox, deduped, prevIds);
           }
         }).catch(function(e) {});
       }
@@ -462,15 +450,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           if (!title) { alert('Title is required.'); return; }
           if (!recommendedFix) { alert('Recommended fix steps are required.'); return; }
 
-          var multi = document.getElementById('custom-advisory-releases');
-          var releaseIds = [];
-          if (multi) {
-            Array.from(multi.options).forEach(function(opt) {
-              if (opt.selected) releaseIds.push(parseInt(opt.value, 10));
-            });
-          }
-          releaseIds = (releaseIds || []).filter(function(x) { return Number.isFinite(x); });
-          if (!releaseIds.length) { alert('Select at least one affected Oreon release.'); return; }
+          var relBox = document.getElementById('custom-advisory-releases');
+          var releaseIds = window.oreonReleaseCheckboxes.getSelectedIds(relBox);
+          if (!releaseIds.length) { alert('Tick at least one affected Oreon release.'); return; }
 
           if (createStatus) createStatus.textContent = 'Creating...';
           api.post('/security/advisories/custom', {
