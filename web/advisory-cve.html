@@ -62,10 +62,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           return JSON.parse(json);
         } catch (e) { return null; }
       }
-      function isAdmin() {
+      function canManageAdvisories() {
         if (!api.token) return false;
         var p = decodeJwt(api.token);
-        return !!(p && p.role === 'admin');
+        return !!(p && (p.role === 'admin' || p.role === 'maintainer'));
       }
       function isAuthed() {
         return !!(api.token && api.token.length > 0);
@@ -126,7 +126,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           '<div style="margin-top:0.75rem;"><span style="font-weight:600;">Affected Oreon releases</span> ' + esc(releases || '-') + '</div>' +
           resolutionBlock;
 
-        if (!handled && isAdmin()) {
+        if (!handled && canManageAdvisories()) {
           var wrap = document.createElement('div');
           wrap.className = 'form-group';
           wrap.style.marginTop = '0.75rem';
