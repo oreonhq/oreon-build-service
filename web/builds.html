@@ -712,6 +712,7 @@
         var batchBody = {
           release_id: selectedReleaseIdNew,
           architectures: arches,
+          skip_complete_arches: false,
           packages: selected.map(function(cb) {
             return { name: cb.dataset.name, spec_path: cb.dataset.spec || '' };
           })
@@ -1127,6 +1128,7 @@
         var batchBody = {
           release_id: selectedReleaseIdNew,
           architectures: arches,
+          skip_complete_arches: false,
           packages: pkgNames.map(function(pkgName) {
             return { name: pkgName, spec_path: releasename + '/' + pkgName + '/' + pkgName + '.spec' };
           })

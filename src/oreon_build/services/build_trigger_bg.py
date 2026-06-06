@@ -69,6 +69,9 @@ async def run_distgit_batch(payload: dict[str, Any], user_id: int, ip: str | Non
         dg_url = (data.distgit_url or "https://github.com/oreonhq/rpm-specfiles.git").strip()
         dg_branch = (data.distgit_branch or "main").strip()
 
+        queued = 0
+        skipped = 0
+        failed: list[str] = []
         for item in data.packages:
             pkg_name = (item.name or "").strip()
             if not pkg_name:
@@ -92,7 +95,7 @@ async def run_distgit_batch(payload: dict[str, Any], user_id: int, ip: str | Non
                 skip_complete_arches=data.skip_complete_arches,
             )
             try:
-                await execute_build_trigger(
+                jobs = await execute_build_trigger(
                     db,
                     user,
                     trigger,
@@ -101,13 +104,26 @@ async def run_distgit_batch(payload: dict[str, Any], user_id: int, ip: str | Non
                     user_agent=ua,
                 )
                 await db.commit()
-            except Exception:
+                if jobs:
+                    queued += 1
+                else:
+                    skipped += 1
+            except Exception as e:
                 await db.rollback()
+                failed.append(f"{pkg_name}: {e}")
                 logger.exception(
                     "distgit batch package=%s release_id=%s failed",
                     pkg_name,
                     data.release_id,
                 )
+        if queued or skipped or failed:
+            logger.info(
+                "distgit batch release_id=%s queued=%s skipped=%s failed=%s",
+                data.release_id,
+                queued,
+                skipped,
+                len(failed),
+            )
 
 
 async def run_single_trigger(payload: dict[str, Any], user_id: int, ip: str | None, ua: str) -> None:

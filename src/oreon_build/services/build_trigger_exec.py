@@ -47,6 +47,31 @@ def infer_github_html_url_from_new_package(np) -> str | None:
     return base
 
 
+async def _sync_distgit_source(
+    db: Any,
+    *,
+    package_version_id: int,
+    source_url: str,
+) -> None:
+    want = (source_url or "").strip()
+    if not want:
+        return
+    row = await db.execute(
+        select(Source)
+        .where(
+            Source.package_version_id == package_version_id,
+            Source.kind == "distgit",
+        )
+        .limit(1)
+    )
+    src = row.scalar_one_or_none()
+    if src is None:
+        db.add(Source(package_version_id=package_version_id, kind="distgit", url=want))
+    elif (src.url or "").strip() != want:
+        src.url = want
+    await db.flush()
+
+
 async def execute_build_trigger(
     db: Any,
     user: "Account",
@@ -57,13 +82,16 @@ async def execute_build_trigger(
     user_agent: str | None = None,
 ) -> list[BuildJob]:
     package_id: int
+    package_name: str | None = None
     package_version_id: int | None = data.package_version_id
     preferred_mock_environment_id: int | None = None
+    account_id = user.id
     ip = ip_address if ip_address is not None else (get_client_ip(request) if request else None)
     ua = user_agent if user_agent is not None else (get_user_agent(request) if request else "api")
 
     if data.new_package:
         np = data.new_package
+        package_name = np.name
         if np.preferred_mock_environment_id:
             me_r = await db.execute(select(MockEnvironment).where(MockEnvironment.id == np.preferred_mock_environment_id))
             me = me_r.scalar_one_or_none()
@@ -76,6 +104,7 @@ async def execute_build_trigger(
         existing_pkg = existing_r.scalar_one_or_none()
         if existing_pkg:
             package_id = existing_pkg.id
+            package_name = existing_pkg.name
             preferred_mock_environment_id = (
                 existing_pkg.preferred_mock_environment_id
                 if existing_pkg.preferred_mock_environment_id
@@ -109,7 +138,7 @@ async def execute_build_trigger(
             await log_audit(
                 db,
                 "package.create",
-                account_id=user.id,
+                account_id=account_id,
                 resource_type="package",
                 resource_id=str(pkg.id),
                 details=np.name,
@@ -125,6 +154,7 @@ async def execute_build_trigger(
         pkg = rp.scalar_one_or_none()
         if not pkg:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Package not found")
+        package_name = pkg.name
         preferred_mock_environment_id = pkg.preferred_mock_environment_id if pkg.preferred_mock_environment_id else None
 
     rr = await db.execute(select(Release).where(Release.id == data.release_id))
@@ -138,6 +168,17 @@ async def execute_build_trigger(
 
     if package_version_id is None:
         package_version_id = await latest_package_version_id(db, package_id)
+
+    if data.new_package:
+        np = data.new_package
+        primary_url = source_url_from_new_package(np)
+        if primary_url and np.source_type.value == "distgit":
+            if package_version_id is None:
+                pv = PackageVersion(package_id=package_id, version=np.version or "0.0.1")
+                db.add(pv)
+                await db.flush()
+                package_version_id = pv.id
+            await _sync_distgit_source(db, package_version_id=package_version_id, source_url=primary_url)
 
     architectures = data.architectures or DEFAULT_ARCHITECTURES
     if not architectures:
@@ -172,7 +213,7 @@ async def execute_build_trigger(
             package_version_id=package_version_id,
             status=BuildStatus.PENDING,
             priority=data.priority,
-            triggered_by_id=user.id,
+            triggered_by_id=account_id,
             branch=publish_branch,
         )
         db.add(job)
@@ -190,23 +231,26 @@ async def execute_build_trigger(
                 "Enroll a worker for at least one selected arch or fix its architecture field."
             )
             logger.warning(
-                "build.trigger rejected release_id=%s package_id=%s %s",
+                "build.trigger rejected release_id=%s package=%s package_id=%s %s",
                 data.release_id,
+                package_name or "?",
                 package_id,
                 detail,
             )
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
         logger.info(
-            "build.trigger skip_all_already_ok release_id=%s package_id=%s requested=%s",
+            "build.trigger skip_all_already_ok release_id=%s package=%s package_id=%s requested=%s skip_complete=%s",
             data.release_id,
+            package_name or "?",
             package_id,
             req_norm,
+            data.skip_complete_arches,
         )
     for job in jobs_created:
         await log_audit(
             db,
             "build.trigger",
-            account_id=user.id,
+            account_id=account_id,
             resource_type="build_job",
             resource_id=str(job.id),
             details=f"package_id={package_id} release_id={data.release_id}",

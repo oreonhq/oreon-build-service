@@ -429,7 +429,10 @@ class DistgitBatchTrigger(BaseModel):
     distgit_url: Optional[str] = Field(None, max_length=1024)
     distgit_branch: Optional[str] = Field(None, max_length=128)
     priority: int = 0
-    skip_complete_arches: bool = True
+    skip_complete_arches: bool = Field(
+        default=False,
+        description="If true, skip arches that already have a successful build for this package and release.",
+    )
 
 
 class ChainStatusResponse(BaseModel):

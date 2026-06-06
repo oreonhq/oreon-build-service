@@ -2,7 +2,7 @@
 import logging
 import uuid
 
-from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Query, Request, UploadFile, status
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import JSONResponse
 
 from oreon_build.utils.spec import name_from_srpm_filename, parse_spec_content
@@ -627,10 +627,9 @@ async def trigger_chain_build_endpoint(
     request: Request,
     db: DbSession,
     user: CurrentUser,
-    background_tasks: BackgroundTasks,
 ):
     from oreon_build.services.build_chain import trigger_chain_build as run_chain_build
-    from oreon_build.services.build_trigger_bg import run_chain_trigger_enqueue
+    from oreon_build.services.build_trigger_bg import run_chain_trigger_enqueue, spawn
 
     chain, _, _ = await run_chain_build(
         db,
@@ -645,7 +644,8 @@ async def trigger_chain_build_endpoint(
         priority=data.priority,
         defer_enqueue=True,
     )
-    background_tasks.add_task(run_chain_trigger_enqueue, chain.id)
+    await db.commit()
+    spawn(run_chain_trigger_enqueue(chain.id))
     stages_raw = chain.stages_json if isinstance(chain.stages_json, list) else []
     stages: list[list[str]] = [[str(n) for n in grp] for grp in stages_raw if isinstance(grp, list)]
     return ChainBuildTriggerResponse(
