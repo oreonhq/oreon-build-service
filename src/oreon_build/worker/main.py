@@ -1458,6 +1458,23 @@ def _maybe_git_lfs_pull(repo_dir: Path) -> tuple[int, str]:
     return 0, ""
 
 
+_SPECTOOL_LIST_ENTRY = re.compile(
+    r"^(?:Source|Patch)(\d+)(?:\s*\([^)]+\))?:\s*(.+)$",
+    re.IGNORECASE,
+)
+
+
+def _parse_spectool_list_entry(line: str) -> str | None:
+    """Return the path or URL from a spectool -l Source/Patch line, else None."""
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    m = _SPECTOOL_LIST_ENTRY.match(line)
+    if not m:
+        return None
+    return m.group(2).strip()
+
+
 def _copy_local_spec_sources_listed_by_spectool(spec_path: Path, staging_dir: Path) -> tuple[bool, str]:
     """
     Copy Source/Patch files that live next to the spec (distgit layout).
@@ -1480,13 +1497,7 @@ def _copy_local_spec_sources_listed_by_spectool(spec_path: Path, staging_dir: Pa
     copied: list[str] = []
     missing: list[str] = []
     for line in out.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if ":" not in line:
-            continue
-        _, _, rest = line.partition(":")
-        rest = rest.strip()
+        rest = _parse_spectool_list_entry(line)
         if not rest:
             continue
         low = rest.lower()
@@ -1600,11 +1611,9 @@ def _collect_url_source_basenames_from_spectool_list(spec_path: Path) -> list[st
 
     basenames: list[str] = []
     for line in out.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or ":" not in line:
+        rest = _parse_spectool_list_entry(line)
+        if not rest:
             continue
-        _, _, rest = line.partition(":")
-        rest = rest.strip()
         low = rest.lower()
         if low.startswith(("http://", "https://", "ftp://")):
             basenames.append(Path(rest.rstrip("/")).name)
