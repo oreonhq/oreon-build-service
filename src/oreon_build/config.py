@@ -369,10 +369,10 @@ class Settings(BaseSettings):
         description="Fail RUNNING attempts older than this many minutes (0 = disable). Default 7 days.",
     )
     build_stale_worker_heartbeat_minutes: int = Field(
-        default=120,
+        default=7200,
         ge=0,
-        le=1440,
-        description="Fail RUNNING attempts whose worker last_heartbeat is older than this (0 = disable).",
+        le=43200,
+        description="Fail RUNNING attempts whose worker last_heartbeat is older than this (0 = disable). Default 5 days.",
     )
     build_stale_pending_minutes: int = Field(
         default=10080,
