@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
 from oreon_build.core.repo_branch import default_repo_branch_segment
@@ -35,15 +35,28 @@ SPEC_NOT_FOUND_MARKER = "Spec not found:"
 async def find_dead_packages(db: Any) -> list[dict[str, Any]]:
     from oreon_build.models import BuildStatus
 
-    rows = await db.execute(
-        select(BuildJob.package_id, BuildAttempt.error_message)
-        .join(BuildAttempt, BuildAttempt.build_job_id == BuildJob.id)
-        .where(
-            BuildAttempt.status == BuildStatus.FAILED,
-            BuildAttempt.error_message.isnot(None),
-            BuildAttempt.error_message.ilike(f"%{SPEC_NOT_FOUND_MARKER}%"),
+    rn = func.row_number().over(
+        partition_by=BuildJob.package_id,
+        order_by=BuildAttempt.id.desc(),
+    ).label("rn")
+    latest = (
+        select(
+            BuildJob.package_id,
+            BuildAttempt.error_message,
+            BuildAttempt.status,
+            rn,
         )
-        .order_by(BuildAttempt.id.desc())
+        .join(BuildAttempt, BuildAttempt.build_job_id == BuildJob.id)
+        .where(BuildJob.package_id.isnot(None))
+        .subquery()
+    )
+    rows = await db.execute(
+        select(latest.c.package_id, latest.c.error_message).where(
+            latest.c.rn == 1,
+            latest.c.status == BuildStatus.FAILED,
+            latest.c.error_message.isnot(None),
+            latest.c.error_message.ilike(f"%{SPEC_NOT_FOUND_MARKER}%"),
+        )
     )
     seen: set[int] = set()
     out: list[dict[str, Any]] = []
