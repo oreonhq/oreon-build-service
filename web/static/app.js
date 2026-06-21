@@ -363,7 +363,6 @@ var OREON_NAV_ITEMS = [
   { href: '/mock-environments.html', label: 'Mock Environments', match: function(p) { return p === '/mock-environments.html'; } },
   { href: '/repos.html', label: 'Repositories', match: function(p) { return p === '/repos.html'; } },
   { href: '/promotions.html', label: 'Promotions', match: function(p) { return p === '/promotions.html'; } },
-  { href: '/dependencies.html', label: 'Dependencies', auth: true, match: function(p) { return p === '/dependencies.html'; } },
   { href: '/admin.html', label: 'Administration', match: function(p) { return p === '/admin.html'; } },
 ];
 
