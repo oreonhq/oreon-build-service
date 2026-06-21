@@ -156,82 +156,38 @@ def _build_job_search_clause(search_trim: str):
 
 
 @router.get("/current-failures", response_model=list[CurrentFailureItem])
-async def list_current_failures(db: DbSession):
+async def list_current_failures(
+    db: DbSession,
+    chain_only: bool = Query(False, description="Only jobs that were part of a chain build"),
+):
     """
-    Jobs whose **latest** row per (package, release, target) is ``failed``.
+    Jobs whose **latest** row per (package, release, architecture) is ``failed``.
 
     Older successful or failed jobs for the same slot are ignored so this reflects only what
     still needs attention today.
     """
-    ranked = (
-        select(
-            BuildJob.id.label("job_id"),
-            func.row_number()
-            .over(
-                partition_by=(
-                    BuildJob.package_id,
-                    BuildJob.release_id,
-                    func.coalesce(BuildJob.target_id, -1),
-                ),
-                order_by=BuildJob.id.desc(),
-            )
-            .label("rn"),
-        )
-        .subquery()
-    )
-    stmt = (
-        select(BuildJob, Package.name, Release.releasename)
-        .join(ranked, BuildJob.id == ranked.c.job_id)
-        .join(Package, Package.id == BuildJob.package_id)
-        .join(Release, Release.id == BuildJob.release_id)
-        .where(ranked.c.rn == 1)
-        .where(BuildJob.status == BuildStatus.FAILED)
-        .order_by(BuildJob.completed_at.desc().nullslast(), BuildJob.id.desc())
-    )
-    result = await db.execute(stmt)
-    rows = result.all()
-    if not rows:
-        return []
+    from oreon_build.services.current_build_failures import fetch_current_failure_rows
 
-    jobs: list[BuildJob] = [r[0] for r in rows]
-    job_ids = [j.id for j in jobs]
-    att_rows = await db.execute(
-        select(BuildAttempt)
-        .where(BuildAttempt.build_job_id.in_(job_ids))
-        .order_by(BuildAttempt.build_job_id.asc(), BuildAttempt.id.desc())
-    )
-    latest_by_job: dict[int, BuildAttempt] = {}
-    for att in att_rows.scalars().all():
-        if att.build_job_id not in latest_by_job:
-            latest_by_job[att.build_job_id] = att
-
-    tid_set = {j.target_id for j in jobs if j.target_id}
-    arch_map: dict[int, str] = {}
-    if tid_set:
-        ar = await db.execute(
-            select(BuildTarget.id, BuildTarget.architecture).where(BuildTarget.id.in_(tid_set))
-        )
-        for tid, architecture in ar.all():
-            arch_map[int(tid)] = architecture
-
+    rows = await fetch_current_failure_rows(db, chain_only=chain_only)
     out: list[CurrentFailureItem] = []
-    for job, pkg_name, rel_name in rows:
-        arch = arch_map.get(job.target_id) if job.target_id else None
-        att = latest_by_job.get(job.id)
+    for row in rows:
+        job = row.job
+        att = row.latest_attempt
         out.append(
             CurrentFailureItem(
                 id=job.id,
                 package_id=job.package_id,
-                package_name=pkg_name or "",
+                package_name=row.package_name,
                 release_id=job.release_id,
-                release_name=rel_name or "",
+                release_name=row.release_name,
                 target_id=job.target_id,
-                architecture=arch,
+                architecture=row.architecture,
                 package_version_id=job.package_version_id,
                 status=job.status.value,
                 priority=job.priority,
                 created_at=job.created_at,
                 completed_at=job.completed_at,
+                chain_id=job.chain_id,
                 last_attempt_id=att.id if att else None,
                 last_error_message=(att.error_message[:2000] if att and att.error_message else None),
             )
