@@ -457,6 +457,7 @@ class CurrentFailureItem(BaseModel):
     priority: int
     created_at: datetime
     completed_at: Optional[datetime] = None
+    chain_id: Optional[int] = None
     last_attempt_id: Optional[int] = None
     last_error_message: Optional[str] = None
 
