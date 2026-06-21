@@ -205,7 +205,7 @@
           return api.get('/packages/dead').then(function(dead) {
             var list = Array.isArray(dead) ? dead : [];
             if (!list.length) {
-              alert('No dead packages found (nothing failed with Spec not found).');
+              alert('No dead packages found (latest build did not fail with Spec not found).');
               return;
             }
             var preview = list.slice(0, 12).map(function(p) { return p.name; }).join(', ');
