@@ -108,8 +108,7 @@ class ReleaseResponse(BaseModel):
 
 
 # --- Mock environment ---
-# Mock ``--addrepo`` lines: additional (misc) + lookaside (bootstrap) combined cap.
-_MOCK_REPO_MAX_COMBINED = 32
+_MOCK_REPO_MAX = 32
 
 
 def _validate_mock_repo_url_list(
@@ -136,7 +135,7 @@ def _validate_mock_repo_url_list(
 
 def _validate_mock_additional_repo_urls(v: object, *, allow_none: bool) -> Optional[List[str]]:
     return _validate_mock_repo_url_list(
-        v, allow_none=allow_none, per_field_cap=_MOCK_REPO_MAX_COMBINED
+        v, allow_none=allow_none, per_field_cap=_MOCK_REPO_MAX
     )
 
 
@@ -145,11 +144,7 @@ class MockEnvironmentCreate(BaseModel):
     name: str = Field(..., max_length=128)
     config_name: str = Field(..., max_length=128, description="Base config name; at build time worker uses <config_name>-<arch>")
     config_content: Optional[str] = None
-    additional_repo_urls: List[str] = Field(default_factory=list, description="Extra mock --addrepo URLs (before lookaside).")
-    lookaside_repo_urls: List[str] = Field(
-        default_factory=list,
-        description="Bootstrap / Fedora lookaside; appended after additional_repo_urls for mock --addrepo.",
-    )
+    additional_repo_urls: List[str] = Field(default_factory=list, description="Extra mock --addrepo URLs")
     is_available: bool = True
     priority: int = 0
 
@@ -159,30 +154,12 @@ class MockEnvironmentCreate(BaseModel):
         out = _validate_mock_additional_repo_urls(v, allow_none=False)
         return list(out) if out is not None else []
 
-    @field_validator("lookaside_repo_urls", mode="before")
-    @classmethod
-    def _repos_create_lookaside(cls, v: object) -> List[str]:
-        out = _validate_mock_repo_url_list(
-            v, allow_none=False, per_field_cap=_MOCK_REPO_MAX_COMBINED
-        )
-        return list(out) if out is not None else []
-
-    @model_validator(mode="after")
-    def _combined_addrepo_limit(self) -> "MockEnvironmentCreate":
-        a, b = self.additional_repo_urls, self.lookaside_repo_urls
-        if len(a) + len(b) > _MOCK_REPO_MAX_COMBINED:
-            raise ValueError(
-                f"additional_repo_urls and lookaside_repo_urls combined may have at most {_MOCK_REPO_MAX_COMBINED} entries"
-            )
-        return self
-
 
 class MockEnvironmentUpdate(BaseModel):
     name: Optional[str] = None
     config_name: Optional[str] = None
     config_content: Optional[str] = None
     additional_repo_urls: Optional[List[str]] = None
-    lookaside_repo_urls: Optional[List[str]] = None
     is_available: Optional[bool] = None
     priority: Optional[int] = None
 
@@ -193,15 +170,6 @@ class MockEnvironmentUpdate(BaseModel):
             return None
         return _validate_mock_additional_repo_urls(v, allow_none=False)
 
-    @field_validator("lookaside_repo_urls", mode="before")
-    @classmethod
-    def _repos_update_lookaside(cls, v: object) -> Optional[List[str]]:
-        if v is None:
-            return None
-        return _validate_mock_repo_url_list(
-            v, allow_none=False, per_field_cap=_MOCK_REPO_MAX_COMBINED
-        )
-
 
 class MockEnvironmentResponse(BaseModel):
     id: int
@@ -210,7 +178,6 @@ class MockEnvironmentResponse(BaseModel):
     config_name: str
     architecture: Optional[str] = None
     additional_repo_urls: List[str] = Field(default_factory=list)
-    lookaside_repo_urls: List[str] = Field(default_factory=list)
     is_available: bool
     priority: int
     created_at: datetime
