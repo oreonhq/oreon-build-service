@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, select
 
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
 from oreon_build.core.repo_branch import default_repo_branch_segment
@@ -22,6 +22,10 @@ from oreon_build.models import (
     RpmCompleteLock,
     Source,
 )
+from oreon_build.services.current_build_failures import (
+    fetch_current_failure_rows,
+    is_spec_not_found_error,
+)
 from oreon_build.services.r2 import get_r2_client, repo_rpms_key, src_r2_key
 
 if TYPE_CHECKING:
@@ -29,52 +33,24 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-SPEC_NOT_FOUND_MARKER = "Spec not found:"
-
 
 async def find_dead_packages(db: Any) -> list[dict[str, Any]]:
-    from oreon_build.models import BuildStatus
-
-    rn = func.row_number().over(
-        partition_by=BuildJob.package_id,
-        order_by=BuildAttempt.id.desc(),
-    ).label("rn")
-    latest = (
-        select(
-            BuildJob.package_id,
-            BuildAttempt.error_message,
-            BuildAttempt.status,
-            rn,
-        )
-        .join(BuildAttempt, BuildAttempt.build_job_id == BuildJob.id)
-        .where(BuildJob.package_id.isnot(None))
-        .subquery()
-    )
-    rows = await db.execute(
-        select(latest.c.package_id, latest.c.error_message).where(
-            latest.c.rn == 1,
-            latest.c.status == BuildStatus.FAILED,
-            latest.c.error_message.isnot(None),
-            latest.c.error_message.ilike(f"%{SPEC_NOT_FOUND_MARKER}%"),
-        )
-    )
+    rows = await fetch_current_failure_rows(db)
     seen: set[int] = set()
     out: list[dict[str, Any]] = []
-    for package_id, err in rows.all():
-        if package_id is None:
+    for row in rows:
+        att = row.latest_attempt
+        err = att.error_message if att else None
+        if not is_spec_not_found_error(err):
             continue
-        pid = int(package_id)
+        pid = int(row.job.package_id)
         if pid in seen:
             continue
         seen.add(pid)
-        pkg_r = await db.execute(select(Package.id, Package.name).where(Package.id == pid))
-        row = pkg_r.one_or_none()
-        if not row:
-            continue
         sample = (err or "").strip()
         if len(sample) > 512:
             sample = sample[:509] + "..."
-        out.append({"id": pid, "name": row[1], "sample_error": sample or None})
+        out.append({"id": pid, "name": row.package_name, "sample_error": sample or None})
     out.sort(key=lambda x: (x["name"] or "").lower())
     return out
 
