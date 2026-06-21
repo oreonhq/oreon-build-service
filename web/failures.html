@@ -24,7 +24,7 @@
   <main class="main">
     <section class="card">
       <h2>Failures</h2>
-      <p class="failures-hint">Shows only slots where the <strong>latest</strong> job for that package, release, and architecture is failed. If you retry and it succeeds, it drops off this list. Older failed or successful jobs do not affect the row.</p>
+      <p class="failures-hint">Shows only slots where the <strong>latest</strong> job for that package, release, and architecture is failed. Retries on the same arch replace the slot even if mock env changed. Older jobs do not affect the row.</p>
       <p style="margin-top:0.75rem;">
         <button type="button" class="btn" id="btn-refresh-failures">Refresh</button>
       </p>
@@ -45,6 +45,27 @@
         </table>
       </div>
     </section>
+    <section class="card" style="margin-top:1.25rem;">
+      <h2>Chain build failures</h2>
+      <p class="failures-hint">Same latest-per-arch rule, but only for jobs that were part of a chain build.</p>
+      <div id="chain-failures-status" class="failures-hint">Loading</div>
+      <div id="chain-failures-table-wrap" style="display:none;">
+        <table class="failures-table" id="chain-failures-table">
+          <thead>
+            <tr>
+              <th>Job</th>
+              <th>Package</th>
+              <th>Release</th>
+              <th>Arch</th>
+              <th>Chain</th>
+              <th>Completed</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="chain-failures-tbody"></tbody>
+        </table>
+      </div>
+    </section>
   </main>
   <footer class="footer">Oreon Build Service</footer>
   <script src="/static/app.js?v=13"></script>
@@ -56,67 +77,96 @@
         d.textContent = s == null ? '' : String(s);
         return d.innerHTML;
       }
+      function renderFailureRows(rows, tbody, opts) {
+        opts = opts || {};
+        var showChain = !!opts.showChain;
+        tbody.innerHTML = rows.map(function(r) {
+          var completed = r.completed_at ? r.completed_at.slice(0, 19).replace('T', ' ') : '—';
+          var aid = r.last_attempt_id;
+          var logBtn = aid
+            ? '<button type="button" class="btn failure-log-btn" data-attempt-id="' + encodeURIComponent(aid) + '">Log</button>'
+            : '<button type="button" class="btn" disabled title="No attempt id">Log</button>';
+          var chainCell = showChain
+            ? '<td>' + (r.chain_id != null ? escapeHtml(String(r.chain_id)) : '—') + '</td>'
+            : '';
+          return '<tr class="failure-main">' +
+            '<td>' + escapeHtml(String(r.id)) + '</td>' +
+            '<td>' + escapeHtml(r.package_name || '') + ' <span class="failures-hint">(' + r.package_id + ')</span></td>' +
+            '<td>' + escapeHtml(r.release_name || '') + ' <span class="failures-hint">(' + r.release_id + ')</span></td>' +
+            '<td>' + escapeHtml(r.architecture || '—') + '</td>' +
+            chainCell +
+            '<td>' + escapeHtml(completed) + '</td>' +
+            '<td><div class="failure-actions"><a href="/build.html?job_id=' + encodeURIComponent(r.id) + '">View</a>' + logBtn + '</div></td>' +
+            '</tr>' +
+            '<tr class="failure-log-expand" style="display:none">' +
+            '<td colspan="' + (showChain ? '7' : '6') + '"><pre class="log-viewer failure-log-pre"></pre></td>' +
+            '</tr>';
+        }).join('');
+        bindFailureLogButtons(tbody);
+      }
+      function bindFailureLogButtons(tbody) {
+        tbody.querySelectorAll('.failure-log-btn').forEach(function(btn) {
+          btn.addEventListener('click', function() {
+            var attemptId = btn.getAttribute('data-attempt-id');
+            if (!attemptId) return;
+            var mainRow = btn.closest('tr.failure-main');
+            var expand = mainRow && mainRow.nextElementSibling;
+            if (!expand || !expand.classList.contains('failure-log-expand')) return;
+            var pre = expand.querySelector('.failure-log-pre');
+            if (!pre) return;
+            if (pre.dataset.loaded === '1') {
+              expand.style.display = expand.style.display === 'none' ? 'table-row' : 'none';
+              return;
+            }
+            var fetchLog = function() {
+              return api.get('/logs/attempts/' + attemptId + '/tail?lines=2000').then(function(resp) {
+                var lines = (resp && resp.lines) ? resp.lines : [];
+                pre.textContent = lines.join('\n') || '(empty log)';
+                pre.dataset.loaded = '1';
+                expand.style.display = 'table-row';
+              }).catch(function(e) {
+                pre.textContent = 'Log not available: ' + (e && e.message ? e.message : 'Log not uploaded or missing in storage.');
+                pre.dataset.loaded = '1';
+                expand.style.display = 'table-row';
+              });
+            };
+            if (window.oreonWithLoading) window.oreonWithLoading(btn, fetchLog);
+            else fetchLog();
+          });
+        });
+      }
       function loadFailures() {
         var statusEl = document.getElementById('failures-status');
         var wrap = document.getElementById('failures-table-wrap');
         var tbody = document.getElementById('failures-tbody');
+        var chainStatusEl = document.getElementById('chain-failures-status');
+        var chainWrap = document.getElementById('chain-failures-table-wrap');
+        var chainTbody = document.getElementById('chain-failures-tbody');
         statusEl.textContent = 'Loading';
+        chainStatusEl.textContent = 'Loading';
         wrap.style.display = 'none';
+        chainWrap.style.display = 'none';
         tbody.innerHTML = '';
-        api.get('/builds/current-failures').then(function(rows) {
-          if (!Array.isArray(rows)) rows = [];
-          statusEl.textContent = rows.length ? (rows.length + ' package slot(s) need attention.') : 'No current failures. Every latest job per package or release or arch is not in failed state.';
-          if (!rows.length) return;
-          wrap.style.display = 'block';
-          tbody.innerHTML = rows.map(function(r) {
-            var completed = r.completed_at ? r.completed_at.slice(0, 19).replace('T', ' ') : '—';
-            var aid = r.last_attempt_id;
-            var logBtn = aid
-              ? '<button type="button" class="btn failure-log-btn" data-attempt-id="' + encodeURIComponent(aid) + '">Log</button>'
-              : '<button type="button" class="btn" disabled title="No attempt id">Log</button>';
-            return '<tr class="failure-main">' +
-              '<td>' + escapeHtml(String(r.id)) + '</td>' +
-              '<td>' + escapeHtml(r.package_name || '') + ' <span class="failures-hint">(' + r.package_id + ')</span></td>' +
-              '<td>' + escapeHtml(r.release_name || '') + ' <span class="failures-hint">(' + r.release_id + ')</span></td>' +
-              '<td>' + escapeHtml(r.architecture || '—') + '</td>' +
-              '<td>' + escapeHtml(completed) + '</td>' +
-              '<td><div class="failure-actions"><a href="/build.html?job_id=' + encodeURIComponent(r.id) + '">View</a>' + logBtn + '</div></td>' +
-              '</tr>' +
-              '<tr class="failure-log-expand" style="display:none">' +
-              '<td colspan="6"><pre class="log-viewer failure-log-pre"></pre></td>' +
-              '</tr>';
-          }).join('');
-          tbody.querySelectorAll('.failure-log-btn').forEach(function(btn) {
-            btn.addEventListener('click', function() {
-              var attemptId = btn.getAttribute('data-attempt-id');
-              if (!attemptId) return;
-              var mainRow = btn.closest('tr.failure-main');
-              var expand = mainRow && mainRow.nextElementSibling;
-              if (!expand || !expand.classList.contains('failure-log-expand')) return;
-              var pre = expand.querySelector('.failure-log-pre');
-              if (!pre) return;
-              if (pre.dataset.loaded === '1') {
-                expand.style.display = expand.style.display === 'none' ? 'table-row' : 'none';
-                return;
-              }
-              var fetchLog = function() {
-                return api.get('/logs/attempts/' + attemptId + '/tail?lines=2000').then(function(resp) {
-                  var lines = (resp && resp.lines) ? resp.lines : [];
-                  pre.textContent = lines.join('\n') || '(empty log)';
-                  pre.dataset.loaded = '1';
-                  expand.style.display = 'table-row';
-                }).catch(function(e) {
-                  pre.textContent = 'Log not available: ' + (e && e.message ? e.message : 'Log not uploaded or missing in storage.');
-                  pre.dataset.loaded = '1';
-                  expand.style.display = 'table-row';
-                });
-              };
-              if (window.oreonWithLoading) window.oreonWithLoading(btn, fetchLog);
-              else fetchLog();
-            });
-          });
+        chainTbody.innerHTML = '';
+        return Promise.all([
+          api.get('/builds/current-failures'),
+          api.get('/builds/current-failures?chain_only=true')
+        ]).then(function(parts) {
+          var rows = Array.isArray(parts[0]) ? parts[0] : [];
+          var chainRows = Array.isArray(parts[1]) ? parts[1] : [];
+          statusEl.textContent = rows.length ? (rows.length + ' package slot(s) need attention.') : 'No current failures.';
+          chainStatusEl.textContent = chainRows.length ? (chainRows.length + ' chain slot(s) still failed.') : 'No current chain build failures.';
+          if (rows.length) {
+            wrap.style.display = 'block';
+            renderFailureRows(rows, tbody, { showChain: false });
+          }
+          if (chainRows.length) {
+            chainWrap.style.display = 'block';
+            renderFailureRows(chainRows, chainTbody, { showChain: true });
+          }
         }).catch(function(e) {
           statusEl.textContent = 'Could not load failures: ' + (e && e.message ? e.message : String(e));
+          chainStatusEl.textContent = '';
         });
       }
       document.getElementById('btn-refresh-failures').addEventListener('click', function() {
