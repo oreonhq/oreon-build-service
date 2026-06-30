@@ -315,29 +315,101 @@ def _mock_log_mtime(path: Path) -> float:
         return 0.0
 
 
-def _read_inprogress_mock_build_log_snippet(result_dir: Path, max_bytes: int = 4 * 1024 * 1024) -> str:
+def _mock_chroot_result_dir(mock_config: str, mock_unique_ext: str | None) -> Path | None:
+    name = (mock_config or "").strip()
+    if name.endswith(".cfg"):
+        name = name[:-4]
+    if not name:
+        return None
+    if mock_unique_ext:
+        name = f"{name}-{mock_unique_ext}"
+    p = Path("/var/lib/mock") / name / "result"
+    return p if p.is_dir() else None
+
+
+def _mock_result_search_dirs(
+    result_dir: Path,
+    *,
+    mock_config: str | None = None,
+    mock_unique_ext: str | None = None,
+) -> list[Path]:
+    dirs: list[Path] = []
+    seen: set[str] = set()
+    for candidate in (result_dir,):
+        if not candidate:
+            continue
+        try:
+            key = str(candidate.resolve())
+        except OSError:
+            key = str(candidate)
+        if key in seen:
+            continue
+        if candidate.is_dir():
+            seen.add(key)
+            dirs.append(candidate)
+    if mock_config:
+        chroot_result = _mock_chroot_result_dir(mock_config, mock_unique_ext)
+        if chroot_result:
+            try:
+                key = str(chroot_result.resolve())
+            except OSError:
+                key = str(chroot_result)
+            if key not in seen and chroot_result.is_dir():
+                seen.add(key)
+                dirs.append(chroot_result)
+    return dirs
+
+
+def _read_inprogress_mock_build_log_snippet(
+    result_dir: Path,
+    max_bytes: int = 4 * 1024 * 1024,
+    *,
+    mock_config: str | None = None,
+    mock_unique_ext: str | None = None,
+) -> str:
     """
     Prefer the *newest* build.log under resultdir (mock can leave older nested paths).
     During ``mock --rebuild``, dnf often streams to **root.log** while **build.log** still
     shows the finished ``rpmbuild -bs`` block for a long time, so include **root.log** too.
     """
     chunks: list[str] = []
+    search_dirs = _mock_result_search_dirs(
+        result_dir,
+        mock_config=mock_config,
+        mock_unique_ext=mock_unique_ext,
+    )
+    if not search_dirs:
+        return ""
 
-    try:
-        build_logs = [p for p in result_dir.rglob("build.log") if p.is_file()]
-    except OSError:
-        build_logs = []
+    build_logs: list[Path] = []
+    root_logs: list[Path] = []
+    for rd in search_dirs:
+        _make_mock_resultdir_world_readable(rd)
+        try:
+            build_logs.extend(p for p in rd.rglob("build.log") if p.is_file())
+        except OSError:
+            pass
+        rp = rd / "root.log"
+        if rp.is_file():
+            root_logs.append(rp)
+        try:
+            root_logs.extend(p for p in rd.rglob("root.log") if p.is_file())
+        except OSError:
+            pass
+
     if build_logs:
         bl_path = max(build_logs, key=_mock_log_mtime)
         try:
             data = bl_path.read_bytes()
         except OSError:
             data = b""
-        rel = ""
+        rel = bl_path.name
         try:
-            rel = str(bl_path.relative_to(result_dir))
+            for rd in search_dirs:
+                rel = str(bl_path.relative_to(rd))
+                break
         except ValueError:
-            rel = bl_path.name
+            pass
         if len(data) > max_bytes:
             data = data[-max_bytes:]
             head = f"## build.log (newest, tail only) — {rel}\n\n[truncated first bytes]\n\n"
@@ -345,14 +417,6 @@ def _read_inprogress_mock_build_log_snippet(result_dir: Path, max_bytes: int = 4
             head = f"## build.log (newest) — {rel}\n\n"
         chunks.append(head + data.decode("utf-8", errors="replace"))
 
-    root_logs: list[Path] = []
-    rp = result_dir / "root.log"
-    if rp.is_file():
-        root_logs.append(rp)
-    try:
-        root_logs.extend(p for p in result_dir.rglob("root.log") if p.is_file())
-    except OSError:
-        pass
     root_logs = list({p.resolve(): p for p in root_logs}.values())
     if root_logs:
         rr_path = max(root_logs, key=_mock_log_mtime)
@@ -377,22 +441,43 @@ def _start_live_build_log_snapshot_thread(
     attempt_id: int,
     result_dir: Path,
     stop_flag: threading.Event,
+    *,
+    log_prefix_getter: Callable[[], str] | None = None,
+    mock_config: str | None = None,
+    mock_unique_ext: str | None = None,
 ) -> None:
     interval = _live_log_interval_sec()
     if interval <= 0:
         return
 
     def runner() -> None:
-        while not stop_flag.wait(timeout=interval):
+        first = True
+        while True:
+            wait_s = 0.0 if first else float(interval)
+            first = False
+            if stop_flag.wait(timeout=wait_s):
+                break
             try:
-                snippet = _read_inprogress_mock_build_log_snippet(result_dir)
-                if not snippet.strip():
+                snippet = _read_inprogress_mock_build_log_snippet(
+                    result_dir,
+                    mock_config=mock_config,
+                    mock_unique_ext=mock_unique_ext,
+                )
+                prefix = ""
+                if log_prefix_getter is not None:
+                    prefix = (log_prefix_getter() or "").strip()
+                if not snippet.strip() and not prefix:
                     continue
                 banner = (
                     "## Live log snapshot (mock still running) "
                     f"{time.strftime('%Y-%m-%d %H:%M:%S')} worker-local\n\n"
                 )
-                body_bytes = (banner + snippet).encode("utf-8")
+                body = banner
+                if prefix:
+                    body += prefix + "\n\n"
+                if snippet.strip():
+                    body += snippet
+                body_bytes = body.encode("utf-8")
                 if len(body_bytes) > _OREON_MAX_BUILD_LOG_BYTES:
                     continue
 
@@ -404,6 +489,18 @@ def _start_live_build_log_snapshot_thread(
                 logger.debug("Live build log snapshot failed (attempt %s)", attempt_id, exc_info=True)
 
     threading.Thread(target=runner, daemon=True, name=f"oreon-live-log-{attempt_id}").start()
+
+
+def _upload_accumulated_build_log(
+    session: httpx.Client,
+    controller_url: str,
+    attempt_id: int,
+    parts: list[str],
+) -> None:
+    msg = "\n\n".join(p for p in parts if p).strip()
+    if not msg:
+        return
+    _upload_build_log_via_controller(session, controller_url, attempt_id, msg.encode("utf-8"))
 
 
 def _download_source_via_controller(
@@ -2241,6 +2338,9 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
             build_log_parts: list[str] = []
             log_max_lines = int(os.environ.get("OREON_WORKER_LOG_MAX_LINES", "40000"))
 
+            def _live_log_prefix() -> str:
+                return "\n\n".join(p for p in build_log_parts if p).strip()
+
             srpm_path: Path | None = None
 
             if srpm_r2_key:
@@ -2331,11 +2431,24 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                     )
                     return
 
+                try:
+                    _upload_accumulated_build_log(session, controller_url, attempt_id, build_log_parts)
+                except Exception:
+                    logger.debug("Pre-mock log upload failed attempt_id=%s", attempt_id, exc_info=True)
+
                 srpm_result_dir = tmp / "srpm_result"
                 srpm_result_dir.mkdir()
                 live_srpm_stop = threading.Event()
+
                 _start_live_build_log_snapshot_thread(
-                    session, controller_url, attempt_id, srpm_result_dir, live_srpm_stop
+                    session,
+                    controller_url,
+                    attempt_id,
+                    srpm_result_dir,
+                    live_srpm_stop,
+                    log_prefix_getter=_live_log_prefix,
+                    mock_config=mock_config,
+                    mock_unique_ext=mock_unique_ext,
                 )
                 try:
                     ok, srpm_path, srpm_out, srpm_cancelled = _mock_build_srpm_from_spec(
@@ -2387,6 +2500,11 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                         {"status": "failed", "log_r2_key": log_key, "error_message": msg[:2000]},
                     )
                     return
+
+                try:
+                    _upload_accumulated_build_log(session, controller_url, attempt_id, build_log_parts)
+                except Exception:
+                    logger.debug("Post-SRPM log upload failed attempt_id=%s", attempt_id, exc_info=True)
             else:
                 msg = "No SRPM or DistGit source in job (upload SRPM or configure DistGit spec path)."
                 log_key = _upload_build_log_via_controller(session, controller_url, attempt_id, msg.encode("utf-8"))
@@ -2402,7 +2520,14 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
             result_dir.mkdir()
             live_rebuild_stop = threading.Event()
             _start_live_build_log_snapshot_thread(
-                session, controller_url, attempt_id, result_dir, live_rebuild_stop
+                session,
+                controller_url,
+                attempt_id,
+                result_dir,
+                live_rebuild_stop,
+                log_prefix_getter=_live_log_prefix,
+                mock_config=mock_config,
+                mock_unique_ext=mock_unique_ext,
             )
             try:
                 ok, rebuild_out, rebuild_cancelled = _mock_rebuild_srpm(

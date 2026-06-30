@@ -57,16 +57,44 @@
         if (m > 0) return m + 'm ' + s + 's';
         return s + 's';
       }
-      function fetchAttemptLogTail(attemptId, pre) {
-        pre.style.display = 'block';
-        pre.textContent = 'Loading';
+      var LOG_POLL_MS = 15000;
+      function stopLogPoll() {
+        if (window.__oreonLogPollTimer) {
+          clearInterval(window.__oreonLogPollTimer);
+          window.__oreonLogPollTimer = null;
+        }
+      }
+      function startLogPoll(attemptId, pre, card) {
+        stopLogPoll();
+        if (!pre || !card) return;
+        var st = (card.getAttribute('data-attempt-status') || '').toLowerCase();
+        if (st !== 'running' && st !== 'queued') return;
+        window.__oreonLogPollTimer = setInterval(function() {
+          var live = (card.getAttribute('data-attempt-status') || '').toLowerCase();
+          if (live !== 'running' && live !== 'queued') {
+            stopLogPoll();
+            return;
+          }
+          if (pre.style.display === 'none') return;
+          fetchAttemptLogTail(attemptId, pre, true);
+        }, LOG_POLL_MS);
+      }
+      function fetchAttemptLogTail(attemptId, pre, silent) {
+        if (!silent) {
+          pre.style.display = 'block';
+          pre.textContent = 'Loading';
+        }
         return api.get('/logs/attempts/' + attemptId + '/tail?lines=2000').then(function(r) {
           var lines = (r && r.lines) ? r.lines : [];
+          var atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 80;
           pre.textContent = lines.join('\n') || '(empty log)';
           pre.dataset.loaded = '1';
+          if (silent && atBottom) pre.scrollTop = pre.scrollHeight;
         }).catch(function(e) {
-          pre.textContent = 'Log not available: ' + (e.message || 'Log not yet uploaded or build did not produce a log.');
-          pre.dataset.loaded = '1';
+          if (!silent) {
+            pre.textContent = 'Log not available: ' + (e.message || 'Log not yet uploaded or build did not produce a log.');
+            pre.dataset.loaded = '1';
+          }
         });
       }
       function refreshAttemptElapsed(container) {
@@ -171,20 +199,33 @@
             btn.addEventListener('click', function() {
               var attemptId = btn.dataset.attemptId;
               var pre = document.getElementById('log-' + attemptId);
+              var card = btn.closest('.attempt-card');
               if (!pre) return;
               if (pre.dataset.loaded === '1') {
-                pre.style.display = pre.style.display === 'none' ? 'block' : 'none';
+                var showing = pre.style.display === 'none';
+                pre.style.display = showing ? 'block' : 'none';
+                if (showing) startLogPoll(attemptId, pre, card);
+                else stopLogPoll();
                 return;
               }
-              oreonWithLoading(btn, function() { return fetchAttemptLogTail(attemptId, pre); });
+              oreonWithLoading(btn, function() {
+                return fetchAttemptLogTail(attemptId, pre, false).then(function() {
+                  startLogPoll(attemptId, pre, card);
+                });
+              });
             });
           });
           container.querySelectorAll('.refresh-log').forEach(function(btn) {
             btn.addEventListener('click', function() {
               var attemptId = btn.dataset.attemptId;
               var pre = document.getElementById('log-' + attemptId);
+              var card = btn.closest('.attempt-card');
               if (!pre) return;
-              oreonWithLoading(btn, function() { return fetchAttemptLogTail(attemptId, pre); });
+              oreonWithLoading(btn, function() {
+                return fetchAttemptLogTail(attemptId, pre, false).then(function() {
+                  startLogPoll(attemptId, pre, card);
+                });
+              });
             });
           });
           // Load artifacts (including signing status) for each attempt

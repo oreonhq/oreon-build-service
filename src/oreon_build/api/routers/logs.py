@@ -1,6 +1,6 @@
 """Build logs - stream or fetch from R2 (read-only)."""
 from fastapi import APIRouter, HTTPException, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import select
 
 from oreon_build.db.session import async_session_maker
@@ -52,4 +52,7 @@ async def get_build_log_tail(attempt_id: int, lines: int = 100):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Log file not found in storage")
     text = data.decode("utf-8", errors="replace")
     tail_lines = text.splitlines()[-lines:]
-    return {"lines": tail_lines}
+    return JSONResponse(
+        content={"lines": tail_lines},
+        headers={"Cache-Control": "no-store"},
+    )
