@@ -40,8 +40,8 @@ so DNF5 can try to take the "best" NEVR from different repos and mix an impossib
 worker uses a short generated config that includes the real root cfg, sets ``[main] best=0`` and appends ``--setopt=best=0`` to
 ``dnf4_common_opts`` and ``dnf5_common_opts`` unless ``OREON_WORKER_MOCK_SKIP_MIXED_REPOS_OPTS=1`` disables that.
 Optional ``OREON_WORKER_EXTRA_MOCK_ADDREPO`` appends comma-separated URLs on the worker.
-During long ``mock`` runs, optional ``OREON_WORKER_LIVE_LOG_INTERVAL_SEC`` (default 60, 0 disables)
-uploads a tail of ``build.log`` so the web UI can show progress before the build finishes.
+During long ``mock`` runs, optional ``OREON_WORKER_LIVE_LOG_INTERVAL_SEC`` (default 15, 0 disables)
+streams mock stdout/stderr plus resultdir log tails to the UI while the build is still running.
 By default the worker passes ``mock --define dist .orN`` where ``N`` is the first run of digits in the job
 ``releasename`` (e.g. ``oreon-11-rp1`` gives ``.or11``) so RPM names use ``orN`` instead of the chroot
 default like ``fc45``. See ``OREON_WORKER_RPM_DIST`` and ``OREON_WORKER_SKIP_RPM_DIST_OVERRIDE`` in deploy docs.
@@ -107,6 +107,58 @@ def _sleep_with_jitter(base_seconds: float, jitter_ratio: float = 0.15) -> None:
 
 # Ignore a second dispatch for the same build_attempt_id (duplicate poll/misbehaving client).
 _inflight_attempt_lock = threading.Lock()
+
+
+class MockLiveOutput:
+    """Thread-safe rolling buffer of mock subprocess stdout/stderr for live log uploads."""
+
+    def __init__(self, max_bytes: int = 4 * 1024 * 1024) -> None:
+        self._lock = threading.Lock()
+        self._buf = ""
+        self._max_bytes = max(1, int(max_bytes))
+
+    def append(self, text: str) -> None:
+        if not text:
+            return
+        with self._lock:
+            self._buf += text
+            if len(self._buf) > self._max_bytes:
+                self._buf = self._buf[-self._max_bytes :]
+
+    def tail(self, max_bytes: int = 800_000) -> str:
+        cap = max(1, int(max_bytes))
+        with self._lock:
+            s = self._buf
+        if len(s) <= cap:
+            return s
+        return s[-cap:]
+
+
+def _worker_max_jobs_hint() -> int:
+    raw = (os.environ.get("OREON_WORKER_MAX_JOBS") or "").strip()
+    if not raw:
+        cpus = os.cpu_count() or 4
+        return max(1, cpus // 8)
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 1
+
+
+def _default_worker_max_jobs() -> int:
+    cpus = os.cpu_count() or 4
+    return max(1, cpus // 8)
+
+
+def _worker_max_jobs_hard_cap() -> int:
+    cpus = os.cpu_count() or 4
+    raw = (os.environ.get("OREON_WORKER_MAX_JOBS_HARD_CAP") or "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return max(32, cpus * 2)
 _inflight_attempt_ids: set[int] = set()
 # Active work-tmpdir paths (same process, multi-thread safety).
 # Belt over the attempt-id inflight set: the prune checks this set directly so it never
@@ -300,7 +352,7 @@ def _upload_build_log_direct_put(
 
 
 def _live_log_interval_sec() -> int:
-    raw = (os.environ.get("OREON_WORKER_LIVE_LOG_INTERVAL_SEC") or "60").strip()
+    raw = (os.environ.get("OREON_WORKER_LIVE_LOG_INTERVAL_SEC") or "15").strip()
     try:
         v = int(raw)
     except ValueError:
@@ -383,17 +435,20 @@ def _read_inprogress_mock_build_log_snippet(
 
     build_logs: list[Path] = []
     root_logs: list[Path] = []
+    state_logs: list[Path] = []
     for rd in search_dirs:
         _make_mock_resultdir_world_readable(rd)
         try:
             build_logs.extend(p for p in rd.rglob("build.log") if p.is_file())
         except OSError:
             pass
-        rp = rd / "root.log"
-        if rp.is_file():
-            root_logs.append(rp)
+        for name in ("root.log", "state.log"):
+            p = rd / name
+            if p.is_file():
+                (root_logs if name == "root.log" else state_logs).append(p)
         try:
             root_logs.extend(p for p in rd.rglob("root.log") if p.is_file())
+            state_logs.extend(p for p in rd.rglob("state.log") if p.is_file())
         except OSError:
             pass
 
@@ -432,6 +487,22 @@ def _read_inprogress_mock_build_log_snippet(
             rhead = "## root.log (dnf / mock wrapper)\n\n"
         chunks.append(rhead + rdata.decode("utf-8", errors="replace"))
 
+    state_logs = list({p.resolve(): p for p in state_logs}.values())
+    if state_logs:
+        st_path = max(state_logs, key=_mock_log_mtime)
+        st_cap = min(max_bytes // 4, 512 * 1024)
+        try:
+            sdata = st_path.read_bytes()
+        except OSError:
+            sdata = b""
+        if sdata:
+            if len(sdata) > st_cap:
+                sdata = sdata[-st_cap:]
+                shead = "## state.log tail\n\n"
+            else:
+                shead = "## state.log\n\n"
+            chunks.append(shead + sdata.decode("utf-8", errors="replace"))
+
     return "\n\n".join(chunks).strip()
 
 
@@ -443,6 +514,7 @@ def _start_live_build_log_snapshot_thread(
     stop_flag: threading.Event,
     *,
     log_prefix_getter: Callable[[], str] | None = None,
+    mock_output_getter: Callable[[], str] | None = None,
     mock_config: str | None = None,
     mock_unique_ext: str | None = None,
 ) -> None:
@@ -466,7 +538,10 @@ def _start_live_build_log_snapshot_thread(
                 prefix = ""
                 if log_prefix_getter is not None:
                     prefix = (log_prefix_getter() or "").strip()
-                if not snippet.strip() and not prefix:
+                mock_tail = ""
+                if mock_output_getter is not None:
+                    mock_tail = (mock_output_getter() or "").strip()
+                if not snippet.strip() and not prefix and not mock_tail:
                     continue
                 banner = (
                     "## Live log snapshot (mock still running) "
@@ -475,6 +550,8 @@ def _start_live_build_log_snapshot_thread(
                 body = banner
                 if prefix:
                     body += prefix + "\n\n"
+                if mock_tail:
+                    body += "## mock output (live)\n\n" + mock_tail + "\n\n"
                 if snippet.strip():
                     body += snippet
                 body_bytes = body.encode("utf-8")
@@ -1124,39 +1201,35 @@ def _mock_cache_topdir_for_attempt(attempt_id: int) -> str:
     return f"{parent}/oreon-{attempt_id}"
 
 
-# Upper bound when choosing default rpmbuild parallel jobs (%_smp_*). Env OREON_WORKER_MOCK_SMP_JOBS=0 means no cap.
-_MOCK_SMP_JOBS_DEFAULT_CAP = 4
+# Upper bound for explicit OREON_WORKER_MOCK_SMP_JOBS values.
+_MOCK_SMP_JOBS_HARD_MAX = 128
 
 
 def _mock_rpmbuild_smp_define_args() -> list[str]:
     """
     Cap compile parallelism inside mock (rpmbuild macros).
 
-    Large C++/LTO builds often default to ``-j$(nproc)`` via ``%_smp_mflags``, which can OOM small
-    workers. When unset, uses ``min(4, CPU count)`` so a 2 vCPU host gets ``-j2``, not ``-j4``.
+    When unset, uses ``max(1, cpu_count // OREON_WORKER_MAX_JOBS)`` so parallel jobs on the
+    same host split cores instead of each running ``-j$(nproc)``.
 
     Set ``OREON_WORKER_MOCK_SMP_JOBS=0`` to omit these defines (rpmbuild/mock default parallelism).
-
-    Not every spec respects these (some hard-code ninja -j). For those, adjust the spec or mock config.
     """
     raw = (os.environ.get("OREON_WORKER_MOCK_SMP_JOBS") or "").strip()
+    cpus = os.cpu_count() or 1
     if not raw:
-        cpus = os.cpu_count() or 1
-        n = min(_MOCK_SMP_JOBS_DEFAULT_CAP, max(1, cpus))
+        n = max(1, cpus // _worker_max_jobs_hint())
     else:
         try:
             n = int(raw)
         except ValueError:
-            cpus = os.cpu_count() or 1
-            fallback = min(_MOCK_SMP_JOBS_DEFAULT_CAP, max(1, cpus))
+            n = max(1, cpus // _worker_max_jobs_hint())
             logger.warning(
-                "OREON_WORKER_MOCK_SMP_JOBS is not an integer, using default %s",
-                fallback,
+                "OREON_WORKER_MOCK_SMP_JOBS is not an integer, using %s",
+                n,
             )
-            n = fallback
     if n == 0:
         return []
-    n = max(1, min(n, 128))
+    n = max(1, min(n, _MOCK_SMP_JOBS_HARD_MAX))
     return [
         "--define",
         f"_smp_mflags -j{n}",
@@ -1245,14 +1318,34 @@ _MOCK_STAGE_TIMEOUT_MAX_SEC = 30 * 24 * 3600  # 30 days
 _MOCK_STAGE_TIMEOUT_MIN_SEC = 600
 
 
+def _drain_subprocess_pipe(pipe, parts: list[str], live_out: MockLiveOutput | None) -> None:
+    if pipe is None:
+        return
+    try:
+        while True:
+            chunk = pipe.read(8192)
+            if not chunk:
+                break
+            parts.append(chunk)
+            if live_out is not None:
+                live_out.append(chunk)
+    finally:
+        try:
+            pipe.close()
+        except OSError:
+            pass
+
+
 def _run_with_abort(
     cmd: list[str],
     timeout_s: int,
     abort_event: threading.Event | None,
     cwd: str | None = None,
+    *,
+    live_out: MockLiveOutput | None = None,
 ) -> tuple[int, str]:
     """Like _run but kills the child process when abort_event is set (user cancelled build)."""
-    if not abort_event:
+    if not abort_event and live_out is None:
         return _run(cmd, timeout_s, cwd)
     env = {**os.environ, "LANG": "C.UTF-8"}
     try:
@@ -1266,9 +1359,23 @@ def _run_with_abort(
         )
     except FileNotFoundError:
         return 127, f"Command not found: {cmd[0]}"
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+    t_out = threading.Thread(
+        target=_drain_subprocess_pipe,
+        args=(proc.stdout, stdout_parts, live_out),
+        daemon=True,
+    )
+    t_err = threading.Thread(
+        target=_drain_subprocess_pipe,
+        args=(proc.stderr, stderr_parts, live_out),
+        daemon=True,
+    )
+    t_out.start()
+    t_err.start()
     start = time.monotonic()
     while True:
-        if abort_event.is_set():
+        if abort_event is not None and abort_event.is_set():
             try:
                 proc.kill()
             except OSError:
@@ -1277,18 +1384,16 @@ def _run_with_abort(
                 proc.wait(timeout=60)
             except Exception:
                 pass
-            out = ""
-            try:
-                stdout, stderr = proc.communicate(timeout=10)
-                out = (stdout or "") + (stderr or "")
-            except Exception:
-                pass
+            t_out.join(timeout=15)
+            t_err.join(timeout=15)
+            out = "".join(stdout_parts) + "".join(stderr_parts)
             return _RC_MOCK_CANCELLED, out + "\n== Build cancelled by user (mock killed) =="
 
         ret = proc.poll()
         if ret is not None:
-            stdout, stderr = proc.communicate()
-            return ret, (stdout or "") + (stderr or "")
+            t_out.join(timeout=120)
+            t_err.join(timeout=120)
+            return ret, "".join(stdout_parts) + "".join(stderr_parts)
 
         if time.monotonic() - start > timeout_s:
             try:
@@ -1299,8 +1404,10 @@ def _run_with_abort(
                 proc.wait(timeout=30)
             except Exception:
                 pass
+            t_out.join(timeout=15)
+            t_err.join(timeout=15)
             return 124, f"Timed out running: {' '.join(cmd)}"
-        time.sleep(0.5)
+        time.sleep(0.25)
 
 
 def _tail_lines(text: str, max_lines: int) -> str:
@@ -1790,6 +1897,7 @@ def _mock_build_srpm_from_spec(
     addrepo_baseurls: list[str] | None = None,
     rpm_dist: str | None = None,
     attempt_id: int | None = None,
+    live_out: MockLiveOutput | None = None,
 ) -> tuple[bool, Path | None, str, bool]:
     """
     Build SRPM from spec/sources using mock (so dependencies are handled in chroot).
@@ -1827,7 +1935,7 @@ def _mock_build_srpm_from_spec(
         str(result_dir),
     ]
     rc, out = _run_with_abort(
-        cmd, timeout_s=_mock_buildsrpm_timeout_sec(), abort_event=abort_event
+        cmd, timeout_s=_mock_buildsrpm_timeout_sec(), abort_event=abort_event, live_out=live_out
     )
     if rc == _RC_MOCK_CANCELLED:
         return False, None, out, True
@@ -1851,6 +1959,7 @@ def _mock_rebuild_srpm(
     addrepo_baseurls: list[str] | None = None,
     rpm_dist: str | None = None,
     attempt_id: int | None = None,
+    live_out: MockLiveOutput | None = None,
 ) -> tuple[bool, str, bool]:
     """Returns (ok, output, cancelled). See :func:`_mock_build_srpm_from_spec` for isolation knobs."""
     eff_mock_config = _mock_config_for_mixed_addrepos(
@@ -1867,7 +1976,7 @@ def _mock_rebuild_srpm(
         attempt_id=attempt_id,
     )
     cmd += ["--rebuild", str(srpm_path), "--resultdir", str(result_dir)]
-    rc, out = _run_with_abort(cmd, timeout_s=_mock_rebuild_timeout_sec(), abort_event=abort_event)
+    rc, out = _run_with_abort(cmd, timeout_s=_mock_rebuild_timeout_sec(), abort_event=abort_event, live_out=live_out)
     if rc == _RC_MOCK_CANCELLED:
         return False, out, True
     return rc == 0, out, False
@@ -2439,6 +2548,10 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                 srpm_result_dir = tmp / "srpm_result"
                 srpm_result_dir.mkdir()
                 live_srpm_stop = threading.Event()
+                srpm_live = MockLiveOutput()
+
+                def _srpm_mock_tail() -> str:
+                    return srpm_live.tail()
 
                 _start_live_build_log_snapshot_thread(
                     session,
@@ -2447,6 +2560,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                     srpm_result_dir,
                     live_srpm_stop,
                     log_prefix_getter=_live_log_prefix,
+                    mock_output_getter=_srpm_mock_tail,
                     mock_config=mock_config,
                     mock_unique_ext=mock_unique_ext,
                 )
@@ -2461,6 +2575,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                         addrepo_baseurls=mock_addrepos,
                         rpm_dist=rpm_dist,
                         attempt_id=attempt_id,
+                        live_out=srpm_live,
                     )
                 finally:
                     live_srpm_stop.set()
@@ -2519,6 +2634,11 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
             result_dir = tmp / "result"
             result_dir.mkdir()
             live_rebuild_stop = threading.Event()
+            rebuild_live = MockLiveOutput()
+
+            def _rebuild_mock_tail() -> str:
+                return rebuild_live.tail()
+
             _start_live_build_log_snapshot_thread(
                 session,
                 controller_url,
@@ -2526,6 +2646,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                 result_dir,
                 live_rebuild_stop,
                 log_prefix_getter=_live_log_prefix,
+                mock_output_getter=_rebuild_mock_tail,
                 mock_config=mock_config,
                 mock_unique_ext=mock_unique_ext,
             )
@@ -2539,6 +2660,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                     addrepo_baseurls=mock_addrepos,
                     rpm_dist=rpm_dist,
                     attempt_id=attempt_id,
+                    live_out=rebuild_live,
                 )
             finally:
                 live_rebuild_stop.set()
@@ -2825,25 +2947,35 @@ def main() -> None:
     headers = {"X-Worker-Token": worker_token}
     session = httpx.Client(timeout=30.0, headers=headers)
 
-    raw_max = os.environ.get("OREON_WORKER_MAX_JOBS", "4")
-    try:
-        max_jobs = int(raw_max)
-    except ValueError:
-        max_jobs = 4
+    raw_max = (os.environ.get("OREON_WORKER_MAX_JOBS") or "").strip()
+    if raw_max:
+        try:
+            max_jobs = int(raw_max)
+        except ValueError:
+            max_jobs = _default_worker_max_jobs()
+    else:
+        max_jobs = _default_worker_max_jobs()
     if max_jobs < 1:
         max_jobs = 1
-    cpu = os.cpu_count() or 2
-    hard_cap = max(1, min(8, cpu * 2))
+    hard_cap = _worker_max_jobs_hard_cap()
     if max_jobs > hard_cap:
         logger.warning("Clamping OREON_WORKER_MAX_JOBS=%s to hard cap %s", max_jobs, hard_cap)
         max_jobs = hard_cap
 
+    smp_jobs = _mock_rpmbuild_smp_define_args()
+    smp_n = "default"
+    for i, part in enumerate(smp_jobs):
+        if part == "_smp_build_ncpus" and i + 1 < len(smp_jobs):
+            smp_n = smp_jobs[i + 1]
+            break
     logger.info(
-        "Worker %s starting (arch=%s), controller=%s, max_concurrent_jobs=%s",
+        "Worker %s starting (arch=%s, cpus=%s), controller=%s, max_concurrent_jobs=%s, mock_smp=%s",
         worker_name,
         _get_arch(),
+        os.cpu_count() or "?",
         controller_url,
         max_jobs,
+        smp_n,
     )
 
     # Clean up any stale mock chroot dirs left over from a previous worker crash/restart.
