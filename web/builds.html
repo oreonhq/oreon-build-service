@@ -974,6 +974,7 @@
           render();
         });
         var bff = document.getElementById('builds-filter');
+        if (bff && window.oreonPrefillUrlSearch) window.oreonPrefillUrlSearch('builds-filter');
         if (bff && window.oreonDebounce) {
           bff.addEventListener('input', window.oreonDebounce(function() {
             buildsPage = 0;
