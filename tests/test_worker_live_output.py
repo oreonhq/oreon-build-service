@@ -1,4 +1,10 @@
-from oreon_build.worker.main import MockLiveOutput, _mock_rpmbuild_smp_define_args, _worker_max_jobs_hint
+from oreon_build.worker.main import (
+    MockLiveOutput,
+    _default_worker_max_jobs,
+    _mock_rpmbuild_smp_define_args,
+    _mock_smp_jobs_auto,
+    _worker_max_jobs_hint,
+)
 
 
 def test_mock_live_output_tail_trims():
@@ -17,3 +23,14 @@ def test_mock_smp_splits_cpus_by_max_jobs(monkeypatch):
     args = _mock_rpmbuild_smp_define_args()
     assert "_smp_build_ncpus 8" in args
     assert _worker_max_jobs_hint() == 4
+
+
+def test_default_one_job_uses_all_cpus(monkeypatch):
+    monkeypatch.delenv("OREON_WORKER_MAX_JOBS", raising=False)
+    monkeypatch.delenv("OREON_WORKER_MOCK_SMP_JOBS", raising=False)
+    monkeypatch.setattr("oreon_build.worker.main.os.cpu_count", lambda: 16)
+    assert _default_worker_max_jobs() == 1
+    assert _worker_max_jobs_hint() == 1
+    assert _mock_smp_jobs_auto() == 16
+    args = _mock_rpmbuild_smp_define_args()
+    assert "_smp_build_ncpus 16" in args

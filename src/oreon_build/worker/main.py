@@ -134,11 +134,14 @@ class MockLiveOutput:
         return s[-cap:]
 
 
+def _worker_cpu_count() -> int:
+    return max(1, os.cpu_count() or 1)
+
+
 def _worker_max_jobs_hint() -> int:
     raw = (os.environ.get("OREON_WORKER_MAX_JOBS") or "").strip()
     if not raw:
-        cpus = os.cpu_count() or 4
-        return max(1, cpus // 8)
+        return 1
     try:
         return max(1, int(raw))
     except ValueError:
@@ -146,8 +149,12 @@ def _worker_max_jobs_hint() -> int:
 
 
 def _default_worker_max_jobs() -> int:
-    cpus = os.cpu_count() or 4
-    return max(1, cpus // 8)
+    return 1
+
+
+def _mock_smp_jobs_auto(max_jobs: int | None = None) -> int:
+    jobs = max(1, max_jobs if max_jobs is not None else _worker_max_jobs_hint())
+    return max(1, _worker_cpu_count() // jobs)
 
 
 def _worker_max_jobs_hard_cap() -> int:
@@ -1209,20 +1216,18 @@ def _mock_rpmbuild_smp_define_args() -> list[str]:
     """
     Cap compile parallelism inside mock (rpmbuild macros).
 
-    When unset, uses ``max(1, cpu_count // OREON_WORKER_MAX_JOBS)`` so parallel jobs on the
-    same host split cores instead of each running ``-j$(nproc)``.
+    When unset, uses ``cpu_count // OREON_WORKER_MAX_JOBS`` (all cores when MAX_JOBS=1).
 
     Set ``OREON_WORKER_MOCK_SMP_JOBS=0`` to omit these defines (rpmbuild/mock default parallelism).
     """
     raw = (os.environ.get("OREON_WORKER_MOCK_SMP_JOBS") or "").strip()
-    cpus = os.cpu_count() or 1
     if not raw:
-        n = max(1, cpus // _worker_max_jobs_hint())
+        n = _mock_smp_jobs_auto()
     else:
         try:
             n = int(raw)
         except ValueError:
-            n = max(1, cpus // _worker_max_jobs_hint())
+            n = _mock_smp_jobs_auto()
             logger.warning(
                 "OREON_WORKER_MOCK_SMP_JOBS is not an integer, using %s",
                 n,
@@ -2963,7 +2968,7 @@ def main() -> None:
         max_jobs = hard_cap
 
     smp_jobs = _mock_rpmbuild_smp_define_args()
-    smp_n = "default"
+    smp_n = str(_mock_smp_jobs_auto(max_jobs))
     for i, part in enumerate(smp_jobs):
         if part == "_smp_build_ncpus" and i + 1 < len(smp_jobs):
             smp_n = smp_jobs[i + 1]
