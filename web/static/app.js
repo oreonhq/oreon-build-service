@@ -408,9 +408,9 @@ function oreonInitNavbar() {
   }
   var qAttr = searchQ.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
   parts.push(
-    '<form class="navbar-search" action="/search.html" method="get" style="display:inline-flex; margin-left:0.5rem;">' +
-    '<input type="search" name="q" id="nav-search-q" placeholder="Search" value="' + qAttr + '" style="padding:0.25rem 0.5rem; width:10rem;">' +
-    '<button type="submit" class="btn" style="margin-left:0.25rem;">Go</button></form>'
+    '<form class="navbar-search" action="/search.html" method="get">' +
+    '<input type="search" name="q" id="nav-search-q" placeholder="Search" value="' + qAttr + '" autocomplete="off">' +
+    '<button type="submit" class="btn">Go</button></form>'
   );
   parts.push(
     '<span id="auth-section">' +
@@ -423,6 +423,26 @@ function oreonInitNavbar() {
 }
 
 window.oreonInitNavbar = oreonInitNavbar;
+
+/** Prefill a filter input from ?q= or ?search= in the page URL. Returns the value used. */
+window.oreonPrefillUrlSearch = function(inputId, paramNames) {
+  var names = paramNames || ['q', 'search'];
+  var val = '';
+  try {
+    var params = new URLSearchParams(window.location.search);
+    for (var i = 0; i < names.length; i++) {
+      var v = params.get(names[i]);
+      if (v && String(v).trim()) {
+        val = String(v).trim();
+        break;
+      }
+    }
+  } catch (_) {}
+  if (!val) return '';
+  var el = document.getElementById(inputId);
+  if (el) el.value = val;
+  return val;
+};
 
 /**
  * Signing pipeline after mock (GPG and repodata on the controller, not on the worker).

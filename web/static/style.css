@@ -75,6 +75,39 @@ body {
   color: var(--accent);
   font-weight: 600;
 }
+.header nav .navbar-search {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex-wrap: nowrap;
+  margin-left: 0.25rem;
+}
+.header nav .navbar-search input[type="search"] {
+  padding: 0.3rem 0.5rem;
+  width: 11rem;
+  max-width: 42vw;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font: inherit;
+}
+.header nav .navbar-search input[type="search"]:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.navbar-search-page {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+.navbar-search-page input[type="search"] {
+  padding: 0.5rem;
+  width: 100%;
+  max-width: 24rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font: inherit;
+}
 #auth-section { display: flex; align-items: center; gap: 0.5rem; }
 #user-info { color: var(--text-muted); font-size: 0.9rem; }
 .main { flex: 1; padding: 1.5rem 2rem; max-width: 1440px; margin: 0 auto; width: 100%; }
