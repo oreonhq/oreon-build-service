@@ -6,7 +6,7 @@
 
 Name:           oreon-build-worker
 Version:        1.0.0
-Release:        58%{?dist}
+Release:        59%{?dist}
 Summary:        Oreon Build Service worker daemon
 License:        GPLv3
 URL:            https://github.com/oreon/oreon-build-service
@@ -50,15 +50,11 @@ mkdir -p %{buildroot}%{_bindir}
 mkdir -p %{buildroot}%{_sysconfdir}/oreon-build-worker
 mkdir -p %{buildroot}%{_unitdir}
 
-# Prefer wheels so pip does not recurse building hatchling from sdist. Force sdist for packages
-# that ship manylinux wheels with bundled libcrypto/krb5/ldap (rpm autoreq then requires missing SONAMEs).
-# bcrypt stays wheel-only to avoid Rust in the build chroot.
 python3 -m pip install --no-compile --ignore-installed --prefer-binary \
   --only-binary bcrypt \
   --no-binary cryptography,cffi,psycopg2-binary \
   --target %{buildroot}%{_prefix}/lib/oreon-build-worker .
 
-# Wrapper script: set PYTHONPATH and run worker (%{_prefix} expands to /usr)
 cat > %{buildroot}%{_bindir}/oreon-worker << WRAPPER
 #!/bin/sh
 export PYTHONPATH="%{_prefix}/lib/oreon-build-worker"
@@ -66,7 +62,6 @@ exec python3 -m oreon_build.worker.main "\$@"
 WRAPPER
 chmod 755 %{buildroot}%{_bindir}/oreon-worker
 
-# Config: env example (Source1 copied to SOURCES/ as oreon-worker.env.example when building)
 install -m 644 %{SOURCE1} %{buildroot}%{_sysconfdir}/oreon-build-worker/oreon-worker.env.example
 
 # systemd unit
@@ -109,8 +104,4 @@ rm -rf %{_prefix}/lib/oreon-build-worker/pydantic_core-*
 %{_unitdir}/oreon-worker.service
 
 %changelog
-* Thu Mar 26 2026 Oreon HQ <packages@oreonhq.com> - 1.0.0-25
-- pip prefer-binary plus no-binary cryptography,cffi,psycopg2-binary for system SSL/LDAP/KRB linkage
-
-* Thu Mar 26 2026 Oreon HQ <packages@oreonhq.com> - 1.0.0-24
-- pip install use --prefer-binary to avoid transitive sdist build failure in mock/install roots
+%autochangelog
