@@ -15,9 +15,10 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """Repository status - read-only; publish/compose may be triggered (auth)."""
+import asyncio
 import logging
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import select
 
@@ -184,6 +185,24 @@ def _regenerate_metadata_job(ordered: list[str], *, force_full: bool = False) ->
             logger.warning("repodata job: %d more failures not listed", len(failed) - 20)
 
 
+async def _run_regenerate_metadata_job(ordered: list[str], *, force_full: bool) -> None:
+    await asyncio.to_thread(_regenerate_metadata_job, ordered, force_full=force_full)
+
+
+def _spawn_regenerate_metadata(ordered: list[str], *, force_full: bool) -> None:
+    task = asyncio.create_task(_run_regenerate_metadata_job(ordered, force_full=force_full))
+
+    def _done(t: asyncio.Task[None]) -> None:
+        try:
+            exc = t.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            logger.exception("background repodata regeneration failed", exc_info=exc)
+
+    task.add_done_callback(_done)
+
+
 @router.post(
     "/regenerate-metadata",
     response_model=RegenerateMetadataQueued,
@@ -192,7 +211,6 @@ def _regenerate_metadata_job(ordered: list[str], *, force_full: bool = False) ->
 async def regenerate_metadata_all_releases(
     _: CurrentAdmin,
     db: DbSession,
-    background_tasks: BackgroundTasks,
 ):
     """
     Queue createrepo for every R2 prefix we know about (DB repositories plus each release's default repo branch,
@@ -200,7 +218,7 @@ async def regenerate_metadata_all_releases(
     request returns immediately (avoids proxy timeouts). Prefixes with no RPMs under RPMS/ are skipped after a quick list.
     """
     ordered = await _all_repo_prefixes(db)
-    background_tasks.add_task(_regenerate_metadata_job, list(ordered), force_full=False)
+    _spawn_regenerate_metadata(list(ordered), force_full=False)
     return RegenerateMetadataQueued(
         status="queued",
         message="Repodata regeneration is running on the API server. Check oreon-api logs for refreshed counts and errors.",
@@ -216,14 +234,13 @@ async def regenerate_metadata_all_releases(
 async def regenerate_metadata_full_all_releases(
     _: CurrentAdmin,
     db: DbSession,
-    background_tasks: BackgroundTasks,
 ):
     """
     Like regenerate-metadata but forces a full createrepo pass per prefix (no --update, clears
     createrepo cache). Use when repodata checksums drifted for packages that were not rebuilt.
     """
     ordered = await _all_repo_prefixes(db)
-    background_tasks.add_task(_regenerate_metadata_job, list(ordered), force_full=True)
+    _spawn_regenerate_metadata(list(ordered), force_full=True)
     return RegenerateMetadataQueued(
         status="queued",
         message="Full repodata regeneration is running on the API server. This rescans every RPM and takes longer than a normal refresh. Check oreon-api logs for completion.",
