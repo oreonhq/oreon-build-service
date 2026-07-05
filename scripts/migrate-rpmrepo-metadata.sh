@@ -22,8 +22,7 @@ if [ -f ".env" ]; then
 fi
 
 export PATH="${HOME}/.local/bin:${PATH}"
-# Default createrepo workers per prefix (not the same as MIGRATE_PARALLEL).
-export OREON_CREATEREPO_WORKERS="${OREON_CREATEREPO_WORKERS:-8}"
+# Default createrepo workers per prefix (inherits publisher auto default when unset).
 CRE_TOOL="${OREON_CREATEREPO_BIN:-createrepo_c}"
 if ! command -v "$CRE_TOOL" &>/dev/null; then
   echo "createrepo_c not found (install e.g. dnf install createrepo_c, or set OREON_CREATEREPO_BIN)"
