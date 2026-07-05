@@ -125,7 +125,22 @@ class RegenerateMetadataQueued(BaseModel):
     prefix_count: int
 
 
-def _regenerate_metadata_job(ordered: list[str]) -> None:
+async def _all_repo_prefixes(db: DbSession) -> list[str]:
+    prefixes: set[str] = set()
+    rrepo = await db.execute(select(Repository.r2_prefix))
+    for p in rrepo.scalars().all():
+        if p:
+            prefixes.add(p)
+    rels = await db.execute(select(Release).where(Release.is_active.is_(True)))
+    for rel in rels.scalars().all():
+        dev_seg = r2_publish_branch(rel)
+        for ch in (dev_seg, "testing", "stable"):
+            for arch in ("x86_64", "aarch64"):
+                prefixes.add(repo_r2_prefix(rel.releasename, ch, arch))
+    return sorted(prefixes)
+
+
+def _regenerate_metadata_job(ordered: list[str], *, force_full: bool = False) -> None:
     refreshed: list[str] = []
     skipped: list[str] = []
     failed: list[RegenerateMetadataFailure] = []
@@ -136,7 +151,7 @@ def _regenerate_metadata_job(ordered: list[str]) -> None:
             not_attempted.append(prefix)
             continue
         try:
-            if update_repodata_at_prefix(prefix):
+            if update_repodata_at_prefix(prefix, force_full=force_full):
                 refreshed.append(prefix)
             else:
                 skipped.append(prefix)
@@ -154,8 +169,9 @@ def _regenerate_metadata_job(ordered: list[str]) -> None:
     if failed or not_attempted:
         st = "partial"
     logger.info(
-        "repodata regeneration job finished status=%s refreshed=%d skipped_no_rpms=%d failed=%d not_attempted=%d",
+        "repodata regeneration job finished status=%s force_full=%s refreshed=%d skipped_no_rpms=%d failed=%d not_attempted=%d",
         st,
+        force_full,
         len(refreshed),
         len(skipped),
         len(failed),
@@ -183,21 +199,33 @@ async def regenerate_metadata_all_releases(
     testing, and stable, times x86_64 and aarch64). Work runs in a background thread on the API server so the HTTP
     request returns immediately (avoids proxy timeouts). Prefixes with no RPMs under RPMS/ are skipped after a quick list.
     """
-    prefixes: set[str] = set()
-    rrepo = await db.execute(select(Repository.r2_prefix))
-    for p in rrepo.scalars().all():
-        if p:
-            prefixes.add(p)
-    rels = await db.execute(select(Release).where(Release.is_active.is_(True)))
-    for rel in rels.scalars().all():
-        dev_seg = r2_publish_branch(rel)
-        for ch in (dev_seg, "testing", "stable"):
-            for arch in ("x86_64", "aarch64"):
-                prefixes.add(repo_r2_prefix(rel.releasename, ch, arch))
-    ordered = sorted(prefixes)
-    background_tasks.add_task(_regenerate_metadata_job, list(ordered))
+    ordered = await _all_repo_prefixes(db)
+    background_tasks.add_task(_regenerate_metadata_job, list(ordered), force_full=False)
     return RegenerateMetadataQueued(
         status="queued",
         message="Repodata regeneration is running on the API server. Check oreon-api logs for refreshed counts and errors.",
+        prefix_count=len(ordered),
+    )
+
+
+@router.post(
+    "/regenerate-metadata-full",
+    response_model=RegenerateMetadataQueued,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def regenerate_metadata_full_all_releases(
+    _: CurrentAdmin,
+    db: DbSession,
+    background_tasks: BackgroundTasks,
+):
+    """
+    Like regenerate-metadata but forces a full createrepo pass per prefix (no --update, clears
+    createrepo cache). Use when repodata checksums drifted for packages that were not rebuilt.
+    """
+    ordered = await _all_repo_prefixes(db)
+    background_tasks.add_task(_regenerate_metadata_job, list(ordered), force_full=True)
+    return RegenerateMetadataQueued(
+        status="queued",
+        message="Full repodata regeneration is running on the API server. This rescans every RPM and takes longer than a normal refresh. Check oreon-api logs for completion.",
         prefix_count=len(ordered),
     )
