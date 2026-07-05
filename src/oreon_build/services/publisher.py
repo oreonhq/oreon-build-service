@@ -352,13 +352,64 @@ def _global_repogen_lock() -> object:
         os.close(fd)
 
 
+# createrepo_c rejects --workers outside 1..100 and silently falls back to 5.
+_CREATEREPO_C_MAX_WORKERS = 100
+
+
+def _createrepo_cpu_count() -> int:
+    return max(1, os.cpu_count() or 1)
+
+
+def _createrepo_workers_hard_cap() -> int:
+    raw = (os.environ.get("OREON_CREATEREPO_WORKERS_HARD_CAP") or "").strip()
+    if raw:
+        try:
+            return max(1, min(int(raw), _CREATEREPO_C_MAX_WORKERS))
+        except ValueError:
+            pass
+    return _CREATEREPO_C_MAX_WORKERS
+
+
+def _createrepo_workers_default() -> int:
+    cpus = _createrepo_cpu_count()
+    return min(max(50, cpus * 4), _createrepo_workers_hard_cap())
+
+
 def _createrepo_workers() -> int:
-    raw = (os.environ.get("OREON_CREATEREPO_WORKERS") or "50").strip()
-    try:
-        w = int(raw)
-    except ValueError:
-        w = 50
-    return max(1, min(w, 128))
+    cap = _createrepo_workers_hard_cap()
+    raw = (os.environ.get("OREON_CREATEREPO_WORKERS") or "").strip()
+    if raw:
+        try:
+            w = int(raw)
+        except ValueError:
+            w = _createrepo_workers_default()
+        else:
+            if w > _CREATEREPO_C_MAX_WORKERS:
+                logger.warning(
+                    "OREON_CREATEREPO_WORKERS=%s exceeds createrepo_c max %s, using %s",
+                    w,
+                    _CREATEREPO_C_MAX_WORKERS,
+                    cap,
+                )
+    else:
+        w = _createrepo_workers_default()
+    return max(1, min(w, cap))
+
+
+def _createrepo_fallback_workers(primary: int) -> int:
+    raw = (os.environ.get("OREON_CREATEREPO_FALLBACK_WORKERS") or "").strip()
+    if raw:
+        try:
+            fb = int(raw)
+        except ValueError:
+            fb = max(8, primary // 4)
+    else:
+        fb = max(8, primary // 4)
+    cap = min(_createrepo_workers_hard_cap(), max(8, primary // 2))
+    fb = max(1, min(fb, cap))
+    if fb >= primary:
+        fb = max(1, primary // 2 or 1)
+    return fb
 
 
 def _createrepo_timeout_sec() -> int:
@@ -568,7 +619,21 @@ def _createrepo_cache_dir(container: Path) -> Path:
     return d
 
 
-def _run_createrepo(repo_dir: Path, *, container: Path | None = None) -> None:
+def _clear_createrepo_cache(container: Path) -> None:
+    d = container / ".createrepo-cache"
+    if d.exists():
+        try:
+            shutil.rmtree(d)
+        except OSError as e:
+            logger.warning("Could not clear createrepo cache %s: %s", d, e)
+
+
+def _run_createrepo(
+    repo_dir: Path,
+    *,
+    container: Path | None = None,
+    force_full: bool = False,
+) -> None:
     # Never use capture_output/PIPE here. createrepo_c can write a lot to stderr; a full pipe blocks the child
     # while the parent waits forever (looks like a hang with RPMs already on disk).
     #
@@ -587,15 +652,29 @@ def _run_createrepo(repo_dir: Path, *, container: Path | None = None) -> None:
             except OSError as e:
                 logger.warning("Could not remove stale createrepo temp dir %s: %s", tmp_repodata, e)
 
+    if force_full and container is not None:
+        _clear_createrepo_cache(container)
+        repodata = repo_dir / "repodata"
+        if repodata.exists():
+            try:
+                shutil.rmtree(repodata)
+            except OSError as e:
+                logger.warning("Could not remove repodata before full regen %s: %s", repodata, e)
+
     def _run_once(workers: int) -> None:
         timeout_s = _createrepo_timeout_sec()
         comps_file = _write_buildsys_comps(repo_dir)
-        use_update = container is not None and (repo_dir / "repodata" / "repomd.xml").exists()
+        use_update = (
+            not force_full
+            and container is not None
+            and (repo_dir / "repodata" / "repomd.xml").exists()
+        )
         logger.info(
-            "createrepo_c starting repo_root=%s workers=%s update=%s",
+            "createrepo_c starting repo_root=%s workers=%s update=%s force_full=%s",
             repo_dir,
             workers,
             use_update,
+            force_full,
         )
         cmd = [
             "createrepo_c",
@@ -633,12 +712,7 @@ def _run_createrepo(repo_dir: Path, *, container: Path | None = None) -> None:
     try:
         _run_once(w)
     except Exception:
-        fb_raw = (os.environ.get("OREON_CREATEREPO_FALLBACK_WORKERS") or "8").strip()
-        try:
-            fb = int(fb_raw)
-        except ValueError:
-            fb = 8
-        fb = max(1, min(fb, 32))
+        fb = _createrepo_fallback_workers(w)
         if fb == w:
             raise
         logger.exception(
@@ -669,7 +743,12 @@ def _upload_repodata_dir_ordered(client: R2Client, r2_prefix: str, repodata_dir:
         client.put_object(r2_key, f.read_bytes())
 
 
-def update_repodata_at_prefix(r2_prefix: str, r2_client: R2Client | None = None) -> bool:
+def update_repodata_at_prefix(
+    r2_prefix: str,
+    r2_client: R2Client | None = None,
+    *,
+    force_full: bool = False,
+) -> bool:
     """
     RPMs are already at r2_prefix/RPMS/. Download them, run createrepo_c, upload only repodata.
     Use this when the worker (or other path) has already uploaded RPMs directly to the repo.
@@ -696,7 +775,7 @@ def update_repodata_at_prefix(r2_prefix: str, r2_client: R2Client | None = None)
             _progress(f"{r2_prefix} syncing RPMs to local stage (may take a while)")
             n = _sync_rpms_dir_from_r2(client, rpms_prefix, rpms_dir, container=container)
             _progress(f"{r2_prefix} synced {n} RPMs, running createrepo_c")
-            _run_createrepo(repo_root, container=container)
+            _run_createrepo(repo_root, container=container, force_full=force_full)
             _progress(f"{r2_prefix} createrepo_c done, uploading repodata to R2")
             repodata_dir = repo_root / "repodata"
             if repodata_dir.exists():
