@@ -69,4 +69,6 @@ also: [Worker deploy guide](docs/WORKER_DEPLOY.md) (you will need workers for bu
 
 ## License
 
-GPLv3. See [LICENSE](LICENSE).
+Oreon Build Service is proprietary.
+
+The worker module (`src/oreon_build/worker/`) is GPLv3+. See [LICENSE-WORKER](LICENSE-WORKER).
