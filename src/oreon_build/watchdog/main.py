@@ -1,19 +1,3 @@
-# Oreon Build Service
-# Copyright (C) 2026 Oreon HQ
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
 from __future__ import annotations
 
 import logging
@@ -47,7 +31,6 @@ CVE_RESOLVE_REASONS = frozenset(
     {"backport", "upstream_bump", "false_positive", "mitigated", "accepted_risk", "other"}
 )
 
-
 def _configure_watchdog_logging() -> None:
     root = logging.getLogger("oreon_build")
     root.setLevel(logging.INFO)
@@ -57,12 +40,9 @@ def _configure_watchdog_logging() -> None:
         root.addHandler(h)
     root.propagate = False
 
-
 class CveResolveBody(BaseModel):
-    """Optional metadata when marking a CVE row handled (e.g. distro backport)."""
     reason: str | None = Field(None, max_length=32)
     notes: str | None = Field(None, max_length=4000)
-
 
 class CustomAdvisoryCreate(BaseModel):
     title: str = Field(..., min_length=1, max_length=256)
@@ -73,7 +53,6 @@ class CustomAdvisoryCreate(BaseModel):
     recommended_fix: str | None = Field(None)
     affected_release_ids: list[int] = Field(..., min_length=1)
 
-
 class CustomAdvisoryUpdate(BaseModel):
     title: str | None = Field(None, min_length=1, max_length=256)
     cve_id: str | None = Field(None, max_length=64)
@@ -83,16 +62,13 @@ class CustomAdvisoryUpdate(BaseModel):
     recommended_fix: str | None = Field(None)
     affected_release_ids: list[int] | None = Field(None, min_length=1)
 
-
 def _dt_to_iso(dt) -> str | None:
-    # Starlette/JSONResponse can’t serialize datetime directly.
     if not dt:
         return None
     try:
         return dt.isoformat()
     except Exception:
         return str(dt)
-
 
 _US_MONTHS = (
     "Jan",
@@ -109,7 +85,6 @@ _US_MONTHS = (
     "Dec",
 )
 
-
 def _dt_utc(dt):
     if dt is None:
         return None
@@ -119,13 +94,11 @@ def _dt_utc(dt):
         return dt.replace(tzinfo=_tz.utc)
     return dt
 
-
 def _fmt_us_date(dt) -> str:
     d = _dt_utc(dt)
     if d is None:
         return "-"
     return f"{_US_MONTHS[d.month - 1]} {d.day}, {d.year}"
-
 
 def _errata_year_for_id(dt) -> int:
     d = _dt_utc(dt)
@@ -135,19 +108,15 @@ def _errata_year_for_id(dt) -> int:
         return _dt.now(_tz.utc).year
     return d.year
 
-
 def _orsa_errata_id(*, kind: str, numeric_id: int, dt_for_year) -> str:
-    """Public errata-style id (similar to ALSA-YYYY:nnnn). ORSA = Oreon security advisory."""
     y = _errata_year_for_id(dt_for_year)
     return f"ORSA-{y}:{numeric_id}"
-
 
 def _capitalize_severity(sev: str | None) -> str:
     s = (sev or "").strip().lower()
     if not s:
         return "Moderate"
     return s[:1].upper() + s[1:] if len(s) > 1 else s.upper()
-
 
 def _bulletin_title(
     *,
@@ -167,7 +136,6 @@ def _bulletin_title(
         return f"{sev}: {cve} security update"
     return f"{sev}: security update"
 
-
 def _platform_display(affected: list[dict]) -> str:
     names: list[str] = []
     for row in affected or []:
@@ -177,7 +145,6 @@ def _platform_display(affected: list[dict]) -> str:
     if not names:
         return "-"
     return ", ".join(names)
-
 
 def _custom_advisory_detail(
     adv: SecurityAdvisory,
@@ -200,9 +167,7 @@ def _custom_advisory_detail(
         "_handled_at": adv.handled_at,
     }
 
-
 def _enrich_errata_row(d: dict) -> None:
-    """Add AlmaLinux-style errata fields for the advisory UI."""
     kind = str(d.get("kind") or "")
     numeric_id = int(d.get("id") or 0)
     created = d.get("_created_at")
@@ -224,9 +189,7 @@ def _enrich_errata_row(d: dict) -> None:
     d["updated_at_display"] = _fmt_us_date(upd)
     d["platform_display"] = _platform_display(d.get("affected_releases") or [])
 
-
 def _json_advisory_detail(d: dict) -> dict:
-    """Return advisory dict for API with errata fields and without internal sort keys."""
     out = dict(d)
     _enrich_errata_row(out)
     out.pop("_created_at", None)
@@ -236,7 +199,6 @@ def _json_advisory_detail(d: dict) -> dict:
         out["created_at"] = _dt_to_iso(d.get("_created_at"))
     return out
 
-
 async def _discord_notify_advisory_resolved(
     *,
     kind: str,
@@ -244,7 +206,6 @@ async def _discord_notify_advisory_resolved(
     admin_username: str,
     extra_fields: list[tuple[str, str]] | None = None,
 ) -> None:
-    """Best-effort Discord post to SECURITY_DISCORD_WEBHOOK_URL when an advisory is resolved."""
     d = dict(row)
     _enrich_errata_row(d)
     d.pop("_created_at", None)
@@ -265,12 +226,10 @@ async def _discord_notify_advisory_resolved(
         color=DISCORD_COLOR_SUCCESS,
     )
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _configure_watchdog_logging()
     yield
-
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Oreon Watchdog", version="1.0.0", lifespan=lifespan)
@@ -281,8 +240,6 @@ def create_app() -> FastAPI:
 
     app.mount("/static", StaticFiles(directory=str(web_dir / "static")), name="static")
 
-    # Reuse the main API login endpoint on this port so the watchdog dashboard
-    # can be "public view, auth-gated data" without cross-service requests.
     app.include_router(auth_router, prefix="/api")
 
     @app.get("/")
@@ -452,10 +409,6 @@ def create_app() -> FastAPI:
 
     @app.get("/api/security/diagnostics")
     async def security_diagnostics(_admin=Depends(require_admin)):
-        """
-        Table row counts and R2 config flags so you can tell an empty UI from a wrong DATABASE_URL
-        or a separate empty Postgres instance.
-        """
         from sqlalchemy import func, select
         from urllib.parse import urlparse
 
@@ -687,8 +640,6 @@ def create_app() -> FastAPI:
         payload: dict = Body(...),
         actor=Depends(require_maintainer_or_admin),
     ):
-        # Validate manually to avoid FastAPI/Pydantic ForwardRef issues
-        # when this app defines models inside nested app factories.
         data = CustomAdvisoryCreate.model_validate(payload)
         from datetime import datetime, timezone
         from sqlalchemy import select
@@ -723,8 +674,6 @@ def create_app() -> FastAPI:
 
             await db.commit()
 
-            # Send Discord notification for the new advisory.
-            # Keep it best-effort; ignore failures.
             try:
                 rel_name_q = await db.execute(
                     select(Release.id, Release.releasename).where(Release.id.in_(expected_ids))
@@ -747,7 +696,6 @@ def create_app() -> FastAPI:
                     fields=fields,
                 )
             except Exception:
-                # Don't break the request for webhook failures.
                 pass
 
             return JSONResponse(content={"ok": True, "id": adv.id})
@@ -883,7 +831,6 @@ def create_app() -> FastAPI:
             return JSONResponse(content={"ok": True})
 
     return app
-
 
 app = create_app()
 
