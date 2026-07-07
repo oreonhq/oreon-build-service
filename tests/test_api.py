@@ -1,4 +1,3 @@
-"""Basic API tests. Endpoints that need a real DB are skipped unless OREON_TEST_DB=1."""
 import os
 import pytest
 from fastapi.testclient import TestClient

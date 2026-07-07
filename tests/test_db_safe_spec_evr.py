@@ -1,4 +1,3 @@
-"""package_versions.version is varchar(64); macro-heavy spec EVRs must not overflow it."""
 from __future__ import annotations
 
 from oreon_build.services.distgit_order import _parse_spec_text, db_safe_spec_evr

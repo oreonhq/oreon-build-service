@@ -1,4 +1,3 @@
-"""Tarball index must not rescan the archive once per spec in a chain closure."""
 from __future__ import annotations
 
 import io

@@ -1,20 +1,3 @@
-# Oreon Build Service
-# Copyright (C) 2026 Oreon HQ
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-"""Unit tests for pesign nickname resolution (no rpmrebuild required)."""
 from __future__ import annotations
 
 import json
@@ -24,7 +7,6 @@ from oreon_build.services.signing import (
     package_name_matches_pesign_pattern,
     resolve_pesign_nickname,
 )
-
 
 OREON_LIKE_RULES = json.dumps(
     [
@@ -38,15 +20,14 @@ OREON_LIKE_RULES = json.dumps(
     ]
 )
 
-
 def test_pesign_pattern_requires_nickname_when_no_rules() -> None:
     s = Settings(
         pesign_certificate_nickname=None,
         pesign_nss_dir="/etc/pki/pesign",
         pesign_package_name_regex=r"^(kernel.*)$",
+        pesign_rules_json="[]",
     )
     assert package_name_matches_pesign_pattern("kernel-core", s) is False
-
 
 def test_pesign_pattern_kernel_matches_global() -> None:
     s = Settings(
@@ -58,7 +39,6 @@ def test_pesign_pattern_kernel_matches_global() -> None:
     assert package_name_matches_pesign_pattern("shim-x64", s) is True
     assert package_name_matches_pesign_pattern("bash", s) is False
 
-
 def test_pesign_pattern_requires_nss_dir() -> None:
     s = Settings(
         pesign_certificate_nickname="signer",
@@ -66,7 +46,6 @@ def test_pesign_pattern_requires_nss_dir() -> None:
         pesign_package_name_regex=r"^(kernel.*)$",
     )
     assert package_name_matches_pesign_pattern("kernel-core", s) is False
-
 
 def test_rules_grub_kernel_s390() -> None:
     s = Settings(
@@ -77,7 +56,6 @@ def test_rules_grub_kernel_s390() -> None:
     assert resolve_pesign_nickname("kernel-core", "s390x", s) == "oreonsecureboot302"
     assert resolve_pesign_nickname("kernel-core", "x86_64", s) == "oreonsecureboot501"
     assert resolve_pesign_nickname("kernel-core", "aarch64", s) == "oreonsecureboot501"
-
 
 def test_rules_then_global_fallback() -> None:
     s = Settings(

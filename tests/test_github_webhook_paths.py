@@ -1,4 +1,3 @@
-# Oreon Build Service tests — GitHub webhook changed-path resolution
 
 from oreon_build.services.github_push_trigger import (
     GITHUB_PUSH_EMPTY_DIFF_SENTINEL,
