@@ -1,21 +1,4 @@
 #!/usr/bin/env bash
-# Oreon Build Service
-# Copyright (C) 2026 Oreon HQ
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-# Stop Oreon Build Service (API + scheduler) started by ./start.sh
 
 cd "$(dirname "$0")"
 
@@ -39,7 +22,6 @@ _kill_tree() {
   if ! kill -0 "$pid" 2>/dev/null; then
     return 0
   fi
-  # Children first (deepest descendants).
   local child
   for child in $(pgrep -P "$pid" 2>/dev/null || true); do
     _kill_tree "$child" "$sig"
@@ -126,11 +108,9 @@ _stop_pid_file "API" .oreon-api.pid
 _stop_pid_file "Scheduler" .oreon-scheduler.pid
 _stop_pid_file "Watchdog" .oreon-watchdog.pid
 
-# Fallback when pid files are stale or the parent was nohup'd and the real listener is a child.
 _kill_oreon_on_port 8000 "oreon_build.api.main:app"
 _kill_oreon_on_port 8001 "oreon_build.watchdog.main:app"
 
-# Last resort: any oreon uvicorn still listening after a stuck chain prepare.
 for pid in $(pgrep -f 'uvicorn oreon_build\.(api|watchdog)\.main:app' 2>/dev/null || true); do
   if kill -0 "$pid" 2>/dev/null; then
     echo "Stopping leftover uvicorn (PID $pid)..."
