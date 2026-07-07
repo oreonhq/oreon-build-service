@@ -1,4 +1,3 @@
-"""Accounts and roles - Admin only."""
 from fastapi import APIRouter, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
