@@ -1,20 +1,3 @@
-# Oreon Build Service
-# Copyright (C) 2026 Oreon HQ
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-"""Repository status - read-only; publish/compose may be triggered (auth)."""
 import asyncio
 import logging
 
@@ -33,7 +16,6 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/repos", tags=["repos"])
 
-
 @router.get("", response_model=list[RepositoryResponse])
 async def list_repos(db: DbSession, release_id: int | None = None):
     q = select(Repository).order_by(Repository.release_id, Repository.channel, Repository.architecture)
@@ -42,10 +24,8 @@ async def list_repos(db: DbSession, release_id: int | None = None):
     result = await db.execute(q)
     return list(result.scalars().all())
 
-
 @router.get("/status", response_model=dict)
 async def repo_status(db: DbSession, release_id: int | None = None):
-    """Summary of repository compose/publish status per release and channel."""
     q = select(Release).where(Release.is_active == True)
     if release_id is not None:
         q = q.where(Release.id == release_id)
@@ -68,7 +48,6 @@ async def repo_status(db: DbSession, release_id: int | None = None):
         ]
     return out
 
-
 @router.get("/{repo_id}", response_model=RepositoryResponse)
 async def get_repo(repo_id: int, db: DbSession):
     result = await db.execute(select(Repository).where(Repository.id == repo_id))
@@ -76,7 +55,6 @@ async def get_repo(repo_id: int, db: DbSession):
     if not repo:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Repository not found")
     return repo
-
 
 @router.post("/publish")
 async def trigger_publish(
@@ -86,7 +64,6 @@ async def trigger_publish(
     channel: str = Query(..., description="Channel (dev/testing/stable)"),
     architecture: str = Query(..., description="Architecture (e.g. x86_64)"),
 ):
-    """Request repository compose and upload to R2 (async)."""
     result = await db.execute(select(Release).where(Release.id == release_id))
     release = result.scalar_one_or_none()
     if not release:
@@ -111,20 +88,16 @@ async def trigger_publish(
         await db.flush()
     return {"status": "accepted", "r2_prefix": prefix}
 
-
 class RegenerateMetadataFailure(BaseModel):
     prefix: str
     kind: str
     detail: str
 
-
 class RegenerateMetadataQueued(BaseModel):
-    """Immediate response while createrepo runs on the API host (see API logs for completion)."""
 
     status: str
     message: str
     prefix_count: int
-
 
 async def _all_repo_prefixes(db: DbSession) -> list[str]:
     prefixes: set[str] = set()
@@ -139,7 +112,6 @@ async def _all_repo_prefixes(db: DbSession) -> list[str]:
             for arch in ("x86_64", "aarch64"):
                 prefixes.add(repo_r2_prefix(rel.releasename, ch, arch))
     return sorted(prefixes)
-
 
 def _regenerate_metadata_job(ordered: list[str], *, force_full: bool = False) -> None:
     refreshed: list[str] = []
@@ -184,10 +156,8 @@ def _regenerate_metadata_job(ordered: list[str], *, force_full: bool = False) ->
         if len(failed) > 20:
             logger.warning("repodata job: %d more failures not listed", len(failed) - 20)
 
-
 async def _run_regenerate_metadata_job(ordered: list[str], *, force_full: bool) -> None:
     await asyncio.to_thread(_regenerate_metadata_job, ordered, force_full=force_full)
-
 
 def _spawn_regenerate_metadata(ordered: list[str], *, force_full: bool) -> None:
     task = asyncio.create_task(_run_regenerate_metadata_job(ordered, force_full=force_full))
@@ -202,7 +172,6 @@ def _spawn_regenerate_metadata(ordered: list[str], *, force_full: bool) -> None:
 
     task.add_done_callback(_done)
 
-
 @router.post(
     "/regenerate-metadata",
     response_model=RegenerateMetadataQueued,
@@ -212,11 +181,6 @@ async def regenerate_metadata_all_releases(
     _: CurrentAdmin,
     db: DbSession,
 ):
-    """
-    Queue createrepo for every R2 prefix we know about (DB repositories plus each release's default repo branch,
-    testing, and stable, times x86_64 and aarch64). Work runs in a background thread on the API server so the HTTP
-    request returns immediately (avoids proxy timeouts). Prefixes with no RPMs under RPMS/ are skipped after a quick list.
-    """
     ordered = await _all_repo_prefixes(db)
     _spawn_regenerate_metadata(list(ordered), force_full=False)
     return RegenerateMetadataQueued(
@@ -224,7 +188,6 @@ async def regenerate_metadata_all_releases(
         message="Repodata regeneration is running on the API server. Check oreon-api logs for refreshed counts and errors.",
         prefix_count=len(ordered),
     )
-
 
 @router.post(
     "/regenerate-metadata-full",
@@ -235,10 +198,6 @@ async def regenerate_metadata_full_all_releases(
     _: CurrentAdmin,
     db: DbSession,
 ):
-    """
-    Like regenerate-metadata but forces a full createrepo pass per prefix (no --update, clears
-    createrepo cache). Use when repodata checksums drifted for packages that were not rebuilt.
-    """
     ordered = await _all_repo_prefixes(db)
     _spawn_regenerate_metadata(list(ordered), force_full=True)
     return RegenerateMetadataQueued(
