@@ -1,4 +1,3 @@
-"""Publisher daemon: composes repositories and uploads to R2 (no local repo storage)."""
 import asyncio
 import logging
 import sys
