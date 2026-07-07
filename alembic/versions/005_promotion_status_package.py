@@ -1,10 +1,3 @@
-"""Promotion: status, package_id, decided_at; to_channel nullable.
-
-Revision ID: 005
-Revises: 004
-Create Date: 2025-03-17
-
-"""
 from typing import Sequence, Union
 
 from alembic import op

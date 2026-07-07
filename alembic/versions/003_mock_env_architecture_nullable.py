@@ -1,10 +1,3 @@
-"""Make mock_environments.architecture nullable (mock envs use config_name + -$ARCH at build time).
-
-Revision ID: 003
-Revises: 002
-Create Date: 2025-03-17
-
-"""
 from typing import Sequence, Union
 
 from alembic import op

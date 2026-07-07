@@ -1,9 +1,3 @@
-"""Workers: indexed token fingerprint for auth (avoid full-table scan + event-loop bcrypt pile-up).
-
-Revision ID: 019
-Revises: 018
-Create Date: 2026-04-08
-"""
 
 from alembic import op
 import sqlalchemy as sa

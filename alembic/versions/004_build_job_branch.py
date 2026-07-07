@@ -1,10 +1,3 @@
-"""Add build_jobs.branch (default 'dev') for repo layout.
-
-Revision ID: 004
-Revises: 003
-Create Date: 2025-03-17
-
-"""
 from typing import Sequence, Union
 
 from alembic import op

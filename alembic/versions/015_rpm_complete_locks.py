@@ -1,9 +1,3 @@
-"""Distributed lock rows for RPM signing/finalize to avoid concurrent overwrite races.
-
-Revision ID: 015
-Revises: 014
-Create Date: 2026-03-30
-"""
 
 from alembic import op
 import sqlalchemy as sa

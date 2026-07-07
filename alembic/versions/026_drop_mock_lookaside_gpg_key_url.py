@@ -1,4 +1,3 @@
-"""Drop lookaside_gpg_key_url from mock_environments."""
 
 from __future__ import annotations
 

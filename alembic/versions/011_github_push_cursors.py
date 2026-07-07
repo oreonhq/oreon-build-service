@@ -1,9 +1,4 @@
-# Oreon Build Service
-# Copyright (C) 2026 Oreon HQ
-#
 # SPDX-License-Identifier: GPL-3.0-or-later
-
-"""Store last seen GitHub push HEAD per repo branch for offline catch-up."""
 
 from __future__ import annotations
 
@@ -14,7 +9,6 @@ revision: str = "011"
 down_revision = "010"
 branch_labels = None
 depends_on = None
-
 
 def upgrade() -> None:
     op.create_table(
@@ -42,7 +36,6 @@ def upgrade() -> None:
         ["repository_id"],
         unique=False,
     )
-
 
 def downgrade() -> None:
     op.drop_index(op.f("ix_github_push_cursors_repository_id"), table_name="github_push_cursors")

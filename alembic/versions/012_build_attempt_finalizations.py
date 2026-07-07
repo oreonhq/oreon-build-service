@@ -1,9 +1,3 @@
-"""Add build_attempt_finalizations for idempotent worker result handling.
-
-Revision ID: 012
-Revises: 011
-Create Date: 2026-03-30
-"""
 
 from alembic import op
 import sqlalchemy as sa

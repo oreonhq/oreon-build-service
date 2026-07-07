@@ -1,9 +1,3 @@
-"""CVE matches: OSV fixed version + structured resolve reason for backports.
-
-Revision ID: 018
-Revises: 017
-Create Date: 2026-04-02
-"""
 
 from alembic import op
 import sqlalchemy as sa

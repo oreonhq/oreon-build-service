@@ -1,31 +1,12 @@
-# Oreon Build Service
-# Copyright (C) 2026 Oreon HQ
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
 from __future__ import annotations
 
 import sqlalchemy as sa
 from alembic import op
 
-
-# Alembic identifiers
 revision: str = "008"
 down_revision = "007"
 branch_labels = None
 depends_on = None
-
 
 def _table_has_column(insp: sa.Inspector, table_name: str, column_name: str) -> bool:
     try:
@@ -34,12 +15,10 @@ def _table_has_column(insp: sa.Inspector, table_name: str, column_name: str) -> 
         return False
     return any(c.get("name") == column_name for c in cols)
 
-
 def upgrade() -> None:
     bind = op.get_bind()
     insp = sa.inspect(bind)
 
-    # --- cve_matches: add handling columns (if not already present)
     if insp.has_table("cve_matches"):
         if not _table_has_column(insp, "cve_matches", "is_handled"):
             op.add_column(
@@ -55,7 +34,6 @@ def upgrade() -> None:
                 sa.Column("handled_by_account_id", sa.Integer(), sa.ForeignKey("accounts.id"), nullable=True),
             )
 
-    # --- custom advisories: tables + m2m mapping
     if not insp.has_table("security_advisories"):
         op.create_table(
             "security_advisories",
@@ -83,9 +61,6 @@ def upgrade() -> None:
             sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=True),
         )
 
-
 def downgrade() -> None:
-    # Keeping downgrade simple since we primarily use upgrade in this project.
-    # If you need downgrade, ask and we will implement it safely.
     pass
 

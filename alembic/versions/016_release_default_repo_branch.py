@@ -1,9 +1,3 @@
-"""Releases: default_repo_branch for R2 layout (not Git branch).
-
-Revision ID: 016
-Revises: 015
-Create Date: 2026-03-31
-"""
 
 from alembic import op
 import sqlalchemy as sa

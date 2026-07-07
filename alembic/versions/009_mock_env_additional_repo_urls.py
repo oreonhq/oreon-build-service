@@ -1,9 +1,4 @@
-# Oreon Build Service
-# Copyright (C) 2026 Oreon HQ
-#
 # SPDX-License-Identifier: GPL-3.0-or-later
-
-"""Add additional_repo_urls JSON to mock_environments."""
 
 from __future__ import annotations
 
@@ -15,7 +10,6 @@ down_revision = "008"
 branch_labels = None
 depends_on = None
 
-
 def upgrade() -> None:
     op.add_column(
         "mock_environments",
@@ -26,7 +20,6 @@ def upgrade() -> None:
             server_default=sa.text("'[]'::json"),
         ),
     )
-
 
 def downgrade() -> None:
     op.drop_column("mock_environments", "additional_repo_urls")

@@ -1,4 +1,3 @@
-"""Add rpmbuild plans and BuildJob layer metadata."""
 
 from __future__ import annotations
 

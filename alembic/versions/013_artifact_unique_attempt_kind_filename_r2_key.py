@@ -1,9 +1,3 @@
-"""Add uniqueness for artifacts to make worker result retries safe.
-
-Revision ID: 013
-Revises: 012
-Create Date: 2026-03-30
-"""
 
 from alembic import op
 import sqlalchemy as sa
@@ -15,7 +9,6 @@ depends_on = None
 
 
 def upgrade() -> None:
-    # Remove existing duplicates (keep the lowest id per unique key set).
     op.execute(
         """
         WITH ranked AS (

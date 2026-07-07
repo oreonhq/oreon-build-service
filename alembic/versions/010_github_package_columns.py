@@ -1,9 +1,4 @@
-# Oreon Build Service
-# Copyright (C) 2026 Oreon HQ
-#
 # SPDX-License-Identifier: GPL-3.0-or-later
-
-"""Rename GitLab package columns to GitHub (repository id + html URL)."""
 
 from __future__ import annotations
 
@@ -14,7 +9,6 @@ revision: str = "010"
 down_revision = "009"
 branch_labels = None
 depends_on = None
-
 
 def upgrade() -> None:
     op.drop_index(op.f("ix_packages_gitlab_project_id"), table_name="packages")
@@ -38,7 +32,6 @@ def upgrade() -> None:
         ["github_repository_id"],
         unique=False,
     )
-
 
 def downgrade() -> None:
     op.drop_index(op.f("ix_packages_github_repository_id"), table_name="packages")

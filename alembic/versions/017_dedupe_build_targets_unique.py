@@ -1,9 +1,3 @@
-"""Dedupe build_targets and enforce uniqueness per (release, arch, mock env).
-
-Revision ID: 017
-Revises: 016
-Create Date: 2026-04-01
-"""
 
 from alembic import op
 

@@ -1,4 +1,3 @@
-"""Add stage_advance_after to build_chains for settle-period gating."""
 
 from __future__ import annotations
 

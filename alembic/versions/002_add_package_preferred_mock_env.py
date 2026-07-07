@@ -1,10 +1,3 @@
-"""Add preferred_mock_environment_id to packages.
-
-Revision ID: 002
-Revises: 001
-Create Date: 2025-03-14
-
-"""
 from typing import Sequence, Union
 
 from alembic import op

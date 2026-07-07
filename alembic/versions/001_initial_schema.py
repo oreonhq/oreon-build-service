@@ -1,10 +1,3 @@
-"""Initial schema: accounts, packages, builds, releases, workers, repos, etc.
-
-Revision ID: 001
-Revises:
-Create Date: 2025-01-01 00:00:00
-
-"""
 from typing import Sequence, Union
 
 from alembic import op

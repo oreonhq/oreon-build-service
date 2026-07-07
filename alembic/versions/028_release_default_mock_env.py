@@ -1,4 +1,3 @@
-"""Add default_mock_environment_id to releases."""
 
 from __future__ import annotations
 

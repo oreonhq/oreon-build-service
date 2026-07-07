@@ -1,31 +1,13 @@
-# Oreon Build Service
-# Copyright (C) 2026 Oreon HQ
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
 from __future__ import annotations
 
 import sqlalchemy as sa
 
 from alembic import op
 
-
 revision: str = "007"
 down_revision = "006"
 branch_labels = None
 depends_on = None
-
 
 def upgrade() -> None:
     bind = op.get_bind()
@@ -73,7 +55,6 @@ def upgrade() -> None:
             sa.Column("release_id", sa.Integer(), sa.ForeignKey("releases.id"), primary_key=True),
             sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
         )
-
 
 def downgrade() -> None:
     op.drop_table("cve_match_releases")

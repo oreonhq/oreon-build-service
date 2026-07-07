@@ -1,11 +1,3 @@
-"""Repair: ensure mock_succeeded_at and signing_status exist on build_attempts.
-
-If revision 020 was stamped or skipped but ``ALTER TABLE`` never committed (wrong DB, rollback,
-or manual ``alembic_version`` drift), the API loads ORM columns that Postgres does not have and
-everything 500s. This migration adds missing columns idempotently.
-
-Revision id must stay <= 32 chars (``alembic_version.version_num`` is VARCHAR(32)).
-"""
 
 from __future__ import annotations
 

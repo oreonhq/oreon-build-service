@@ -1,10 +1,3 @@
-"""Add artifacts.is_signed to track GPG signing.
-
-Revision ID: 006
-Revises: 005
-Create Date: 2025-03-18
-
-"""
 from typing import Sequence, Union
 
 from alembic import op

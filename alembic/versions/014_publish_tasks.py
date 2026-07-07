@@ -1,9 +1,3 @@
-"""Durable publish task queue for expensive R2/repodata updates.
-
-Revision ID: 014
-Revises: 013
-Create Date: 2026-03-30
-"""
 
 from alembic import op
 import sqlalchemy as sa

@@ -1,4 +1,3 @@
-"""Add gcp_instance_name to workers table."""
 
 from __future__ import annotations
 

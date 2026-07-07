@@ -1,4 +1,3 @@
-"""Add build_chains and chain columns on build_jobs (distgit chain-build)."""
 
 from __future__ import annotations
 

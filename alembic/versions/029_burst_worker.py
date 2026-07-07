@@ -1,4 +1,3 @@
-"""Add burst worker fields to workers table."""
 
 from __future__ import annotations
 

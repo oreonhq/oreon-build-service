@@ -1,4 +1,3 @@
-"""Add packages_json to security_advisories."""
 
 from __future__ import annotations
 

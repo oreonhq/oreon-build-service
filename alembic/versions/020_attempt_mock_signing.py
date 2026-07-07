@@ -1,12 +1,3 @@
-"""Build attempt mock success + controller pipeline status for UI (GPG on controller).
-
-``ALTER TABLE build_attempts`` needs an ACCESS EXCLUSIVE lock. If oreon-api, workers, or any
-long transaction touches this table, the migration can block until those finish. Stop the API
-and workers (or wait for idle sessions) before running ``alembic upgrade``, or you will sit
-there with no output until Postgres gets the lock.
-
-``lock_timeout`` below makes a stuck lock fail after 2 minutes instead of hanging forever.
-"""
 
 from __future__ import annotations
 
@@ -22,9 +13,7 @@ depends_on = None
 def upgrade() -> None:
     bind = op.get_bind()
     if bind.dialect.name == "postgresql":
-        # Fail fast with a clear lock error instead of blocking without a time limit.
         op.execute(sa.text("SET LOCAL lock_timeout = '120s'"))
-        # One ALTER keeps catalog churn minimal vs two separate ADD COLUMN statements.
         op.execute(
             sa.text(
                 """
