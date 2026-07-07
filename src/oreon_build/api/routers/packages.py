@@ -1,21 +1,3 @@
-#
-# Oreon Build Service - Packages API router
-# Copyright (C) 2026 Oreon HQ
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-#
-"""Packages - list public; create/update require maintainer or admin; delete requires admin."""
 import logging
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, status
@@ -38,9 +20,7 @@ from oreon_build.services.package_delete import delete_package_record, find_dead
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/packages", tags=["packages"])
 
-
 def _package_search_clause(raw: str):
-    """Substring match on name or exact id when the term is all digits."""
     term = raw.strip()
     if not term:
         return None
@@ -50,7 +30,6 @@ def _package_search_clause(raw: str):
     if term.isdigit():
         parts.append(Package.id == int(term))
     return or_(*parts)
-
 
 @router.get("", response_model=PaginatedResponse[PackageResponse])
 async def list_packages(
@@ -69,12 +48,10 @@ async def list_packages(
     result = await db.execute(base.limit(limit).offset(offset))
     return PaginatedResponse(items=list(result.scalars().all()), total=total)
 
-
 @router.get("/dead", response_model=list[DeadPackageItem])
 async def list_dead_packages(db: DbSession, user: CurrentAdmin):
     rows = await find_dead_packages(db)
     return [DeadPackageItem.model_validate(r) for r in rows]
-
 
 @router.post("/purge-dead", status_code=status.HTTP_202_ACCEPTED, response_model=PurgeDeadPackagesAccepted)
 async def purge_dead_packages(
@@ -98,7 +75,6 @@ async def purge_dead_packages(
         package_count=len(dead),
     )
 
-
 @router.get("/{package_id}", response_model=PackageResponse)
 async def get_package(package_id: int, db: DbSession):
     result = await db.execute(select(Package).where(Package.id == package_id))
@@ -106,7 +82,6 @@ async def get_package(package_id: int, db: DbSession):
     if not p:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Package not found")
     return p
-
 
 @router.post("", response_model=PackageResponse, status_code=status.HTTP_201_CREATED)
 async def create_package(
@@ -139,7 +114,6 @@ async def create_package(
     )
     return pkg
 
-
 @router.patch("/{package_id}", response_model=PackageResponse)
 async def update_package(
     package_id: int,
@@ -171,7 +145,6 @@ async def update_package(
         user_agent=get_user_agent(request),
     )
     return pkg
-
 
 @router.delete("/{package_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_package(
