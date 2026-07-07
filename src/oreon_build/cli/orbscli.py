@@ -1,8 +1,3 @@
-# Oreon Build Service
-# Copyright (C) 2026 Oreon HQ
-#
-# SPDX-License-Identifier: GPL-3.0-or-later
-"""orbscli - non-interactive CLI for Oreon Build Service (mirrors web API + Watchdog)."""
 from __future__ import annotations
 
 import base64
@@ -23,14 +18,11 @@ CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / 
 CREDENTIALS_PATH = CONFIG_DIR / "credentials.json"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
-
 def _current_ctx() -> click.Context | None:
     return click.get_current_context(silent=True)
 
-
 def _ensure_config_dir() -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-
 
 def _load_json(path: Path) -> dict[str, Any]:
     if not path.is_file():
@@ -40,7 +32,6 @@ def _load_json(path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return {}
 
-
 def _save_json(path: Path, data: dict[str, Any]) -> None:
     _ensure_config_dir()
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -48,7 +39,6 @@ def _save_json(path: Path, data: dict[str, Any]) -> None:
         path.chmod(stat.S_IRUSR | stat.S_IWUSR)
     except OSError:
         pass
-
 
 def get_api_url() -> str:
     ctx = _current_ctx()
@@ -60,7 +50,6 @@ def get_api_url() -> str:
     cfg = _load_json(CONFIG_PATH)
     return str(cfg.get("api_url", "https://build.oreonhq.com")).rstrip("/")
 
-
 def get_watchdog_url() -> str:
     ctx = _current_ctx()
     if ctx and ctx.obj.get("WATCHDOG_URL"):
@@ -71,14 +60,12 @@ def get_watchdog_url() -> str:
     cfg = _load_json(CONFIG_PATH)
     return str(cfg.get("watchdog_url", "http://localhost:8001")).rstrip("/")
 
-
 def get_token() -> str | None:
     cred = _load_json(CREDENTIALS_PATH)
     t = (cred.get("access_token") or "").strip()
     if t:
         return t
     return (os.environ.get("ORBSCLI_TOKEN") or os.environ.get("OREON_TOKEN") or "").strip() or None
-
 
 def _jwt_payload_unverified(token: str) -> dict[str, Any]:
     try:
@@ -91,10 +78,8 @@ def _jwt_payload_unverified(token: str) -> dict[str, Any]:
     except Exception:
         return {}
 
-
 def jwt_role(token: str) -> str:
     return str(_jwt_payload_unverified(token).get("role") or "")
-
 
 def require_auth(token: str | None) -> str:
     if not token:
@@ -102,20 +87,17 @@ def require_auth(token: str | None) -> str:
         sys.exit(2)
     return token
 
-
 def require_maintainer(token: str) -> None:
     role = jwt_role(token)
     if role not in ("admin", "maintainer"):
         click.echo("Maintainer or admin role required (your role: %s)." % (role or "unknown"), err=True)
         sys.exit(3)
 
-
 def require_admin(token: str) -> None:
     role = jwt_role(token)
     if role != "admin":
         click.echo("Admin role required (your role: %s)." % (role or "unknown"), err=True)
         sys.exit(3)
-
 
 def http_request_raw(
     method: str,
@@ -133,7 +115,6 @@ def http_request_raw(
         headers["Authorization"] = f"Bearer {token}"
     with httpx.Client(timeout=timeout) as client:
         return client.request(method, url, headers=headers, json=json_body, params=params)
-
 
 def http_json(
     method: str,
@@ -160,18 +141,14 @@ def http_json(
         return r.json()
     return r.text
 
-
 def parse_package_names(args: tuple[str, ...]) -> list[str]:
-    """Join argv fragments and split on commas and whitespace."""
     joined = " ".join(args).strip()
     if not joined:
         return []
     parts = re.split(r"[\s,]+", joined)
     return [p for p in parts if p]
 
-
 def _nevra_to_name(nevra: str) -> str:
-    """Best-effort RPM name from a NEVRA string (strip arch, epoch, version-release)."""
     s = nevra.strip()
     for arch in (".x86_64", ".aarch64", ".ppc64le", ".s390x", ".noarch", ".i686"):
         if s.endswith(arch):
@@ -184,9 +161,7 @@ def _nevra_to_name(nevra: str) -> str:
         return s.rsplit("-", 2)[0]
     return s
 
-
 def _spec_dir_for_rpm(spec_root: Path, rpm_name: str) -> str | None:
-    """Return dist-git style directory name under spec_root if a spec file exists."""
     if (spec_root / rpm_name).is_dir():
         p = spec_root / rpm_name
         if (p / f"{rpm_name}.spec").is_file():
@@ -202,7 +177,6 @@ def _spec_dir_for_rpm(spec_root: Path, rpm_name: str) -> str | None:
             return alt
     return None
 
-
 def resolve_release_id(api_base: str, token: str | None, release: str) -> int:
     release = release.strip()
     if release.isdigit():
@@ -213,7 +187,6 @@ def resolve_release_id(api_base: str, token: str | None, release: str) -> int:
             return int(item["id"])
     click.echo("Release not found: %s" % release, err=True)
     sys.exit(1)
-
 
 def find_package_by_name(api_base: str, token: str | None, name: str) -> dict[str, Any] | None:
     out = http_json(
@@ -229,7 +202,6 @@ def find_package_by_name(api_base: str, token: str | None, name: str) -> dict[st
             exact = p
             break
     return exact
-
 
 def distgit_new_package_payload(
     pkg: str,
@@ -254,7 +226,6 @@ def distgit_new_package_payload(
         "version": "0.0.1",
     }
 
-
 @click.group()
 @click.option(
     "--api-url",
@@ -271,11 +242,9 @@ def distgit_new_package_payload(
 @click.version_option(version="1.0.0", prog_name="orbscli")
 @click.pass_context
 def cli(ctx: click.Context, api_url: str | None, watchdog_url: str | None) -> None:
-    """Oreon Build Service CLI (non-interactive, mirrors web permissions)."""
     ctx.ensure_object(dict)
     ctx.obj["API_URL"] = api_url
     ctx.obj["WATCHDOG_URL"] = watchdog_url
-
 
 @cli.command("login")
 @click.option("--url", "api_url", default=None, help="API base URL, e.g. https://build.example.com")
@@ -292,7 +261,6 @@ def cmd_login(
     watchdog_url: str | None,
     no_save: bool,
 ) -> None:
-    """Login and store JWT in ~/.config/orbscli/credentials.json (mode 0600)."""
     base = (api_url or get_api_url()).rstrip("/")
     if not password:
         click.echo("Password required (-p or ORBSCLI_PASSWORD).", err=True)
@@ -320,22 +288,17 @@ def cmd_login(
     _save_json(CONFIG_PATH, cfg)
     click.echo("Logged in as %s. Token stored in %s" % (username, CREDENTIALS_PATH))
 
-
 @cli.command("logout")
 def cmd_logout() -> None:
-    """Remove stored credentials."""
     if CREDENTIALS_PATH.is_file():
         CREDENTIALS_PATH.unlink()
     click.echo("Logged out (credentials removed).")
 
-
 @cli.command("whoami")
 def cmd_whoami() -> None:
-    """Show username and role from stored JWT (unverified decode for display)."""
     token = require_auth(get_token())
     p = _jwt_payload_unverified(token)
     click.echo("user: %s\nrole: %s" % (p.get("sub", "?"), p.get("role", "?")))
-
 
 @cli.command("iso-dnf-log")
 @click.argument(
@@ -365,7 +328,6 @@ def cmd_iso_dnf_log(
     release_ref: str,
     print_providers: bool,
 ) -> None:
-    """Parse anaconda/dnf problem lines and suggest orbscli build for local specs."""
     text = log_path.read_text(encoding="utf-8", errors="replace")
     names: set[str] = set()
     for m in re.finditer(r"\bneeded by (\S+) from\b", text):
@@ -405,7 +367,6 @@ def cmd_iso_dnf_log(
         click.echo("No local spec dir for (%d): %s" % (len(uncovered), " ".join(head)))
         if tail:
             click.echo("  … (%d more)" % len(tail))
-
 
 @cli.command("build")
 @click.argument("packages", nargs=-1, required=True)
@@ -457,7 +418,6 @@ def cmd_build(
     distgit_url: str,
     distgit_branch: str,
 ) -> None:
-    """Queue distgit builds for one or more packages (CLI only supports distgit new_package or existing package)."""
     token = require_auth(get_token())
     require_maintainer(token)
     api_base = get_api_url()
@@ -538,7 +498,6 @@ def cmd_build(
         for job in jobs_out:
             _wait_job_and_maybe_log(api_base, token, int(job["id"]), log_path)
 
-
 @cli.command("chain-build")
 @click.argument("spec_parts", nargs=-1, required=True)
 @click.option("--release", "release_ref", required=True, help="Release id or releasename (e.g. oreon-11-rp1)")
@@ -580,7 +539,6 @@ def cmd_chain_build(
     distgit_url: str,
     distgit_branch: str,
 ) -> None:
-    """Queue a distgit chain build (colon separates parallel groups; no colon means sequential)."""
     token = require_auth(get_token())
     require_maintainer(token)
     api_base = get_api_url()
@@ -628,7 +586,6 @@ def cmd_chain_build(
         for job in jobs_out:
             _wait_job_and_maybe_log(api_base, token, int(job["id"]), log_path)
 
-
 def _wait_job_and_maybe_log(api_base: str, token: str, job_id: int, log_dir: Path | None) -> None:
     terminal = {"success", "failed", "cancelled", "skipped"}
     attempt_id: int | None = None
@@ -646,7 +603,6 @@ def _wait_job_and_maybe_log(api_base: str, token: str, job_id: int, log_dir: Pat
     if log_dir and attempt_id:
         _fetch_attempt_log(api_base, attempt_id, log_dir / f"build-{job_id}.log")
 
-
 def _fetch_attempt_log(api_base: str, attempt_id: int, dest: Path) -> None:
     r = http_request_raw("GET", api_base, f"/api/logs/attempts/{attempt_id}", token=None)
     if r.status_code != 200:
@@ -655,12 +611,9 @@ def _fetch_attempt_log(api_base: str, attempt_id: int, dest: Path) -> None:
     dest.write_bytes(r.content)
     click.echo("wrote %s" % dest)
 
-
 @cli.group("builds")
 def grp_builds() -> None:
-    """List, show, retry, cancel builds."""
     pass
-
 
 _BUILD_JOB_STATUSES = (
     "pending",
@@ -671,7 +624,6 @@ _BUILD_JOB_STATUSES = (
     "cancelled",
     "skipped",
 )
-
 
 @grp_builds.command("list")
 @click.option("--release-id", type=int, default=None)
@@ -699,7 +651,6 @@ def builds_list(
     offset: int,
     as_json: bool,
 ) -> None:
-    """List build jobs, optionally filtered by status (same states as the web UI)."""
     token = get_token()
     params: dict[str, Any] = {"limit": limit, "offset": offset}
     if release_id is not None:
@@ -743,14 +694,12 @@ def builds_list(
             )
         )
 
-
 @grp_builds.command("show")
 @click.argument("job_id", type=int)
 def builds_show(job_id: int) -> None:
     token = get_token()
     j = http_json("GET", get_api_url(), f"/api/builds/jobs/{job_id}", token=token)
     click.echo(json.dumps(j, indent=2))
-
 
 @grp_builds.command("retry")
 @click.argument("job_id", type=int)
@@ -760,7 +709,6 @@ def builds_retry(job_id: int) -> None:
     http_json("POST", get_api_url(), f"/api/builds/jobs/{job_id}/retry", token=token)
     click.echo("retry ok job %s" % job_id)
 
-
 @grp_builds.command("cancel")
 @click.argument("job_id", type=int)
 def builds_cancel(job_id: int) -> None:
@@ -768,7 +716,6 @@ def builds_cancel(job_id: int) -> None:
     require_maintainer(token)
     http_json("POST", get_api_url(), f"/api/builds/jobs/{job_id}/cancel", token=token)
     click.echo("cancel ok job %s" % job_id)
-
 
 @grp_builds.command("failures")
 @click.option("--release-id", type=int, default=None)
@@ -788,7 +735,6 @@ def builds_failures(release_id: int | None) -> None:
                 row.get("architecture") or "-",
             )
         )
-
 
 @grp_builds.command("fix-current")
 @click.option("--release-id", type=int, default=None, help="Same filter as builds failures (optional).")
@@ -822,12 +768,6 @@ def builds_fix_current(
     distgit_url: str,
     distgit_branch: str,
 ) -> None:
-    """Act only on /api/builds/current-failures (not every historic failed job).
-
-    Default mode retries each listed job. Use rebuild to re-trigger distgit builds
-    while skipping arches that already succeeded (avoids cases like nano getting
-    extra jobs when both arches are already green).
-    """
     token_read = get_token()
     params: dict[str, Any] = {}
     if release_id is not None:
@@ -882,7 +822,6 @@ def builds_fix_current(
             )
         return
 
-    # rebuild: one trigger per (release_id, package_name), always skip_complete_arches
     explicit_arches = [a.strip() for a in arch.split(",") if a.strip()]
     keys: dict[tuple[int, str], dict[str, Any]] = {}
     arches_for_key: dict[tuple[int, str], set[str]] = {}
@@ -967,24 +906,15 @@ def builds_fix_current(
                 % (int(job["id"]), pkg, job.get("architecture") or "")
             )
 
-
 @cli.group("logs")
 def grp_logs() -> None:
-    """Fetch build logs.
-
-    Typical flow: ``orbscli builds list --status failed --limit 20`` then
-    ``orbscli builds show <job_id>`` for package name, then
-    ``orbscli logs job <job_id> --tail 400`` (or omit --tail for full log via attempts API).
-    """
     pass
-
 
 @grp_logs.command("job")
 @click.argument("job_id", type=int)
 @click.option("--tail", type=int, default=120, help="Last N log lines (default 120)")
 @click.option("--attempt", type=int, default=None, help="Use this attempt id instead of latest for the job")
 def logs_job(job_id: int, tail: int, attempt: int | None) -> None:
-    """Resolve latest build attempt for a job id, then print the log tail (build job id from UI)."""
     token = get_token()
     base = get_api_url()
     if attempt is not None:
@@ -999,7 +929,6 @@ def logs_job(job_id: int, tail: int, attempt: int | None) -> None:
         click.echo("job %s latest_attempt %s" % (job_id, aid), err=True)
     ctx = click.get_current_context()
     ctx.invoke(logs_view, attempt_id=aid, out=None, tail=tail)
-
 
 @grp_logs.command("view")
 @click.argument("attempt_id", type=int)
@@ -1022,7 +951,6 @@ def logs_view(attempt_id: int, out: str | None, tail: int | None) -> None:
     else:
         click.echo(r.text, nl=False)
 
-
 @cli.command("promote")
 @click.argument("from_channel")
 @click.argument("to_channel")
@@ -1038,7 +966,6 @@ def cmd_promote(
     package_name: str | None,
     build_job_id: int | None,
 ) -> None:
-    """Create a promotion record (same as GUI promote)."""
     token = require_auth(get_token())
     require_maintainer(token)
     body: dict[str, Any] = {
@@ -1053,11 +980,9 @@ def cmd_promote(
     out = http_json("POST", get_api_url(), "/api/promotions/promote", token=token, json_body=body)
     click.echo(json.dumps(out, indent=2))
 
-
 @cli.group("promotions")
 def grp_promotions() -> None:
     pass
-
 
 @grp_promotions.command("list")
 @click.option("--release-id", type=int, default=None)
@@ -1075,12 +1000,9 @@ def promotions_list(ctx: click.Context, release_id: int | None, status: str | No
     for p in out.get("items", []):
         click.echo("%s\t%s\t%s\t%s" % (p.get("id"), p.get("package_name"), p.get("status"), p.get("from_channel")))
 
-
 @cli.group("mockenv")
 def grp_mockenv() -> None:
-    """Mock environments (admin)."""
     pass
-
 
 @grp_mockenv.command("list")
 @click.option("--release-id", type=int, default=None)
@@ -1094,7 +1016,6 @@ def mockenv_list(ctx: click.Context, release_id: int | None) -> None:
     for e in out.get("items", []):
         click.echo("%s\t%s\trelease=%s\t%s" % (e.get("id"), e.get("name"), e.get("release_id"), e.get("config_name")))
 
-
 @grp_mockenv.command("show")
 @click.argument("env_id", type=int)
 @click.pass_context
@@ -1102,7 +1023,6 @@ def mockenv_show(ctx: click.Context, env_id: int) -> None:
     token = get_token()
     out = http_json("GET", get_api_url(), f"/api/mock-environments/{env_id}", token=token)
     click.echo(json.dumps(out, indent=2, default=str))
-
 
 @grp_mockenv.command("create")
 @click.option("--release-id", type=int, required=True)
@@ -1134,7 +1054,6 @@ def mockenv_create(
     }
     out = http_json("POST", get_api_url(), "/api/mock-environments", token=token, json_body=body)
     click.echo(json.dumps(out, indent=2, default=str))
-
 
 @grp_mockenv.command("update")
 @click.argument("env_id", type=int)
@@ -1169,7 +1088,6 @@ def mockenv_update(
     out = http_json("PATCH", get_api_url(), f"/api/mock-environments/{env_id}", token=token, json_body=patch)
     click.echo(json.dumps(out, indent=2, default=str))
 
-
 @grp_mockenv.command("delete")
 @click.argument("env_id", type=int)
 @click.pass_context
@@ -1179,12 +1097,9 @@ def mockenv_delete(ctx: click.Context, env_id: int) -> None:
     http_json("DELETE", get_api_url(), f"/api/mock-environments/{env_id}", token=token)
     click.echo("deleted mock env %s" % env_id)
 
-
 @cli.group("worker")
 def grp_worker() -> None:
-    """Workers (enroll/delete admin; list public)."""
     pass
-
 
 @grp_worker.command("list")
 @click.pass_context
@@ -1192,7 +1107,6 @@ def worker_list(ctx: click.Context) -> None:
     out = http_json("GET", get_api_url(), "/api/workers", token=get_token())
     for w in out.get("items", []):
         click.echo("%s\t%s\t%s\t%s" % (w.get("id"), w.get("name"), w.get("state"), w.get("architecture") or ""))
-
 
 @grp_worker.command("enroll")
 @click.option("--name", required=True)
@@ -1211,7 +1125,6 @@ def worker_enroll(ctx: click.Context, name: str, architecture: str | None, enrol
     out = http_json("POST", get_api_url(), "/api/workers/enroll", token=token, json_body=body)
     click.echo(json.dumps(out, indent=2))
 
-
 @grp_worker.command("delete")
 @click.argument("worker_id", type=int)
 @click.pass_context
@@ -1221,12 +1134,9 @@ def worker_delete(ctx: click.Context, worker_id: int) -> None:
     http_json("DELETE", get_api_url(), f"/api/workers/{worker_id}", token=token)
     click.echo("deleted worker %s" % worker_id)
 
-
 @cli.group("release")
 def grp_release() -> None:
-    """Releases (mutations admin-only)."""
     pass
-
 
 @grp_release.command("list")
 @click.pass_context
@@ -1235,14 +1145,12 @@ def release_list(ctx: click.Context) -> None:
     for r in out.get("items", []):
         click.echo("%s\t%s\tactive=%s" % (r.get("id"), r.get("releasename"), r.get("is_active")))
 
-
 @grp_release.command("show")
 @click.argument("release_id", type=int)
 @click.pass_context
 def release_show(ctx: click.Context, release_id: int) -> None:
     out = http_json("GET", get_api_url(), f"/api/releases/{release_id}", token=get_token())
     click.echo(json.dumps(out, indent=2, default=str))
-
 
 @grp_release.command("create")
 @click.option("--releasename", required=True)
@@ -1271,7 +1179,6 @@ def release_create(
     }
     out = http_json("POST", get_api_url(), "/api/releases", token=token, json_body=body)
     click.echo(json.dumps(out, indent=2, default=str))
-
 
 @grp_release.command("update")
 @click.argument("release_id", type=int)
@@ -1314,7 +1221,6 @@ def release_update(
     out = http_json("PATCH", get_api_url(), f"/api/releases/{release_id}", token=token, json_body=patch)
     click.echo(json.dumps(out, indent=2, default=str))
 
-
 @grp_release.command("delete")
 @click.argument("release_id", type=int)
 @click.pass_context
@@ -1324,12 +1230,9 @@ def release_delete(ctx: click.Context, release_id: int) -> None:
     http_json("DELETE", get_api_url(), f"/api/releases/{release_id}", token=token)
     click.echo("deleted release %s" % release_id)
 
-
 @cli.group("package")
 def grp_package() -> None:
-    """Packages."""
     pass
-
 
 @grp_package.command("list")
 @click.option("--search", default=None)
@@ -1344,14 +1247,12 @@ def package_list(ctx: click.Context, search: str | None, limit: int) -> None:
     for p in out.get("items", []):
         click.echo("%s\t%s" % (p.get("id"), p.get("name")))
 
-
 @grp_package.command("show")
 @click.argument("package_id", type=int)
 @click.pass_context
 def package_show(ctx: click.Context, package_id: int) -> None:
     out = http_json("GET", get_api_url(), f"/api/packages/{package_id}", token=get_token())
     click.echo(json.dumps(out, indent=2, default=str))
-
 
 @grp_package.command("create")
 @click.option("--name", required=True)
@@ -1377,7 +1278,6 @@ def package_create(
         body["github_html_url"] = github_html_url
     out = http_json("POST", get_api_url(), "/api/packages", token=token, json_body=body)
     click.echo(json.dumps(out, indent=2, default=str))
-
 
 @grp_package.command("update")
 @click.argument("package_id", type=int)
@@ -1408,7 +1308,6 @@ def package_update(
     out = http_json("PATCH", get_api_url(), f"/api/packages/{package_id}", token=token, json_body=patch)
     click.echo(json.dumps(out, indent=2, default=str))
 
-
 @grp_package.command("delete")
 @click.argument("package_id", type=int)
 @click.pass_context
@@ -1418,12 +1317,9 @@ def package_delete(ctx: click.Context, package_id: int) -> None:
     http_json("DELETE", get_api_url(), f"/api/packages/{package_id}", token=token)
     click.echo("deleted package %s" % package_id)
 
-
 @cli.group("schedule")
 def grp_schedule() -> None:
-    """Schedules (admin)."""
     pass
-
 
 @grp_schedule.command("list")
 @click.pass_context
@@ -1433,7 +1329,6 @@ def schedule_list(ctx: click.Context) -> None:
     out = http_json("GET", get_api_url(), "/api/schedules", token=token)
     click.echo(json.dumps(out, indent=2, default=str))
 
-
 @grp_schedule.command("show")
 @click.argument("schedule_id", type=int)
 @click.pass_context
@@ -1442,7 +1337,6 @@ def schedule_show(ctx: click.Context, schedule_id: int) -> None:
     require_admin(token)
     out = http_json("GET", get_api_url(), f"/api/schedules/{schedule_id}", token=token)
     click.echo(json.dumps(out, indent=2, default=str))
-
 
 @grp_schedule.command("create")
 @click.option("--release-id", type=int, required=True)
@@ -1474,7 +1368,6 @@ def schedule_create(
     out = http_json("POST", get_api_url(), "/api/schedules", token=token, json_body=body)
     click.echo(json.dumps(out, indent=2, default=str))
 
-
 @grp_schedule.command("update")
 @click.argument("schedule_id", type=int)
 @click.option("--cron", "cron_expression", default=None)
@@ -1500,7 +1393,6 @@ def schedule_update(
     out = http_json("PATCH", get_api_url(), f"/api/schedules/{schedule_id}", token=token, json_body=patch)
     click.echo(json.dumps(out, indent=2, default=str))
 
-
 @grp_schedule.command("delete")
 @click.argument("schedule_id", type=int)
 @click.pass_context
@@ -1510,12 +1402,9 @@ def schedule_delete(ctx: click.Context, schedule_id: int) -> None:
     http_json("DELETE", get_api_url(), f"/api/schedules/{schedule_id}", token=token)
     click.echo("deleted schedule %s" % schedule_id)
 
-
 @cli.group("repo")
 def grp_repo() -> None:
-    """Repository status and publish."""
     pass
-
 
 @grp_repo.command("status")
 @click.option("--release-id", type=int, default=None)
@@ -1527,7 +1416,6 @@ def repo_status(ctx: click.Context, release_id: int | None) -> None:
         params["release_id"] = release_id
     out = http_json("GET", get_api_url(), "/api/repos/status", token=token, params=params or None)
     click.echo(json.dumps(out, indent=2, default=str))
-
 
 @grp_repo.command("publish")
 @click.option("--release-id", type=int, required=True)
@@ -1546,7 +1434,6 @@ def repo_publish(ctx: click.Context, release_id: int, channel: str, architecture
     )
     click.echo("publish requested")
 
-
 @grp_repo.command("regenerate-metadata")
 @click.pass_context
 def repo_regenerate_metadata(ctx: click.Context) -> None:
@@ -1555,12 +1442,9 @@ def repo_regenerate_metadata(ctx: click.Context) -> None:
     out = http_json("POST", get_api_url(), "/api/repos/regenerate-metadata", token=token)
     click.echo(json.dumps(out, indent=2, default=str))
 
-
 @cli.group("audit")
 def grp_audit() -> None:
-    """Audit log (admin)."""
     pass
-
 
 @grp_audit.command("list")
 @click.option("--limit", type=int, default=100)
@@ -1572,12 +1456,9 @@ def audit_list(ctx: click.Context, limit: int) -> None:
     for row in out:
         click.echo("%s\t%s\t%s\t%s" % (row.get("id"), row.get("action"), row.get("resource_type"), row.get("details")))
 
-
 @cli.group("account")
 def grp_account() -> None:
-    """User accounts (admin)."""
     pass
-
 
 @grp_account.command("list")
 @click.pass_context
@@ -1587,7 +1468,6 @@ def account_list(ctx: click.Context) -> None:
     out = http_json("GET", get_api_url(), "/api/accounts", token=token)
     for a in out:
         click.echo("%s\t%s\t%s\tactive=%s" % (a.get("id"), a.get("username"), a.get("role"), a.get("is_active")))
-
 
 @grp_account.command("create")
 @click.option("--username", required=True)
@@ -1605,7 +1485,6 @@ def account_create(ctx: click.Context, username: str, password: str, role: str) 
         json_body={"username": username, "password": password, "role": role},
     )
     click.echo(json.dumps(out, indent=2, default=str))
-
 
 @grp_account.command("update")
 @click.argument("account_id", type=int)
@@ -1635,7 +1514,6 @@ def account_update(
     out = http_json("PATCH", get_api_url(), f"/api/accounts/{account_id}", token=token, json_body=patch)
     click.echo(json.dumps(out, indent=2, default=str))
 
-
 @grp_account.command("delete")
 @click.argument("account_id", type=int)
 @click.pass_context
@@ -1645,7 +1523,6 @@ def account_delete(ctx: click.Context, account_id: int) -> None:
     http_json("DELETE", get_api_url(), f"/api/accounts/{account_id}", token=token)
     click.echo("deleted account %s" % account_id)
 
-
 @cli.command("search")
 @click.argument("query")
 @click.pass_context
@@ -1654,12 +1531,9 @@ def cmd_search(ctx: click.Context, query: str) -> None:
     out = http_json("GET", get_api_url(), "/api/search", token=token, params={"q": query})
     click.echo(json.dumps(out, indent=2, default=str))
 
-
 @cli.group("advisory")
 def grp_advisory() -> None:
-    """Watchdog security advisories (same JWT as build API; uses ORBSCLI_WATCHDOG_URL)."""
     pass
-
 
 @grp_advisory.command("list")
 @click.option("--release-id", type=int, default=None)
@@ -1674,7 +1548,6 @@ def advisory_list(ctx: click.Context, release_id: int | None, limit: int) -> Non
     out = http_json("GET", wd, "/api/security/advisories", token=token, params=params)
     click.echo(json.dumps(out, indent=2, default=str)[:8000])
 
-
 @grp_advisory.command("scan")
 @click.pass_context
 def advisory_scan(ctx: click.Context) -> None:
@@ -1683,7 +1556,6 @@ def advisory_scan(ctx: click.Context) -> None:
     wd = get_watchdog_url()
     out = http_json("POST", wd, "/api/security/scan", token=token, json_body={})
     click.echo(json.dumps(out, indent=2, default=str))
-
 
 @grp_advisory.command("create-custom")
 @click.option("--title", required=True)
@@ -1725,7 +1597,6 @@ def advisory_create_custom(
     out = http_json("POST", wd, "/api/security/advisories/custom", token=token, json_body=body)
     click.echo(json.dumps(out, indent=2, default=str))
 
-
 @grp_advisory.command("resolve-cve")
 @click.argument("cve_match_id", type=int)
 @click.option("--reason", type=click.Choice(["backport", "upstream_bump", "false_positive", "mitigated", "accepted_risk", "other"]))
@@ -1754,7 +1625,6 @@ def advisory_resolve_cve(
     )
     click.echo(json.dumps(out, indent=2, default=str))
 
-
 @grp_advisory.command("resolve-custom")
 @click.argument("advisory_id", type=int)
 @click.pass_context
@@ -1764,7 +1634,6 @@ def advisory_resolve_custom(ctx: click.Context, advisory_id: int) -> None:
     wd = get_watchdog_url()
     out = http_json("POST", wd, f"/api/security/advisories/custom/{advisory_id}/resolve", token=token)
     click.echo(json.dumps(out, indent=2, default=str))
-
 
 def main() -> None:
     cli.add_command(grp_builds)
@@ -1780,7 +1649,6 @@ def main() -> None:
     cli.add_command(grp_account)
     cli.add_command(grp_advisory)
     cli()
-
 
 if __name__ == "__main__":
     main()
