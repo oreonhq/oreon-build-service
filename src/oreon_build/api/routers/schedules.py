@@ -1,4 +1,3 @@
-"""Schedules - list public; create/update/delete require admin."""
 from fastapi import APIRouter, HTTPException, Request, status
 from sqlalchemy import select
 
