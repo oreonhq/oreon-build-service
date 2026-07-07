@@ -1,4 +1,3 @@
-"""Workers - list public; enroll (admin); heartbeat/poll (worker token)."""
 from datetime import datetime, timezone
 import secrets
 
@@ -15,11 +14,6 @@ router = APIRouter(prefix="/workers", tags=["workers"])
 
 
 def _effective_worker_state(w: Worker) -> str:
-    """DB state stays idle/busy when a host dies. Treat stale or missing heartbeat as offline for API/UI.
-
-    Burst workers never show as offline -- their VM may be stopped intentionally.
-    They always show as idle when not actively running a job.
-    """
     if w.is_burst_worker:
         if w.state == WorkerState.BUSY:
             return WorkerState.BUSY.value
