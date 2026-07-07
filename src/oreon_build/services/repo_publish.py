@@ -1,9 +1,3 @@
-# Oreon Build Service
-# Copyright (C) 2026 Oreon HQ
-#
-# SPDX-License-Identifier: GPL-3.0-or-later
-"""Copy build RPMs into repo layout, prune, regenerate repodata. Used right after POST /worker/result."""
-
 from __future__ import annotations
 
 import asyncio
@@ -27,8 +21,7 @@ logger = logging.getLogger(__name__)
 _publish_locks: dict[int, asyncio.Lock] = {}
 _publish_global_sem: asyncio.Semaphore | None = None
 _publish_global_sem_lock = threading.Lock()
-_publish_completed_attempts: set[int] = set()  # Track completed attempts for cleanup
-
+_publish_completed_attempts: set[int] = set()
 
 def _repo_publish_timeout_sec() -> int:
     raw = (os.environ.get("OREON_REPO_PUBLISH_TIMEOUT_SEC") or "2400").strip()
@@ -38,9 +31,7 @@ def _repo_publish_timeout_sec() -> int:
         n = 2400
     return max(120, min(n, 12 * 3600))
 
-
 def _global_publish_semaphore() -> asyncio.Semaphore:
-    """One process-wide limit for heavy R2 + createrepo work so burst completions do not stall the API."""
     global _publish_global_sem
     with _publish_global_sem_lock:
         if _publish_global_sem is None:
@@ -49,7 +40,6 @@ def _global_publish_semaphore() -> asyncio.Semaphore:
             logger.info("repo publish global concurrency limit=%s", n)
         return _publish_global_sem
 
-
 def _lock_for(attempt_id: int) -> asyncio.Lock:
     lock = _publish_locks.get(attempt_id)
     if lock is None:
@@ -57,17 +47,13 @@ def _lock_for(attempt_id: int) -> asyncio.Lock:
         _publish_locks[attempt_id] = lock
     return lock
 
-
 def _cleanup_old_locks() -> None:
-    """Remove locks for completed attempts to prevent unbounded memory growth."""
-    # Keep only recent completed attempts to avoid memory bloat
     max_cache_size = 100
     if len(_publish_completed_attempts) > max_cache_size:
         oldest = sorted(list(_publish_completed_attempts))[: len(_publish_completed_attempts) - max_cache_size]
         for attempt_id in oldest:
             _publish_locks.pop(attempt_id, None)
             _publish_completed_attempts.discard(attempt_id)
-
 
 def process_repo_publish_sync(
     *,
@@ -115,7 +101,6 @@ def process_repo_publish_sync(
                     except Exception:
                         pass
 
-
 @dataclass
 class _PrefixPublishBatch:
     releasename: str
@@ -126,7 +111,6 @@ class _PrefixPublishBatch:
     attempt_ids: list[int] = field(default_factory=list)
     payload_artifacts: list = field(default_factory=list)
     build_attempt_r2_keys: list[str] = field(default_factory=list)
-
 
 def _group_publish_tasks_by_prefix(batches: list[_PrefixPublishBatch]) -> dict[str, _PrefixPublishBatch]:
     out: dict[str, _PrefixPublishBatch] = {}
@@ -140,7 +124,6 @@ def _group_publish_tasks_by_prefix(batches: list[_PrefixPublishBatch]) -> dict[s
         cur.payload_artifacts.extend(b.payload_artifacts)
         cur.build_attempt_r2_keys.extend(b.build_attempt_r2_keys)
     return out
-
 
 async def _load_publish_batch(task: PublishTask) -> _PrefixPublishBatch | None:
     from oreon_build.api.worker_api import ArtifactPayload
@@ -204,7 +187,6 @@ async def _load_publish_batch(task: PublishTask) -> _PrefixPublishBatch | None:
         build_attempt_r2_keys=r2_keys,
     )
 
-
 async def _mark_publish_tasks_running(task_ids: list[int]) -> None:
     if not task_ids:
         return
@@ -216,7 +198,6 @@ async def _mark_publish_tasks_running(task_ids: list[int]) -> None:
             .values(status="running", started_at=now)
         )
         await db.commit()
-
 
 async def _mark_publish_tasks_success(task_ids: list[int], attempt_ids: list[int]) -> None:
     now = datetime.now(timezone.utc)
@@ -232,7 +213,6 @@ async def _mark_publish_tasks_success(task_ids: list[int], attempt_ids: list[int
         _publish_completed_attempts.add(attempt_id)
     _cleanup_old_locks()
 
-
 async def _mark_publish_tasks_failed(task_ids: list[int], attempt_ids: list[int], err: str) -> None:
     now = datetime.now(timezone.utc)
     async with async_session_maker() as db:
@@ -246,7 +226,6 @@ async def _mark_publish_tasks_failed(task_ids: list[int], attempt_ids: list[int]
     for attempt_id in attempt_ids:
         _publish_completed_attempts.add(attempt_id)
     _cleanup_old_locks()
-
 
 async def _notify_publish_success(attempt_ids: list[int]) -> None:
     from oreon_build.services.build_chain import on_repo_publish_success_for_chain
@@ -262,7 +241,6 @@ async def _notify_publish_success(attempt_ids: list[int]) -> None:
         except Exception:
             logger.exception("rpmbuild settle notify after publish attempt_id=%s", attempt_id)
 
-
 async def _notify_publish_failed(attempt_ids: list[int], err: str) -> None:
     from oreon_build.services.build_chain import on_repo_publish_failed_for_chain
 
@@ -271,7 +249,6 @@ async def _notify_publish_failed(attempt_ids: list[int], err: str) -> None:
             await on_repo_publish_failed_for_chain(attempt_id, err)
         except Exception:
             logger.exception("build chain notify publish failure attempt_id=%s", attempt_id)
-
 
 async def _run_prefix_publish_batch(batch: _PrefixPublishBatch) -> None:
     await _mark_publish_tasks_running(batch.publish_task_ids)
@@ -304,14 +281,7 @@ async def _run_prefix_publish_batch(batch: _PrefixPublishBatch) -> None:
     logger.info("repo publish done prefix=%s attempts=%s", batch.prefix, batch.attempt_ids)
     await _notify_publish_success(batch.attempt_ids)
 
-
 async def run_repo_publish_tasks_batch(tasks: list[PublishTask]) -> None:
-    """
-    Run one coalesced publish+repodata pass per repo prefix for this dequeue batch.
-
-    Parallel builds that finish together for the same arch must not skip repodata because
-    an earlier task in the batch marked later ones success without running.
-    """
     if not tasks:
         return
 
@@ -330,13 +300,11 @@ async def run_repo_publish_tasks_batch(tasks: list[PublishTask]) -> None:
         for batch in grouped:
             await _run_prefix_publish_batch(batch)
 
-
 async def run_repo_publish_for_attempt(
     attempt_id: int,
     *,
     publish_task_id: int | None = None,
 ) -> None:
-    """Publish one attempt. Prefer run_repo_publish_tasks_batch from the poll loop."""
     async with async_session_maker() as db:
         if publish_task_id is not None:
             pt_r = await db.execute(select(PublishTask).where(PublishTask.id == publish_task_id))

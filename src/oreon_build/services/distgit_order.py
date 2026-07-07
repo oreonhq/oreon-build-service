@@ -1,4 +1,3 @@
-"""Topological build order and spec-tree resolver from distgit spec files (GitHub)."""
 from __future__ import annotations
 
 import asyncio
@@ -36,7 +35,6 @@ def _distgit_spec_parse_executor() -> ThreadPoolExecutor:
         n = 32
     return ThreadPoolExecutor(max_workers=max(4, min(n, 64)))
 
-# Match BuildRequires name token (source-package-like token extraction)
 _BR_NAME = re.compile(r"^([A-Za-z0-9_][A-Za-z0-9+._-]*)")
 
 
@@ -46,9 +44,8 @@ class DistgitBuildOrderResult:
     distgit_url: str
     distgit_branch: str
     package_names: list[str]
-    edges: list[dict[str, str]]  # { "from": consumer, "to": provider } consumer needs provider
-    layers: list[list[str]]  # topological levels (parallel groups)
-    # Capability name (Provides/subpackage/source name) -> distgit source packages that provide it.
+    edges: list[dict[str, str]]
+    layers: list[list[str]]
     capability_providers: dict[str, list[str]]
     spec_evrs: dict[str, str]
     build_requires_raw: dict[str, list[str]]
@@ -62,16 +59,16 @@ class SpecTreeResolveResult:
     repo_branch: str
     distgit_url: str
     distgit_branch: str
-    mode: str  # "all_missing" | "existing_only"
+    mode: str
     total_spec_packages: int
     built_sources: list[str]
     never_built_sources: list[str]
     selected_for_chain: list[str]
     required_missing_sources: list[str]
-    edges: list[dict[str, str]]  # selected consumer -> selected provider
+    edges: list[dict[str, str]]
     layers: list[list[str]]
     chain_string: str
-    unresolved_requirements: list[dict[str, str]]  # consumer + requirement for provider not in spec tree
+    unresolved_requirements: list[dict[str, str]]
     errors: list[str]
     cycle_warning: bool
 
@@ -108,7 +105,6 @@ class _SpecParseResult:
 
 
 def db_safe_spec_evr(evr: str, *, max_len: int = 64) -> str:
-    """Fit spec EVR into package_versions.version (varchar 64); hash unexpanded macros."""
     s = (evr or "").strip() or "0:0-0"
     if (
         len(s) <= max_len
@@ -141,7 +137,6 @@ _RE_GLOBAL_IN_CONDITIONAL = re.compile(r"%global\s+(\S+)\s+([^}%]+)", re.IGNOREC
 
 
 def _parse_spec_macro_table(spec_text: str) -> dict[str, str]:
-    """Collect ``%global`` / ``%define`` values and globals embedded in ``%{?cond:...}`` lines."""
     macros: dict[str, str] = {}
     for line in (spec_text or "").splitlines():
         s = line.strip()
@@ -158,7 +153,6 @@ def _parse_spec_macro_table(spec_text: str) -> dict[str, str]:
 
 
 def _expand_rpm_macros(value: str, macros: dict[str, str], *, max_rounds: int = 24) -> str:
-    """Expand ``%{name}`` using macro values from the same spec (no conditionals)."""
     out = value or ""
     for _ in range(max_rounds):
         changed = False
@@ -208,12 +202,6 @@ def _extract_br_tokens_from_tag_value(value: str) -> list[str]:
 
 
 def _extract_pkg_name_from_package_options(opts: str, source_name: str) -> str | None:
-    """
-    Parse `%package` options and return the emitted binary package name.
-    Supports both:
-    - `%package devel` -> `<source>-devel`
-    - `%package -n explicit-name` -> `explicit-name`
-    """
     raw = (opts or "").strip()
     if not raw:
         return None
@@ -224,7 +212,6 @@ def _extract_pkg_name_from_package_options(opts: str, source_name: str) -> str |
     if not suffix:
         return None
     if suffix.startswith("-"):
-        # Other options we do not model here.
         return None
     return f"{source_name}-{suffix}"
 
@@ -239,8 +226,6 @@ def _parse_spec_text(spec_text: str, filename_hint: str = "inline.spec") -> _Spe
     version = ""
     release = ""
     macros = _parse_spec_macro_table(spec_text)
-    # Fast path parser (line oriented) for large trees.
-    # This avoids `specfile`'s expensive parse on thousands of specs.
     for line in (spec_text or "").splitlines():
         s = line.strip()
         if not s or s.startswith("#"):
@@ -291,7 +276,6 @@ def _parse_spec_text(spec_text: str, filename_hint: str = "inline.spec") -> _Spe
                     continue
                 provided.add(tok)
     provided.add(source_name)
-    # Optional slow path for max fidelity. Keep disabled by default.
     if (os.environ.get("OREON_SPECFILE_DEEP_PARSE") or "").strip().lower() not in ("1", "true", "yes", "on"):
         return _SpecParseResult(
             source_name=source_name,
@@ -303,7 +287,6 @@ def _parse_spec_text(spec_text: str, filename_hint: str = "inline.spec") -> _Spe
             release=release,
         )
 
-    # Slow path with specfile library (opt-in).
     try:
         spec = Specfile(content=spec_text, force_parse=True, sourcedir=tempfile.gettempdir())
         with spec.tags() as tags:
@@ -348,7 +331,6 @@ def _parse_spec_text(spec_text: str, filename_hint: str = "inline.spec") -> _Spe
         )
     except Exception as exc:
         logger.warning("specfile parse failed for %s: %s", filename_hint, exc)
-    # Return the fast-path result if deep parse fails.
     return _SpecParseResult(
         source_name=source_name,
         build_requires=br_out,
@@ -372,7 +354,6 @@ def _provider_map_from_specs(parsed_by_source: dict[str, _SpecParseResult]) -> d
 def _kahn_layers(
     names: set[str], deps: dict[str, set[str]], rdeps: dict[str, set[str]]
 ) -> tuple[list[list[str]], bool]:
-    """deps[a] = predecessor packages a needs built first. Kahn; on cycle, peel one node per round."""
     remaining = set(names)
     in_deg = {n: len(deps.get(n, set())) for n in names}
     layers: list[list[str]] = []
@@ -409,7 +390,6 @@ async def _download_distgit_tarball(
 def _tarball_spec_member_index(
     tarball: bytes, releasename: str
 ) -> tuple[set[str], dict[str, tarfile.TarInfo]]:
-    """One ``getmembers()`` pass: package names and TarInfo for each ``<pkg>/<pkg>.spec``."""
     all_names: set[str] = set()
     members: dict[str, tarfile.TarInfo] = {}
     with tarfile.open(fileobj=io.BytesIO(tarball), mode="r:gz") as tf:
@@ -438,7 +418,6 @@ def _read_specs_from_tarball(
     *,
     members: dict[str, tarfile.TarInfo] | None = None,
 ) -> dict[str, str]:
-    """Read only ``packages`` spec files from an already-downloaded tarball (single tar open)."""
     want = set(packages)
     if not want:
         return {}
@@ -569,11 +548,6 @@ def _expand_chain_spec_closure(
     *,
     members: dict[str, tarfile.TarInfo] | None = None,
 ) -> tuple[dict[str, str], dict[str, _SpecParseResult], list[str]]:
-    """
-    Incrementally read/parse specs along BuildRequires from ``roots`` (not the full distgit tree).
-
-    Parses each BFS wave in parallel (IO batch read, then thread-pool spec parse).
-    """
     err: list[str] = []
     names_set = set(all_names)
     if members is None:
@@ -660,9 +634,6 @@ async def compute_distgit_build_order_for_chain(
     distgit_branch: str = "main",
     root_packages: list[str],
 ) -> DistgitBuildOrderResult:
-    """
-    Fresh distgit metadata for a chain: one tarball fetch, parse only specs reachable from ``root_packages``.
-    """
     err: list[str] = []
     gr = _github_owner_repo_from_git_url(distgit_url)
     if not gr:
@@ -751,7 +722,6 @@ async def _fetch_specs_by_tarball(
     distgit_branch: str,
     headers: dict[str, str],
 ) -> tuple[dict[str, str], list[str]]:
-    """Download branch tarball once, extract every ``<releasename>/<pkg>/<pkg>.spec`` (full tree)."""
     errs: list[str] = []
     tarball, t_err = await _download_distgit_tarball(
         owner=owner, repo=repo, distgit_branch=distgit_branch, headers=headers
@@ -795,7 +765,6 @@ async def compute_distgit_build_order(
     distgit_url: str = "https://github.com/oreonhq/rpm-specfiles.git",
     distgit_branch: str = "main",
 ) -> DistgitBuildOrderResult:
-    """List packages under ``releasename/`` in distgit, parse specs, return topo order."""
     err: list[str] = []
     gr = _github_owner_repo_from_git_url(distgit_url)
     if not gr:
@@ -846,7 +815,6 @@ def _sources_from_spec_capability_map(
     prov_map: dict[str, list[str]],
     spec_set: set[str],
 ) -> set[str]:
-    """Source packages whose spec lists ``capability`` as a Provide or subpackage name."""
     cap = (capability or "").strip()
     if not cap:
         return set()
@@ -870,13 +838,6 @@ def resolve_distgit_sources_for_capability(
     repo_provides_index: dict[str, set[str]] | None = None,
     repo_known_sources: set[str] | None = None,
 ) -> list[str]:
-    """
-    Map a dnf/RPM capability to distgit source package name(s) that Provide it.
-
-    Lookup order:
-    1. Parsed spec ``Provides:`` / ``%package`` names (with ``%global`` expansion).
-    2. Published repo ``primary.xml`` provide entries (already-built binaries).
-    """
     cap = (capability or "").strip()
     if not cap:
         return []
@@ -906,13 +867,6 @@ async def compute_spec_tree_dependency_plan(
     distgit_url: str = "https://github.com/oreonhq/rpm-specfiles.git",
     distgit_branch: str = "main",
 ) -> SpecTreeResolveResult:
-    """
-    Resolve a chain plan from spec-tree + R2 source RPMs only.
-
-    - Parse ALL specs from `<releasename>/` in distgit (parallel).
-    - Compare against built SOURCE packages under `R2 <releasename>/<repo_branch>/src/*.src.rpm`.
-    - No DB package-state comparison.
-    """
     errors: list[str] = []
     gr = _github_owner_repo_from_git_url(distgit_url)
     if not gr:
@@ -1048,7 +1002,6 @@ async def compute_unbuilt_spec_list(
     distgit_url: str = "https://github.com/oreonhq/rpm-specfiles.git",
     distgit_branch: str = "main",
 ) -> UnbuiltSpecListResult:
-    """Return all dist-git packages under release that are not present in DB."""
     errors: list[str] = []
     gr = _github_owner_repo_from_git_url(distgit_url)
     if not gr:

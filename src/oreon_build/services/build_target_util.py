@@ -1,4 +1,3 @@
-"""Shared helpers for resolving build targets and skip-complete checks (used by builds router and chain builds)."""
 from __future__ import annotations
 
 from collections import defaultdict
@@ -17,7 +16,6 @@ async def get_or_create_build_target(
     architecture: str,
     mock_environment_id: int | None,
 ) -> BuildTarget:
-    """Get or create a BuildTarget for (release_id, architecture, mock_environment_id)."""
     mock_env_id = mock_environment_id
     if mock_env_id is None:
         fb = await db.execute(
@@ -65,7 +63,6 @@ async def get_or_create_build_target(
 
 
 async def latest_package_version_id(db, package_id: int) -> int | None:
-    """Highest-id PackageVersion for a package, or None if the package has no versions."""
     return (
         await db.scalar(
             select(PackageVersion.id)
@@ -85,15 +82,6 @@ async def has_successful_build_for_target(
     *,
     jobs_created_on_or_after: datetime | None = None,
 ) -> bool:
-    """True if there is already a successful job for this package, release, and build target.
-
-    When ``package_version_id`` is set, only successes for that version count.
-
-    When ``jobs_created_on_or_after`` is set (used for chain builds), only successes
-    from jobs created at or after that time count. That prevents ``skip_complete_arches``
-    from treating pre-chain historical successes as satisfying a new chain after
-    distgit/spec updates where jobs used unpinned ``package_version_id``.
-    """
     q = (
         select(BuildJob.id)
         .where(
@@ -118,7 +106,6 @@ async def has_successful_build_for_target(
 
 
 async def batch_package_ids_by_name(db, names: Iterable[str]) -> dict[str, int]:
-    """Map package name -> id in one query."""
     uniq = sorted({(n or "").strip() for n in names if (n or "").strip()})
     if not uniq:
         return {}
@@ -127,7 +114,6 @@ async def batch_package_ids_by_name(db, names: Iterable[str]) -> dict[str, int]:
 
 
 async def batch_latest_package_version_ids(db, package_ids: list[int]) -> dict[int, int | None]:
-    """Highest PackageVersion id per package_id."""
     if not package_ids:
         return {}
     rows = await db.execute(
@@ -154,7 +140,6 @@ async def package_ids_with_success_on_all_targets(
     version_by_package: dict[int, int | None],
     jobs_created_on_or_after: datetime | None,
 ) -> set[int]:
-    """package_ids that already have SUCCESS on every target_id (with matching package_version_id)."""
     if not package_ids or not target_ids:
         return set()
     required_targets = set(target_ids)

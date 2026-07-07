@@ -1,20 +1,3 @@
-# Oreon Build Service
-# Copyright (C) 2026 Oreon HQ
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program. If not, see <https://www.gnu.org/licenses/>.
-
-"""One-shot repair: build attempts marked failed but with RPM artifacts (HTTP timeout race)."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -27,14 +10,7 @@ from oreon_build.config import get_settings
 from oreon_build.core.repo_branch import r2_publish_branch
 from oreon_build.models import BuildAttempt, BuildJob, BuildStatus, Package, Promotion, Release
 
-
 def repair_misclassified_builds(*, dry_run: bool) -> List[str]:
-    """
-    For each build job, if the **latest** attempt is FAILED but has at least one artifact, set
-    attempt + job to SUCCESS and ensure a pending Promotion exists (matches successful build flow).
-
-    Returns human-readable log lines.
-    """
     settings = get_settings()
     engine = create_engine(settings.sync_database_url, pool_pre_ping=True)
     SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)

@@ -1,4 +1,3 @@
-"""Core build trigger logic shared by HTTP handlers and background workers."""
 from __future__ import annotations
 
 import logging

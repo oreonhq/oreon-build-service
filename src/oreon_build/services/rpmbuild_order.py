@@ -1,4 +1,3 @@
-"""Persistent rpmbuild-order plans with strict layer metadata."""
 from __future__ import annotations
 
 import logging
@@ -37,7 +36,6 @@ logger = logging.getLogger(__name__)
 
 
 def _plan_skip_jobs_not_before(plan: RpmbuildPlan) -> datetime | None:
-    """Lower bound for ``skip_complete`` checks scoped to this rpmbuild plan."""
     ca = plan.created_at
     if ca is None:
         return None
@@ -252,7 +250,6 @@ async def create_rpmbuild_plan(
     await db.flush()
     await db.refresh(plan)
 
-    # Minimal seed bootstrap behavior: only queue seed packages in the opening layer.
     initial_jobs: list[BuildJob] = []
     for pkg_name in clean_seed:
         if layer_map[pkg_name] != start_layer:

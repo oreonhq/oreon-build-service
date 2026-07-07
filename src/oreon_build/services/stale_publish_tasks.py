@@ -1,9 +1,3 @@
-# Oreon Build Service
-# Copyright (C) 2026 Oreon HQ
-#
-# SPDX-License-Identifier: GPL-3.0-or-later
-"""Recover ``publish_tasks`` rows stuck in ``running`` after API crash or hung createrepo."""
-
 from __future__ import annotations
 
 import logging
@@ -17,15 +11,7 @@ from oreon_build.models import PublishTask
 
 logger = logging.getLogger(__name__)
 
-
 async def reclaim_publish_tasks_stuck_running(db: AsyncSession, settings: Settings) -> int:
-    """
-    The API poll loop only claims ``pending`` rows. If the process dies after setting
-    ``running`` or createrepo never returns, the row stays ``running`` forever and repo
-    publish never retries. Reset old ``running`` rows to ``pending`` so work can continue.
-
-    Returns the number of rows updated.
-    """
     minutes = int(settings.publish_task_stale_running_minutes or 0)
     if minutes <= 0:
         return 0

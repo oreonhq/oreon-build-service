@@ -1,4 +1,3 @@
-"""Fire-and-forget build trigger work so HTTP handlers return before enqueue finishes."""
 from __future__ import annotations
 
 import asyncio

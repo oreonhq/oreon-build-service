@@ -1,20 +1,3 @@
-# Oreon Build Service
-# Copyright (C) 2026 Oreon HQ
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-"""Poll GitHub compare API vs stored cursors to enqueue builds after missed webhooks."""
 from __future__ import annotations
 
 import logging
@@ -35,7 +18,6 @@ from oreon_build.services.github_push_trigger import (
 )
 
 logger = logging.getLogger(__name__)
-
 
 def _owner_repo_from_any_github_url(url: str) -> tuple[str, str] | None:
     base = url.split("#")[0].strip()
@@ -61,7 +43,6 @@ def _owner_repo_from_any_github_url(url: str) -> tuple[str, str] | None:
         return segs[0], segs[1]
     return None
 
-
 async def _resolve_repository_id(
     client: GitHubClient,
     owner: str,
@@ -78,9 +59,7 @@ async def _resolve_repository_id(
     cache[key] = rid
     return rid
 
-
 async def discover_repo_branch_pairs(db: AsyncSession, client: GitHubClient) -> list[tuple[int, str]]:
-    """Distinct (GitHub repository id, branch) from distgit-like github sources."""
     id_rows = await db.execute(
         select(Package.id)
         .join(PackageVersion, PackageVersion.package_id == Package.id)
@@ -133,7 +112,6 @@ async def discover_repo_branch_pairs(db: AsyncSession, client: GitHubClient) -> 
                 out.append(key)
     return out
 
-
 async def upsert_github_push_cursor(db: AsyncSession, repository_id: int, branch: str, head_sha: str) -> None:
     r = await db.execute(
         select(GitHubPushCursor).where(
@@ -146,7 +124,6 @@ async def upsert_github_push_cursor(db: AsyncSession, repository_id: int, branch
         row.head_sha = head_sha
     else:
         db.add(GitHubPushCursor(repository_id=repository_id, branch=branch, head_sha=head_sha))
-
 
 async def run_github_push_catchup(db: AsyncSession) -> dict[str, Any]:
     settings = get_settings()
@@ -319,7 +296,6 @@ async def run_github_push_catchup(db: AsyncSession) -> dict[str, Any]:
             except Exception as e:
                 logger.exception("GitHub catch-up pair failed repo_id=%s branch=%s", repository_id, branch)
                 summary["errors"].append(f"{repository_id}@{branch}: {e}")
-                # Swallowed errors can leave the async session needing a rollback before commit().
                 try:
                     await db.rollback()
                 except Exception:

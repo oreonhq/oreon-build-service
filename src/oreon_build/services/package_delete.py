@@ -1,4 +1,3 @@
-"""Shared package deletion (DB cascade + R2 cleanup)."""
 from __future__ import annotations
 
 import logging

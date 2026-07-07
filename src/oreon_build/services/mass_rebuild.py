@@ -1,4 +1,3 @@
-"""Queue distgit package builds when in-tree BuildRequires are satisfied."""
 from __future__ import annotations
 
 import logging
@@ -33,7 +32,6 @@ logger = logging.getLogger(__name__)
 async def _distgit_packages_for_release(
     db: Any, releasename: str
 ) -> list[tuple[int, str, int | None]]:
-    """Registered packages with distgit source under ``releasename/`` in the spec URL."""
     rel = (releasename or "").strip()
     r = await db.execute(
         select(Package.id, Package.name, Package.preferred_mock_environment_id, Source.url)

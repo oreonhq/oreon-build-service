@@ -1,4 +1,3 @@
-"""Manual chain builds: user-defined stages, publish-gated advance, no auto dependency injection."""
 from __future__ import annotations
 
 import asyncio

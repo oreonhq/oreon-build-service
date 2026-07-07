@@ -1,20 +1,3 @@
-# Oreon Build Service
-# Copyright (C) 2026 Oreon HQ
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-"""GitHub REST API client for org repo lists and branches (DistGit UI)."""
 from __future__ import annotations
 
 import logging
@@ -26,7 +9,6 @@ import httpx
 from oreon_build.config import get_settings
 
 logger = logging.getLogger(__name__)
-
 
 class GitHubClient:
     def __init__(self) -> None:
@@ -84,7 +66,6 @@ class GitHubClient:
         return r.json()
 
     async def compare_refs(self, owner: str, repo: str, base: str, head: str) -> Optional[dict[str, Any]]:
-        """GET repos/compare/{base}...{head} . Returns None on 404/422 (unrelated/missing)."""
         spec = f"{quote(base, safe='')}...{quote(head, safe='')}"
         r = await self._client.get(f"/repos/{owner}/{repo}/compare/{spec}")
         if r.status_code in (404, 422):
@@ -101,11 +82,6 @@ class GitHubClient:
         return r.json()
 
     async def list_git_tree_recursive(self, owner: str, repo: str, ref: str) -> dict[str, Any]:
-        """Return the full recursive git tree for a ref.
-
-        The response has ``tree`` (list of entries with ``path``, ``type``, ``sha``) and
-        ``truncated`` (bool). Callers must handle truncated=True (repo is too large).
-        """
         r = await self._client.get(
             f"/repos/{owner}/{repo}/git/trees/{quote(ref, safe='')}",
             params={"recursive": "1"},
@@ -114,7 +90,6 @@ class GitHubClient:
         return r.json()
 
     async def get_repo_contents(self, owner: str, repo: str, path: str, ref: str | None = None) -> Any:
-        """Return the GitHub Contents API response for a path (file or directory listing)."""
         params = {}
         if ref:
             params["ref"] = ref
@@ -129,7 +104,6 @@ class GitHubClient:
 
     async def close(self) -> None:
         await self._client.aclose()
-
 
 def get_github_client() -> GitHubClient:
     return GitHubClient()

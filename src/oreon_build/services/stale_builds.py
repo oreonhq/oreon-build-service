@@ -1,20 +1,3 @@
-# Oreon Build Service
-# Copyright (C) 2026 Oreon HQ
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program. If not, see <https://www.gnu.org/licenses/>.
-
-"""Mark build attempts/jobs stuck in *running* or *pending* as failed (worker crash, hung mock, full disk, no eligible worker, etc.)."""
 from __future__ import annotations
 
 import logging
@@ -46,34 +29,12 @@ _TERMINAL_STATUSES = (
     BuildStatus.SKIPPED,
 )
 
-
 async def reconcile_queue_inconsistencies(db: AsyncSession) -> tuple[int, int, int]:
-    """
-    Repair controller-side drift that blocks the queue under load:
-
-    - **Worker BUSY** with no RUNNING attempts (missed ``sync_worker_state_after_attempt_finished``,
-      partial handler failure, or tooling edits). Those workers still *poll*, but UI and any future
-      logic that keys off ``current_build_attempt_id`` are wrong; we reset to IDLE.
-
-    - **Worker.current_build_attempt_id** points at a terminal attempt even though the worker row
-      still has other RUNNING attempts. Re-point it at the newest RUNNING attempt so the UI
-      and poll-claim logic do not wedge on a ghost id.
-
-    - **BuildJob RUNNING** with no RUNNING attempts (job row out of sync with attempts). Align the
-      job to the latest attempt terminal status so pending work is not blocked by a ghost running job.
-
-    - **BuildAttempt RUNNING** but parent BuildJob is already in a terminal state (cancel raced
-      ahead, earlier handler crashed mid-transition, etc.). Align the attempt to the job status
-      so the worker row never stays BUSY against a phantom.
-
-    Returns ``(workers_fixed, jobs_fixed, attempts_fixed)``.
-    """
     now = datetime.now(timezone.utc)
     workers_fixed = 0
     jobs_fixed = 0
     attempts_fixed = 0
 
-    # ---- Workers BUSY with no RUNNING attempts ----
     busy_orphan = await db.execute(
         select(Worker).where(
             Worker.state == WorkerState.BUSY,
@@ -95,9 +56,6 @@ async def reconcile_queue_inconsistencies(db: AsyncSession) -> tuple[int, int, i
             w.id,
         )
 
-    # ---- Workers whose current_build_attempt_id points at a terminal attempt ----
-    # These workers still have other RUNNING attempts (else the block above already healed them),
-    # so we just re-point current_build_attempt_id at the newest RUNNING row.
     stale_ptr_workers = await db.execute(
         select(Worker).where(
             Worker.current_build_attempt_id.isnot(None),
@@ -134,7 +92,6 @@ async def reconcile_queue_inconsistencies(db: AsyncSession) -> tuple[int, int, i
             newest_running,
         )
 
-    # ---- BuildJob RUNNING with no RUNNING attempts ----
     job_orphan = await db.execute(
         select(BuildJob).where(
             BuildJob.status == BuildStatus.RUNNING,
@@ -178,10 +135,6 @@ async def reconcile_queue_inconsistencies(db: AsyncSession) -> tuple[int, int, i
         if w2 is not None:
             await sync_worker_state_after_attempt_finished(db, w2)
 
-    # ---- BuildAttempt RUNNING but parent job already terminal ----
-    # This happens when cancel/timeout handlers changed the job row but the attempt update lost
-    # the race (transient error, pod kill, connection drop). The attempt would otherwise keep
-    # the assigned worker stuck BUSY until the global runtime cutoff (default 7 days).
     running_with_terminal_job = await db.execute(
         select(BuildAttempt)
         .join(BuildJob, BuildAttempt.build_job_id == BuildJob.id)
@@ -199,8 +152,6 @@ async def reconcile_queue_inconsistencies(db: AsyncSession) -> tuple[int, int, i
             continue
         new_status = job_status
         if job_status == BuildStatus.SUCCESS:
-            # Don't promote an attempt to SUCCESS on its own; the controller's result handler is
-            # the source of truth for SUCCESS. Mark FAILED so the orphan is cleared.
             new_status = BuildStatus.FAILED
         prev = (att.error_message or "").strip()
         reason = (
@@ -248,17 +199,7 @@ async def reconcile_queue_inconsistencies(db: AsyncSession) -> tuple[int, int, i
 
     return workers_fixed, jobs_fixed, attempts_fixed
 
-
 async def sweep_stale_running_builds(db: AsyncSession, settings: Settings) -> int:
-    """
-    Fail RUNNING attempts (and their jobs) when any of these hold:
-    - the attempt has been running longer than ``build_stale_running_minutes``, or
-    - the assigned worker has not heartbeated within ``build_stale_worker_heartbeat_minutes``, or
-    - the attempt references a ``worker_id`` that no longer exists (worker row deleted while the
-      attempt was RUNNING) and the attempt is older than the heartbeat cutoff.
-
-    Returns the number of attempts updated.
-    """
     max_min = settings.build_stale_running_minutes
     hb_min = settings.build_stale_worker_heartbeat_minutes
     if max_min <= 0 and hb_min <= 0:
@@ -295,9 +236,6 @@ async def sweep_stale_running_builds(db: AsyncSession, settings: Settings) -> in
         w = att.worker
         if cutoff_hb is not None and att.worker_id is not None:
             if w is None:
-                # Worker row was deleted (admin action, re-enrollment, DB surgery) while the
-                # attempt was mid-flight. Use the same age gate as the missing-heartbeat path
-                # so we don't fail an attempt the second a worker row disappears.
                 if ref < now - timedelta(minutes=hb_min):
                     reasons.append(
                         f"Assigned worker id={att.worker_id} no longer exists and attempt started "
@@ -351,15 +289,9 @@ async def sweep_stale_running_builds(db: AsyncSession, settings: Settings) -> in
 
     return updated
 
-
 async def _no_eligible_live_worker(
     db: AsyncSession, job: BuildJob, worker_offline_after_seconds: int
 ) -> bool:
-    """
-    Return True when no worker matching this job's architecture has heartbeated within
-    ``worker_offline_after_seconds``. If ``worker_offline_after_seconds`` is 0, treat any
-    IDLE/BUSY worker with matching arch as live (DB state only).
-    """
     arch_vals: frozenset[str] = frozenset()
     if job.target_id is not None:
         target_arch = await db.scalar(
@@ -370,7 +302,6 @@ async def _no_eligible_live_worker(
 
     q = select(Worker).where(Worker.state.in_([WorkerState.IDLE, WorkerState.BUSY]))
     if arch_vals:
-        # Jobs without a target match any arch; here job.target_id is set so we require a match.
         q = q.where(Worker.architecture.in_(list(arch_vals)))
 
     if worker_offline_after_seconds and worker_offline_after_seconds > 0:
@@ -380,29 +311,7 @@ async def _no_eligible_live_worker(
     exists_live = await db.scalar(select(func.count()).select_from(q.subquery()))
     return (exists_live or 0) == 0
 
-
 async def sweep_stale_pending_builds(db: AsyncSession, settings: Settings) -> int:
-    """
-    Fail ``PENDING``/``QUEUED`` build jobs that have been waiting far too long to be claimed by a
-    worker. Without this, a job targeted at an architecture with no enrolled worker (or whose only
-    matching worker was decommissioned) would sit in the queue forever because the main
-    running-sweep only looks at RUNNING attempts.
-
-    Behavior:
-    - If ``build_stale_pending_minutes`` is 0, the sweep is disabled.
-    - Queue age is measured from ``BuildJob.updated_at`` (last change to the job row), not
-      ``created_at``. That way a **retry** after a pending timeout (POST sets status back to
-      pending and clears ``completed_at``) starts a fresh wait window instead of failing again
-      immediately because ``created_at`` is still from the original trigger.
-    - If ``build_stale_pending_require_no_eligible_worker`` is True, age alone is not enough: the
-      job is only failed when **no** worker matching its architecture has heartbeated recently
-      (uses ``worker_offline_after_seconds``). Jobs with no target (match-any-arch) are never
-      failed by this policy because any live worker can still claim them.
-    - Otherwise jobs are failed purely by age, which is safer when you want a hard ceiling on how
-      long a build can sit in the queue.
-
-    Returns the number of jobs updated.
-    """
     pend_min = settings.build_stale_pending_minutes
     if pend_min <= 0:
         return 0
@@ -422,8 +331,6 @@ async def sweep_stale_pending_builds(db: AsyncSession, settings: Settings) -> in
     for job in jobs:
         if settings.build_stale_pending_require_no_eligible_worker:
             if job.target_id is None:
-                # No target means any live worker can pick this up; don't time it out by age
-                # when the user explicitly asked for the stricter mode.
                 continue
             if not await _no_eligible_live_worker(
                 db, job, settings.worker_offline_after_seconds
@@ -442,10 +349,6 @@ async def sweep_stale_pending_builds(db: AsyncSession, settings: Settings) -> in
             )
 
         prev_status = job.status.value
-        # A pending job never had an attempt, so there is no attempt row to finalize here;
-        # updating the job row is enough for the queue to clear and for the UI to show it as
-        # failed with an explanatory error. error_message lives on attempts, not jobs; the
-        # reason text is emitted through audit so admins can find it in the audit log.
         job.status = BuildStatus.FAILED
         job.completed_at = now
         updated += 1

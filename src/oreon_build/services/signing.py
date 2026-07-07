@@ -1,20 +1,3 @@
-# Oreon Build Service
-# Copyright (C) 2026 Oreon HQ
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-"""RPM signing: GPG (rpm header) and optional pesign (PE/kernel modules inside payload)."""
 from __future__ import annotations
 
 import json
@@ -34,7 +17,6 @@ from oreon_build.config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
 
-
 def _signing_passphrase_plain(settings: Settings) -> Optional[str]:
     sec = settings.signing_gpg_passphrase
     if sec is None:
@@ -42,14 +24,11 @@ def _signing_passphrase_plain(settings: Settings) -> Optional[str]:
     v = sec.get_secret_value().strip()
     return v or None
 
-
 class PesignRepackError(RuntimeError):
-    """Raised when pesign/repack was required (strict mode) but failed."""
-
+    pass
 
 @dataclass
 class PesignRuntimeConfig:
-    """Controller-issued pesign material on a worker (``pesign_nss_dir`` is a local extracted path)."""
 
     pesign_nss_dir: str
     pesign_rules_json: Optional[str] = None
@@ -60,9 +39,7 @@ class PesignRuntimeConfig:
     pesign_aarch64_qemu_prefix: Optional[str] = None
     pesign_aarch64_guest_shell: Optional[str] = None
 
-
 PesignConfig = Settings | PesignRuntimeConfig
-
 
 def _norm_arch(a: str) -> str:
     x = (a or "").strip().lower()
@@ -72,12 +49,9 @@ def _norm_arch(a: str) -> str:
         return "aarch64"
     return x
 
-
-_EM_AARCH64 = 183  # e_machine in ELFhdr (little-endian AArch64)
-
+_EM_AARCH64 = 183
 
 def _elf_is_aarch64(path: str | Path) -> bool:
-    """True if path is an ELF64 executable with e_machine AArch64."""
     try:
         p = Path(path)
         with p.open("rb") as fh:
@@ -91,29 +65,18 @@ def _elf_is_aarch64(path: str | Path) -> bool:
     em = int.from_bytes(hdr[18:20], "little")
     return em == _EM_AARCH64
 
-
 def _normalize_qemu_prefix_line(prefix: str) -> str:
-    """Strip outer wrapping quotes some dotenv parsers leave on the whole value."""
     s = (prefix or "").strip()
     if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
         s = s[1:-1].strip()
     return s
 
-
 def _qemu_bash_argv(prefix: str, script: str, guest_shell: Optional[str] = None) -> list[str]:
-    """
-    Build argv for qemu execution.
-    Supports both:
-      - "qemu-aarch64-static -L /usr/aarch64-linux-gnu"
-      - "qemu-aarch64-static -L /usr/aarch64-linux-gnu /usr/bin/bash"
-    """
     raw = _normalize_qemu_prefix_line(prefix)
     parts = [p.strip() for p in shlex.split(raw)]
     if not parts:
         raise ValueError("empty qemu prefix")
     tail_name = Path(parts[-1]).name.lower()
-    # Only treat as explicit guest shell if it is a normal file named sh/bash (not a missing path
-    # and not a directory whose basename happens to be "sh").
     if tail_name in ("bash", "sh"):
         explicit_shell = parts[-1]
         rp = Path(explicit_shell)
@@ -164,7 +127,6 @@ def _qemu_bash_argv(prefix: str, script: str, guest_shell: Optional[str] = None)
         )
     return parts + [shell_candidate, "-lc", script]
 
-
 def _rpm_query(rpm_path: Path, query_format: str) -> Optional[str]:
     try:
         result = subprocess.run(
@@ -181,7 +143,6 @@ def _rpm_query(rpm_path: Path, query_format: str) -> Optional[str]:
         logger.warning("rpm -qp failed for %s: %s", rpm_path.name, err or "(no output)")
         return None
     return (result.stdout or "").strip()
-
 
 def _parse_pesign_rules(settings: PesignConfig) -> list[dict[str, str]]:
     raw = (settings.pesign_rules_json or "").strip()
@@ -215,16 +176,7 @@ def _parse_pesign_rules(settings: PesignConfig) -> list[dict[str, str]]:
         out.append(rule)
     return out
 
-
 def resolve_pesign_nickname(package_name: str, arch: str, settings: PesignConfig) -> Optional[str]:
-    """
-    Pick the NSS signing certificate nickname for this RPM name and architecture.
-
-    Order: ordered rules from pesign_rules_json (name_regex full-match, optional arch_regex
-    full-match on RPM %%{ARCH}); then if pesign_certificate_nickname is set, use it when
-    pesign_package_name_regex full-matches the name. Signing CA trust-only certs belong in the
-    NSS DB but must not be used as -c signing identities.
-    """
     if not settings.pesign_nss_dir:
         return None
     flags = re.IGNORECASE | re.DOTALL
@@ -250,16 +202,12 @@ def resolve_pesign_nickname(package_name: str, arch: str, settings: PesignConfig
         logger.error("Invalid pesign_package_name_regex: %s", exc)
     return None
 
-
 def package_name_matches_pesign_pattern(
     package_name: str, settings: PesignConfig, arch: str = "x86_64"
 ) -> bool:
-    """True if a signing nickname would be chosen for this name/arch (tests/diagnostics)."""
     return resolve_pesign_nickname(package_name, arch, settings) is not None
 
-
 def should_apply_pesign_to_rpm(rpm_path: Path, settings: Optional[PesignConfig] = None) -> bool:
-    """True if this binary RPM should be repacked with pesign on PE binaries and .ko modules."""
     s = settings or get_settings()
     if rpm_path.name.endswith(".src.rpm"):
         return False
@@ -271,8 +219,6 @@ def should_apply_pesign_to_rpm(rpm_path: Path, settings: Optional[PesignConfig] 
     arch = (parts[1].strip() if len(parts) > 1 else "") or "noarch"
     return resolve_pesign_nickname(name, arch, s) is not None
 
-
-# Executed by rpmrebuild with cwd = extracted RPM root (see rpmrebuild --change-files).
 _PESIGN_TREE_SCRIPT = r"""#!/usr/bin/env bash
 set -euo pipefail
 NSS_DEFAULT_DB_TYPE="${NSS_DEFAULT_DB_TYPE:-sql}"
@@ -303,17 +249,7 @@ while IFS= read -r -d '' f; do
 done < <(find . -type f -print0)
 """
 
-
 def pesign_rpm_if_configured(rpm_path: Path, settings: Optional[PesignConfig] = None) -> bool:
-    """
-    If configured and a signing nickname is resolved for this RPM (rules and/or global fallback),
-    rebuild the RPM with rpmrebuild so PE executables and *.ko modules are signed with pesign.
-
-    Requires: pesign, rpmrebuild, rpm, file, bash, find on PATH.
-
-    Returns True if pesign repack ran and succeeded. False if skipped (not configured/no match/tools missing when not strict). Raises PesignRepackError when strict and signing must apply
-    but fails.
-    """
     s = settings or get_settings()
     if rpm_path.name.endswith(".src.rpm"):
         return False
@@ -358,9 +294,6 @@ def pesign_rpm_if_configured(rpm_path: Path, settings: Optional[PesignConfig] = 
             env["PESIGN_TOKEN"] = s.pesign_token
         env["RPMREBUILD_TMPDIR"] = str(rb_tmp)
         env["RPM_BUILD_ARCH"] = pkg_arch
-        # rpmrebuild always injects `setarch <rpm-arch> ...`. On many x86 hosts,
-        # util-linux setarch does not recognize "aarch64". For cross-aarch64 mode,
-        # force qemu by providing PESIGN_AARCH64_QEMU_PREFIX.
         real_setarch = shutil.which("setarch") or "/usr/bin/setarch"
         setarch_wrapper.write_text(
             "\n".join(
@@ -374,10 +307,6 @@ def pesign_rpm_if_configured(rpm_path: Path, settings: Optional[PesignConfig] = 
                     '    echo "PESIGN_AARCH64_QEMU_PREFIX is required for aarch64 repack" >&2',
                     "    exit 97",
                     "  fi",
-                    "  # rpmrebuild always runs `setarch aarch64 ...`. On x86 hosts that breaks, so the",
-                    "  # outer flow wraps the whole rpmrebuild in qemu-aarch64. Once we are already",
-                    "  # inside that guest userspace, child rpmbuild/rpm binaries are aarch64 ELFs.",
-                    "  # Do not spawn another qemu layer or a host bash here; just run the command.",
                     '  bin="$(command -v "${1:-}" || true)"',
                     '  if [[ -n "$bin" ]] && file -Lb -- "$bin" 2>/dev/null | grep -qi "aarch64"; then',
                     "    exec \"$@\"",
@@ -402,9 +331,6 @@ def pesign_rpm_if_configured(rpm_path: Path, settings: Optional[PesignConfig] = 
                 logger.error(msg)
                 raise PesignRepackError(msg) from None
             env["PESIGN_AARCH64_QEMU_PREFIX"] = qemu_prefix
-            # rpmrebuild consumes this variable and appends it to rpmbuild/rpm commands.
-            # Force build/host/target arches so rpmbuild does not reject aarch64 payload repack
-            # on an x86_64 controller.
             extra_defines = " ".join(
                 [
                     '--define "_target_cpu aarch64"',
@@ -430,8 +356,6 @@ def pesign_rpm_if_configured(rpm_path: Path, settings: Optional[PesignConfig] = 
             str(rpm_path),
         ]
         if cross_aarch64:
-            # Run the entire rpmrebuild flow inside qemu-provided aarch64 userspace.
-            # Supports prefixes with or without trailing shell binary.
             inner_cmd = " ".join(shlex.quote(x) for x in cmd)
             try:
                 qemu_argv = _qemu_bash_argv(
@@ -500,7 +424,6 @@ def pesign_rpm_if_configured(rpm_path: Path, settings: Optional[PesignConfig] = 
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 
-
 def sign_rpm(rpm_path: Path, key_id: Optional[str] = None) -> bool:
     settings = get_settings()
     kid = key_id or settings.signing_key_id
@@ -554,7 +477,6 @@ def sign_rpm(rpm_path: Path, key_id: Optional[str] = None) -> bool:
                 os.unlink(pass_path)
             except OSError:
                 pass
-
 
 def sign_repomd(repomd_path: Path, key_id: Optional[str] = None) -> bool:
     settings = get_settings()

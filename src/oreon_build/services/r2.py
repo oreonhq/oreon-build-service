@@ -1,7 +1,3 @@
-"""
-Cloudflare R2 (S3-compatible) service.
-All repository and artifact storage is direct to R2; no local repo storage.
-"""
 from __future__ import annotations
 
 import io
@@ -18,7 +14,6 @@ logger = logging.getLogger(__name__)
 
 
 class R2Client:
-    """S3-compatible client for Cloudflare R2."""
 
     def __init__(self) -> None:
         s = get_settings()
@@ -38,7 +33,6 @@ class R2Client:
         content_type: Optional[str] = None,
         metadata: Optional[dict[str, str]] = None,
     ) -> None:
-        """Upload object to R2. Body can be stream or bytes."""
         extra = {}
         if content_type:
             extra["ContentType"] = content_type
@@ -52,7 +46,6 @@ class R2Client:
         )
 
     def upload_fileobj(self, key: str, fileobj: BinaryIO, content_type: Optional[str] = None) -> None:
-        """Stream upload for large files (e.g. RPMs, logs)."""
         extra = {}
         if content_type:
             extra["ContentType"] = content_type
@@ -64,7 +57,6 @@ class R2Client:
         )
 
     def get_object(self, key: str) -> Optional[bytes]:
-        """Download object; returns None if not found."""
         try:
             resp = self._client.get_object(Bucket=self.bucket, Key=key)
             return resp["Body"].read()
@@ -74,7 +66,6 @@ class R2Client:
             raise
 
     def get_object_stream(self, key: str):
-        """Return a streaming body for reading."""
         try:
             resp = self._client.get_object(Bucket=self.bucket, Key=key)
             return resp["Body"]
@@ -87,7 +78,6 @@ class R2Client:
         self._client.delete_object(Bucket=self.bucket, Key=key)
 
     def list_objects(self, prefix: str, max_keys: int = 1000) -> list[dict]:
-        """List objects under prefix. Includes ``etag`` (quote-stripped) for change detection."""
         paginator = self._client.get_paginator("list_objects_v2")
         out = []
         for page in paginator.paginate(
@@ -112,7 +102,6 @@ class R2Client:
         return out
 
     def iter_keys_with_prefix(self, prefix: str, *, page_size: int = 1000) -> Iterator[str]:
-        """Yield every object key under prefix (full bucket walk, paginated)."""
         paginator = self._client.get_paginator("list_objects_v2")
         for page in paginator.paginate(
             Bucket=self.bucket,
@@ -130,7 +119,6 @@ class R2Client:
             return False
 
     def head_object_content_length(self, key: str) -> int | None:
-        """Return Content-Length from HEAD, or None if missing."""
         try:
             r = self._client.head_object(Bucket=self.bucket, Key=key)
             return int(r["ContentLength"])
@@ -141,10 +129,8 @@ class R2Client:
             raise
 
     def head_object_metadata(self, key: str) -> dict[str, str] | None:
-        """Return user-defined metadata from HEAD, or None if object is missing."""
         try:
             r = self._client.head_object(Bucket=self.bucket, Key=key)
-            # boto3 returns Metadata keys already stripped from the `x-amz-meta-` prefix.
             return r.get("Metadata") or {}
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code", "")
@@ -159,7 +145,6 @@ class R2Client:
         content_type: str,
         expires_in: int,
     ) -> str:
-        """Time-limited PUT URL so workers can upload large RPMs straight to R2 (not through the API tunnel)."""
         return self._client.generate_presigned_url(
             "put_object",
             Params={
@@ -172,41 +157,31 @@ class R2Client:
         )
 
 
-# Repository layout: <releasename>/<branch>/<basearch>/RPMS/ and repodata/
-# Source layout: <releasename>/<branch>/src/*.src.rpm
-
 def repo_r2_prefix(releasename: str, branch: str, basearch: str) -> str:
-    """R2 prefix for binary repo: <releasename>/<branch>/<basearch>/ (RPMS + repodata under this)."""
     return f"{releasename}/{branch}/{basearch}"
 
 
 def repo_rpms_key(releasename: str, branch: str, basearch: str, filename: str) -> str:
-    """R2 key for a binary RPM in the repo."""
     return f"{releasename}/{branch}/{basearch}/RPMS/{filename}"
 
 
 def src_r2_prefix(releasename: str, branch: str) -> str:
-    """R2 prefix for source RPMs: <releasename>/<branch>/src/"""
     return f"{releasename}/{branch}/src"
 
 
 def src_r2_key(releasename: str, branch: str, filename: str) -> str:
-    """R2 key for a source RPM in the repo."""
     return f"{releasename}/{branch}/src/{filename}"
 
 
 def artifact_r2_key(releasename: str, build_attempt_id: int, filename: str) -> str:
-    """R2 key for a build artifact (RPM) when worker uploads; later published to repo layout."""
     return f"{releasename}/builds/{build_attempt_id}/{filename}"
 
 
 def log_r2_key(releasename: str, build_attempt_id: int) -> str:
-    """R2 key for build log."""
     return f"{releasename}/logs/{build_attempt_id}.log"
 
 
 def upload_r2_key(releasename: str, package_name: str, unique_id: str, filename: str) -> str:
-    """R2 key for uploaded source (SRPM or spec)."""
     import re
     safe = re.sub(r"[^\w.\-]", "_", filename)
     return f"{releasename}/uploads/{package_name}/{unique_id}_{safe}"

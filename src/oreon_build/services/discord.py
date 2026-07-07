@@ -1,20 +1,3 @@
-# Oreon Build Service
-# Copyright (C) 2026 Oreon HQ
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-"""Discord webhook integration for audit events."""
 from __future__ import annotations
 
 import hashlib
@@ -27,12 +10,9 @@ from oreon_build.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-# Discord can be slow or blocked from some hosts, short timeouts caused noisy tracebacks.
 _DISCORD_TIMEOUT = httpx.Timeout(30.0, connect=20.0)
 
-
 async def _post(payload: dict, webhook_url: str | None = None) -> None:
-    """Low-level helper to POST a payload to the Discord webhook, if configured."""
     settings = get_settings()
     url = webhook_url or getattr(settings, "discord_webhook_url", None)
     if not url:
@@ -47,28 +27,20 @@ async def _post(payload: dict, webhook_url: str | None = None) -> None:
     except Exception:
         logger.exception("Discord webhook unexpected error")
 
-
 async def send_discord_message(text: str) -> None:
-    """Send a plain-text message to the configured Discord webhook, if any."""
     if not text:
         return
-    # Discord has a 2000-char hard limit on content; stay safely under it.
     await _post({"content": (text or "")[:1900]})
 
-
-# Discord embed side-bar colors by event category.
-# Values are 24-bit integers (0xRRGGBB).
-DISCORD_COLOR_SUCCESS  = 0x16A34A  # green
-DISCORD_COLOR_FAILED   = 0xDC2626  # red
-DISCORD_COLOR_CANCELLED = 0x6B7280  # gray
-DISCORD_COLOR_WARNING  = 0xD97706  # amber/stale/timeout
-DISCORD_COLOR_INFO     = 0x2563EB  # blue (default, trigger/create/update)
-DISCORD_COLOR_PROMOTE  = 0x7C3AED  # purple (promotions)
-DISCORD_COLOR_RETRY    = 0xF59E0B  # yellow-orange
-
+DISCORD_COLOR_SUCCESS  = 0x16A34A
+DISCORD_COLOR_FAILED   = 0xDC2626
+DISCORD_COLOR_CANCELLED = 0x6B7280
+DISCORD_COLOR_WARNING  = 0xD97706
+DISCORD_COLOR_INFO     = 0x2563EB
+DISCORD_COLOR_PROMOTE  = 0x7C3AED
+DISCORD_COLOR_RETRY    = 0xF59E0B
 
 def _color_for_action(action: str, details: str | None = None) -> int:
-    """Return the Discord embed color int for a given audit action + detail string."""
     details_lower = (details or "").lower()
 
     if action == "build.result":
@@ -101,10 +73,7 @@ def _color_for_action(action: str, details: str | None = None) -> int:
     if action in ("package.delete", "account.delete", "release.delete", "mock_env.delete", "schedule.delete"):
         return DISCORD_COLOR_FAILED
 
-    # build.trigger, build.github_auto_trigger, build.github_catchup_trigger,
-    # package.create/update, account.create/update, release.create/update, etc.
     return DISCORD_COLOR_INFO
-
 
 async def send_discord_embed(
     title: str,
@@ -112,7 +81,6 @@ async def send_discord_embed(
     fields: list[tuple[str, str]],
     color: int | None = None,
 ) -> None:
-    """Send a single rich embed (no emojis) to the Discord webhook."""
     settings = get_settings()
     if not getattr(settings, "discord_webhook_url", None):
         return
@@ -123,7 +91,7 @@ async def send_discord_embed(
         embed_fields.append(
             {
                 "name": name,
-                "value": value[:900],  # safety
+                "value": value[:900],
                 "inline": False,
             }
         )
@@ -135,7 +103,6 @@ async def send_discord_embed(
     }
     await _post({"embeds": [embed]})
 
-
 async def send_security_discord_embed(
     title: str,
     description: str,
@@ -143,13 +110,10 @@ async def send_security_discord_embed(
     *,
     color: int | None = None,
 ) -> None:
-    """Send a CVE/security embed to the dedicated security webhook (if configured)."""
     settings = get_settings()
     url = getattr(settings, "security_discord_webhook_url", None)
     if not url:
         return
-    # If security and normal webhooks are misconfigured to be identical,
-    # the embeds will appear in the same Discord destination.
     normal_url = getattr(settings, "discord_webhook_url", None)
     if normal_url and normal_url == url:
         logger.warning("SECURITY_DISCORD_WEBHOOK_URL equals DISCORD_WEBHOOK_URL; security embeds go to the normal webhook destination.")
@@ -163,7 +127,6 @@ async def send_security_discord_embed(
             fp,
         )
     except Exception:
-        # Never break the request for logging failures.
         pass
 
     embed_fields = []
@@ -171,7 +134,7 @@ async def send_security_discord_embed(
         if not value:
             continue
         embed_fields.append({"name": name, "value": value[:900], "inline": False})
-    embed_color = color if color is not None else 0xB91C1C  # default red-ish for new advisories
+    embed_color = color if color is not None else 0xB91C1C
     embed = {
         "title": title[:256] if title else "Oreon Security Advisory",
         "description": (description or "")[:1000],

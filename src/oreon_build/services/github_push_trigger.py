@@ -1,20 +1,3 @@
-# Oreon Build Service
-# Copyright (C) 2026 Oreon HQ
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-"""Shared GitHub push handling for webhooks and offline catch-up."""
 from __future__ import annotations
 
 import logging
@@ -37,11 +20,9 @@ logger = logging.getLogger(__name__)
 
 TriggerKind = Literal["webhook", "catchup"]
 
-# Webhook-only. Compare said there were commits but zero file paths, do not treat as "match all".
 GITHUB_PUSH_EMPTY_DIFF_SENTINEL = "__oreon_empty_diff__"
 
 GITHUB_COMPARE_MAX_FILES = 300
-
 
 def normalize_repo_url(url: str | None) -> str:
     if not url:
@@ -63,7 +44,6 @@ def normalize_repo_url(url: str | None) -> str:
     except Exception:
         pass
     return u.lower()
-
 
 def package_matches_github_repo(pkg: Package, repository: dict[str, Any], repo_id: int) -> bool:
     if pkg.github_repository_id is not None and int(pkg.github_repository_id) == int(repo_id):
@@ -90,7 +70,6 @@ def package_matches_github_repo(pkg: Package, repository: dict[str, Any], repo_i
                     return True
     return False
 
-
 def parse_distgit_branch_and_spec(url: str) -> tuple[str | None, str | None]:
     if "#" not in url:
         return None, None
@@ -103,7 +82,6 @@ def parse_distgit_branch_and_spec(url: str) -> tuple[str | None, str | None]:
         return (br.strip() or None, (spec.strip().lstrip("/").replace("\\", "/") or None))
     return frag, None
 
-
 def latest_distgit_source(pkg: Package) -> tuple[str | None, str | None]:
     for pv in pkg.versions or []:
         for src in pv.sources or []:
@@ -113,7 +91,6 @@ def latest_distgit_source(pkg: Package) -> tuple[str | None, str | None]:
             if spec:
                 return br, spec
     return None, None
-
 
 def push_touches_distgit_spec(changed: set[str], spec_rel: str | None) -> bool:
     if not spec_rel:
@@ -133,8 +110,6 @@ def push_touches_distgit_spec(changed: set[str], spec_rel: str | None) -> bool:
     for p in changed_n:
         if p == spec_n or p.startswith(prefix):
             return True
-    # Payload paths are sometimes missing the top release dir (e.g. bash/bash.spec) while
-    # distgit URLs store oreon-11-rp1/bash/bash.spec — still the same package tree.
     for p in changed_n:
         if not p or p.count("/") < 1:
             continue
@@ -142,14 +117,7 @@ def push_touches_distgit_spec(changed: set[str], spec_rel: str | None) -> bool:
             return True
     return False
 
-
 def candidate_package_names_from_paths(changed: set[str]) -> set[str]:
-    """
-    Best-effort package names from changed distgit paths.
-    Examples:
-      oreon-11-rp1/bash/bash.spec -> {"bash"}
-      foo/bar.spec -> {"bar", "foo"}
-    """
     names: set[str] = set()
     for raw in changed:
         p = (raw or "").strip().replace("\\", "/").lstrip("/")
@@ -167,7 +135,6 @@ def candidate_package_names_from_paths(changed: set[str]) -> set[str]:
             names.add(parts[-2])
     return {n for n in names if n}
 
-
 async def release_arch_combos_for_auto_build(db: AsyncSession, pkg: Package) -> set[tuple[int, str]]:
     combos: set[tuple[int, str]] = set()
     for j in pkg.build_jobs or []:
@@ -181,7 +148,6 @@ async def release_arch_combos_for_auto_build(db: AsyncSession, pkg: Package) -> 
             combos.add((rid, arch))
     return combos
 
-
 def _paths_from_commit_object(c: dict[str, Any]) -> set[str]:
     out: set[str] = set()
     for key in ("added", "modified"):
@@ -190,9 +156,7 @@ def _paths_from_commit_object(c: dict[str, Any]) -> set[str]:
                 out.add(p.strip().replace("\\", "/"))
     return out
 
-
 def collect_paths_from_webhook_commits(body: dict[str, Any]) -> set[str]:
-    """Paths from push payload commits[] and head_commit (GitHub often omits file lists on commits[])."""
     out: set[str] = set()
     for c in body.get("commits") or []:
         if isinstance(c, dict):
@@ -202,9 +166,7 @@ def collect_paths_from_webhook_commits(body: dict[str, Any]) -> set[str]:
         out |= _paths_from_commit_object(hc)
     return out
 
-
 def push_webhook_ref_advanced(body: dict[str, Any]) -> bool:
-    """True if before/after say the branch tip moved (including new refs)."""
     after = body.get("after")
     if not isinstance(after, str) or not after.strip():
         return False
@@ -214,31 +176,16 @@ def push_webhook_ref_advanced(body: dict[str, Any]) -> bool:
         return True
     return isinstance(before, str) and bool(before.strip()) and before.strip() != after_s
 
-
 def _is_null_github_sha(sha: str | None) -> bool:
     if not sha or not isinstance(sha, str):
         return True
     s = sha.strip().lower()
     return len(s) == 40 and set(s) <= {"0"}
 
-
 async def resolve_github_webhook_changed_paths(
     body: dict[str, Any],
     repository: dict[str, Any],
 ) -> set[str]:
-    """
-    Build the changed-path set for a push webhook.
-
-    A single commit that touches thousands of files can still break path discovery. The push JSON
-    is capped at 25 MB so GitHub may skip delivery entirely, and the commit file arrays in the
-    payload can be incomplete for very large diffs. The REST compare endpoint lists changed files
-    more reliably (still capped at about 300 files per response, see GITHUB_COMPARE_MAX_FILES).
-
-    When GITHUB_TOKEN is set we merge compare(base...head) paths with whatever the webhook sent.
-    If compare is truncated or returns a full file page we return an empty set so every matching
-    distgit package is considered touched. If the webhook never arrives, catch-up still needs
-    GITHUB_TOKEN and a running catch-up loop.
-    """
     from_commits = collect_paths_from_webhook_commits(body)
     settings = get_settings()
     if not settings.github_token:
@@ -278,9 +225,6 @@ async def resolve_github_webhook_changed_paths(
         files = cmp.get("files") or []
         api_paths = collect_paths_from_compare_files(cmp)
         if cmp.get("truncated") or len(files) >= GITHUB_COMPARE_MAX_FILES:
-            # Compare hit GitHub's per-request file cap. Use whatever files we got — they still
-            # identify real changed packages. Catch-up will pick up anything beyond the cap on the
-            # next cycle. Never return an empty set here (empty = "trigger every package").
             logger.warning(
                 "GitHub webhook compare truncated/capped repo=%s files=%s paths=%s, "
                 "triggering only matched packages (catch-up handles the rest)",
@@ -289,7 +233,6 @@ async def resolve_github_webhook_changed_paths(
                 len(api_paths),
             )
             if not api_paths and not from_commits:
-                # Truly no paths at all from any source — fall back to triggering all.
                 logger.warning(
                     "GitHub webhook compare returned no paths at all repo=%s, auto-triggering all distgit packages",
                     full_name,
@@ -316,7 +259,6 @@ async def resolve_github_webhook_changed_paths(
     finally:
         await client.close()
 
-
 def collect_paths_from_compare_files(compare_json: dict[str, Any]) -> set[str]:
     out: set[str] = set()
     for f in compare_json.get("files") or []:
@@ -333,7 +275,6 @@ def collect_paths_from_compare_files(compare_json: dict[str, Any]) -> set[str]:
             if isinstance(prev, str) and prev.strip():
                 out.add(prev.strip().replace("\\", "/"))
     return out
-
 
 async def load_matching_packages_for_github_repo(
     db: AsyncSession,
@@ -368,7 +309,6 @@ async def load_matching_packages_for_github_repo(
     candidates = list(pkg_result.scalars().all())
     return [p for p in candidates if package_matches_github_repo(p, repository, repo_id)]
 
-
 async def apply_github_push(
     db: AsyncSession,
     repository: dict[str, Any],
@@ -379,7 +319,6 @@ async def apply_github_push(
     kind: TriggerKind,
     max_jobs: int | None = None,
 ) -> dict[str, Any]:
-    """Select packages, enqueue builds for matching distgit paths. Caller commits."""
     fn = (repository.get("full_name") or "").strip()
     packages = await load_matching_packages_for_github_repo(db, repository, repo_id)
     if not packages:
@@ -392,11 +331,6 @@ async def apply_github_push(
         )
         return {"status": "ignored", "reason": "no_matching_package", "jobs": [], "skipped": []}
 
-    # Narrow the candidate list to packages mentioned by changed paths.
-    # This avoids evaluating the whole repo package set for every push.
-    # If changed_paths is non-empty but no package names can be extracted (e.g. all flat
-    # top-level files like .gitignore) we keep all matched packages so push_touches_distgit_spec
-    # can make the final call instead of silently skipping everyone.
     if changed_paths and GITHUB_PUSH_EMPTY_DIFF_SENTINEL not in changed_paths:
         name_candidates = {n.lower() for n in candidate_package_names_from_paths(changed_paths)}
         if name_candidates:
@@ -412,7 +346,6 @@ async def apply_github_push(
                 )
                 packages = narrowed
             else:
-                # All extracted names are unregistered packages — nothing to do.
                 logger.warning(
                     "GitHub push repo=%s changed_paths=%s names=%s — none registered in Oreon, no builds triggered "
                     "(register the package via DistGit trigger first, then future pushes will auto-build it)",

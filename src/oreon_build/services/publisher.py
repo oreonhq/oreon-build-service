@@ -1,28 +1,3 @@
-"""
-Repository publishing: stage RPMs from R2 under a persistent tree in ``~/.oreon/repo-tmp``,
-run ``createrepo_c``, upload only ``repodata/`` to R2.
-
-The local stage is reused across calls (no fresh temp dir per run). RPMs are only
-downloaded when missing or when the size no longer matches R2.
-"""
-
-#
-# Oreon Build Service - Publisher
-# Copyright (C) 2026 Oreon HQ
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-#
 from __future__ import annotations
 
 import errno
@@ -43,7 +18,6 @@ from oreon_build.services.r2 import R2Client, get_r2_client
 from oreon_build.services.signing import sign_repomd
 
 logger = logging.getLogger(__name__)
-
 
 _BUILDSYS_GROUP_PREFER: list[str] = [
     "bash",
@@ -68,7 +42,6 @@ _BUILDSYS_GROUP_PREFER: list[str] = [
     "xz",
 ]
 
-
 def _rpm_name_from_filename(filename: str) -> str | None:
     base = filename.strip()
     if not base.endswith(".rpm") or base.endswith(".src.rpm"):
@@ -78,7 +51,6 @@ def _rpm_name_from_filename(filename: str) -> str | None:
     if len(parts) != 3:
         return None
     return parts[0] or None
-
 
 def _discover_available_binary_names(rpms_dir: Path) -> list[str]:
     out: set[str] = set()
@@ -90,29 +62,14 @@ def _discover_available_binary_names(rpms_dir: Path) -> list[str]:
             out.add(n)
     return sorted(out)
 
-
 def _fedora_comps_repo_path() -> Path:
-    """
-    Local clone path for Fedora comps templates.
-
-    Defaults to `<repo>/vendor/fedora-comps` and can be overridden with
-    `OREON_FEDORA_COMPS_REPO_PATH`.
-    """
     raw = (os.environ.get("OREON_FEDORA_COMPS_REPO_PATH") or "").strip()
     if raw:
         return Path(raw).expanduser()
     repo_root = Path(__file__).resolve().parents[3]
     return repo_root / "vendor" / "fedora-comps"
 
-
 def _select_local_fedora_comps_template(repo_path: Path) -> Path | None:
-    """
-    Pick a Fedora comps template from the local clone.
-
-    Priority:
-    - `OREON_FEDORA_COMPS_TEMPLATE_FILE` if set
-    - highest `f/comps-f<NN>.xml.in` in the local clone
-    """
     explicit = (os.environ.get("OREON_FEDORA_COMPS_TEMPLATE_FILE") or "").strip()
     if explicit:
         p = Path(explicit).expanduser()
@@ -136,7 +93,6 @@ def _select_local_fedora_comps_template(repo_path: Path) -> Path | None:
                 best_path = p
     return best_path
 
-
 def _load_fedora_comps_template_text() -> str | None:
     repo_path = _fedora_comps_repo_path()
     template_path = _select_local_fedora_comps_template(repo_path)
@@ -154,7 +110,6 @@ def _load_fedora_comps_template_text() -> str | None:
     except Exception as exc:
         logger.warning("Could not read local Fedora comps template path=%s: %s", template_path, exc)
         return None
-
 
 def _buildsys_group_xml(selected: list[str]) -> str:
     lines: list[str] = [
@@ -178,7 +133,6 @@ def _buildsys_group_xml(selected: list[str]) -> str:
     ]
     return "\n".join(lines)
 
-
 def _write_buildsys_comps(repo_dir: Path) -> Path | None:
     rpms_dir = repo_dir / "RPMS"
     if not rpms_dir.is_dir():
@@ -188,11 +142,9 @@ def _write_buildsys_comps(repo_dir: Path) -> Path | None:
         return None
 
     selected = [n for n in _BUILDSYS_GROUP_PREFER if n in set(available)]
-    # Ensure group is not empty. If preferred set is absent, seed a tiny fallback from repo content.
     if not selected:
         selected = available[: min(8, len(available))]
 
-    # Start from Fedora comps template when available.
     template = _load_fedora_comps_template_text()
     if template and "<comps" in template:
         lines = [template.rstrip(), ""]
@@ -203,7 +155,6 @@ def _write_buildsys_comps(repo_dir: Path) -> Path | None:
             else:
                 lines = [template.rstrip(), "<comps>", group, "</comps>", ""]
     else:
-        # Fallback minimal comps (still provides buildsys-build).
         lines = [
             '<?xml version="1.0" encoding="UTF-8"?>',
             "<comps>",
@@ -215,28 +166,21 @@ def _write_buildsys_comps(repo_dir: Path) -> Path | None:
     out.write_text("\n".join(lines), encoding="utf-8")
     return out
 
-
 def _progress_stdout_enabled() -> bool:
     v = (os.environ.get("OREON_REPO_PROGRESS_STDOUT") or "").strip().lower()
     return v in ("1", "true", "yes", "on")
 
-
 def _progress(msg: str) -> None:
-    """Emit lines for migrate-rpmrepo-metadata.sh (OREON_REPO_PROGRESS_STDOUT=1)."""
     if _progress_stdout_enabled():
         print(f"PROGRESS {msg}", flush=True)
 
-
 class RepodataDiskQuotaError(RuntimeError):
-    """Createrepo temp workspace hit EDQUOT or ENOSPC. Override OREON_REPO_TMPDIR or oreon_repo_tmpdir (default is ~/.oreon/repo-tmp)."""
-
+    pass
 
 def _repo_temp_dir_label(tmp_parent: str | None) -> str:
-    """Human-readable path for logs (matches tempfile parent when set, else system tmp)."""
     if tmp_parent:
         return tmp_parent
     return os.environ.get("TMPDIR") or "/tmp"
-
 
 def _is_disk_quota_or_no_space(err: OSError) -> bool:
     en = getattr(err, "errno", None)
@@ -246,9 +190,7 @@ def _is_disk_quota_or_no_space(err: OSError) -> bool:
         return True
     return en == getattr(errno, "EDQUOT", 122)
 
-
 def _ensure_dir_parent(path: Path) -> str | None:
-    """Create path if needed and return it as str, or None if unusable."""
     try:
         path.mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -257,14 +199,7 @@ def _ensure_dir_parent(path: Path) -> str | None:
         return str(path)
     return None
 
-
 def _repo_temp_dir_parent() -> str | None:
-    """
-    Parent directory for createrepo temp dirs (oreon-repo-*/repo/RPMS).
-
-    Order: OREON_REPO_TMPDIR, then settings.oreon_repo_tmpdir, else ~/.oreon/repo-tmp
-    (real disk under $HOME, not tmpfs /tmp).
-    """
     raw = (os.environ.get("OREON_REPO_TMPDIR") or "").strip()
     candidates: list[str] = []
     if raw:
@@ -290,20 +225,15 @@ def _repo_temp_dir_parent() -> str | None:
         pass
     return None
 
-
 def _stage_container_for_prefix(r2_prefix: str) -> Path:
-    """Stable directory for one repo prefix (holds ``repo/`` and lock)."""
     parent = _repo_temp_dir_parent()
     if not parent:
         parent = str(Path.home() / ".oreon" / "repo-tmp")
     h = hashlib.sha256(r2_prefix.strip().encode()).hexdigest()[:24]
     return Path(parent) / "stages" / h
 
-
 def _persistent_repo_root(r2_prefix: str) -> Path:
-    """Local createrepo root: ``.../stages/<hash>/repo`` (RPMS + repodata under it)."""
     return _stage_container_for_prefix(r2_prefix) / "repo"
-
 
 def _ensure_stage_sidecar(container: Path, r2_prefix: str) -> None:
     p = container / ".r2_prefix.txt"
@@ -314,10 +244,8 @@ def _ensure_stage_sidecar(container: Path, r2_prefix: str) -> None:
     except OSError:
         pass
 
-
 @contextmanager
 def prefix_publish_lock(r2_prefix: str) -> object:
-    """Cross-process lock for copy/prune/repodata on one repo prefix."""
     parent = _repo_temp_dir_parent()
     if not parent:
         parent = str(Path.home() / ".oreon" / "repo-tmp")
@@ -333,10 +261,8 @@ def prefix_publish_lock(r2_prefix: str) -> object:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
 
-
 @contextmanager
 def _repo_stage_lock(container: Path) -> object:
-    """Exclusive lock so two processes do not run createrepo on the same stage."""
     container.mkdir(parents=True, exist_ok=True)
     lock_path = container / ".oreon-repodata.lock"
     fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
@@ -347,15 +273,8 @@ def _repo_stage_lock(container: Path) -> object:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
 
-
 @contextmanager
 def _global_repogen_lock() -> object:
-    """
-    Cross-process global lock for createrepo_c runs.
-
-    One repogen at a time prevents CPU/disk storms when many publish tasks
-    land together. Per-prefix stage locking still prevents same-prefix races.
-    """
     parent = _repo_temp_dir_parent()
     if not parent:
         parent = str(Path.home() / ".oreon" / "repo-tmp")
@@ -370,14 +289,10 @@ def _global_repogen_lock() -> object:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
 
-
-# createrepo_c rejects --workers outside 1..100 and silently falls back to 5.
 _CREATEREPO_C_MAX_WORKERS = 100
-
 
 def _createrepo_cpu_count() -> int:
     return max(1, os.cpu_count() or 1)
-
 
 def _createrepo_workers_hard_cap() -> int:
     raw = (os.environ.get("OREON_CREATEREPO_WORKERS_HARD_CAP") or "").strip()
@@ -388,11 +303,9 @@ def _createrepo_workers_hard_cap() -> int:
             pass
     return _CREATEREPO_C_MAX_WORKERS
 
-
 def _createrepo_workers_default() -> int:
     cpus = _createrepo_cpu_count()
     return min(max(50, cpus * 4), _createrepo_workers_hard_cap())
-
 
 def _createrepo_workers() -> int:
     cap = _createrepo_workers_hard_cap()
@@ -414,7 +327,6 @@ def _createrepo_workers() -> int:
         w = _createrepo_workers_default()
     return max(1, min(w, cap))
 
-
 def _createrepo_fallback_workers(primary: int) -> int:
     raw = (os.environ.get("OREON_CREATEREPO_FALLBACK_WORKERS") or "").strip()
     if raw:
@@ -430,7 +342,6 @@ def _createrepo_fallback_workers(primary: int) -> int:
         fb = max(1, primary // 2 or 1)
     return fb
 
-
 def _createrepo_timeout_sec() -> int:
     raw = (os.environ.get("OREON_CREATEREPO_TIMEOUT_SEC") or "1800").strip()
     try:
@@ -439,12 +350,7 @@ def _createrepo_timeout_sec() -> int:
         n = 1800
     return max(60, min(n, 8 * 3600))
 
-
 def _r2_etag_strong_content_md5(etag: str) -> bool:
-    """
-    S3/R2 single-part object ETag is the MD5 hex. Multipart and other forms are not; do not
-    use those for a local file comparison.
-    """
     t = (etag or "").strip()
     if not t or "-" in t:
         return False
@@ -456,22 +362,17 @@ def _r2_etag_strong_content_md5(etag: str) -> bool:
             return False
     return True
 
-
 def _local_rpm_bytes_match_r2_etag(path: Path, etag: str) -> bool:
-    """True if the file's MD5 matches a strong (single-part) S3 ETag."""
     if not _r2_etag_strong_content_md5(etag) or not path.is_file() or path.stat().st_size == 0:
         return False
     m = hashlib.md5()
     m.update(path.read_bytes())
     return m.hexdigest() == etag.lower()
 
-
 def _etag_cache_path(container: Path) -> Path:
     return container / ".etag-cache.json"
 
-
 def _load_etag_cache(container: Path) -> dict[str, str]:
-    """Load the persistent filename->etag map from the container directory."""
     import json
 
     p = _etag_cache_path(container)
@@ -484,7 +385,6 @@ def _load_etag_cache(container: Path) -> dict[str, str]:
             pass
     return {}
 
-
 def _save_etag_cache(container: Path, cache: dict[str, str]) -> None:
     import json
 
@@ -496,7 +396,6 @@ def _save_etag_cache(container: Path, cache: dict[str, str]) -> None:
     except Exception as exc:
         logger.debug("Could not save etag cache to %s: %s", p, exc)
 
-
 def _sync_rpms_dir_from_r2(
     client: R2Client,
     rpms_prefix: str,
@@ -504,17 +403,6 @@ def _sync_rpms_dir_from_r2(
     *,
     container: Path | None = None,
 ) -> int:
-    """
-    Ensure ``rpms_dir`` matches R2 under ``rpms_prefix``.
-
-    R2 is the source of truth. We verify each local file against the R2 ETag:
-    - If a persistent ``container`` is provided, a JSON ETag cache is used so that files
-      already verified in a previous run are trusted without re-reading from disk. This
-      avoids reading tens of GB on every publish for repos with thousands of packages.
-    - On cache miss (first run or new files), MD5 is computed from disk and the result is
-      stored in the cache for next time.
-    - Files whose ETag is absent or multipart are accepted by size alone.
-    """
     import json as _json
 
     rpms_dir.mkdir(parents=True, exist_ok=True)
@@ -559,15 +447,12 @@ def _sync_rpms_dir_from_r2(
             if etag and _r2_etag_strong_content_md5(etag):
                 cached_etag = etag_cache.get(fname)
                 if cached_etag == etag:
-                    # Already verified against this exact ETag - no disk read needed.
                     need_fetch = False
                 elif _local_rpm_bytes_match_r2_etag(dest, etag):
                     need_fetch = False
                     etag_cache[fname] = etag
                     cache_dirty = True
-                # size matches but ETag differs: re-download (content changed in R2)
             else:
-                # No strong ETag from R2: trust size match (R2 always sends etag but be safe).
                 need_fetch = False
 
         if not need_fetch:
@@ -589,7 +474,6 @@ def _sync_rpms_dir_from_r2(
 
     return len(wanted)
 
-
 def _list_repodata_keys(client: R2Client, r2_prefix: str) -> list[str]:
     repodata_prefix = f"{r2_prefix}/repodata/"
     objs = client.list_objects(repodata_prefix)
@@ -600,14 +484,9 @@ def _list_repodata_keys(client: R2Client, r2_prefix: str) -> list[str]:
             keys.append(k)
     return keys
 
-
 def _cleanup_old_repodata(
     client: R2Client, r2_prefix: str, keep_filenames: set[str]
 ) -> None:
-    """
-    Remove stale objects under `<r2_prefix>/repodata/` that are not part of the
-    newly generated repodata set (prevents "repodata junk" accumulating).
-    """
     old_keys = _list_repodata_keys(client, r2_prefix)
     if not old_keys:
         return
@@ -630,13 +509,10 @@ def _cleanup_old_repodata(
         f"{r2_prefix}/repodata/",
     )
 
-
 def _createrepo_cache_dir(container: Path) -> Path:
-    """Persistent per-prefix checksum cache for createrepo_c --cachedir across runs."""
     d = container / ".createrepo-cache"
     d.mkdir(parents=True, exist_ok=True)
     return d
-
 
 def _clear_createrepo_cache(container: Path) -> None:
     d = container / ".createrepo-cache"
@@ -646,25 +522,15 @@ def _clear_createrepo_cache(container: Path) -> None:
         except OSError as e:
             logger.warning("Could not clear createrepo cache %s: %s", d, e)
 
-
 def _run_createrepo(
     repo_dir: Path,
     *,
     container: Path | None = None,
     force_full: bool = False,
 ) -> None:
-    # Never use capture_output/PIPE here. createrepo_c can write a lot to stderr; a full pipe blocks the child
-    # while the parent waits forever (looks like a hang with RPMs already on disk).
-    #
-    # When container is provided (persistent stage) we pass --update so only new/changed RPMs get
-    # re-checksummed. Without it every publish re-scans the entire repo which is extremely slow once
-    # there are hundreds of packages. --cachedir stores per-file checksums across API restarts so
-    # even after a service restart the next run is fast.
     def _cleanup_tmp_repodata() -> None:
         tmp_repodata = repo_dir / ".repodata"
         if tmp_repodata.exists():
-            # Previous interrupted createrepo runs can leave this behind and every future run
-            # fails with "Temporary repodata directory ... already exists".
             try:
                 shutil.rmtree(tmp_repodata)
                 logger.warning("Removed stale createrepo temp dir %s", tmp_repodata)
@@ -742,12 +608,7 @@ def _run_createrepo(
         _cleanup_tmp_repodata()
         _run_once(fb)
 
-
 def _upload_repodata_dir_ordered(client: R2Client, r2_prefix: str, repodata_dir: Path) -> None:
-    """
-    Upload repodata so repomd.xml (and its signature) go last. Otherwise a client can
-    fetch a new repomd that references primary/filelists objects not visible yet.
-    """
     files = [f for f in repodata_dir.iterdir() if f.is_file()]
     by_name = {f.name: f for f in files}
     tail: list[str] = []
@@ -761,17 +622,12 @@ def _upload_repodata_dir_ordered(client: R2Client, r2_prefix: str, repodata_dir:
         r2_key = f"{r2_prefix}/repodata/{name}"
         client.put_object(r2_key, f.read_bytes())
 
-
 def update_repodata_at_prefix(
     r2_prefix: str,
     r2_client: R2Client | None = None,
     *,
     force_full: bool = False,
 ) -> bool:
-    """
-    RPMs are already at r2_prefix/RPMS/. Download them, run createrepo_c, upload only repodata.
-    Use this when the worker (or other path) has already uploaded RPMs directly to the repo.
-    """
     client = r2_client or get_r2_client()
     rpms_prefix = f"{r2_prefix}/RPMS/"
     objs = client.list_objects(rpms_prefix)
@@ -798,15 +654,12 @@ def update_repodata_at_prefix(
             _progress(f"{r2_prefix} createrepo_c done, uploading repodata to R2")
             repodata_dir = repo_root / "repodata"
             if repodata_dir.exists():
-                # Keep track of which repodata filenames we just generated so we can
-                # delete older R2 objects that createrepo no longer produces.
                 new_filenames = {f.name for f in repodata_dir.iterdir()}
 
                 repomd = repodata_dir / "repomd.xml"
                 if repomd.exists():
                     sign_repomd(repomd)
 
-                # Upload new repodata first; only after that do we purge stale objects.
                 _upload_repodata_dir_ordered(client, r2_prefix, repodata_dir)
 
                 _cleanup_old_repodata(client, r2_prefix, new_filenames)
@@ -825,19 +678,11 @@ def update_repodata_at_prefix(
             raise RepodataDiskQuotaError(msg) from e
         raise
 
-
 def publish_rpms_to_r2(
     r2_prefix: str,
     rpm_keys: List[str],
     r2_client: R2Client | None = None,
 ) -> None:
-    """
-    Given a list of R2 keys where RPMs already live, create repodata and upload to R2.
-
-    Puts each object at ``<r2_prefix>/RPMS/<name>`` (when it is not already there) *before* running
-    createrepo or uploading repodata, so a client can never see new primary/repomd checksums that
-    still point at stale bytes in ``RPMS/``.
-    """
     client = r2_client or get_r2_client()
     tmp_parent = _repo_temp_dir_parent()
     try:

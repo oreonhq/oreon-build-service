@@ -1,4 +1,3 @@
-"""Repodata settle checks and layer advancement for rpmbuild plans."""
 from __future__ import annotations
 
 import bz2
@@ -139,7 +138,6 @@ async def advance_rpmbuild_plans_once(db: Any) -> None:
             plan.error_message = f"Layer {cur} contains failed job(s)"
             continue
         if not jobs:
-            # Opening layer had no queued rows yet, queue it now.
             rel = await db.get(Release, plan.release_id)
             if rel is None:
                 plan.status = RpmbuildPlanStatus.FAILED
@@ -158,7 +156,6 @@ async def advance_rpmbuild_plans_once(db: Any) -> None:
             plan.status = RpmbuildPlanStatus.RUNNING
             continue
 
-        # Repodata settle visibility check per arch.
         rel = await db.get(Release, plan.release_id)
         if rel is None:
             plan.status = RpmbuildPlanStatus.FAILED
@@ -218,7 +215,6 @@ async def advance_rpmbuild_plans_once(db: Any) -> None:
 
 
 async def on_repo_publish_event_for_rpmbuild(attempt_id: int) -> None:
-    """Fast-path reevaluation after repo publish succeeds for a plan job."""
     from oreon_build.db.session import async_session_maker
     from oreon_build.models import BuildAttempt
 

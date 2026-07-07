@@ -1,22 +1,3 @@
-#
-# Oreon Build Service - Promotion R2 cleanup
-# Copyright (C) 2026 Oreon HQ
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-#
-"""R2 maintenance after promoting build artifacts between channels."""
-
 from __future__ import annotations
 
 import logging
@@ -32,9 +13,7 @@ logger = logging.getLogger(__name__)
 
 _REPO_CHANNELS = ("dev", "testing", "stable")
 
-
 def _rpm_name_from_bytes(data: bytes) -> Optional[str]:
-    """Return RPM %{NAME} using host ``rpm`` (needs full file)."""
     if not data:
         return None
     path: str | None = None
@@ -67,7 +46,6 @@ def _rpm_name_from_bytes(data: bytes) -> Optional[str]:
             except OSError:
                 pass
 
-
 def _collect_binary_rpm_names(
     r2: R2Client,
     releasename: str,
@@ -88,7 +66,6 @@ def _collect_binary_rpm_names(
             names.add(n)
     return names
 
-
 def _collect_src_rpm_names(
     r2: R2Client,
     releasename: str,
@@ -107,7 +84,6 @@ def _collect_src_rpm_names(
         if n:
             names.add(n)
     return names
-
 
 def _prune_binary_rpms_matching_names(
     r2: R2Client,
@@ -139,7 +115,6 @@ def _prune_binary_rpms_matching_names(
                 r2.delete_object(key)
                 logger.info("Pruned superseded binary RPM from R2: %s", key)
 
-
 def _prune_src_rpms_matching_names(
     r2: R2Client,
     releasename: str,
@@ -169,7 +144,6 @@ def _prune_src_rpms_matching_names(
                 r2.delete_object(key)
                 logger.info("Pruned superseded SRPM from R2: %s", key)
 
-
 def _remove_promoted_objects_from_branch(
     r2: R2Client,
     releasename: str,
@@ -187,7 +161,6 @@ def _remove_promoted_objects_from_branch(
         except Exception as e:
             logger.warning("Could not delete promoted object %s: %s", key, e)
 
-
 def run_post_promotion_r2_maintenance(
     releasename: str,
     from_branch: str,
@@ -196,14 +169,6 @@ def run_post_promotion_r2_maintenance(
     artifact_filenames: list[str],
     copied_filenames: list[str],
 ) -> None:
-    """
-    After copying promoted RPMs to ``dest_channel``:
-
-    - Drop older RPMs/SRPMs with the same ``rpm -qp %{NAME}`` as the promoted set
-      under dev, testing, and stable (except exact filenames in this promotion).
-    - Remove successfully copied files from ``from_branch`` (move semantics).
-    - Refresh repodata on the destination repo and on ``from_branch``.
-    """
     r2 = get_r2_client()
     keep_basenames = set(artifact_filenames)
     binary_names = _collect_binary_rpm_names(r2, releasename, from_branch, arch, copied_filenames)

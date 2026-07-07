@@ -1,10 +1,3 @@
-"""GCP Compute Engine helpers for burst worker VM lifecycle management.
-
-Uses the `gcloud` CLI via subprocess so authentication is handled by
-Application Default Credentials on the host (no extra Python deps needed).
-All operations are fire-and-forget; failures are logged but never propagate
-to the caller so a GCP error never breaks the build queue.
-"""
 from __future__ import annotations
 
 import asyncio
@@ -23,7 +16,6 @@ def _resolve_project_and_zone(project: str | None, zone: str | None) -> tuple[st
 
 
 async def _run_gcloud(*args: str) -> bool:
-    """Run a gcloud command. Returns True on success, False on error."""
     cmd = ["gcloud", *args, "--quiet"]
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -53,7 +45,6 @@ async def _run_gcloud(*args: str) -> bool:
 
 
 async def start_instance(instance_name: str, *, zone: str | None = None, project: str | None = None) -> None:
-    """Start a GCP Compute Engine instance. Fire-and-forget; never raises."""
     resolved_project, resolved_zone = _resolve_project_and_zone(project, zone)
     logger.info("burst-vm: starting GCP instance %s (zone=%s project=%s)", instance_name, resolved_zone, resolved_project)
     cmd_args = ["compute", "instances", "start", instance_name, f"--zone={resolved_zone}"]
@@ -65,7 +56,6 @@ async def start_instance(instance_name: str, *, zone: str | None = None, project
 
 
 async def stop_instance(instance_name: str, *, zone: str | None = None, project: str | None = None) -> None:
-    """Stop a GCP Compute Engine instance. Fire-and-forget; never raises."""
     resolved_project, resolved_zone = _resolve_project_and_zone(project, zone)
     logger.info("burst-vm: stopping GCP instance %s (zone=%s project=%s)", instance_name, resolved_zone, resolved_project)
     cmd_args = ["compute", "instances", "stop", instance_name, f"--zone={resolved_zone}"]

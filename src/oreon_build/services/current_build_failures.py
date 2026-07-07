@@ -1,4 +1,3 @@
-"""Latest failed build slot helpers (package + release + architecture)."""
 from __future__ import annotations
 
 from dataclasses import dataclass
