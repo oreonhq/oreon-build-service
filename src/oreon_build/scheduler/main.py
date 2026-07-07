@@ -1,4 +1,3 @@
-"""Scheduler: cron-style jobs, dependency rebuilds, compose triggers."""
 from __future__ import annotations
 
 import asyncio
@@ -23,7 +22,6 @@ async def run_scheduled_tasks() -> None:
         )
         for s in result.scalars().all():
             logger.info("Schedule run: %s kind=%s", s.name, s.kind)
-            # TODO: trigger build or compose based on s.kind and s.config
     return None
 
 
