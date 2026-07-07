@@ -1,55 +1,6 @@
-# Oreon Build Service
-# Copyright (C) 2026 Oreon HQ
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program. If not, see <https://www.gnu.org/licenses/>.
-
-"""
-Oreon Build Worker: polls controller, runs mock builds, uploads build logs via the controller API.
-
-Built RPMs are posted to `/api/worker/upload-rpm/...`. Optional PE / `*.ko` signing streams NSS from
-``GET /api/worker/pesign-bundle/{attempt}`` into RAM, extracts only under ``/dev/shm`` (tmpfs) when
-possible, then deletes that tree as soon as signing finishes. The raw tarball is never written to disk.
-The controller GPG-signs and writes RPMs to R2.
-
-If mock leaves RPMs under ``--resultdir`` owned by root with restrictive modes, the worker can hit
-``PermissionError`` when scanning or uploading artifacts. Use ``OREON_WORKER_CHMOD_MOCK_RESULTDIR``
-and/or ``OREON_WORKER_CHMOD_MOCK_RESULTDIR_SUDO`` (see ``deploy/oreon-worker.env.example``).
-
-After each job, the worker runs ``mock --scrub=all`` for that job’s ``--uniqueext``, then removes only
-that attempt’s trees under ``/var/lib/mock`` (directory names ending in ``-oreon-<attempt_id>``), the
-attempt’s mock cache under ``/var/cache/mock/oreon-<attempt_id>/`` (see ``--config-opts cache_topdir``),
-then removes the job tempdir (prefix ``oreon-worker-<attempt_id>-``) so parallel jobs are not touched.
-Stale legacy ``oreon-worker-*`` dirs are pruned by age (see deploy docs).
-
-DistGit: Source(kind="distgit", url="<repo>.git#branch:spec_relpath") — mock --buildsrpm then mock --rebuild.
-
-Poll may include ``mock_additional_repos`` (base URLs) from the job mock environment. Each becomes ``mock --addrepo``.
-Mock already tags those with ``cost=1`` (higher DNF priority than the default ~1000). Fedora templates still set ``best=1`` in ``[main]``,
-so DNF5 can try to take the "best" NEVR from different repos and mix an impossible gcc stack. When at least one addrepo is present, the
-worker uses a short generated config that includes the real root cfg, sets ``[main] best=0`` and appends ``--setopt=best=0`` to
-``dnf4_common_opts`` and ``dnf5_common_opts`` unless ``OREON_WORKER_MOCK_SKIP_MIXED_REPOS_OPTS=1`` disables that.
-Optional ``OREON_WORKER_EXTRA_MOCK_ADDREPO`` appends comma-separated URLs on the worker.
-During long ``mock`` runs, optional ``OREON_WORKER_LIVE_LOG_INTERVAL_SEC`` (default 15, 0 disables)
-streams mock stdout/stderr plus resultdir log tails to the UI while the build is still running.
-By default the worker passes ``mock --define dist .orN`` where ``N`` is the first run of digits in the job
-``releasename`` (e.g. ``oreon-11-rp1`` gives ``.or11``) so RPM names use ``orN`` instead of the chroot
-default like ``fc45``. See ``OREON_WORKER_RPM_DIST`` and ``OREON_WORKER_SKIP_RPM_DIST_OVERRIDE`` in deploy docs.
-
-Each build thread opens its own ``httpx.Client`` (same auth headers as poll). The poll/heartbeat loop keeps a separate client so nothing shares a sync client with mock (multi-hour jobs were seeing broken pipes from pooled stale connections and from unsafe concurrent use).
-Transient ``ReadError`` / broken pipe on controller API calls is retried (see ``OREON_WORKER_HTTP_RETRIES``).
-RPM uploads default to presigned PUT to R2 plus a small API ``complete`` call (``OREON_WORKER_RPM_UPLOAD_VIA_PRESIGNED_R2`` defaults on). Build logs default the same way (``OREON_WORKER_BUILD_LOG_VIA_PRESIGNED_R2``) to avoid Cloudflare 524 while the origin ingests huge ``PUT`` bodies. Disable with ``=0`` to use legacy tunnel POSTs.
-"""
+# Oreon Build Worker
+# Copyright (c) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
 
 from __future__ import annotations
 
@@ -85,7 +36,6 @@ from oreon_build.services.signing import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-
 def _env_float(name: str, default: float, *, min_v: float, max_v: float) -> float:
     raw = (os.environ.get(name) or "").strip()
     if not raw:
@@ -96,21 +46,16 @@ def _env_float(name: str, default: float, *, min_v: float, max_v: float) -> floa
         return default
     return max(min_v, min(max_v, v))
 
-
 def _sleep_with_jitter(base_seconds: float, jitter_ratio: float = 0.15) -> None:
-    # Spread requests across workers and avoid synchronized poll spikes.
     j = max(0.0, min(0.9, jitter_ratio))
     delta = base_seconds * j
     low = max(0.0, base_seconds - delta)
     high = max(low, base_seconds + delta)
     time.sleep(random.uniform(low, high))
 
-# Ignore a second dispatch for the same build_attempt_id (duplicate poll/misbehaving client).
 _inflight_attempt_lock = threading.Lock()
 
-
 class MockLiveOutput:
-    """Thread-safe rolling buffer of mock subprocess stdout/stderr for live log uploads."""
 
     def __init__(self, max_bytes: int = 4 * 1024 * 1024) -> None:
         self._lock = threading.Lock()
@@ -133,10 +78,8 @@ class MockLiveOutput:
             return s
         return s[-cap:]
 
-
 def _worker_cpu_count() -> int:
     return max(1, os.cpu_count() or 1)
-
 
 def _worker_max_jobs_hint() -> int:
     raw = (os.environ.get("OREON_WORKER_MAX_JOBS") or "").strip()
@@ -147,15 +90,12 @@ def _worker_max_jobs_hint() -> int:
     except ValueError:
         return 1
 
-
 def _default_worker_max_jobs() -> int:
     return 1
-
 
 def _mock_smp_jobs_auto(max_jobs: int | None = None) -> int:
     jobs = max(1, max_jobs if max_jobs is not None else _worker_max_jobs_hint())
     return max(1, _worker_cpu_count() // jobs)
-
 
 def _worker_max_jobs_hard_cap() -> int:
     cpus = os.cpu_count() or 4
@@ -167,13 +107,9 @@ def _worker_max_jobs_hard_cap() -> int:
             pass
     return max(32, cpus * 2)
 _inflight_attempt_ids: set[int] = set()
-# Active work-tmpdir paths (same process, multi-thread safety).
-# Belt over the attempt-id inflight set: the prune checks this set directly so it never
-# deletes a directory that a live thread is still writing to, even under unusual conditions.
 _active_work_tmpdir_paths: set[str] = set()
 
 T = TypeVar("T")
-
 
 def _http_retry_attempts_and_base() -> tuple[int, float]:
     raw_n = (os.environ.get("OREON_WORKER_HTTP_RETRIES") or "5").strip()
@@ -187,7 +123,6 @@ def _http_retry_attempts_and_base() -> tuple[int, float]:
     except ValueError:
         base = 2.0
     return max(1, min(n, 12)), max(0.5, min(base, 60.0))
-
 
 def _is_transient_http_error(exc: BaseException) -> bool:
     transient_types: tuple[type[BaseException], ...] = (
@@ -207,7 +142,6 @@ def _is_transient_http_error(exc: BaseException) -> bool:
         resp = exc.response
         if resp is not None:
             sc = resp.status_code
-            # Cloudflare 522/524 (origin down/timeout), plus generic gateway overload.
             if sc in (408, 425, 429, 500, 502, 503, 504, 522, 523, 524):
                 return True
     if isinstance(exc, OSError) and exc.errno in (errno.EPIPE, errno.ECONNRESET, errno.ETIMEDOUT):
@@ -224,9 +158,7 @@ def _is_transient_http_error(exc: BaseException) -> bool:
         unwrapped = c
     return False
 
-
 def _with_http_retries(label: str, fn: Callable[[], T]) -> T:
-    """Retry on dead pooled connections (common after multi-hour mock) and similar transport glitches."""
     attempts, base = _http_retry_attempts_and_base()
     last: BaseException | None = None
     for i in range(attempts):
@@ -249,14 +181,12 @@ def _with_http_retries(label: str, fn: Callable[[], T]) -> T:
     assert last is not None
     raise last
 
-
 def _controller_base_url() -> str:
     return (
         os.environ.get("CONTROLLER_URL")
         or os.environ.get("OREON_CONTROLLER_URL")
         or "http://localhost:8000"
     ).rstrip("/")
-
 
 def _build_log_put_timeout() -> httpx.Timeout:
     raw = (os.environ.get("OREON_WORKER_BUILD_LOG_PUT_TIMEOUT_SEC") or "7200").strip()
@@ -267,12 +197,9 @@ def _build_log_put_timeout() -> httpx.Timeout:
     total = max(120.0, min(total, 86400.0))
     return httpx.Timeout(total, connect=120.0)
 
-
 def _build_log_presigned_r2_enabled() -> bool:
-    """Default on so huge logs do not POST through Cloudflare Tunnel (524 timeouts)."""
     v = (os.environ.get("OREON_WORKER_BUILD_LOG_VIA_PRESIGNED_R2") or "1").strip().lower()
     return v not in ("0", "false", "no", "off")
-
 
 def _upload_build_log_via_presigned_r2(
     session: httpx.Client,
@@ -313,7 +240,6 @@ def _upload_build_log_via_presigned_r2(
     out = _with_http_retries(f"build-log complete attempt_id={attempt_id}", _complete)
     return str(out.get("log_r2_key") or "")
 
-
 def _upload_build_log_via_controller(
     session: httpx.Client,
     controller_url: str,
@@ -335,9 +261,7 @@ def _upload_build_log_via_controller(
 
     return _with_http_retries(f"build-log upload attempt_id={attempt_id}", _do)
 
-
 _OREON_MAX_BUILD_LOG_BYTES = 64 * 1024 * 1024
-
 
 def _upload_build_log_direct_put(
     session: httpx.Client,
@@ -345,10 +269,6 @@ def _upload_build_log_direct_put(
     attempt_id: int,
     data: bytes,
 ) -> None:
-    """
-    PUT log through the controller (no presign+complete). Used for periodic live snapshots so we
-    do not hash the full object on every tick.
-    """
     r = session.put(
         f"{controller_url}/api/worker/build-log/{attempt_id}",
         content=data,
@@ -356,7 +276,6 @@ def _upload_build_log_direct_put(
         timeout=_build_log_put_timeout(),
     )
     r.raise_for_status()
-
 
 def _live_log_interval_sec() -> int:
     raw = (os.environ.get("OREON_WORKER_LIVE_LOG_INTERVAL_SEC") or "15").strip()
@@ -366,13 +285,11 @@ def _live_log_interval_sec() -> int:
         v = 60
     return max(0, min(v, 3600))
 
-
 def _mock_log_mtime(path: Path) -> float:
     try:
         return path.stat().st_mtime
     except OSError:
         return 0.0
-
 
 def _mock_chroot_result_dir(mock_config: str, mock_unique_ext: str | None) -> Path | None:
     name = (mock_config or "").strip()
@@ -384,7 +301,6 @@ def _mock_chroot_result_dir(mock_config: str, mock_unique_ext: str | None) -> Pa
         name = f"{name}-{mock_unique_ext}"
     p = Path("/var/lib/mock") / name / "result"
     return p if p.is_dir() else None
-
 
 def _mock_result_search_dirs(
     result_dir: Path,
@@ -418,7 +334,6 @@ def _mock_result_search_dirs(
                 dirs.append(chroot_result)
     return dirs
 
-
 def _read_inprogress_mock_build_log_snippet(
     result_dir: Path,
     max_bytes: int = 4 * 1024 * 1024,
@@ -426,11 +341,6 @@ def _read_inprogress_mock_build_log_snippet(
     mock_config: str | None = None,
     mock_unique_ext: str | None = None,
 ) -> str:
-    """
-    Prefer the *newest* build.log under resultdir (mock can leave older nested paths).
-    During ``mock --rebuild``, dnf often streams to **root.log** while **build.log** still
-    shows the finished ``rpmbuild -bs`` block for a long time, so include **root.log** too.
-    """
     chunks: list[str] = []
     search_dirs = _mock_result_search_dirs(
         result_dir,
@@ -512,7 +422,6 @@ def _read_inprogress_mock_build_log_snippet(
 
     return "\n\n".join(chunks).strip()
 
-
 def _start_live_build_log_snapshot_thread(
     session: httpx.Client,
     controller_url: str,
@@ -574,7 +483,6 @@ def _start_live_build_log_snapshot_thread(
 
     threading.Thread(target=runner, daemon=True, name=f"oreon-live-log-{attempt_id}").start()
 
-
 def _upload_accumulated_build_log(
     session: httpx.Client,
     controller_url: str,
@@ -585,7 +493,6 @@ def _upload_accumulated_build_log(
     if not msg:
         return
     _upload_build_log_via_controller(session, controller_url, attempt_id, msg.encode("utf-8"))
-
 
 def _download_source_via_controller(
     session: httpx.Client,
@@ -604,7 +511,6 @@ def _download_source_via_controller(
 
     return _with_http_retries(f"source-blob attempt_id={attempt_id}", _do)
 
-
 def _pesign_bundle_max_bytes() -> int:
     raw = (os.environ.get("OREON_WORKER_PESIGN_BUNDLE_MAX_MIB") or "256").strip()
     try:
@@ -612,7 +518,6 @@ def _pesign_bundle_max_bytes() -> int:
     except ValueError:
         mib = 256
     return max(16, min(mib, 1024)) * 1024 * 1024
-
 
 def _pesign_extract_parent_dir() -> Path:
     override = (os.environ.get("OREON_WORKER_PESIGN_EXTRACT_DIR") or "").strip()
@@ -630,7 +535,6 @@ def _pesign_extract_parent_dir() -> Path:
     )
     return Path(tempfile.gettempdir())
 
-
 def _wipe_pesign_tree(root: Path | None) -> None:
     if root is None:
         return
@@ -640,14 +544,12 @@ def _wipe_pesign_tree(root: Path | None) -> None:
     except OSError:
         shutil.rmtree(str(root), ignore_errors=True)
 
-
 @contextmanager
 def _pesign_bundle_context(
     session: httpx.Client,
     controller_url: str,
     attempt_id: int,
 ) -> Iterator[PesignRuntimeConfig | None]:
-    """Yield pesign config while NSS lives only under RAM-backed extract_root, then wipe it."""
     volatile: Path | None = None
     cfg: PesignRuntimeConfig | None = None
     try:
@@ -663,16 +565,11 @@ def _pesign_bundle_context(
     finally:
         _wipe_pesign_tree(volatile)
 
-
 def _fetch_pesign_bundle_volatile(
     session: httpx.Client,
     controller_url: str,
     attempt_id: int,
 ) -> tuple[PesignRuntimeConfig | None, Path | None]:
-    """
-    Stream bundle into RAM (no tarball file on disk). Extract under tmpfs when possible.
-    Returns (config, extract_root). Caller must _wipe_pesign_tree(extract_root) in a finally block.
-    """
     cap = _pesign_bundle_max_bytes()
     buf = bytearray()
     with session.stream(
@@ -737,7 +634,6 @@ def _fetch_pesign_bundle_volatile(
     )
     return cfg, extract_root
 
-
 def _get_arch() -> str:
     m = platform.machine()
     if m in ("x86_64", "AMD64"):
@@ -746,13 +642,7 @@ def _get_arch() -> str:
         return "aarch64"
     return m
 
-
 def _worker_result_post_timeout() -> httpx.Timeout:
-    """
-    Controller ``POST /worker/result/...`` can run createrepo and R2 copies for many RPMs; the default
-    client read timeout (30s) causes ReadTimeout after the server already committed success. The worker
-    then posts a spurious *failed* and overwrites the DB. Override with OREON_WORKER_RESULT_POST_TIMEOUT_SEC.
-    """
     raw = os.environ.get("OREON_WORKER_RESULT_POST_TIMEOUT_SEC", "900")
     try:
         total = float(raw)
@@ -761,7 +651,6 @@ def _worker_result_post_timeout() -> httpx.Timeout:
     total = max(120.0, min(total, 7200.0))
     connect = min(120.0, total)
     return httpx.Timeout(connect=connect, read=total, write=total, pool=total)
-
 
 def _post_worker_build_result(
     session: httpx.Client,
@@ -778,9 +667,7 @@ def _post_worker_build_result(
 
     return _with_http_retries(f"worker result attempt_id={attempt_id}", _do)
 
-
 def _post_mock_complete(session: httpx.Client, controller_url: str, attempt_id: int) -> httpx.Response:
-    """Tell the controller mock finished so the UI can show build success while the controller pipeline runs."""
 
     def _do() -> httpx.Response:
         return session.post(
@@ -790,7 +677,6 @@ def _post_mock_complete(session: httpx.Client, controller_url: str, attempt_id: 
 
     return _with_http_retries(f"mock-complete attempt_id={attempt_id}", _do)
 
-
 def _try_post_orphan_failure(
     controller_url: str,
     worker_headers: dict[str, str],
@@ -798,7 +684,6 @@ def _try_post_orphan_failure(
     attempt_id: int,
     exc: BaseException,
 ) -> None:
-    """If _process_job dies without returning, still fail the attempt so the UI does not stick on *running*."""
     msg = f"Worker unhandled error during build: {type(exc).__name__}: {exc}"
     log_key = ""
     with httpx.Client(
@@ -821,7 +706,6 @@ def _try_post_orphan_failure(
         except Exception:
             logger.exception("Orphan failure: could not POST result for attempt %s", attempt_id)
 
-
 def _rpm_file_sha256(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -832,18 +716,11 @@ def _rpm_file_sha256(path: Path) -> str:
             h.update(chunk)
     return h.hexdigest()
 
-
 def _rpm_upload_presigned_r2_enabled() -> bool:
-    """Default on. Set OREON_WORKER_RPM_UPLOAD_VIA_PRESIGNED_R2=0 to use multipart POST through the controller."""
     v = (os.environ.get("OREON_WORKER_RPM_UPLOAD_VIA_PRESIGNED_R2") or "1").strip().lower()
     return v not in ("0", "false", "no", "off")
 
-
 def _rpm_complete_post_timeout() -> httpx.Timeout:
-    """
-    Controller may download a multi GiB object from R2, hash it, and ``rpm --addsign`` while other
-    builds run. Default read timeout is higher than the presigned PUT timeout.
-    """
     raw = (os.environ.get("OREON_WORKER_RPM_COMPLETE_TIMEOUT_SEC") or "32400").strip()
     try:
         total = float(raw)
@@ -852,16 +729,13 @@ def _rpm_complete_post_timeout() -> httpx.Timeout:
     total = max(300.0, min(total, 86400.0))
     return httpx.Timeout(total, connect=120.0)
 
-
 def _rpm_complete_extra_retries() -> int:
-    """Extra passes after a non-transient HTTP 400 with a retryable error detail (R2 lag, verify race)."""
     raw = (os.environ.get("OREON_WORKER_RPM_COMPLETE_EXTRA_RETRIES") or "5").strip()
     try:
         n = int(raw)
     except ValueError:
         n = 5
     return max(0, min(n, 15))
-
 
 def _rpm_complete_400_retryable(detail: str) -> bool:
     if not detail:
@@ -881,7 +755,6 @@ def _rpm_complete_400_retryable(detail: str) -> bool:
         )
     )
 
-
 def _upload_rpm_via_presigned_r2(
     session: httpx.Client,
     controller_url: str,
@@ -896,7 +769,7 @@ def _upload_rpm_via_presigned_r2(
     complete_timeout = _rpm_complete_post_timeout()
     extra = _rpm_complete_extra_retries()
     max_pass = 1 + extra
-    cycles = 4  # full re-presign and re-put cycle count for huge SRPMs and R2 eventual consistency
+    cycles = 4
     last_exc: BaseException | None = None
     for cycle in range(cycles):
         def _presign() -> dict:
@@ -1026,14 +899,12 @@ def _upload_rpm_via_presigned_r2(
     assert last_exc is not None
     raise last_exc
 
-
 def _upload_rpm_to_controller(
     session: httpx.Client,
     controller_url: str,
     attempt_id: int,
     rpm_path: Path,
 ) -> dict:
-    """Default: presigned R2 PUT + API complete. Optional: multipart POST when presign is disabled."""
     upload_timeout = httpx.Timeout(7200.0, connect=120.0)
     fname = rpm_path.name
 
@@ -1061,14 +932,11 @@ def _upload_rpm_to_controller(
             return _upload_rpm_via_presigned_r2(session, controller_url, attempt_id, rpm_path)
         raise
 
-
 def _truthy_env(name: str) -> bool:
     v = (os.environ.get(name) or "").strip().lower()
     return v in ("1", "true", "yes", "on")
 
-
 def _mock_addrepo_baseurls(job: dict) -> list[str]:
-    """URLs for ``mock --addrepo`` from poll ``mock_additional_repos`` plus optional worker env."""
     seen: set[str] = set()
     out: list[str] = []
     raw = job.get("mock_additional_repos") or []
@@ -1088,12 +956,7 @@ def _mock_addrepo_baseurls(job: dict) -> list[str]:
                 out.append(p)
     return out
 
-
 def _resolve_mock_config_file(name: str) -> str | None:
-    """
-    Return an absolute path to a mock ``.cfg`` on the worker so we can ``include(...)`` it from
-    a generated wrapper. ``MOCK_CONFDIR`` (default ``/etc/mock``) is used for short names.
-    """
     s = (name or "").strip()
     if not s:
         return None
@@ -1108,23 +971,16 @@ def _resolve_mock_config_file(name: str) -> str | None:
         return os.path.realpath(c)
     return None
 
-
 def _write_oreon_mock_mixed_repos_wrapper_cfg(
     include_path: str,
     parent: Path,
     attempt_id: int,
 ) -> Path:
-    """
-    Generate a mock config that includes the real root config, then relaxes dnf "best" so
-    ``--addrepo`` (already ``cost=1`` in mock) and base repos do not form impossible mixed stacks
-    (typical: gcc N from the extra repo vs gcc N-1 from fedora/updates in one transaction).
-    """
     parent.mkdir(parents=True, exist_ok=True)
     out = parent / f"oreon-mock-mixed-repos-{attempt_id}.cfg"
     lines: list[str] = [
-        "# Oreon worker: mixed mock --addrepo dnf5 solver (auto-generated, do not edit)",
+        "# auto-generated",
         f"include({repr(include_path)})",
-        "# addrepo repos get cost=1 in mock; below relaxes [main] best=1 and dnf --setopt=best=0",
         "",
         '_oreon_d4 = " ".join(str(x) for x in (config_opts.get("dnf4_common_opts") or []))',
         'if "best=0" not in _oreon_d4.lower() and "best=false" not in _oreon_d4.lower():',
@@ -1142,7 +998,6 @@ def _write_oreon_mock_mixed_repos_wrapper_cfg(
     ]
     out.write_text("\n".join(lines), encoding="utf-8")
     return out
-
 
 def _mock_config_for_mixed_addrepos(
     base_cfg: str,
@@ -1166,16 +1021,7 @@ def _mock_config_for_mixed_addrepos(
     logger.info("mock -r %s (mixed addrepo, include %s)", wpath, inc)
     return str(wpath)
 
-
 def _rpm_dist_macro_value(releasename: str | None) -> str | None:
-    """
-    Return the value for rpmbuild ``dist`` (e.g. ``.or11``) so ``Release`` and filenames use ``orN``
-    instead of the Fedora mock default (``fc45``). Return None to leave the chroot default.
-
-    Order: if ``OREON_WORKER_SKIP_RPM_DIST_OVERRIDE`` is set, None. Else if ``OREON_WORKER_RPM_DIST`` is
-    set, use that (add a leading dot when missing). Else derive ``.or`` + first digit run in
-    ``releasename`` (``oreon-11-rp1`` -> ``11``).
-    """
     if _truthy_env("OREON_WORKER_SKIP_RPM_DIST_OVERRIDE"):
         return None
     raw = (os.environ.get("OREON_WORKER_RPM_DIST") or "").strip()
@@ -1191,35 +1037,16 @@ def _rpm_dist_macro_value(releasename: str | None) -> str | None:
         return None
     return f".or{m.group(1)}"
 
-
 def _mock_shared_host_cache_enabled() -> bool:
-    """
-    If set, the worker does not pass per-attempt ``cache_topdir`` to mock.
-
-    Default off so parallel jobs do not share ``/var/cache/mock/<root>/dnf_cache`` (mock uses
-    ``shared_root_name`` without ``uniqueext`` for that path). Sharing it causes dnf5 races
-    (tmpdir/directory iterator errors) under load.
-    """
     return _truthy_env("OREON_WORKER_MOCK_SHARED_CACHE")
-
 
 def _mock_cache_topdir_for_attempt(attempt_id: int) -> str:
     parent = (os.environ.get("OREON_WORKER_MOCK_CACHE_PARENT") or "/var/cache/mock").rstrip("/")
     return f"{parent}/oreon-{attempt_id}"
 
-
-# Upper bound for explicit OREON_WORKER_MOCK_SMP_JOBS values.
 _MOCK_SMP_JOBS_HARD_MAX = 128
 
-
 def _mock_rpmbuild_smp_define_args() -> list[str]:
-    """
-    Cap compile parallelism inside mock (rpmbuild macros).
-
-    When unset, uses ``cpu_count // OREON_WORKER_MAX_JOBS`` (all cores when MAX_JOBS=1).
-
-    Set ``OREON_WORKER_MOCK_SMP_JOBS=0`` to omit these defines (rpmbuild/mock default parallelism).
-    """
     raw = (os.environ.get("OREON_WORKER_MOCK_SMP_JOBS") or "").strip()
     if not raw:
         n = _mock_smp_jobs_auto()
@@ -1242,7 +1069,6 @@ def _mock_rpmbuild_smp_define_args() -> list[str]:
         f"_smp_build_ncpus {n}",
     ]
 
-
 def _mock_cmd_base(
     mock_config: str,
     mock_unique_ext: str | None,
@@ -1263,18 +1089,7 @@ def _mock_cmd_base(
         cmd += ["--define", f"dist {rpm_dist}"]
     return cmd
 
-
 def _make_mock_resultdir_world_readable(result_dir: Path) -> None:
-    """
-    Best-effort chmod so the worker user can traverse result_dir and read logs + ``*.rpm``.
-
-    mock often drops root-owned subtrees. We must run this **before** any ``result_dir.rglob()``
-    (e.g. ``_mock_stage_log_sections`` / ``build.log``), not only before artifact upload.
-
-    Non-sudo ``chmod -R`` runs every time (cheap). For root-only files, set
-    ``OREON_WORKER_CHMOD_MOCK_RESULTDIR_SUDO=1`` and sudoers (see deploy/oreon-worker.env.example).
-    Set ``OREON_WORKER_SKIP_CHMOD_MOCK_RESULTDIR=1`` to skip the non-sudo chmod (unusual).
-    """
     if not result_dir.is_dir():
         return
     if not _truthy_env("OREON_WORKER_SKIP_CHMOD_MOCK_RESULTDIR"):
@@ -1295,7 +1110,6 @@ def _make_mock_resultdir_world_readable(result_dir: Path) -> None:
                 _tail_lines(out, 25),
             )
 
-
 def _run(cmd: list[str], timeout_s: int | None, cwd: str | None = None) -> tuple[int, str]:
     try:
         res = subprocess.run(
@@ -1313,15 +1127,11 @@ def _run(cmd: list[str], timeout_s: int | None, cwd: str | None = None) -> tuple
     except subprocess.TimeoutExpired:
         return 124, f"Timed out running: {' '.join(cmd)}"
 
-
-# Exit code when mock is killed because the user cancelled the build (worker convention)
 _RC_MOCK_CANCELLED = 130
 
-# Default mock wall-clock caps (override with OREON_WORKER_MOCK_*_TIMEOUT_SEC). Upper bound for env overrides.
-_MOCK_STAGE_TIMEOUT_DEFAULT_SEC = 5 * 24 * 3600  # 5 days
-_MOCK_STAGE_TIMEOUT_MAX_SEC = 30 * 24 * 3600  # 30 days
+_MOCK_STAGE_TIMEOUT_DEFAULT_SEC = 5 * 24 * 3600
+_MOCK_STAGE_TIMEOUT_MAX_SEC = 30 * 24 * 3600
 _MOCK_STAGE_TIMEOUT_MIN_SEC = 600
-
 
 def _drain_subprocess_pipe(pipe, parts: list[str], live_out: MockLiveOutput | None) -> None:
     if pipe is None:
@@ -1340,7 +1150,6 @@ def _drain_subprocess_pipe(pipe, parts: list[str], live_out: MockLiveOutput | No
         except OSError:
             pass
 
-
 def _run_with_abort(
     cmd: list[str],
     timeout_s: int,
@@ -1349,7 +1158,6 @@ def _run_with_abort(
     *,
     live_out: MockLiveOutput | None = None,
 ) -> tuple[int, str]:
-    """Like _run but kills the child process when abort_event is set (user cancelled build)."""
     if not abort_event and live_out is None:
         return _run(cmd, timeout_s, cwd)
     env = {**os.environ, "LANG": "C.UTF-8"}
@@ -1414,7 +1222,6 @@ def _run_with_abort(
             return 124, f"Timed out running: {' '.join(cmd)}"
         time.sleep(0.25)
 
-
 def _tail_lines(text: str, max_lines: int) -> str:
     if max_lines <= 0:
         return text
@@ -1423,16 +1230,13 @@ def _tail_lines(text: str, max_lines: int) -> str:
         return text
     return "\n".join(lines[-max_lines:])
 
-
 def _read_text_file(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return ""
 
-
 def _read_mock_log_tail(result_dir: Path, log_basename: str, max_lines: int) -> str:
-    """Read the newest ``log_basename`` under result_dir (e.g. build.log) and return a tailed body."""
     try:
         matches = sorted(result_dir.rglob(log_basename))
     except OSError:
@@ -1444,13 +1248,10 @@ def _read_mock_log_tail(result_dir: Path, log_basename: str, max_lines: int) -> 
         return ""
     return _tail_lines(txt, max_lines).strip()
 
-
-# mock's Python logging: "DEBUG util.py:461:  message" (note: space after DEBUG, not "DEBUG:")
 _RE_MOCK_PY_DEBUG = re.compile(r"^\s*DEBUG\s+(\S+\.py):(\d+):\s*(.*)$")
 _RE_MOCK_PY_INFO = re.compile(r"^\s*INFO\s+(\S+\.py):(\d+):\s*(.*)$")
 _RE_MOCK_PY_WARNING = re.compile(r"^\s*WARNING\s+(\S+\.py):(\d+):\s*(.*)$")
 
-# Substrings of mock/dnf housekeeping lines (drop whole line or DEBUG-wrapped message)
 _MOCK_INFRA_SNIPPETS = (
     "child environment:",
     "executing command:",
@@ -1461,19 +1262,13 @@ _MOCK_INFRA_SNIPPETS = (
     "unmounting",
 )
 
-# Lines in build.log that usually indicate failure (for tail-first UIs)
 _RE_BUILD_ERROR_HINT = re.compile(
     r"(?i)(\berror:\b|\bfatal\b|\*\*\*\s|BUILD FAILED|RPM build errors|recipe failed|"
     r"undefined reference|incorrect format|no such file|cannot find|command not found|"
     r"make\[\d+\]: \*\*\*|error TS|error: |error \d+|traceback|\bFAILED\b)"
 )
 
-
 def _sanitize_mock_log_line(line: str) -> str | None:
-    """
-    Normalize or drop a single log line. Mock emits ``DEBUG util.py:N: ...``; we keep only the
-    message after the colon when it is not pure infrastructure noise. Returns None to omit the line.
-    """
     raw = line.rstrip("\n")
     stripped = raw.strip()
     if not stripped:
@@ -1498,7 +1293,6 @@ def _sanitize_mock_log_line(line: str) -> str | None:
         for snip in _MOCK_INFRA_SNIPPETS:
             if snip in mlow:
                 return None
-        # Most INFO/WARNING from mock's util.py is noise; keep if it looks actionable
         if rx is _RE_MOCK_PY_INFO or rx is _RE_MOCK_PY_WARNING:
             if not _RE_BUILD_ERROR_HINT.search(msg):
                 return None
@@ -1506,9 +1300,7 @@ def _sanitize_mock_log_line(line: str) -> str | None:
 
     return stripped
 
-
 def _sanitize_mock_output(text: str) -> str:
-    """Strip mock Python DEBUG/INFO noise, dedupe consecutive identical lines."""
     out: list[str] = []
     for line in text.splitlines():
         cleaned = _sanitize_mock_log_line(line)
@@ -1524,9 +1316,7 @@ def _sanitize_mock_output(text: str) -> str:
         prev = L
     return "\n".join(deduped).strip()
 
-
 def _extract_build_error_highlights(text: str, max_lines: int = 80) -> str:
-    """Pull likely error lines from a full (sanitized) build log for tail-first web UIs."""
     seen: set[str] = set()
     hits: list[str] = []
     for line in text.splitlines():
@@ -1543,7 +1333,6 @@ def _extract_build_error_highlights(text: str, max_lines: int = 80) -> str:
             break
     return "\n".join(hits).strip()
 
-
 def _format_build_log_display(
     result_dir: Path,
     *,
@@ -1551,10 +1340,6 @@ def _format_build_log_display(
     failed_or_cancelled: bool,
     max_read_bytes: int = 5 * 1024 * 1024,
 ) -> str:
-    """
-    Prefer **build.log** (rpmbuild). On failure/cancel, scan a capped full file for error lines
-    and append ``## Detected errors`` so dashboards that only show the log *tail* still see causes.
-    """
     try:
         matches = sorted(result_dir.rglob("build.log"))
     except OSError:
@@ -1583,7 +1368,6 @@ def _format_build_log_display(
         return f"{tail}\n\n## Detected errors (from full build.log)\n{highlights}"
     return tail
 
-
 def _mock_stage_log_sections(
     result_dir: Path,
     *,
@@ -1594,13 +1378,6 @@ def _mock_stage_log_sections(
     max_build_log_lines: int,
     chroot_tail_lines: int = 120,
 ) -> list[str]:
-    """
-    Build user-facing log sections from a mock ``--resultdir``.
-
-    Primary content is **build.log** (rpmbuild output inside the chroot). We omit state.log,
-    config.log, and full root.log to avoid chroot/dnf noise. On failure before rpmbuild runs,
-    a short tail of root.log is included only when build.log is empty.
-    """
     sections: list[str] = []
     failed_or_cancelled = (not mock_rc_ok) or cancelled
     build_txt = _format_build_log_display(
@@ -1633,7 +1410,6 @@ def _mock_stage_log_sections(
 
     return sections
 
-
 def _parse_distgit_url(distgit_url: str) -> tuple[str, str | None, str | None]:
     repo = distgit_url
     branch = None
@@ -1646,7 +1422,6 @@ def _parse_distgit_url(distgit_url: str) -> tuple[str, str | None, str | None]:
             branch = frag or None
     return repo, branch, spec_rel
 
-
 def _clone_repo(repo: str, branch: str | None, dst: Path) -> tuple[bool, str]:
     cmd = ["git", "clone", "--quiet", "--depth", "1"]
     if branch:
@@ -1655,9 +1430,7 @@ def _clone_repo(repo: str, branch: str | None, dst: Path) -> tuple[bool, str]:
     rc, out = _run(cmd, timeout_s=600)
     return rc == 0, out
 
-
 def _maybe_git_lfs_pull(repo_dir: Path) -> tuple[int, str]:
-    """Fetch Git LFS objects when .gitattributes uses filter=lfs (shallow clone may miss blobs)."""
     ga = repo_dir / ".gitattributes"
     try:
         if ga.is_file() and "filter=lfs" in ga.read_text(encoding="utf-8", errors="replace"):
@@ -1666,15 +1439,12 @@ def _maybe_git_lfs_pull(repo_dir: Path) -> tuple[int, str]:
         pass
     return 0, ""
 
-
 _SPECTOOL_LIST_ENTRY = re.compile(
     r"^(?:Source|Patch)(\d+)(?:\s*\([^)]+\))?:\s*(.+)$",
     re.IGNORECASE,
 )
 
-
 def _parse_spectool_list_entry(line: str) -> str | None:
-    """Return the path or URL from a spectool -l Source/Patch line, else None."""
     line = line.strip()
     if not line or line.startswith("#"):
         return None
@@ -1683,15 +1453,7 @@ def _parse_spectool_list_entry(line: str) -> str | None:
         return None
     return m.group(2).strip()
 
-
 def _copy_local_spec_sources_listed_by_spectool(spec_path: Path, staging_dir: Path) -> tuple[bool, str]:
-    """
-    Copy Source/Patch files that live next to the spec (distgit layout).
-
-    ``spectool -g`` only downloads *URL* sources. Local ``SourceN: foo`` and
-    ``PatchN: bar`` lines must be copied into the mock --sources staging dir
-    or rpmbuild fails with "Bad file: .../SOURCES/foo".
-    """
     spec_dir = spec_path.parent
     staging_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1719,7 +1481,6 @@ def _copy_local_spec_sources_listed_by_spectool(spec_path: Path, staging_dir: Pa
 
         src = spec_dir / rel
         if not src.is_file():
-            # Often listed as basename only; try next to spec
             base = Path(rel).name
             alt = spec_dir / base
             if alt.is_file():
@@ -1746,15 +1507,7 @@ def _copy_local_spec_sources_listed_by_spectool(spec_path: Path, staging_dir: Pa
 
     return True, "\n".join(parts)
 
-
 def _seed_sources_from_spec_tree(spec_path: Path, staging_dir: Path) -> str:
-    """
-    Best-effort pre-seed for specs that need local side files *during* parse.
-
-    Some specs (lua/includes/conditionals) touch files under SOURCES while parsing,
-    before rpmbuild starts. If those files live in distgit next to the spec, stage
-    them first so spectool/rpm parse does not fail with "Unable to open .../SOURCES/...".
-    """
     spec_dir = spec_path.parent
     staging_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1765,7 +1518,6 @@ def _seed_sources_from_spec_tree(spec_path: Path, staging_dir: Path) -> str:
             continue
         rel = p.relative_to(spec_dir)
         srel = rel.as_posix()
-        # Skip VCS internals and the spec file itself.
         if srel.startswith(".git/") or p == spec_path:
             continue
         dst = staging_dir / rel
@@ -1777,15 +1529,7 @@ def _seed_sources_from_spec_tree(spec_path: Path, staging_dir: Path) -> str:
             skipped += 1
     return f"Pre-seeded local source tree: copied={copied} skipped={skipped}"
 
-
 def _spectool_cmd(args: list[str], sourcedir: Path) -> list[str]:
-    """
-    Build spectool command with explicit RPM macro dirs for parse-time source lookups.
-
-    Some specs reference %{_sourcedir} files while parsing (Lua/includes). Without
-    overriding these macros, worker-local ~/.rpmmacros can point to unrelated host
-    paths (e.g. /var/lib/oreon-build-worker/rpmbuild/SOURCES) and parse fails.
-    """
     src = str(sourcedir.resolve())
     top = str(sourcedir.resolve().parent)
     return [
@@ -1797,18 +1541,8 @@ def _spectool_cmd(args: list[str], sourcedir: Path) -> list[str]:
         *args,
     ]
 
-
 def _collect_url_source_basenames_from_spectool_list(spec_path: Path) -> list[str]:
-    """
-    Return basenames of every URL-based Source/Patch entry in the spec.
-
-    Used to validate that spectool -g actually downloaded each one; spectool can
-    silently return rc=0 even when a download fails (e.g. 404 or timeout), and the
-    missing file only surfaces as a cryptic "Bad file" error inside mock.
-    """
     spec_dir = spec_path.parent
-    # For specs that expect files in %{_sourcedir} during parse, use an explicit
-    # sourcedir/topdir so spectool sees the staged workspace, not host rpmbuild dirs.
     staging_dir = spec_dir
     rc, out = _run(
         _spectool_cmd(["-l", str(spec_path.name)], staging_dir),
@@ -1828,25 +1562,13 @@ def _collect_url_source_basenames_from_spectool_list(spec_path: Path) -> list[st
             basenames.append(Path(rest.rstrip("/")).name)
     return basenames
 
-
 def _prepare_mock_sources_with_spectool(spec_path: Path, staging_dir: Path) -> tuple[bool, str]:
-    """
-    Prepare sources for mock (spectool from rpmdevtools).
-
-    Koji/COPR do the same: sources are prepared before mock. Koji uses lookaside;
-    for URL-based Source lines, spectool is the standard tool (Fedora rpmdevtools).
-    ``spectool -g`` fetches URL sources only; local distgit files are copied by
-    :func:`_copy_local_spec_sources_listed_by_spectool`.
-    Returns (ok, log).
-    """
     spec_dir = spec_path.parent
     staging_dir.mkdir(parents=True, exist_ok=True)
     log_parts: list[str] = []
 
-    # Seed local files before spectool parse; required by some specs.
     log_parts.append(_seed_sources_from_spec_tree(spec_path, staging_dir))
 
-    # Collect expected URL source basenames BEFORE downloading so we can verify after.
     expected_url_basenames = _collect_url_source_basenames_from_spectool_list(spec_path)
 
     rc, out = _run(
@@ -1871,9 +1593,6 @@ def _prepare_mock_sources_with_spectool(spec_path: Path, staging_dir: Path) -> t
     more = f" (+{len(names) - 6} more)" if len(names) > 6 else ""
     log_parts.append(f"URL sources via spectool: {len(names)} file(s){(': ' + head + more) if names else ''}")
 
-    # Verify every expected URL source was actually downloaded. spectool can return rc=0
-    # even when a download fails (server 404, timeout, etc.), which causes a confusing
-    # "Bad file: /builddir/build/SOURCES/foo" error deep inside mock rather than here.
     missing_downloads = [b for b in expected_url_basenames if b not in names]
     if missing_downloads:
         shown = ", ".join(missing_downloads[:10])
@@ -1891,7 +1610,6 @@ def _prepare_mock_sources_with_spectool(spec_path: Path, staging_dir: Path) -> t
 
     return True, "\n".join(log_parts)
 
-
 def _mock_build_srpm_from_spec(
     mock_config: str,
     spec_path: Path,
@@ -1904,19 +1622,6 @@ def _mock_build_srpm_from_spec(
     attempt_id: int | None = None,
     live_out: MockLiveOutput | None = None,
 ) -> tuple[bool, Path | None, str, bool]:
-    """
-    Build SRPM from spec/sources using mock (so dependencies are handled in chroot).
-    Produces *.src.rpm in result_dir.
-    Returns (ok, srpm_path, output, cancelled).
-
-    ``mock_unique_ext`` must be set per concurrent build on this host (e.g. attempt id);
-    otherwise mock shares one chroot per ``-r`` config and parallel jobs fail with
-    "Build root is locked by another process."
-
-    Pass ``attempt_id`` so mock gets a dedicated ``cache_topdir`` (unless
-    ``OREON_WORKER_MOCK_SHARED_CACHE`` is set). Otherwise dnf metadata and tmpdirs are shared
-    across all jobs using the same ``-r`` and dnf5 can fail when builds overlap.
-    """
     eff_mock_config = _mock_config_for_mixed_addrepos(
         mock_config,
         addrepo_baseurls or [],
@@ -1948,12 +1653,10 @@ def _mock_build_srpm_from_spec(
         return False, None, out, False
     srpms = sorted(result_dir.glob("*.src.rpm"))
     if not srpms:
-        # mock sometimes nests outputs; fall back to recursive search
         srpms = sorted(result_dir.rglob("*.src.rpm"))
     if not srpms:
         return False, None, out + "\nNo .src.rpm produced by mock --buildsrpm.", False
     return True, srpms[0], out, False
-
 
 def _mock_rebuild_srpm(
     mock_config: str,
@@ -1966,7 +1669,6 @@ def _mock_rebuild_srpm(
     attempt_id: int | None = None,
     live_out: MockLiveOutput | None = None,
 ) -> tuple[bool, str, bool]:
-    """Returns (ok, output, cancelled). See :func:`_mock_build_srpm_from_spec` for isolation knobs."""
     eff_mock_config = _mock_config_for_mixed_addrepos(
         mock_config,
         addrepo_baseurls or [],
@@ -1986,9 +1688,7 @@ def _mock_rebuild_srpm(
         return False, out, True
     return rc == 0, out, False
 
-
 def _mock_buildsrpm_timeout_sec() -> int:
-    """Seconds before killing ``mock --buildsrpm`` (default 5 days)."""
     raw = os.environ.get(
         "OREON_WORKER_MOCK_BUILDSRPM_TIMEOUT_SEC", str(_MOCK_STAGE_TIMEOUT_DEFAULT_SEC)
     )
@@ -1998,9 +1698,7 @@ def _mock_buildsrpm_timeout_sec() -> int:
         v = _MOCK_STAGE_TIMEOUT_DEFAULT_SEC
     return max(_MOCK_STAGE_TIMEOUT_MIN_SEC, min(v, _MOCK_STAGE_TIMEOUT_MAX_SEC))
 
-
 def _mock_rebuild_timeout_sec() -> int:
-    """Seconds before killing ``mock --rebuild`` (default 5 days)."""
     raw = os.environ.get(
         "OREON_WORKER_MOCK_REBUILD_TIMEOUT_SEC", str(_MOCK_STAGE_TIMEOUT_DEFAULT_SEC)
     )
@@ -2010,18 +1708,11 @@ def _mock_rebuild_timeout_sec() -> int:
         v = _MOCK_STAGE_TIMEOUT_DEFAULT_SEC
     return max(_MOCK_STAGE_TIMEOUT_MIN_SEC, min(v, _MOCK_STAGE_TIMEOUT_MAX_SEC))
 
-
 def _worker_temp_parent_dir() -> str | None:
-    """Optional dedicated parent for worker scratch dirs (keeps system /tmp free)."""
     p = (os.environ.get("OREON_WORKER_TMP_PARENT") or "").strip()
     return p or None
 
-
 def _inflight_marker_paths(attempt_id: int) -> list[Path]:
-    """
-    Cross-process inflight markers so stale prune cannot delete active attempt dirs when multiple
-    worker processes run on the same host.
-    """
     roots: list[Path] = [Path(tempfile.gettempdir())]
     extra = _worker_temp_parent_dir()
     if extra:
@@ -2039,7 +1730,6 @@ def _inflight_marker_paths(attempt_id: int) -> list[Path]:
         out.append(r / f".oreon-worker-inflight-{attempt_id}.lock")
     return out
 
-
 def _mark_inflight_attempt_external(attempt_id: int) -> None:
     for p in _inflight_marker_paths(attempt_id):
         try:
@@ -2051,7 +1741,6 @@ def _mark_inflight_attempt_external(attempt_id: int) -> None:
                 p, attempt_id, exc,
             )
 
-
 def _clear_inflight_attempt_external(attempt_id: int) -> None:
     for p in _inflight_marker_paths(attempt_id):
         try:
@@ -2059,12 +1748,7 @@ def _clear_inflight_attempt_external(attempt_id: int) -> None:
         except OSError:
             pass
 
-
 def _mock_scrub_unique_chroot(mock_config: str, mock_unique_ext: str, attempt_id: int | None = None) -> None:
-    """
-    Delete mock chroot + bootstrap for this job's ``--uniqueext`` (frees space under
-    ``/var/lib/mock``). Safe to call even if the build never created a root.
-    """
     if not mock_config or not mock_unique_ext:
         return
     timeout = int(os.environ.get("OREON_WORKER_MOCK_SCRUB_TIMEOUT_SEC", "3600"))
@@ -2089,13 +1773,7 @@ def _mock_scrub_unique_chroot(mock_config: str, mock_unique_ext: str, attempt_id
             snippet,
         )
 
-
 def _rm_rf_var_lib_mock_for_attempt(attempt_id: int) -> None:
-    """
-    Remove mock top-level roots for this attempt only (parallel-safe: names end with
-    ``-oreon-<attempt_id>``, e.g. ``fedora-rawhide-x86_64-oreon-139`` and
-    ``fedora-rawhide-x86_64-bootstrap-oreon-139``).
-    """
     base = Path("/var/lib/mock")
     if not base.is_dir():
         return
@@ -2114,9 +1792,7 @@ def _rm_rf_var_lib_mock_for_attempt(attempt_id: int) -> None:
     if removed:
         logger.info("Removed %d mock root(s) under /var/lib/mock for attempt %s", removed, attempt_id)
 
-
 def _rm_rf_mock_cache_topdir_for_attempt(attempt_id: int) -> None:
-    """Remove per-attempt mock ``cache_topdir`` (dnf/yum host cache bind-mounted into the chroot)."""
     if _mock_shared_host_cache_enabled():
         return
     p = Path(_mock_cache_topdir_for_attempt(attempt_id))
@@ -2127,14 +1803,7 @@ def _rm_rf_mock_cache_topdir_for_attempt(attempt_id: int) -> None:
     except OSError as e:
         logger.warning("Could not remove mock cache_topdir %s: %s", p, e)
 
-
 def _rm_rf_worker_tempdirs_for_attempt(attempt_id: int, tmp_parent: str | None) -> None:
-    """
-    Best-effort ``rm -rf`` of scratch dirs for this attempt only:
-    ``oreon-worker-<attempt_id>-…`` under TMPDIR and optional OREON_WORKER_TMP_PARENT.
-
-    Uses ``startswith("oreon-worker-{id}-")`` (not a glob) so attempt **8** never deletes **86**'s dir.
-    """
     name_prefix = f"oreon-worker-{attempt_id}-"
     roots: list[Path] = [Path(tempfile.gettempdir())]
     if tmp_parent:
@@ -2164,17 +1833,8 @@ def _rm_rf_worker_tempdirs_for_attempt(attempt_id: int, tmp_parent: str | None) 
     if removed:
         logger.info("Removed %d worker temp dir(s) with prefix %r for attempt %s", removed, name_prefix, attempt_id)
 
-
 def _cleanup_job_disk(attempt_id: int, mock_config: str, mock_unique_ext: str, work_tmpdir: str | None) -> None:
-    """
-    After each job: mock scrub (umount), then rm -rf this attempt's trees under /var/lib/mock,
-    then this job's work tmpdir and any matching oreon-worker-<id>-* dirs, then stale prune.
-    Safe with parallel builds (everything keyed by attempt_id/known work path).
-    """
     tmp_parent = _worker_temp_parent_dir()
-    # Remove the in-dir sentinel and deregister from the active-path set before any rmtree so that
-    # _prune_stale_oreon_worker_tempdirs called at the end of this function does not see our own
-    # (now-dead) dir as live while still correctly protecting other parallel jobs' dirs.
     if work_tmpdir:
         try:
             (Path(work_tmpdir) / ".oreon-active").unlink(missing_ok=True)
@@ -2192,12 +1852,7 @@ def _cleanup_job_disk(attempt_id: int, mock_config: str, mock_unique_ext: str, w
     _prune_stale_oreon_worker_tempdirs()
     _prune_stale_var_lib_mock_dirs()
 
-
 def _prune_stale_oreon_worker_tempdirs() -> None:
-    """
-    Remove ``oreon-worker-*`` directories older than OREON_WORKER_PRUNE_TMP_AGE_SEC (default 300s).
-    Set OREON_WORKER_PRUNE_TMP_AGE_SEC=0 to disable. Covers TMPDIR and OREON_WORKER_TMP_PARENT.
-    """
     age = int(os.environ.get("OREON_WORKER_PRUNE_TMP_AGE_SEC", "300"))
     if age <= 0:
         return
@@ -2235,22 +1890,18 @@ def _prune_stale_oreon_worker_tempdirs() -> None:
             for p in root.glob("oreon-worker-*"):
                 if not p.is_dir():
                     continue
-                # Check 1 (same-process, most reliable): attempt-id in in-memory inflight set.
                 aid = _tempdir_attempt_id(p.name)
                 if aid is not None and aid in inflight_ids:
                     continue
-                # Check 2 (same-process, belt): path registered in active tmpdir set.
                 try:
                     p_str = str(p.resolve())
                 except OSError:
                     p_str = str(p)
                 if p_str in active_paths or str(p) in active_paths:
                     continue
-                # Check 3 (cross-process): inflight marker file written before thread starts.
                 if aid is not None:
                     if any(mp.exists() for mp in _inflight_marker_paths(aid)):
                         continue
-                # Check 4 (cross-process fallback): sentinel file inside the dir itself.
                 if (p / ".oreon-active").exists():
                     continue
                 try:
@@ -2262,18 +1913,7 @@ def _prune_stale_oreon_worker_tempdirs() -> None:
         except OSError:
             pass
 
-
 def _prune_stale_var_lib_mock_dirs() -> None:
-    """
-    Scrub and remove ``/var/lib/mock/*-oreon-<id>`` and ``/var/cache/mock/oreon-<id>``
-    directories left behind by crashed or cancelled builds.
-
-    The per-build cleanup in ``_cleanup_job_disk`` handles the happy path. This sweeper
-    catches anything that slipped through (worker killed mid-cleanup, mock crash, etc.).
-
-    Age threshold: OREON_WORKER_PRUNE_MOCK_CHROOT_AGE_SEC (default 3600s / 1 hour).
-    Set to 0 to disable.
-    """
     age = int(os.environ.get("OREON_WORKER_PRUNE_MOCK_CHROOT_AGE_SEC", "3600"))
     if age <= 0:
         return
@@ -2283,7 +1923,6 @@ def _prune_stale_var_lib_mock_dirs() -> None:
 
     now = time.time()
 
-    # Pattern: <anything>-oreon-<digits>  (skip -bootstrap- dirs; scrubbing the main handles them)
     _mock_chroot_re = re.compile(r"^(.+)-oreon-(\d+)$")
 
     mock_lib_base = Path("/var/lib/mock")
@@ -2294,7 +1933,6 @@ def _prune_stale_var_lib_mock_dirs() -> None:
             for p in list(mock_lib_base.iterdir()):
                 if not p.is_dir():
                     continue
-                # Skip bootstrap dirs - they are cleaned when the main chroot is scrubbed.
                 if "-bootstrap-oreon-" in p.name:
                     continue
                 m = _mock_chroot_re.match(p.name)
@@ -2319,9 +1957,7 @@ def _prune_stale_var_lib_mock_dirs() -> None:
                     attempt_id,
                     mock_config,
                 )
-                # Run mock --scrub first to unmount any lingering bind mounts.
                 _mock_scrub_unique_chroot(mock_config, mock_unique_ext)
-                # Belt-and-suspenders: rm -rf anything still left.
                 for leftover in list(mock_lib_base.iterdir()):
                     if leftover.is_dir() and leftover.name.endswith(f"-oreon-{attempt_id}"):
                         shutil.rmtree(leftover, ignore_errors=True)
@@ -2348,7 +1984,6 @@ def _prune_stale_var_lib_mock_dirs() -> None:
                 shutil.rmtree(p, ignore_errors=True)
         except OSError:
             pass
-
 
 def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict) -> None:
     done_event = threading.Event()
@@ -2389,7 +2024,6 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
         arch = job.get("architecture") or "x86_64"
         sources = job.get("sources") or []
         mock_config = job.get("mock_config")
-        # Locate SRPM in R2 or distgit URL
         srpm_r2_key = None
         distgit_url = None
         for s in sources:
@@ -2410,7 +2044,6 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
             )
             return
 
-        # One chroot lock per mock "-r" config; parallel threads need distinct roots.
         mock_unique_ext = f"oreon-{attempt_id}"
         scrub_mock_cfg = mock_config
         scrub_mock_ext = mock_unique_ext
@@ -2437,13 +2070,8 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                 if tmp_parent
                 else tempfile.mkdtemp(prefix=tmp_prefix)
             )
-            # Register path in the same-process active set so _prune_stale_oreon_worker_tempdirs
-            # never deletes this directory from a parallel thread's cleanup run.
             with _inflight_attempt_lock:
                 _active_work_tmpdir_paths.add(tmpdir)
-            # Write a sentinel file inside the dir for cross-process protection (different worker
-            # processes on the same host share /tmp but not in-memory state).  The file is removed
-            # at the start of _cleanup_job_disk before the rmtree so it does not linger.
             try:
                 (Path(tmpdir) / ".oreon-active").write_text(str(os.getpid()), encoding="utf-8")
             except OSError as _e:
@@ -2722,8 +2350,6 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
             rpm_upload_stage = tmp / "rpm_upload_staging"
             rpm_upload_stage.mkdir(exist_ok=True)
 
-            # Upload RPMs before the big build log so a tunnel timeout on log cannot block any binary,
-            # and so alphabetical order (e.g. huge debuginfo before kernel-modules) does not strand later RPMs.
             with _pesign_bundle_context(session, controller_url, attempt_id) as pesign_cfg:
                 perm_hint = (
                     "Permission denied while reading mock --resultdir RPMs (tree may still be "
@@ -2766,7 +2392,6 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                         f.replace(staged)
                     except OSError as stage_err:
                         if isinstance(stage_err, FileNotFoundError):
-                            # If tmp tree was removed unexpectedly, recreate staging once and retry.
                             try:
                                 rpm_upload_stage.mkdir(parents=True, exist_ok=True)
                                 f.replace(staged)
@@ -2941,7 +2566,6 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
             except Exception:
                 pass
 
-
 def main() -> None:
     worker_name = os.environ.get("OREON_WORKER_NAME", "worker-1")
     worker_token = os.environ.get("OREON_WORKER_TOKEN")
@@ -2983,7 +2607,6 @@ def main() -> None:
         smp_n,
     )
 
-    # Clean up any stale mock chroot dirs left over from a previous worker crash/restart.
     _prune_stale_var_lib_mock_dirs()
 
     active: list[threading.Thread] = []
@@ -3073,7 +2696,6 @@ def main() -> None:
         except Exception as e:
             logger.exception("Poll error: %s", e)
             time.sleep(30)
-
 
 if __name__ == "__main__":
     main()
