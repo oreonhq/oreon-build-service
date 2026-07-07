@@ -1,20 +1,3 @@
-# Oreon Build Service
-# Copyright (C) 2026 Oreon HQ
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-"""Mock environments - list public; create/update/delete require admin."""
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from sqlalchemy import func, select, update
 
@@ -29,7 +12,6 @@ from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
 from oreon_build.models import BuildJob, BuildTarget, MockEnvironment, Package, Release
 
 router = APIRouter(prefix="/mock-environments", tags=["mock-environments"])
-
 
 @router.get("", response_model=PaginatedResponse[MockEnvironmentResponse])
 async def list_mock_environments(
@@ -47,7 +29,6 @@ async def list_mock_environments(
     result = await db.execute(q.limit(limit).offset(offset))
     return PaginatedResponse(items=list(result.scalars().all()), total=total)
 
-
 @router.get("/{env_id}", response_model=MockEnvironmentResponse)
 async def get_mock_environment(env_id: int, db: DbSession):
     result = await db.execute(select(MockEnvironment).where(MockEnvironment.id == env_id))
@@ -55,7 +36,6 @@ async def get_mock_environment(env_id: int, db: DbSession):
     if not env:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mock environment not found")
     return env
-
 
 @router.post("", response_model=MockEnvironmentResponse, status_code=status.HTTP_201_CREATED)
 async def create_mock_environment(
@@ -91,7 +71,6 @@ async def create_mock_environment(
         user_agent=get_user_agent(request),
     )
     return env
-
 
 @router.patch("/{env_id}", response_model=MockEnvironmentResponse)
 async def update_mock_environment(
@@ -133,7 +112,6 @@ async def update_mock_environment(
     )
     return env
 
-
 @router.delete("/{env_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_mock_environment(
     env_id: int,
@@ -146,16 +124,12 @@ async def delete_mock_environment(
     if not env:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mock environment not found")
 
-    # Detach package preferences so FK does not fail on delete.
     await db.execute(
         update(Package)
         .where(Package.preferred_mock_environment_id == env_id)
         .values(preferred_mock_environment_id=None)
     )
 
-    # BuildTarget rows can still point to this env, including historical job references.
-    # Remap jobs to an existing NULL-mock target per (release, arch) when present;
-    # otherwise convert the current target to NULL-mock in place.
     targets_result = await db.execute(
         select(BuildTarget).where(BuildTarget.mock_environment_id == env_id)
     )
