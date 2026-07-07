@@ -1,20 +1,3 @@
-# Oreon Build Service
-# Copyright (C) 2026 Oreon HQ
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-"""GitHub push webhook and DistGit helper routes."""
 from __future__ import annotations
 
 import hashlib
@@ -37,13 +20,11 @@ from oreon_build.services.github_push_trigger import (
 router = APIRouter(prefix="/github", tags=["github"])
 logger = logging.getLogger(__name__)
 
-
 def _push_ref_branch(body: dict[str, Any]) -> str | None:
     ref = body.get("ref") or ""
     if isinstance(ref, str) and ref.startswith("refs/heads/"):
         return ref[len("refs/heads/") :] or None
     return None
-
 
 def _verify_github_signature(body_bytes: bytes, signature_header: str | None, secret: str) -> bool:
     if not signature_header or not signature_header.startswith("sha256="):
@@ -52,10 +33,8 @@ def _verify_github_signature(body_bytes: bytes, signature_header: str | None, se
     expected = "sha256=" + mac
     return hmac.compare_digest(signature_header, expected)
 
-
 @router.post("/webhook")
 async def github_push_webhook(request: Request, db: DbSession) -> dict[str, Any]:
-    """Handle GitHub push events. Match packages by repository id or github_html_url."""
     settings = get_settings()
     body_bytes = await request.body()
 
@@ -119,10 +98,8 @@ async def github_push_webhook(request: Request, db: DbSession) -> dict[str, Any]
     )
     return result
 
-
 @router.get("/repos", response_model=List[dict])
 async def list_org_repositories(search: str | None = None) -> List[dict[str, Any]]:
-    """List GitHub repos for the configured org (DistGit UI)."""
     settings = get_settings()
     if not settings.github_org:
         raise HTTPException(
@@ -152,10 +129,8 @@ async def list_org_repositories(search: str | None = None) -> List[dict[str, Any
         )
     return out
 
-
 @router.get("/repos/{repository_id}/branches", response_model=List[dict])
 async def list_repository_branches_api(repository_id: int) -> List[dict[str, Any]]:
-    """List branches for a GitHub repository (numeric id)."""
     client = get_github_client()
     repo: dict[str, Any] | None = None
     branches: list[dict[str, Any]] = []
