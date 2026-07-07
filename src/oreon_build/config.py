@@ -1,20 +1,3 @@
-# Oreon Build Service
-# Copyright (C) 2026 Oreon HQ
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-"""Application configuration from environment."""
 from __future__ import annotations
 
 import os
@@ -26,7 +9,6 @@ from typing import Optional
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -34,7 +16,6 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Database
     database_url: str = Field(
         default="postgresql+asyncpg://oreon:oreon@localhost:5432/oreon_build",
         description="PostgreSQL connection URL (async)",
@@ -158,16 +139,13 @@ class Settings(BaseSettings):
         self.database_max_overflow = max(0, new_mo)
         return self
 
-    # Auth
     secret_key: str = Field(default="change-me-to-a-secure-random-string-min-32-chars")
     jwt_algorithm: str = Field(default="HS256")
     jwt_expire_minutes: int = Field(default=60, ge=5, le=10080)
 
-    # Default admin (first boot)
     admin_username: str = Field(default="admin")
     admin_password: str = Field(default="change-me-secure-password")
 
-    # R2
     r2_account_id: str = Field(default="")
     r2_access_key_id: str = Field(default="")
     r2_secret_access_key: str = Field(default="")
@@ -208,7 +186,6 @@ class Settings(BaseSettings):
         ),
     )
 
-    # GitHub (API + webhooks)
     github_api_url: str = Field(default="https://api.github.com", description="GitHub REST API base URL")
     github_token: Optional[str] = Field(default=None, description="Fine-grained or classic PAT for API calls")
     github_org: Optional[str] = Field(default=None, description="Org login for /api/github/repos listing")
@@ -249,7 +226,6 @@ class Settings(BaseSettings):
         description="Hard cap on jobs enqueued by one catch-up cycle to prevent flood/spam.",
     )
 
-    # Worker
     worker_enrollment_secret: str = Field(default="change-me-worker-secret")
     controller_url: str = Field(default="http://localhost:8000")
     mock_config_dir: str = Field(default="/etc/mock")
@@ -262,15 +238,12 @@ class Settings(BaseSettings):
             "seconds (idle/busy in the DB are stale). Workers heartbeat about every 30s. 0 uses DB state only."
         ),
     )
-    # Google Cloud Platform (burst worker VM lifecycle)
     gcp_project_id: Optional[str] = Field(default=None, description="GCP project ID for burst worker VM management")
     gcp_zone: str = Field(default="us-central1-a", description="Default GCP zone for burst worker VMs")
 
-    # Webhooks/integrations
     discord_webhook_url: Optional[str] = Field(default=None)
     security_discord_webhook_url: Optional[str] = Field(default=None)
 
-    # Watchdog (security advisories dashboard)
     watchdog_url: str = Field(default="http://localhost:8001", description="Public base URL for Oreon Watchdog")
     cve_scan_interval_minutes: int = Field(
         default=30,
@@ -283,7 +256,6 @@ class Settings(BaseSettings):
         description="Comma-separated name suffixes to skip (e.g. foo-debuginfo). Empty string disables.",
     )
 
-    # Signing (controller only — workers upload unsigned RPMs; controller signs then pushes to R2)
     signing_key_id: Optional[str] = Field(default=None)
     signing_key_grip: Optional[str] = Field(default=None)
     gpg_home: str = Field(default="/var/lib/oreon-build/gnupg")
@@ -296,9 +268,6 @@ class Settings(BaseSettings):
         ),
     )
 
-    # Secure Boot/PE signing: controller holds NSS + rules; workers fetch a short-lived bundle
-    # (GET /api/worker/pesign-bundle) and run pesign before upload. Controller only GPG-signs RPMs.
-    # Workers need pesign, rpmrebuild, file, bash on PATH.
     pesign_nss_dir: str = Field(
         default="/etc/pki/pesign",
         description="NSS database directory for pesign (-n)",
@@ -347,11 +316,6 @@ class Settings(BaseSettings):
         description="If true, upload fails when a matching RPM cannot be pesign-repacked",
     )
 
-    # Worker → controller RPM upload (single artifact size cap, MiB). Default 51200 (= 50 GiB).
-    # Keep <= any reverse-proxy client_max_body_size on the origin. HTTP 413 with no JSON detail
-    # is often nginx or another hop before FastAPI. Cloudflare Tunnel (cloudflared) does not add the
-    # same upload cap as orange-cloud HTTP proxy, but whatever cloudflared forwards to must allow
-    # large POST bodies (e.g. nginx on loopback in front of uvicorn).
     max_worker_rpm_upload_mib: int = Field(default=51200, ge=16, le=102400)
     worker_rpm_presign_put_expires_seconds: int = Field(
         default=7200,
@@ -360,8 +324,6 @@ class Settings(BaseSettings):
         description="Presigned PUT to R2 TTL for worker direct RPM uploads (bypasses small POST limits on tunnels).",
     )
 
-    # Stuck builds: jobs stay RUNNING until the worker posts a result; sweep marks them failed if
-    # the attempt is too old or the worker has not heartbeated (see services/stale_builds.py).
     build_stale_running_minutes: int = Field(
         default=10080,
         ge=0,
@@ -398,7 +360,6 @@ class Settings(BaseSettings):
         description="How often the API runs the stale-build sweeper in the background.",
     )
 
-    # Mass auto-queue: distgit packages whose in-tree BRs are satisfied (OREON_MASS_REBUILD_ENABLED).
     mass_rebuild_enabled: bool = Field(
         default=False,
         description="Background loop queues distgit builds when deps are met. OREON_MASS_REBUILD_ENABLED.",
@@ -462,7 +423,6 @@ class Settings(BaseSettings):
         description="Settle loop poll interval for rpmbuild plans. OREON_RPMBUILD_SETTLE_POLL_SECONDS.",
     )
 
-    # Logging
     log_level: str = Field(default="INFO")
 
     @field_validator("github_token", mode="before")
@@ -485,13 +445,10 @@ class Settings(BaseSettings):
 
     @property
     def sync_database_url(self) -> str:
-        """URL for sync driver (Alembic)."""
         if self.database_url.startswith("postgresql+asyncpg://"):
             return self.database_url.replace("postgresql+asyncpg://", "postgresql://", 1)
         return self.database_url
 
-
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """One cached instance per process (API, Watchdog, CLI each have their own cache)."""
     return Settings()
