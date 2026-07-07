@@ -1,4 +1,3 @@
-"""Sitewide search: packages, builds, releases."""
 from fastapi import APIRouter, Query
 from sqlalchemy import String, cast, or_, select
 
@@ -19,7 +18,6 @@ async def search(
     q: str = Query(..., min_length=1, description="Search query"),
     limit: int = Query(20, ge=1, le=50),
 ):
-    """Search packages (name, id), builds (job id, package/release name, arch, status), releases (name, id)."""
     term = (q or "").strip()
     if not term:
         return {"packages": [], "builds": [], "releases": []}
