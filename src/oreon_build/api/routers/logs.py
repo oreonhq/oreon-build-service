@@ -1,4 +1,3 @@
-"""Build logs - stream or fetch from R2 (read-only)."""
 from fastapi import APIRouter, HTTPException, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import select
@@ -12,7 +11,6 @@ router = APIRouter(prefix="/logs", tags=["logs"])
 
 @router.get("/attempts/{attempt_id}")
 async def get_build_log(attempt_id: int):
-    # Use explicit session management to release DB connection before streaming
     async with async_session_maker() as db:
         result = await db.execute(select(BuildAttempt).where(BuildAttempt.id == attempt_id))
         attempt = result.scalar_one_or_none()
