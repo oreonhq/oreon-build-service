@@ -1,4 +1,3 @@
-"""Releases - list public, create/update/delete require auth (admin)."""
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
