@@ -1,4 +1,3 @@
-"""Builds - list/view public; trigger/cancel require maintainer or admin."""
 import logging
 import uuid
 
@@ -41,7 +40,6 @@ router = APIRouter(prefix="/builds", tags=["builds"])
 
 logger = logging.getLogger(__name__)
 
-# Default architectures for multi-arch builds
 DEFAULT_ARCHITECTURES = ["x86_64", "aarch64"]
 
 
@@ -83,7 +81,6 @@ def _normalize_signing_status(raw: str) -> str:
 
 
 def _effective_signing_status_attempt(a: BuildAttempt) -> str:
-    """Infer controller pipeline phase when DB still has default not_started (older rows or no mock-complete)."""
     raw = _normalize_signing_status((a.signing_status or "").strip() or "not_started")
     if raw != "not_started":
         return raw
@@ -95,7 +92,6 @@ def _effective_signing_status_attempt(a: BuildAttempt) -> str:
 
 
 def _effective_signing_status_job(job: BuildJob, latest: BuildAttempt | None) -> str | None:
-    """Prefer stored status; for finished jobs with default not_started, infer from job + attempt."""
     if latest is None:
         return None
     raw = _normalize_signing_status((latest.signing_status or "").strip() or "not_started")
@@ -160,12 +156,6 @@ async def list_current_failures(
     db: DbSession,
     chain_only: bool = Query(False, description="Only jobs that were part of a chain build"),
 ):
-    """
-    Jobs whose **latest** row per (package, release, architecture) is ``failed``.
-
-    Older successful or failed jobs for the same slot are ignored so this reflects only what
-    still needs attention today.
-    """
     from oreon_build.services.current_build_failures import fetch_current_failure_rows
 
     rows = await fetch_current_failure_rows(db, chain_only=chain_only)
@@ -205,7 +195,6 @@ async def list_builds(
     limit: int = Query(25, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ):
-    """List build jobs. Query params: release_id, package_id, status, search, limit, offset."""
     q = select(BuildJob).options(selectinload(BuildJob.build_target)).order_by(BuildJob.created_at.desc())
     count_q = select(func.count()).select_from(BuildJob)
     search_trim = (search or "").strip()
@@ -278,14 +267,6 @@ async def distgit_checklist(
     db: DbSession,
     user: CurrentUser,
 ):
-    """Return packages in the distgit repo (oreonhq/rpm-specfiles) that:
-    - have a spec file at <releasename>/<pkg>/<pkg>.spec
-    - do NOT have a dead.package marker
-    - do NOT yet have a successful build for this release
-
-    Uses the GitHub git-tree API (one call) to enumerate the full repo tree.
-    Returns {packages: [{name, spec_path}], truncated: bool}.
-    """
     from oreon_build.services.github import get_github_client
 
     rel_res = await db.execute(select(Release).where(Release.id == release_id))
@@ -334,8 +315,6 @@ async def distgit_checklist(
 
     valid_names = sorted(has_spec - is_dead)
 
-    # "Already built" means has SUCCESS and no FAILED/CANCELLED jobs for this release.
-    # Failed or cancelled packages stay visible in the checklist for retry.
     if valid_names:
         success_q = (
             select(Package.name)
@@ -388,12 +367,6 @@ async def layers_checklist(
     distgit_url: str | None = Query(None, max_length=1024),
     distgit_branch: str | None = Query(None, max_length=128),
 ) -> dict:
-    """Return rpmbuild-order layers from distgit specs with per-package ``finished``.
-
-    Used by the Builds page Layers tab. A package is finished only when its latest attempt
-    status for this release is SUCCESS. If latest attempt is FAILED/CANCELLED (or not success),
-    it stays actionable so hide-finished remains accurate after retries.
-    """
     from oreon_build.config import get_settings
     from oreon_build.services.distgit_order import compute_distgit_build_order
 
@@ -487,7 +460,6 @@ async def layers_checklist(
 
 
 def _source_url_from_new_package(np) -> str | None:
-    """Primary URL for Source record from NewPackageForBuild."""
     if np.source_url:
         return np.source_url
     if np.source_urls:
@@ -496,7 +468,6 @@ def _source_url_from_new_package(np) -> str | None:
 
 
 def _infer_github_html_url_from_new_package(np) -> str | None:
-    """Best-effort https://github.com/org/repo from distgit or scm URL fragment."""
     u = _source_url_from_new_package(np)
     if not u or "github.com" not in u.lower():
         return None
@@ -798,7 +769,6 @@ async def upload_and_trigger(
     architectures: str = Form("x86_64,aarch64", description="Comma-separated, e.g. x86_64,aarch64"),
     files: list[UploadFile] = File(...),
 ):
-    """Upload SRPM and/or spec files, create package and version, trigger build(s) per architecture."""
     from datetime import datetime, timezone
     from oreon_build.models import BuildAttempt, MockEnvironment, Package, PackageVersion, Release, Source
 
@@ -812,7 +782,6 @@ async def upload_and_trigger(
                 detail=f"File must be .src.rpm or .spec; got {f.filename}",
             )
 
-    # Read all files and derive name/description from spec when not provided
     parsed_name: str | None = None
     parsed_summary: str | None = None
     file_contents: list[tuple[str, bytes]] = []
@@ -828,7 +797,6 @@ async def upload_and_trigger(
                 parsed_name = info.name
             if info.summary:
                 parsed_summary = info.summary
-    # Resolve package name: form > parsed from spec > from first SRPM filename
     pkg_name = (name or "").strip() or parsed_name
     if not pkg_name:
         for fn, _ in file_contents:
@@ -907,7 +875,7 @@ async def upload_and_trigger(
         canon = normalize_machine_arch(arch)
         has_worker = workers_by_arch.get(canon, False)
         if not has_worker:
-            continue  # Skip arch with no worker; only create jobs that can run
+            continue
         target = await get_or_create_build_target(db, release_id, canon, mock_env_id)
         job = BuildJob(
             package_id=pkg.id,
@@ -954,7 +922,6 @@ async def upload_and_trigger(
 async def _job_to_response(
     db: DbSession, job: BuildJob, latest: BuildAttempt | None = None
 ) -> BuildJobResponse:
-    """Build BuildJobResponse without touching job.build_target (avoids async lazy-load)."""
     if latest is None:
         r = await db.execute(
             select(BuildAttempt)
@@ -1003,7 +970,6 @@ async def retry_build(
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Build job not found")
 
-    # Re-resolve target on retry so package mock-env changes are respected.
     pkg_result = await db.execute(select(Package).where(Package.id == job.package_id))
     pkg = pkg_result.scalar_one_or_none()
     if pkg is not None:
@@ -1065,7 +1031,6 @@ async def cancel_build(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Job not in cancellable state")
     job.status = BuildStatus.CANCELLED
     job.completed_at = datetime.now(timezone.utc)
-    # Mark in-flight attempts cancelled so UI does not show "running" forever; worker will stop mock when it polls cancel-check.
     att_result = await db.execute(
         select(BuildAttempt).where(
             BuildAttempt.build_job_id == job_id,
@@ -1082,9 +1047,6 @@ async def cancel_build(
             att.signing_status = "failed"
         if att.worker_id is not None:
             affected_worker_ids.add(att.worker_id)
-    # Without this, the worker row stays BUSY with current_build_attempt_id pointing at a
-    # cancelled attempt until its next /poll heals itself, which blocks capacity accounting
-    # in the UI and any logic that keys off worker.state.
     if affected_worker_ids:
         await db.flush()
         from oreon_build.services.worker_state_sync import (
