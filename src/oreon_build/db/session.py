@@ -17,9 +17,6 @@ if _settings.database_idle_in_transaction_timeout_seconds > 0:
     )
 
 if _settings.database_use_null_pool:
-    # One real server connection per in-flight session, closed when the session returns to the pool.
-    # Avoids QueuePool times (pool_size + max_overflow) per OS process, which exhausts small Postgres
-    # max_connections when API, Watchdog, and scheduler all run on one host.
     _engine = create_async_engine(
         _settings.database_url,
         echo=False,
@@ -65,5 +62,4 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def get_session() -> AsyncSession:
-    """One-off session for startup scripts (no dependency injection)."""
     return async_session_maker()
