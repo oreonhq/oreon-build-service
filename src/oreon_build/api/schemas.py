@@ -1,4 +1,3 @@
-"""Pydantic request/response schemas for API."""
 from __future__ import annotations
 
 from datetime import datetime
@@ -11,13 +10,11 @@ T = TypeVar("T")
 
 
 class PaginatedResponse(BaseModel, Generic[T]):
-    """List response with total count for pagination."""
     items: List[T]
     total: int
     offset: int = 0
 
 
-# --- Account ---
 class RoleNameSchema(str, Enum):
     admin = "admin"
     maintainer = "maintainer"
@@ -45,7 +42,6 @@ class AccountResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-# --- Release ---
 class ReleaseChannelSchema(str, Enum):
     dev = "dev"
     testing = "testing"
@@ -107,7 +103,6 @@ class ReleaseResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-# --- Mock environment ---
 _MOCK_REPO_MAX = 32
 
 
@@ -186,7 +181,6 @@ class MockEnvironmentResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-# --- Package ---
 class SourceTypeSchema(str, Enum):
     url = "url"
     upload = "upload"
@@ -195,7 +189,6 @@ class SourceTypeSchema(str, Enum):
 
 
 class NewPackageForBuild(BaseModel):
-    """Create a new package with source and use it for the build."""
     name: str = Field(..., max_length=256, description="Package name")
     description: Optional[str] = None
     preferred_mock_environment_id: Optional[int] = Field(None, description="Mock env to use for rebuilds (must belong to build release)")
@@ -264,7 +257,6 @@ class PackageVersionResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-# --- Build ---
 class BuildStatusSchema(str, Enum):
     pending = "pending"
     queued = "queued"
@@ -276,7 +268,6 @@ class BuildStatusSchema(str, Enum):
 
 
 class BuildTrigger(BaseModel):
-    """Trigger build for an existing package, or create a new package and build."""
     package_id: Optional[int] = Field(None, description="Existing package ID (omit if using new_package)")
     new_package: Optional[NewPackageForBuild] = Field(None, description="Create this package and build it")
     release_id: int = Field(..., description="Release to build for")
@@ -303,7 +294,6 @@ class BuildTrigger(BaseModel):
 
 
 class ChainBuildTrigger(BaseModel):
-    """Manual chain build: colon marks parallel names in one stage; no colon means ordered one-per-stage."""
 
     chain_spec: str = Field(
         ...,
@@ -333,7 +323,6 @@ class ChainBuildTrigger(BaseModel):
 
 
 class ChainResumeRequest(BaseModel):
-    """Re-submit the same chain as a new chain, starting from the first incomplete stage."""
 
     from_chain_id: int = Field(..., ge=1, description="Previous build chain id (failed, cancelled, or success)")
 
@@ -348,9 +337,7 @@ class BuildJobResponse(BaseModel):
     architecture: Optional[str] = None
     package_version_id: Optional[int] = None
     status: str
-    #: Badge-friendly status: ``success`` once mock finished, even if controller pipeline still running.
     display_status: str = ""
-    #: Latest attempt controller pipeline: ``not_started`` | ``running`` | ``signed`` | ``failed``.
     signing_status: Optional[str] = None
     priority: int
     created_at: datetime
@@ -443,7 +430,6 @@ class RpmbuildPlanResponse(BaseModel):
 
 
 class CurrentFailureItem(BaseModel):
-    """Latest job per package or release or arch slot is failed (ignores older jobs in that slot)."""
 
     id: int
     package_id: int
@@ -470,10 +456,8 @@ class BuildAttemptResponse(BaseModel):
     worker_id: Optional[int] = None
     attempt_number: int
     status: str
-    #: Badge: ``success`` when mock succeeded, even if ``status`` is still ``running`` (upload to controller).
     display_status: str = ""
     mock_succeeded_at: Optional[datetime] = None
-    #: Controller pipeline after mock (GPG signing runs on controller, not worker).
     signing_status: Optional[str] = None
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
@@ -494,13 +478,11 @@ class ArtifactResponse(BaseModel):
     r2_key: str
     size_bytes: Optional[int] = None
     checksum_sha256: Optional[str] = None
-     # True if the RPM was successfully GPG-signed on the worker
     is_signed: Optional[bool] = None
 
     model_config = ConfigDict(from_attributes=True)
 
 
-# --- Worker ---
 class WorkerStateSchema(str, Enum):
     idle = "idle"
     busy = "busy"
@@ -543,7 +525,6 @@ class WorkerResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-# --- Promotion ---
 class PromoteRequest(BaseModel):
     release_id: int
     from_channel: str = Field(..., max_length=32)
@@ -568,7 +549,6 @@ class PromotionResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-# --- Repository ---
 class RepositoryResponse(BaseModel):
     id: int
     release_id: int
@@ -581,7 +561,6 @@ class RepositoryResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-# --- Schedule ---
 class ScheduleCreate(BaseModel):
     release_id: int
     name: str = Field(..., max_length=128)
@@ -611,7 +590,6 @@ class ScheduleResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-# --- Audit ---
 class AuditLogResponse(BaseModel):
     id: int
     account_id: Optional[int] = None
@@ -624,7 +602,6 @@ class AuditLogResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-# --- Pagination ---
 class PaginatedMeta(BaseModel):
     total: int
     page: int
@@ -632,7 +609,6 @@ class PaginatedMeta(BaseModel):
     pages: int
 
 
-# --- Login ---
 class LoginRequest(BaseModel):
     username: str
     password: str

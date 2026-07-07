@@ -1,4 +1,3 @@
-"""Shared API dependencies."""
 from typing import Annotated
 
 from fastapi import Depends

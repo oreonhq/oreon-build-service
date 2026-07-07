@@ -1,20 +1,3 @@
-# Oreon Build Service
-# Copyright (C) 2026 Oreon HQ
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-"""Oreon Build Service API - main application."""
 import asyncio
 import logging
 import os
@@ -39,7 +22,6 @@ logger = logging.getLogger(__name__)
 
 _github_catchup_misconfig_logged = False
 
-
 def _too_many_connections(exc: BaseException) -> bool:
     if isinstance(exc, asyncpg.TooManyConnectionsError):
         return True
@@ -48,9 +30,7 @@ def _too_many_connections(exc: BaseException) -> bool:
         return isinstance(c, asyncpg.TooManyConnectionsError)
     return False
 
-
 def _configure_oreon_logging(settings: Settings) -> None:
-    """Ensure oreon_build log lines reach stderr (uvicorn often leaves app loggers quiet)."""
     name = (settings.log_level or "INFO").upper()
     level = getattr(logging, name, logging.INFO)
     root = logging.getLogger("oreon_build")
@@ -80,7 +60,6 @@ from .routers import (
     github_webhook,
 )
 from .worker_api import router as worker_router
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -129,7 +108,6 @@ async def lifespan(app: FastAPI):
                     result = await db.execute(select(Account).where(Account.username == settings.admin_username))
                     admin = result.scalar_one_or_none()
                     if not admin:
-                        # First boot: create the default admin from env.
                         admin = Account(
                             username=settings.admin_username,
                             password_hash=hash_password(settings.admin_password),
@@ -138,8 +116,6 @@ async def lifespan(app: FastAPI):
                         )
                         db.add(admin)
                     else:
-                        # Subsequent boots: if the env password changed, update the stored
-                        # password hash (the "invalid password" symptom many users hit).
                         try:
                             if not verify_password(settings.admin_password, admin.password_hash):
                                 admin.password_hash = hash_password(settings.admin_password)
@@ -273,8 +249,6 @@ async def lifespan(app: FastAPI):
                 idle_interval_s = max(1.0, min(idle_interval_s, 60.0))
                 batch = max(1, int(s.repo_publish_poll_batch))
                 async with async_session_maker() as db:
-                    # Chain-related tasks go first so in-progress chain builds are not blocked by
-                    # a potentially large backlog of older non-chain publish tasks.
                     q = (
                         select(PublishTask)
                         .join(BuildJob, BuildJob.id == PublishTask.build_job_id, isouter=True)
@@ -301,8 +275,6 @@ async def lifespan(app: FastAPI):
                         [(t.id, t.attempt_id) for t in tasks],
                     )
 
-                # Don't sleep after successful processing: immediately check for more pending rows
-                # so repodata refresh starts as soon as artifacts are queued.
                 if len(tasks) < batch:
                     await asyncio.sleep(0)
             except asyncio.CancelledError:
@@ -393,7 +365,6 @@ async def lifespan(app: FastAPI):
     rpmbuild_settle_task = asyncio.create_task(_rpmbuild_settle_loop(), name="rpmbuild-settle")
 
     async def _burst_vm_watcher_loop() -> None:
-        """Start GCP VMs for burst workers that have pending whitelisted jobs but are not yet online."""
         from oreon_build.db.session import async_session_maker
         from oreon_build.models import BuildJob, BuildStatus, Package, Worker
         from oreon_build.services.gcp_compute import start_instance
@@ -410,7 +381,6 @@ async def lifespan(app: FastAPI):
                         whitelist_lower = {n.lower() for n in (bw.burst_whitelist or []) if n}
                         if not whitelist_lower:
                             continue
-                        # Check if there are pending/queued burst jobs for this worker.
                         pending = await db.scalar(
                             select(func.count(BuildJob.id))
                             .join(Package, BuildJob.package_id == Package.id)
@@ -421,8 +391,6 @@ async def lifespan(app: FastAPI):
                         )
                         if (pending or 0) == 0:
                             continue
-                        # There are pending burst jobs. Check if the worker is offline
-                        # (no heartbeat or stale heartbeat) and start the VM.
                         from datetime import datetime, timezone
                         now = datetime.now(timezone.utc)
                         hb = bw.last_heartbeat
@@ -476,8 +444,6 @@ async def lifespan(app: FastAPI):
                 pass
             except Exception:
                 logger.exception("Error stopping background task %s", label)
-    # shutdown
-
 
 def create_app() -> FastAPI:
     app = FastAPI(
@@ -508,7 +474,6 @@ def create_app() -> FastAPI:
     app.include_router(search_router.router, prefix="/api")
     app.include_router(github_webhook.router, prefix="/api")
     app.include_router(worker_router, prefix="/api")
-    # api/main.py -> oreon_build -> src -> repo root
     web_dir = Path(__file__).resolve().parent.parent.parent.parent / "web"
     _no_cache_html = {"Cache-Control": "no-cache, must-revalidate"}
 
@@ -559,9 +524,7 @@ def create_app() -> FastAPI:
             return RedirectResponse(url="/builds.html", status_code=302)
     return app
 
-
 app = create_app()
-
 
 def run_server():
     import uvicorn
@@ -573,7 +536,6 @@ def run_server():
         log_level=settings.log_level.lower(),
         reload=False,
     )
-
 
 if __name__ == "__main__":
     run_server()

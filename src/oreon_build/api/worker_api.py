@@ -1,20 +1,3 @@
-# Oreon Build Service
-# Copyright (C) 2026 Oreon HQ
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-"""Worker-facing API: poll job, heartbeat, upload RPMs for signing, report result."""
 from __future__ import annotations
 
 import asyncio
@@ -76,9 +59,7 @@ logger = logging.getLogger(__name__)
 _cancel_check_cache: dict[tuple[int, int], tuple[float, bool]] = {}
 _cancel_check_cache_lock = threading.Lock()
 
-
 def _cancel_cache_ttl_seconds() -> float:
-    # Keep tiny to preserve fast cancel semantics while reducing repeated DB reads.
     raw = (os.environ.get("OREON_CANCEL_CHECK_CACHE_TTL_SEC") or "2.0").strip()
     try:
         v = float(raw)
@@ -87,11 +68,6 @@ def _cancel_cache_ttl_seconds() -> float:
     return max(0.2, min(v, 10.0))
 
 _MAX_BUILD_LOG_BYTES = 64 * 1024 * 1024
-
-#
-# RPM finalize uses a DB-backed distributed lock (see `RpmCompleteLock`) so multiple controller
-# workers cannot sign/upload the same R2 key at the same time.
-
 
 def _pesign_material_configured(settings) -> bool:
     nss = Path((settings.pesign_nss_dir or "").strip()).expanduser()
@@ -107,7 +83,6 @@ def _pesign_material_configured(settings) -> bool:
         return True
     return False
 
-
 async def _maybe_stop_burst_vm(
     db: Any,
     worker_name: str,
@@ -115,11 +90,6 @@ async def _maybe_stop_burst_vm(
     gcp_instance_name: str | None,
     gcp_zone: str | None,
 ) -> None:
-    """Stop the GCP VM for a burst worker if no more pending/running burst jobs exist.
-
-    Takes explicit args instead of the Worker ORM object because this is called
-    after db.commit() when the worker object is expired and can't be lazy-loaded.
-    """
     whitelist_lower = {n.lower() for n in whitelist if n}
     if not whitelist_lower:
         return
@@ -142,13 +112,7 @@ async def _maybe_stop_burst_vm(
         else:
             logger.warning("burst-vm: worker %s has no gcp_instance_name set, skipping VM stop", worker_name)
 
-
 def _worker_declared_max_parallel_attempts(worker: Worker) -> int:
-    """
-    Capacity check for poll-claim readiness.
-    Prefers worker.capabilities JSON (`max_jobs` or `max_parallel_builds`) and
-    falls back to worker runtime default (4) when not declared.
-    """
     fallback = 4
     raw = (worker.capabilities or "").strip()
     if not raw:
@@ -168,7 +132,6 @@ def _worker_declared_max_parallel_attempts(worker: Worker) -> int:
         return fallback
     return max(1, min(n, 64))
 
-
 def _build_pesign_bundle_file(dest: Path, nss_dir: Path, manifest: dict) -> None:
     raw = json.dumps(manifest, indent=2).encode("utf-8")
     with tarfile.open(dest, "w:gz") as tf:
@@ -176,7 +139,6 @@ def _build_pesign_bundle_file(dest: Path, nss_dir: Path, manifest: dict) -> None
         info.size = len(raw)
         tf.addfile(info, io.BytesIO(raw))
         tf.add(str(nss_dir.resolve()), arcname="nss")
-
 
 async def get_worker(
     db: DbSession,
@@ -189,7 +151,6 @@ async def get_worker(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid worker token")
     return w
 
-
 async def _require_worker(
     db: DbSession,
     x_worker_token: Annotated[str | None, Header(alias="X-Worker-Token")] = None,
@@ -201,7 +162,6 @@ async def _require_worker(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid worker token")
     return w
 
-
 def _presence_write_interval_seconds() -> int:
     raw = (os.environ.get("OREON_WORKER_PRESENCE_WRITE_INTERVAL_SEC") or "15").strip()
     try:
@@ -210,7 +170,6 @@ def _presence_write_interval_seconds() -> int:
         n = 15
     return max(1, min(n, 300))
 
-
 async def _touch_worker_presence(
     db: DbSession,
     worker: Worker,
@@ -218,12 +177,6 @@ async def _touch_worker_presence(
     include_heartbeat: bool,
     revive_offline: bool,
 ) -> None:
-    """
-    Throttle worker presence writes.
-
-    Poll/cancel/heartbeat can be very hot. Writing last_seen/last_heartbeat on every
-    request creates avoidable DB write pressure and lock churn under load.
-    """
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(seconds=_presence_write_interval_seconds())
 
@@ -249,13 +202,11 @@ async def _touch_worker_presence(
         .values(**values)
     )
 
-
 class ResultPayload(BaseModel):
     status: str
     error_message: str | None = None
     log_r2_key: str | None = None
     artifacts: list[ArtifactPayload] = []
-
 
 class ArtifactPayload(BaseModel):
     kind: str
@@ -264,7 +215,6 @@ class ArtifactPayload(BaseModel):
     size_bytes: int | None = None
     checksum_sha256: str | None = None
     signed: bool | None = None
-
 
 async def _upsert_attempt_artifact(
     db: DbSession,
@@ -300,7 +250,6 @@ async def _upsert_attempt_artifact(
     await db.execute(stmt)
     await db.flush()
 
-
 @router.post("/heartbeat")
 async def heartbeat(db: DbSession, worker: Annotated[Worker, Depends(_require_worker)]):
     await _touch_worker_presence(
@@ -311,7 +260,6 @@ async def heartbeat(db: DbSession, worker: Annotated[Worker, Depends(_require_wo
     )
     return {"status": "ok", "state": worker.state.value}
 
-
 @router.get("/poll")
 async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_worker)]):
     await _touch_worker_presence(
@@ -320,8 +268,6 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
         include_heartbeat=False,
         revive_offline=False,
     )
-    # Serialize poll/claim per worker row so duplicate processes sharing one token cannot
-    # over-claim jobs in parallel.
     wr = await db.execute(select(Worker).where(Worker.id == worker.id).with_for_update())
     locked_worker = wr.scalar_one_or_none()
     if locked_worker is None:
@@ -344,9 +290,6 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
         or 0
     )
     max_parallel = _worker_declared_max_parallel_attempts(locked_worker)
-    # Readiness reconciliation only.
-    # Keep BUSY workers eligible to poll so one worker host can run parallel builds.
-    # If DB state says BUSY but no RUNNING attempts remain, heal back to IDLE.
     if running_attempts == 0 and locked_worker.state == WorkerState.BUSY:
         locked_worker.state = WorkerState.IDLE
         locked_worker.current_build_attempt_id = None
@@ -379,7 +322,6 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
         locked_worker.state = WorkerState.BUSY
         locked_worker.current_build_attempt_id = newest_running_attempt_id
         await db.flush()
-    # Only return jobs whose target architecture matches this worker (or job has no target for backward compat)
     worker_arch = (locked_worker.architecture or "").strip() or None
     q = (
         select(BuildJob)
@@ -387,8 +329,6 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
         .order_by(BuildJob.priority.desc(), BuildJob.created_at.asc())
     )
     if get_settings().rpmbuild_strict_gate_enabled:
-        # Chain jobs use chain_stage_index for ordering; they must never be blocked by an active
-        # rpmbuild plan's current_open_layer even if layer metadata was populated historically.
         q = q.outerjoin(RpmbuildPlan, BuildJob.rpmbuild_plan_id == RpmbuildPlan.id).where(
             (BuildJob.chain_id.isnot(None))
             | (BuildJob.rpmbuild_plan_id.is_(None))
@@ -407,8 +347,6 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
                 (BuildJob.target_id.is_(None)) | (BuildTarget.architecture.in_(arch_vals))
             )
 
-    # Burst worker routing: burst workers only handle their whitelisted packages;
-    # normal workers never handle packages reserved for any burst worker.
     burst_workers_res = await db.execute(
         select(Worker.burst_whitelist).where(Worker.is_burst_worker == True)  # noqa: E712
     )
@@ -422,18 +360,14 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
         whitelist_lower = {n.lower() for n in (locked_worker.burst_whitelist or []) if n}
         if not whitelist_lower:
             return {"job": None}
-        # Burst workers only pick up jobs for their whitelisted packages.
         q = q.join(Package, BuildJob.package_id == Package.id).where(
             func.lower(Package.name).in_(whitelist_lower)
         )
     elif all_burst_names:
-        # Normal workers skip jobs whose package is reserved for a burst worker.
         q = q.outerjoin(Package, BuildJob.package_id == Package.id).where(
             (BuildJob.package_id.is_(None)) | (~func.lower(Package.name).in_(all_burst_names))
         )
 
-    # One transaction must not claim the same job row twice (concurrent polls, duplicate worker
-    # processes with the same token, or LB retry). Lock the chosen row until commit.
     q = q.limit(1).with_for_update(of=BuildJob, skip_locked=True)
     result = await db.execute(q)
     job = result.scalar_one_or_none()
@@ -467,7 +401,6 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
     release = rel_result.scalar_one_or_none()
     if release:
         releasename = release.releasename
-    # Collect sources: prefer this job's package_version so distgit/new-package sources are always included.
     if job.package_version_id:
         src_result = await db.execute(
             select(Source).where(Source.package_version_id == job.package_version_id)
@@ -513,12 +446,10 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
             selected_mock_env = me
             mock_config = me.config_name
 
-    # At build time, worker uses <config_name>-<arch> (mock env is not arch-specific)
     build_arch = (target.architecture if target else None) or (worker.architecture or "").strip() or "x86_64"
     branch = r2_publish_branch(release)
     if mock_config:
         base = mock_config.strip()
-        # Normalize: if stored value already ends with -x86_64 or -aarch64, treat as base
         for suffix in ("-x86_64", "-aarch64"):
             if base.endswith(suffix):
                 base = base[: -len(suffix)]
@@ -547,14 +478,12 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
         },
     }
 
-
 @router.get("/cancel-check/{attempt_id}")
 async def cancel_check(
     attempt_id: int,
     db: DbSession,
     worker: Annotated[Worker, Depends(_require_worker)],
 ):
-    """Worker polls this while a build runs; true when the user cancelled the job."""
     key = (worker.id, attempt_id)
     now_ts = time.monotonic()
     ttl = _cancel_cache_ttl_seconds()
@@ -576,40 +505,28 @@ async def cancel_check(
     job = job_result.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
-    # Job may already be PENDING again after cancel+retry while this attempt row is still
-    # CANCELLED; workers must stop mock based on the attempt, not only job.status.
     cancel_requested = job.status == BuildStatus.CANCELLED or attempt.status == BuildStatus.CANCELLED
     with _cancel_check_cache_lock:
-        # Small bounded cache to avoid unbounded growth in long-lived API processes.
         if len(_cancel_check_cache) > 4096:
             _cancel_check_cache.clear()
         _cancel_check_cache[key] = (now_ts + ttl, cancel_requested)
     return {"cancel_requested": cancel_requested}
 
-
 def _put_rpm_bytes_to_r2(key: str, raw: bytes) -> None:
     get_r2_client().put_object(key, raw, content_type="application/x-rpm")
-
 
 _RPM_UPLOAD_CONTENT_TYPE = "application/x-rpm"
 
 _RPM_QUIET_TIMEOUT_SEC = 600
 
-
 def _rpm_subproc_timeout_sec(path: Path) -> int:
-    """
-    Large SRPMs (e.g. linux-firmware) need a longer ``rpm -qp`` window or nevra/sig probes time out and
-    idempotent complete retries falsely fail with HTTP 400.
-    """
     try:
         mib = max(1, path.stat().st_size // (1024 * 1024))
     except OSError:
         return _RPM_QUIET_TIMEOUT_SEC
     return min(7200, max(_RPM_QUIET_TIMEOUT_SEC, mib * 3))
 
-
 def _rpm_nevra_stem_from_path(path: Path) -> str | None:
-    """NEVRA string like NAME-VERSION-RELEASE.ARCH (no trailing .rpm)."""
     to = _rpm_subproc_timeout_sec(path)
     try:
         r = subprocess.run(
@@ -626,7 +543,6 @@ def _rpm_nevra_stem_from_path(path: Path) -> str | None:
     except Exception:
         return None
 
-
 def _rpm_signature_verifies(path: Path) -> bool:
     try:
         r = subprocess.run(
@@ -640,14 +556,7 @@ def _rpm_signature_verifies(path: Path) -> bool:
     except Exception:
         return False
 
-
 def _rpm_appears_gpg_signed(path: Path) -> bool:
-    """
-    Check signature presence without verifying against the local rpmdb keys.
-
-    rpm -K can fail when the public key isn't imported into the controller's rpmdb.
-    Some builds only populate OPENPGP/SIGGPG style slots in the header, so SIGPGP alone is not enough.
-    """
     to = _rpm_subproc_timeout_sec(path)
     for qf in (
         "%{SIGPGP:pgpsig}",
@@ -668,13 +577,7 @@ def _rpm_appears_gpg_signed(path: Path) -> bool:
             continue
     return False
 
-
 def _presigned_rpm_already_finalized_on_retry(path: Path, fname: str) -> bool:
-    """
-    After a successful complete, R2 holds the GPG-signed RPM while the worker may retry complete
-    with the original unsigned size/checksum (e.g. read timeout on the JSON response). Accept the
-    object if it is the same NEVRA as the filename and signatures verify.
-    """
     name = Path(fname.strip()).name
     if not name.lower().endswith(".rpm"):
         return False
@@ -683,7 +586,6 @@ def _presigned_rpm_already_finalized_on_retry(path: Path, fname: str) -> bool:
     if not got:
         return False
     if got != stem:
-        # Some rpm builds include an epoch prefix "(none):" or "0:" in tag output.
         ep = subprocess.run(
             ["rpm", "-qp", "--qf", "%{EPOCH}:%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}", str(path)],
             capture_output=True,
@@ -696,14 +598,10 @@ def _presigned_rpm_already_finalized_on_retry(path: Path, fname: str) -> bool:
             if alt.startswith("(none):") or alt.startswith("0:"):
                 rest = alt.split(":", 1)[-1]
                 if rest == stem:
-                    # Don't require rpmdb key verification; just check signature presence.
                     return _rpm_appears_gpg_signed(path)
         return False
 
-    # Don't require rpm -K verification for idempotent retry. Just verify that the object looks
-    # like the expected NEVRA and has a PGP signature already embedded.
     return _rpm_appears_gpg_signed(path)
-
 
 async def _resolve_worker_rpm_upload_context(
     db: DbSession,
@@ -711,10 +609,6 @@ async def _resolve_worker_rpm_upload_context(
     attempt_id: int,
     fname_raw: str,
 ) -> tuple[BuildAttempt, BuildJob, Release, str, str, str]:
-    """
-    Validate worker/attempt/job and compute repo ``r2_key`` for ``fname``.
-    Returns ``attempt``, ``job``, ``release``, ``arch``, ``branch``, ``r2_key``.
-    """
     fname = Path(fname_raw.strip()).name
     if not fname or not fname.lower().endswith(".rpm"):
         raise HTTPException(
@@ -762,16 +656,13 @@ async def _resolve_worker_rpm_upload_context(
 
     return attempt, job, release, arch, branch, r2_key
 
-
 class WorkerRpmPresignBody(BaseModel):
     filename: str
-
 
 class WorkerRpmCompleteBody(BaseModel):
     filename: str
     checksum_sha256: str
     size_bytes: int
-
 
 @router.post("/upload-rpm/presign/{attempt_id}")
 async def upload_worker_rpm_presign(
@@ -780,10 +671,6 @@ async def upload_worker_rpm_presign(
     worker: Annotated[Worker, Depends(_require_worker)],
     body: WorkerRpmPresignBody,
 ):
-    """
-    Presigned PUT to R2 so workers can upload very large RPMs without POSTing through Cloudflare Tunnel
-    (which often returns 413 for very large bodies). Binary RPMs can still use multipart ``/upload-rpm/``.
-    """
     settings = get_settings()
     _, _, _, _, _, r2_key = await _resolve_worker_rpm_upload_context(
         db, worker, attempt_id, body.filename
@@ -808,7 +695,6 @@ async def upload_worker_rpm_presign(
         "expires_in": expires,
     }
 
-
 @router.post("/upload-rpm/complete/{attempt_id}")
 async def upload_worker_rpm_complete(
     attempt_id: int,
@@ -816,19 +702,9 @@ async def upload_worker_rpm_complete(
     worker: Annotated[Worker, Depends(_require_worker)],
     body: WorkerRpmCompleteBody,
 ):
-    """
-    After the worker PUTs the unsigned RPM to R2 using a presigned URL, this runs on the controller:
-    HEAD+GET from R2 into a temp file (same network path as any S3 client, not through the worker
-    tunnel), verify size and SHA-256, ``rpm --addsign`` on that file, then ``put_object`` overwrites
-    the same R2 key with the signed RPM bytes.
-    """
-    # IMPORTANT: This endpoint does `await db.rollback()` while waiting on the distributed lock.
-    # SQLAlchemy can expire ORM attributes on rollback, so never access `worker.id` after the wait.
-    # Capture the plain int early and reuse it for audit logging.
     try:
         worker_id = int(worker.id)
     except Exception:
-        # If ORM state is unexpectedly expired, avoid failing the whole upload complete endpoint.
         worker_id = -1
 
     settings = get_settings()
@@ -1021,7 +897,6 @@ async def upload_worker_rpm_complete(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="Timed out waiting for RPM finalize lock",
                 )
-            # Release transaction resources while waiting on another worker's finalize lock.
             await db.rollback()
             await asyncio.sleep(2)
 
@@ -1074,7 +949,6 @@ async def upload_worker_rpm_complete(
         "checksum_sha256": digest,
     }
 
-
 @router.get("/upload-rpm/status/{attempt_id}")
 async def upload_worker_rpm_status(
     attempt_id: int,
@@ -1082,12 +956,6 @@ async def upload_worker_rpm_status(
     worker: Annotated[Worker, Depends(_require_worker)],
     filename: str = Query(..., min_length=1, max_length=512),
 ):
-    """
-    Lightweight probe for presigned upload completion.
-
-    Used by workers after transient 5xx/522/524 on /complete to verify whether the
-    controller finished finalize+sign asynchronously before Cloudflare timed out.
-    """
     _, _, _, _, _, r2_key = await _resolve_worker_rpm_upload_context(
         db, worker, attempt_id, filename
     )
@@ -1114,9 +982,7 @@ async def upload_worker_rpm_status(
         "checksum_sha256": (row.checksum_sha256 or "").strip(),
     }
 
-
 def _rpm_name_from_bytes(data: bytes) -> str | None:
-    """Extract RPM NAME from bytes using host rpm command."""
     if not data:
         return None
     path: str | None = None
@@ -1144,14 +1010,7 @@ def _rpm_name_from_bytes(data: bytes) -> str | None:
             except OSError:
                 pass
 
-
 def _rpm_name_from_filename(filename: str) -> str | None:
-    """
-    Best-effort NAME parser from RPM basename.
-
-    RPM filenames are typically NAME-VERSION-RELEASE.ARCH.rpm (or .src.rpm).
-    NAME may contain dashes, so split from the right.
-    """
     fn = (filename or "").strip()
     if not fn.endswith(".rpm"):
         return None
@@ -1163,13 +1022,11 @@ def _rpm_name_from_filename(filename: str) -> str | None:
         if dot <= 0:
             return None
         stem = stem[:dot]
-    # Now stem should be NAME-VERSION-RELEASE
     parts = stem.rsplit("-", 2)
     if len(parts) != 3:
         return None
     name = parts[0].strip()
     return name or None
-
 
 def _prune_superseded_repo_objects(
     *,
@@ -1179,14 +1036,8 @@ def _prune_superseded_repo_objects(
     keep_artifact_filenames: set[str],
     payload_artifacts: list[ArtifactPayload],
 ) -> None:
-    """
-    Remove older RPM/SRPM objects in the same branch when a new release is published,
-    including skipped-release upgrades (e.g. -11 -> -14).
-    """
     r2 = get_r2_client()
 
-    # Resolve package NAMEs from newly produced payload artifacts.
-    # Prefer filename parse (cheap + reliable across R2/client differences), then fallback to RPM metadata.
     binary_names: set[str] = set()
     src_names: set[str] = set()
     for a in payload_artifacts:
@@ -1205,8 +1056,6 @@ def _prune_superseded_repo_objects(
         else:
             binary_names.add(name)
 
-    # Safety net: artifact payload rows can occasionally miss metadata fields in edge cases.
-    # Derive names from the keep-set too so pruning still runs for the newly published package(s).
     for fn in keep_artifact_filenames:
         name = _rpm_name_from_filename(fn)
         if not name:
@@ -1216,7 +1065,6 @@ def _prune_superseded_repo_objects(
         elif fn.endswith(".rpm"):
             binary_names.add(name)
 
-    # Binary RPMs (same branch/arch)
     bin_prefix = f"{repo_r2_prefix(releasename, branch, arch)}/RPMS/"
     for obj in r2.list_objects(bin_prefix):
         key = obj.get("key")
@@ -1237,7 +1085,6 @@ def _prune_superseded_repo_objects(
             r2.delete_object(key)
             logger.info("Pruned superseded binary RPM %s", key)
 
-    # Source RPMs (same branch/src)
     src_prefix = f"{releasename}/{branch}/src/"
     for obj in r2.list_objects(src_prefix):
         key = obj.get("key")
@@ -1258,8 +1105,6 @@ def _prune_superseded_repo_objects(
             r2.delete_object(key)
             logger.info("Pruned superseded SRPM %s", key)
 
-    # Strict policy enforcement: keep exactly one version per package name in repo paths.
-    # This protects against any historical leftovers even if a prior publish missed pruning.
     def _enforce_single_version(prefix: str, *, src: bool) -> None:
         by_name: dict[str, list[tuple[str, str, object]]] = {}
         for obj in r2.list_objects(prefix):
@@ -1300,9 +1145,7 @@ def _prune_superseded_repo_objects(
     _enforce_single_version(bin_prefix, src=False)
     _enforce_single_version(src_prefix, src=True)
 
-
 _BUILD_LOG_PUT_CONTENT_TYPE = "text/plain; charset=utf-8"
-
 
 async def _resolve_worker_build_log_r2_key(
     db: DbSession,
@@ -1332,9 +1175,7 @@ async def _resolve_worker_build_log_r2_key(
         )
     return log_r2_key(release.releasename, attempt_id)
 
-
 async def _assign_attempt_build_log_key(db: DbSession, worker: Worker, attempt_id: int, key: str) -> None:
-    """Expose build logs in the UI while the job is still running (not only after result POST)."""
     r = await db.execute(
         select(BuildAttempt).where(
             BuildAttempt.id == attempt_id,
@@ -1347,11 +1188,9 @@ async def _assign_attempt_build_log_key(db: DbSession, worker: Worker, attempt_i
     att.log_r2_key = key
     await db.flush()
 
-
 class WorkerBuildLogCompleteBody(BaseModel):
     checksum_sha256: str
     size_bytes: int
-
 
 @router.post("/build-log/presign/{attempt_id}")
 async def worker_build_log_presign(
@@ -1359,10 +1198,6 @@ async def worker_build_log_presign(
     db: DbSession,
     worker: Annotated[Worker, Depends(_require_worker)],
 ):
-    """
-    Presigned PUT so workers can stream large logs to R2 without tunneling huge bodies through
-    Cloudflare (which often returns 524 while the origin buffers and uploads to R2).
-    """
     settings = get_settings()
     key = await _resolve_worker_build_log_r2_key(db, worker, attempt_id)
     expires = settings.worker_rpm_presign_put_expires_seconds
@@ -1385,7 +1220,6 @@ async def worker_build_log_presign(
         "expires_in": expires,
     }
 
-
 @router.post("/build-log/complete/{attempt_id}")
 async def worker_build_log_complete(
     attempt_id: int,
@@ -1393,7 +1227,6 @@ async def worker_build_log_complete(
     worker: Annotated[Worker, Depends(_require_worker)],
     body: WorkerBuildLogCompleteBody,
 ):
-    """After presigned PUT, verify log object in R2 (size + SHA-256). No re-upload; log is not GPG-signed."""
     if body.size_bytes > _MAX_BUILD_LOG_BYTES:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
@@ -1413,8 +1246,6 @@ async def worker_build_log_complete(
         if cl != sz:
             raise ValueError(f"Size mismatch: R2 has {cl} bytes, worker claimed {sz}")
 
-        # Fast retry path: if worker uploaded metadata in the presigned PUT, the controller can
-        # validate integrity via HEAD user-metadata without re-hashing the whole object.
         meta = r2.head_object_metadata(key)
         if meta:
             meta_sha = (meta.get("sha256") or meta.get("checksum_sha256") or "").strip().lower()
@@ -1458,7 +1289,6 @@ async def worker_build_log_complete(
     )
     return {"log_r2_key": key}
 
-
 @router.put("/build-log/{attempt_id}")
 async def worker_upload_build_log(
     attempt_id: int,
@@ -1466,10 +1296,6 @@ async def worker_upload_build_log(
     worker: Annotated[Worker, Depends(_require_worker)],
     content: bytes = Body(...),
 ):
-    """
-    Store a build log in R2 on behalf of the authenticated worker. No R2 credentials on the worker.
-    Large logs should use ``/build-log/presign`` + PUT to R2 + ``/build-log/complete`` from the worker instead.
-    """
     if len(content) > _MAX_BUILD_LOG_BYTES:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
@@ -1484,7 +1310,6 @@ async def worker_upload_build_log(
     await _assign_attempt_build_log_key(db, worker, attempt_id, key)
     return {"log_r2_key": key}
 
-
 @router.get("/source-blob/{attempt_id}")
 async def worker_download_source_blob(
     attempt_id: int,
@@ -1492,7 +1317,6 @@ async def worker_download_source_blob(
     worker: Annotated[Worker, Depends(_require_worker)],
     key: str = Query(..., min_length=1, max_length=2048),
 ):
-    """Stream an object from R2 for keys attached to this job. Workers need no R2 creds."""
     ar = await db.execute(
         select(BuildAttempt).where(
             BuildAttempt.id == attempt_id,
@@ -1516,16 +1340,12 @@ async def worker_download_source_blob(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Object not found")
     return Response(content=data, media_type="application/octet-stream")
 
-
 @router.get("/pesign-bundle/{attempt_id}")
 async def worker_download_pesign_bundle(
     attempt_id: int,
     db: DbSession,
     worker: Annotated[Worker, Depends(_require_worker)],
 ):
-    """
-    Tar.gz of NSS DB plus manifest. Only while attempt is RUNNING; only the assigned worker; use TLS.
-    """
     settings = get_settings()
     ar = await db.execute(
         select(BuildAttempt).where(
@@ -1593,7 +1413,6 @@ async def worker_download_pesign_bundle(
         background=BackgroundTask(_cleanup),
     )
 
-
 @router.post("/upload-rpm/{attempt_id}")
 async def upload_worker_rpm(
     attempt_id: int,
@@ -1601,9 +1420,6 @@ async def upload_worker_rpm(
     worker: Annotated[Worker, Depends(_require_worker)],
     file: UploadFile = File(...),
 ):
-    """
-    Receive a built RPM. Pesign runs on the worker (bundle from GET .../pesign-bundle). GPG here.
-    """
     settings = get_settings()
     max_bytes = settings.max_worker_rpm_upload_mib * 1024 * 1024
 
@@ -1673,14 +1489,12 @@ async def upload_worker_rpm(
         "checksum_sha256": digest,
     }
 
-
 @router.post("/mock-complete/{attempt_id}")
 async def worker_mock_complete(
     attempt_id: int,
     db: DbSession,
     worker: Annotated[Worker, Depends(_require_worker)],
 ):
-    """Worker calls this after ``mock --rebuild`` succeeds so the UI can show success while RPMs upload and the controller signs/publishes."""
     result = await db.execute(
         select(BuildAttempt)
         .where(BuildAttempt.id == attempt_id, BuildAttempt.worker_id == worker.id)
@@ -1698,7 +1512,6 @@ async def worker_mock_complete(
     attempt.signing_status = "running"
     await db.flush()
     return {"status": "ok"}
-
 
 @router.post("/result/{attempt_id}")
 async def report_result(
@@ -1718,7 +1531,6 @@ async def report_result(
     job_result = await db.execute(select(BuildJob).where(BuildJob.id == attempt.build_job_id))
     job = job_result.scalar_one()
 
-    # Capture burst info now before any db.commit() expires the worker object.
     _burst_worker_name = worker.name
     _burst_whitelist: list[str] = list(worker.burst_whitelist or []) if worker.is_burst_worker else []
     _burst_gcp_instance: str | None = worker.gcp_instance_name if worker.is_burst_worker else None
@@ -1733,8 +1545,6 @@ async def report_result(
         except Exception:
             logger.exception("burst-vm stop check failed for worker %s", _burst_worker_name)
 
-    # Idempotency: if we already finalized this attempt, do nothing (no artifacts insert,
-    # no promotion duplication, no repodata/prune/repack side effects).
     existing_final = await db.execute(
         select(BuildAttemptFinalization).where(BuildAttemptFinalization.attempt_id == attempt_id)
     )
@@ -1768,7 +1578,6 @@ async def report_result(
         )
         await db.execute(stmt)
 
-    # User cancelled: do not mark job success or promote artifacts when the worker finishes later.
     if job.status == BuildStatus.CANCELLED:
         if payload.log_r2_key:
             attempt.log_r2_key = payload.log_r2_key
@@ -1796,8 +1605,6 @@ async def report_result(
         await _burst_vm_stop_check()
         return {"status": "ok", "job_cancelled": True}
 
-    # Worker default HTTP read timeout can fire after this handler already committed rows. A later
-    # orphan "failed" POST must not wipe success, and must fix failed status when artifacts exist.
     if str(payload.status).lower() == "failed":
         prior_art_count = await db.scalar(
             select(func.count(Artifact.id)).where(Artifact.build_attempt_id == attempt_id)
@@ -1827,8 +1634,6 @@ async def report_result(
                     attempt.log_r2_key = payload.log_r2_key
                 await db.flush()
                 await sync_worker_state_after_attempt_finished(db, worker)
-                # Durably persist the repaired terminal status before follow-up side effects.
-                # If any later step fails, worker retry should continue from SUCCESS, not RUNNING.
                 await db.commit()
                 promo_count = await db.scalar(
                     select(func.count(Promotion.id)).where(Promotion.build_job_id == job.id)
@@ -1887,13 +1692,8 @@ async def report_result(
     job.completed_at = attempt.finished_at
     await db.flush()
     await sync_worker_state_after_attempt_finished(db, worker)
-    # Critical durability boundary.
-    # Final status transitions must survive failures in artifact insert/repo publish enqueue /
-    # promotion creation/R2 cleanup during large autobuild bursts.
     await db.commit()
 
-    # Burst VM lifecycle: stop the GCP instance if this was a burst worker and
-    # there are no more pending/running burst jobs for its whitelisted packages.
     await _burst_vm_stop_check()
 
     if st_l in ("failed", "cancelled"):
@@ -1920,12 +1720,8 @@ async def report_result(
             )
         )
         await db.execute(stmt)
-    # Persist artifact rows immediately. The job/attempt success status was already committed
-    # above, so a later side-effect failure must not erase artifact metadata from the UI/API.
     await db.commit()
 
-    # On success: ensure RPMs are in dev/, then update repodata, create promotion
-    # Worker may upload to builds/ or dev/. If builds/: copy to dev/ FIRST, then we delete builds/ later.
     if str(payload.status).lower() == "success":
         try:
             pkg_result = await db.execute(select(Package).where(Package.id == job.package_id))
@@ -1938,9 +1734,7 @@ async def report_result(
             branch = r2_publish_branch(release)
             job.branch = branch
             if release and arch:
-                # Durable PublishTask row; API lifespan poll loop runs repo publish under a global concurrency cap.
                 await _enqueue_repo_publish_task()
-                # Copy package SRPM to releasename/branch/src/ (from uploads) if we have one
                 if job.package_version_id:
                     src_result = await db.execute(
                         select(Source).where(
@@ -1961,7 +1755,6 @@ async def report_result(
                                     r2.put_object(dest_key, data)
                         except Exception:
                             pass
-            # Create promotion candidate (pending), but don't duplicate it on retries.
             promo_count = await db.scalar(
                 select(func.count(Promotion.id)).where(
                     Promotion.build_job_id == job.id,
@@ -1990,8 +1783,6 @@ async def report_result(
             )
             await db.rollback()
 
-    # Delete upload R2 objects after build (success or fail); uploads are not reused for retries.
-    # ONLY delete keys under /uploads/ - never touch repo path (dev/arch/RPMS, dev/src).
     if job.package_version_id:
         try:
             src_list_result = await db.execute(
@@ -2018,7 +1809,6 @@ async def report_result(
             logger.exception("upload-source cleanup failed for attempt_id=%s", attempt_id)
             await db.rollback()
 
-    # Delete ONLY keys under releasename/builds/{attempt_id}/ - never touch dev/arch or repo path.
     rel_result = await db.execute(select(Release).where(Release.id == job.release_id))
     release = rel_result.scalar_one_or_none()
     if release and attempt.status != BuildStatus.SUCCESS:
@@ -2041,7 +1831,6 @@ async def report_result(
         except Exception:
             pass
 
-    # Emit audit + Discord for build result
     await _insert_finalization_row(attempt.status.value)
     await log_audit(
         db,
@@ -2055,7 +1844,6 @@ async def report_result(
     )
 
     return {"status": "ok"}
-
 
 @router.post("/artifact/{attempt_id}")
 async def register_artifact(
