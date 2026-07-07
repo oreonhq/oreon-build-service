@@ -1,21 +1,3 @@
-#
-# Oreon Build Service - Promotions API router
-# Copyright (C) 2026 Oreon HQ
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-#
-"""Promotions - list candidates (pending); to-testing/to-stable require auth."""
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
@@ -31,7 +13,6 @@ from oreon_build.services.r2 import get_r2_client, repo_rpms_key, src_r2_key
 from oreon_build.services.promotion_r2_cleanup import run_post_promotion_r2_maintenance
 
 router = APIRouter(prefix="/promotions", tags=["promotions"])
-
 
 def _promotion_search_clause(raw: str):
     term = raw.strip()
@@ -56,7 +37,6 @@ def _promotion_search_clause(raw: str):
         )
     return or_(*parts)
 
-
 @router.get("", response_model=PaginatedResponse[PromotionResponse])
 async def list_promotions(
     db: DbSession,
@@ -66,7 +46,6 @@ async def list_promotions(
     limit: int = Query(25, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ):
-    # Only show promotions whose package still exists. Old promos for deleted packages are hidden.
     base = (
         select(Promotion)
         .join(Package, Promotion.package_id == Package.id)
@@ -86,7 +65,6 @@ async def list_promotions(
     total = (await db.execute(count_q)).scalar() or 0
     result = await db.execute(base.limit(limit).offset(offset))
     return PaginatedResponse(items=list(result.scalars().all()), total=total)
-
 
 @router.post("/promote", response_model=PromotionResponse, status_code=status.HTTP_201_CREATED)
 async def promote(
@@ -121,7 +99,6 @@ async def promote(
     )
     return promo
 
-
 def _copy_branch_to_branch(
     releasename: str,
     from_branch: str,
@@ -129,7 +106,6 @@ def _copy_branch_to_branch(
     arch: str,
     rpm_filenames: list[str],
 ) -> tuple[list[str], list[str]]:
-    """Copy RPMs from from_branch to to_branch in R2. Returns (dest keys, filenames copied)."""
     r2 = get_r2_client()
     dest_keys: list[str] = []
     copied_filenames: list[str] = []
@@ -146,7 +122,6 @@ def _copy_branch_to_branch(
             dest_keys.append(dest_key)
             copied_filenames.append(fn)
     return dest_keys, copied_filenames
-
 
 async def _promote_pending_to_channel(
     promotion_id: int,
@@ -211,7 +186,6 @@ async def _promote_pending_to_channel(
     )
     return promo
 
-
 @router.post("/{promotion_id}/to-testing", response_model=PromotionResponse)
 async def promote_to_testing(
     promotion_id: int,
@@ -228,7 +202,6 @@ async def promote_to_testing(
         "promoted_testing",
         "promotion.to_testing",
     )
-
 
 @router.post("/{promotion_id}/to-stable", response_model=PromotionResponse)
 async def promote_to_stable(
