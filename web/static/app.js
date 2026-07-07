@@ -1,20 +1,4 @@
-/*
- * Oreon Build Service - frontend helpers
- * Copyright (C) 2026 Oreon HQ
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
- */
+
 
 function oreonParseJwtPayload(token) {
   if (!token || typeof token !== 'string') return null;
@@ -30,11 +14,6 @@ function oreonParseJwtPayload(token) {
   }
 }
 
-/**
- * Turn FastAPI ``detail`` (string, list of validation errors, or object) into a single line.
- * Avoids ``new Error([])`` which yields an empty ``message`` and blank UI alerts.
- * HTTP/2 responses often have an empty ``statusText`` so we always fall back to the status code.
- */
 function oreonNormalizeApiErrorDetail(detail, status, statusText) {
   var st = (statusText && String(statusText).trim()) ? String(statusText).trim() : '';
   var code = typeof status === 'number' && status > 0 ? status : 0;
@@ -75,7 +54,6 @@ function oreonNormalizeApiErrorDetail(detail, status, statusText) {
   return asStr || fallback;
 }
 
-/** Non-empty text for alerts when ``e.message`` is missing (e.g. old bugs or thrown primitives). */
 window.oreonErrorMessage = function(e) {
   if (!e) return 'Unknown error';
   var m = e.message;
@@ -169,10 +147,6 @@ window.oreonApi = {
 
 oreonLoadStoredAuth(window.oreonApi);
 
-/**
- * Checkbox table: show a bulk bar and refresh counts. Call refresh() after re-rendering tbody.
- * opts: { rowCheckboxSelector, selectAll, bulkBar, onSelectionChange(ids, buttonsEl) }
- */
 window.oreonBindTableSelection = function(tbody, opts) {
   if (!tbody || !opts) return { refresh: function() {}, getSelectedIds: function() { return []; } };
   var rowSel = opts.rowCheckboxSelector || '.row-cb';
@@ -226,11 +200,6 @@ window.oreonBindTableSelection = function(tbody, opts) {
   return { refresh: refresh, getSelectedIds: getSelectedIds };
 };
 
-/**
- * Disable btn while asyncFn() is running, then restore it.
- * Appends " ..." to the label during the operation.
- * Returns the promise from asyncFn so callers can .catch() as normal.
- */
 window.oreonWithLoading = function(btn, asyncFn) {
   if (!btn) return asyncFn();
   var orig = btn.textContent;
@@ -244,7 +213,6 @@ window.oreonWithLoading = function(btn, asyncFn) {
   });
 };
 
-/** Returns a function that runs fn after ms quiet time (use for server-backed list filters). */
 window.oreonDebounce = function(fn, ms) {
   var t;
   return function() {
@@ -341,7 +309,6 @@ function updateAuthUI() {
   }
 }
 
-/** Drop legacy Chains link (stale cached HTML/JS). */
 function oreonStripChainsNavLink() {
   try {
     document.querySelectorAll('header.header nav a').forEach(function(a) {
@@ -352,7 +319,6 @@ function oreonStripChainsNavLink() {
   } catch (_) {}
 }
 
-/** Canonical OBS top nav (single source of truth for all build-service pages). */
 var OREON_NAV_ITEMS = [
   { href: '/', label: 'Dashboard', match: function(p) { return p === '/' || p === '/index.html'; } },
   { href: '/builds.html', label: 'Builds', match: function(p) { return p === '/builds.html' || p === '/build.html'; } },
@@ -424,7 +390,6 @@ function oreonInitNavbar() {
 
 window.oreonInitNavbar = oreonInitNavbar;
 
-/** Prefill a filter input from ?q= or ?search= in the page URL. Returns the value used. */
 window.oreonPrefillUrlSearch = function(inputId, paramNames) {
   var names = paramNames || ['q', 'search'];
   var val = '';
@@ -444,10 +409,6 @@ window.oreonPrefillUrlSearch = function(inputId, paramNames) {
   return val;
 };
 
-/**
- * Signing pipeline after mock (GPG and repodata on the controller, not on the worker).
- * Needs Font Awesome 6 (``fa-solid fa-key``) on the page.
- */
 function oreonSigningKeyHtml(signingStatus) {
   var ss = (signingStatus || 'not_started').toLowerCase();
   if (ss === 'uploading') {
@@ -490,7 +451,6 @@ function oreonSigningKeyHtml(signingStatus) {
   );
 }
 
-/** Prefer API ``display_status`` (success right after mock) over raw ``status``. */
 function oreonJobDisplayStatus(job) {
   if (!job) return '';
   var d = job.display_status;
