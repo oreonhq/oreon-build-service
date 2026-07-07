@@ -1,24 +1,4 @@
 #!/usr/bin/env bash
-# Oreon Build Service
-# Copyright (C) 2026 Oreon HQ
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-# Start Oreon Build Service (API + scheduler) in the background.
-# Run from repo root. Stop with ./stop.sh
-#
-# Optional: ./start.sh --regen  (background repodata refresh for all DB prefixes; heavy, uses scripts/migrate-rpmrepo-metadata.sh)
 
 set -e
 cd "$(dirname "$0")"
@@ -60,10 +40,8 @@ if [ -f .oreon-watchdog.pid ] && kill -0 "$(cat .oreon-watchdog.pid)" 2>/dev/nul
   exit 1
 fi
 
-# Load env
 [ -f .env ] && set -a && source .env && set +a
 
-# Start PostgreSQL if not running (same logic as scripts/deploy.sh)
 if command -v systemctl &>/dev/null; then
   for svc in postgresql-16 postgresql-15 postgresql-14 postgresql; do
     if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${svc}.service"; then
@@ -77,7 +55,6 @@ if command -v systemctl &>/dev/null; then
   done
 fi
 
-# Wait for PostgreSQL to accept connections
 for i in 1 2 3 4 5; do
   if python3 -c "import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1', 5432)); s.close()" 2>/dev/null; then
     break
@@ -91,15 +68,12 @@ done
 
 source .venv/bin/activate
 
-# One-shot: inspect DB pressure and terminate only safe idle sessions before services connect.
 echo "DB unclog preflight (safe idle session cleanup)..."
 set +e
 python -u "$ROOT/scripts/db_unclog_safe_idles.py"
 _db_unclog_rc=$?
 set -e
 if [ "$_db_unclog_rc" -eq 3 ]; then
-  # No slot available for app role at all. Hard-unclog fallback:
-  # restart local postgres service to clear stale client backends, then retry once.
   echo "DB unclog: no connection slots available for app role; attempting PostgreSQL restart fallback..."
   _pg_restarted=0
   if command -v systemctl &>/dev/null; then
@@ -133,29 +107,21 @@ if ! command -v createrepo_c &>/dev/null; then
   echo "WARNING: createrepo_c not on PATH. Install it for repodata refresh (e.g. dnf install createrepo_c)."
 fi
 
-# Logs
 LOG_DIR="${OREON_LOG_DIR:-.oreon-logs}"
 mkdir -p "$LOG_DIR"
 
-# API
 nohup uvicorn oreon_build.api.main:app --host 0.0.0.0 --port 8000 \
   > "$LOG_DIR/oreon-api.log" 2>&1 &
 echo $! > .oreon-api.pid
 echo "API started (PID $(cat .oreon-api.pid)), http://localhost:8000"
 
-# Scheduler
 nohup oreon-scheduler \
   > "$LOG_DIR/oreon-scheduler.log" 2>&1 &
 echo $! > .oreon-scheduler.pid
 echo "Scheduler started (PID $(cat .oreon-scheduler.pid))"
 
-# Watchdog (security advisory dashboard)
 WATCHDOG_URL_VAL="${WATCHDOG_URL:-http://localhost:8001}"
 
-# Extract port from common forms:
-# - "8001"
-# - "http://localhost:8001"
-# - "localhost:8001"
 if [[ "$WATCHDOG_URL_VAL" =~ ^[0-9]+$ ]]; then
   WATCHDOG_PORT="$WATCHDOG_URL_VAL"
 elif [[ "$WATCHDOG_URL_VAL" =~ :([0-9]+) ]]; then
@@ -169,7 +135,6 @@ nohup uvicorn oreon_build.watchdog.main:app --host 0.0.0.0 --port "$WATCHDOG_POR
 echo $! > .oreon-watchdog.pid
 echo "Oreon Watchdog started (PID $(cat .oreon-watchdog.pid)), http://localhost:${WATCHDOG_PORT}"
 
-# Show actual logs (non-blocking)
 LOG_SHOW_LINES="${OREON_LOG_SHOW_LINES:-200}"
 sleep 1
 
@@ -182,7 +147,6 @@ tail -n "$LOG_SHOW_LINES" "$LOG_DIR/oreon-watchdog.log" 2>/dev/null || true
 
 echo "Done. Run ./stop.sh to stop."
 
-# Background repodata refresh only when ./start.sh --regen (uses persistent ~/.oreon/repo-tmp stages + MIGRATE_PARALLEL).
 if [ "$DO_REGEN" -eq 1 ]; then
   echo "Starting background repodata refresh (logs: $LOG_DIR/repodata-refresh.log, parallel=${MIGRATE_PARALLEL:-4})..."
   nohup env MIGRATE_PARALLEL="${MIGRATE_PARALLEL:-4}" bash -c "cd \"$ROOT\" && exec bash ./scripts/migrate-rpmrepo-metadata.sh" \
