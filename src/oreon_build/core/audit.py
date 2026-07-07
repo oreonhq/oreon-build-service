@@ -1,4 +1,3 @@
-"""Audit logging for actions."""
 from __future__ import annotations
 
 import logging
@@ -36,8 +35,6 @@ async def log_audit(
     )
     db.add(entry)
     await db.flush()
-    # Username lookup, job enrichment, and Discord must never roll back the caller's
-    # transaction (e.g. package.create/build.trigger already flushed their rows).
     try:
         username = None
         if account_id is not None:

@@ -1,4 +1,3 @@
-"""JWT and dependency injection for auth."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
