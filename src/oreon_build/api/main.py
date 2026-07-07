@@ -260,7 +260,7 @@ async def lifespan(app: FastAPI):
     async def _publish_tasks_loop() -> None:
         from oreon_build.db.session import async_session_maker
         from oreon_build.models import BuildJob, PublishTask
-        from oreon_build.services.repo_publish import run_repo_publish_for_attempt
+        from oreon_build.services.repo_publish import run_repo_publish_tasks_batch
 
         while True:
             try:
@@ -293,16 +293,13 @@ async def lifespan(app: FastAPI):
                         continue
                     await db.commit()
 
-                for t in tasks:
-                    try:
-                        await run_repo_publish_for_attempt(t.attempt_id, publish_task_id=t.id)
-                    except Exception:
-                        logger.exception(
-                            "Publish task failed id=%s attempt_id=%s job_id=%s",
-                            t.id,
-                            t.attempt_id,
-                            t.build_job_id,
-                        )
+                try:
+                    await run_repo_publish_tasks_batch(tasks)
+                except Exception:
+                    logger.exception(
+                        "Publish batch failed tasks=%s",
+                        [(t.id, t.attempt_id) for t in tasks],
+                    )
 
                 # Don't sleep after successful processing: immediately check for more pending rows
                 # so repodata refresh starts as soon as artifacts are queued.

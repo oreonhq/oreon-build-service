@@ -316,6 +316,25 @@ def _ensure_stage_sidecar(container: Path, r2_prefix: str) -> None:
 
 
 @contextmanager
+def prefix_publish_lock(r2_prefix: str) -> object:
+    """Cross-process lock for copy/prune/repodata on one repo prefix."""
+    parent = _repo_temp_dir_parent()
+    if not parent:
+        parent = str(Path.home() / ".oreon" / "repo-tmp")
+    lock_dir = Path(parent) / "publish-locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    h = hashlib.sha256(r2_prefix.strip().encode()).hexdigest()[:24]
+    lock_path = lock_dir / f"{h}.lock"
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+@contextmanager
 def _repo_stage_lock(container: Path) -> object:
     """Exclusive lock so two processes do not run createrepo on the same stage."""
     container.mkdir(parents=True, exist_ok=True)
