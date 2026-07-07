@@ -1,19 +1,3 @@
-# Oreon Build Service
-# Copyright (C) 2026 Oreon HQ
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
 from __future__ import annotations
 
 from datetime import datetime
@@ -28,7 +12,6 @@ if TYPE_CHECKING:
     from .build import BuildJob
     from .mock_env import MockEnvironment
     from .release import Release
-
 
 class Package(Base):
     __tablename__ = "packages"
@@ -54,7 +37,6 @@ class Package(Base):
         "MockEnvironment", foreign_keys=[preferred_mock_environment_id]
     )
 
-
 class PackageVersion(Base):
     __tablename__ = "package_versions"
 
@@ -67,7 +49,6 @@ class PackageVersion(Base):
 
     package: Mapped["Package"] = relationship("Package", back_populates="versions")
     sources: Mapped[List["Source"]] = relationship("Source", back_populates="package_version")
-
 
 class Source(Base):
     __tablename__ = "sources"

@@ -18,8 +18,8 @@ class Promotion(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     release_id: Mapped[int] = mapped_column(nullable=False)
     from_channel: Mapped[str] = mapped_column(String(32), nullable=False)
-    to_channel: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)  # null when status=pending
-    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)  # pending, promoted_testing, promoted_stable, kept_dev
+    to_channel: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     package_id: Mapped[Optional[int]] = mapped_column(nullable=True)
     package_name: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
     build_job_id: Mapped[Optional[int]] = mapped_column(nullable=True)

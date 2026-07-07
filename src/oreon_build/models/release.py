@@ -65,7 +65,6 @@ class Release(Base):
 
 
 class ReleaseRepo(Base):
-    """Base dependency repo URL for a release (used by mock)."""
 
     __tablename__ = "release_repos"
 

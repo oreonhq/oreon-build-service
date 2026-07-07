@@ -24,7 +24,6 @@ class BuildChainStatus(str, enum.Enum):
 
 
 class BuildChain(Base):
-    """Chain build: stages of parallel distgit jobs, gated on repo publish."""
 
     __tablename__ = "build_chains"
 
@@ -38,17 +37,12 @@ class BuildChain(Base):
         index=True,
     )
     chain_spec: Mapped[str] = mapped_column(Text, nullable=False)
-    #: Per-stage enqueue settings (arches, skip_complete, distgit, mock, priority).
     chain_options: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     stages_json: Mapped[list[Any]] = mapped_column(JSON, nullable=False)
     active_stage_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    #: Jobs created for the active stage (each needs a successful repo publish before the chain advances).
     stage_expected_jobs: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    #: Slots satisfied by skip_complete (already successful for that package or arch).
     stage_skip_slots: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     stage_publish_done: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    #: When set, the chain waits until this timestamp before advancing to the next stage.
-    #: Allows a settle period after all stage publishes finish so workers see fresh repodata.
     stage_advance_after: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -62,7 +56,6 @@ class BuildChain(Base):
 
 
 class BuildChainPublishReceipt(Base):
-    """Idempotent marker so repo publish retries do not double-count chain stage progress."""
 
     __tablename__ = "build_chain_publish_receipts"
 
