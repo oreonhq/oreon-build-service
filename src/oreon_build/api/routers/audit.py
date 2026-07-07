@@ -1,4 +1,3 @@
-"""Audit logs - admin only."""
 from fastapi import APIRouter, Query
 from sqlalchemy import select
 
