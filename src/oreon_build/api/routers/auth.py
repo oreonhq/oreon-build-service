@@ -1,4 +1,3 @@
-"""Login and token."""
 from fastapi import APIRouter, HTTPException, status
 
 from oreon_build.core.auth import create_access_token
