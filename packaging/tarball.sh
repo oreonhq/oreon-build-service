@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# take the project sdist tarball and build the srpm
 
 set -e
 cd "$(dirname "$0")/.."
@@ -11,7 +10,6 @@ if [[ -z "$VERSION" ]]; then
   exit 1
 fi
 
-# python -m build produces oreon_build_service-*.tar.gz (normalized name from oreon-build-service)
 SDIST_NAME="oreon_build_service-${VERSION}.tar.gz"
 DIST_DIR="${ROOT}/dist"
 RPMBUILD_DIR="${RPMBUILD_DIR:-$HOME/rpmbuild}"
