@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Oreon Build Service - helper script to create a GPG key for RPM/repo signing.
-# Usage (no sudo): ./scripts/gpg.sh "Oreon Build Signing <signing@example.com>"
 
 set -euo pipefail
 

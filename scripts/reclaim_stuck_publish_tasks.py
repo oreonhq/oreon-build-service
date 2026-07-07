@@ -1,12 +1,3 @@
-#!/usr/bin/env python3
-"""One-shot: reset publish_tasks stuck in ``running`` (same logic as the API stale sweep).
-
-Run from repo root with the project venv active (``pip install -e .`` or ``PYTHONPATH=src``).
-
-If Postgres returns "remaining connection slots are reserved for roles with the SUPERUSER attribute",
-the app role cannot open a new session. Set DATABASE_RECLAIM_URL to an async superuser URL for the
-same database so this script can still connect, reclaim stuck rows, and free logical queue blockage.
-"""
 from __future__ import annotations
 
 import asyncio
@@ -45,7 +36,6 @@ def _invalid_password(exc: BaseException) -> bool:
 
 
 def _url_role_key(database_url: str) -> tuple[str, str, int, str | None]:
-    """host, user, port, database for comparing whether two URLs target the same DB role."""
     u = make_url(database_url)
     host = (u.host or "").lower()
     user = (u.username or "").lower()
@@ -67,7 +57,6 @@ def _server_settings(settings: Settings, application_name: str) -> dict[str, str
     return d
 
 
-# Do not hang start.sh on wedged Postgres or long retry loops.
 _RECLAIM_CONNECT_TIMEOUT_S = 8.0
 
 
@@ -129,7 +118,6 @@ async def main() -> int:
     s = get_settings()
     base = (s.database_application_name or "oreon-build-service")[:100]
 
-    # Few short waits (post-stop drain), then fall through to DATABASE_RECLAIM_URL or fail fast.
     if await _try_url(
         s.database_url,
         s,

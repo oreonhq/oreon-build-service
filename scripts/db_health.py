@@ -1,18 +1,3 @@
-#!/usr/bin/env python3
-"""DB health/availability snapshot for Oreon Build Service.
-
-Usage:
-  python scripts/db_health.py
-
-Reads DATABASE_URL from environment (.env if sourced by caller) and prints:
-- connectivity + latency
-- max/current connections and utilization
-- top pg_stat_activity groups by user/app/state
-- blocked queries count
-
-how to run:
-set -a && source .env && set +a && .venv/bin/python scripts/db_health.py
-"""
 from __future__ import annotations
 
 import asyncio
@@ -46,7 +31,6 @@ async def main() -> int:
         )
         utilization = (current / maxc * 100.0) if maxc > 0 else 0.0
 
-        # Reserved slots signal: if this is >0 and app role cannot connect, saturation is near.
         super_reserved = int(await conn.fetchval("show superuser_reserved_connections"))
 
         blocked = int(

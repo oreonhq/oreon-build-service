@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Repodata refresh across active repo prefixes (createrepo_c + upload repodata/ only).
-# Progress is printed per prefix as [done/total] with OK, SKIP, or FAIL.
 
 set -euo pipefail
 
@@ -13,16 +11,13 @@ if [ ! -d ".venv" ]; then
   exit 1
 fi
 
-# Load controller env so DB/R2/signing settings match production.
 if [ -f ".env" ]; then
   set -a
-  # shellcheck disable=SC1091
   source ".env"
   set +a
 fi
 
 export PATH="${HOME}/.local/bin:${PATH}"
-# Default createrepo workers per prefix (inherits publisher auto default when unset).
 CRE_TOOL="${OREON_CREATEREPO_BIN:-createrepo_c}"
 if ! command -v "$CRE_TOOL" &>/dev/null; then
   echo "createrepo_c not found (install e.g. dnf install createrepo_c, or set OREON_CREATEREPO_BIN)"
@@ -36,7 +31,6 @@ if [ ! -x "$PYTHON_BIN" ]; then
 fi
 
 ARCHES_RAW="${MIGRATE_ARCHES:-x86_64,aarch64}"
-# How many prefixes run at once. High values fork many Python processes and can overwhelm the host.
 PARALLEL_RAW="${MIGRATE_PARALLEL:-4}"
 DRY_RUN="${MIGRATE_DRY_RUN:-0}"
 

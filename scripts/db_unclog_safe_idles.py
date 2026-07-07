@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-"""Inspect pg_stat_activity and terminate only safe idle offenders.
-
-Defaults to DATABASE_URL (no extra env required). If DATABASE_ADMIN_URL or
-DATABASE_RECLAIM_URL is provided, the script can clean up across roles too.
-"""
 from __future__ import annotations
 
 import asyncio
@@ -79,9 +73,6 @@ async def main() -> int:
         me_user = await conn.fetchval("select current_user")
         print(f"connected_as={me_user}")
 
-        # Kill only idle sessions old enough to be safe.
-        # Always skip current backend. Without superuser privileges this naturally only
-        # terminates sessions owned by the same DB role.
         killed = await conn.fetch(
             """
             with victims as (
