@@ -26,7 +26,10 @@ from oreon_build.api.deps import DbSession
 from oreon_build.config import get_settings
 from oreon_build.core.machine_arch import sql_arch_match_values
 from oreon_build.core.repo_branch import r2_publish_branch
-from oreon_build.core.build_result import normalize_terminal_build_status
+from oreon_build.core.build_result import (
+    find_architecture_excluded_line,
+    normalize_terminal_build_status,
+)
 from oreon_build.services.worker_token_resolve import resolve_worker_for_token
 from oreon_build.core.audit import log_audit
 from sqlalchemy.orm import selectinload
@@ -1606,7 +1609,11 @@ async def report_result(
         await _burst_vm_stop_check()
         return {"status": "ok", "job_cancelled": True}
 
-    terminal_st = normalize_terminal_build_status(str(payload.status), payload.error_message)
+    err_msg = payload.error_message
+    arch_line = find_architecture_excluded_line(err_msg)
+    if arch_line:
+        err_msg = arch_line
+    terminal_st = normalize_terminal_build_status(str(payload.status), err_msg)
 
     if terminal_st == "failed":
         prior_art_count = await db.scalar(
@@ -1687,8 +1694,8 @@ async def report_result(
         attempt.signing_status = "signed"
     elif st_l in ("failed", "cancelled"):
         attempt.signing_status = "failed"
-    if payload.error_message:
-        attempt.error_message = payload.error_message
+    if err_msg:
+        attempt.error_message = err_msg
     if payload.log_r2_key:
         attempt.log_r2_key = payload.log_r2_key
     job.status = BuildStatus(terminal_st)
@@ -1703,7 +1710,7 @@ async def report_result(
         try:
             from oreon_build.services.build_chain import notify_chain_job_terminal_after_result
 
-            await notify_chain_job_terminal_after_result(job.id, st_l, payload.error_message)
+            await notify_chain_job_terminal_after_result(job.id, st_l, err_msg)
         except Exception:
             logger.exception("chain notify after terminal job result job_id=%s", job.id)
     for a in payload.artifacts:
