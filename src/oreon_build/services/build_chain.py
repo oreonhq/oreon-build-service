@@ -32,6 +32,7 @@ from oreon_build.models import (
     Worker,
 )
 from oreon_build.services.distgit_order import db_safe_spec_evr
+from oreon_build.services.ci_callback import notify_chain_terminal
 from oreon_build.services.build_target_util import (
     get_or_create_build_target,
     latest_package_version_id,
@@ -355,6 +356,7 @@ async def fail_chain(
     )
     for j in jres.scalars().all():
         await _cancel_job_and_running_attempts(db, j, "Chain build stopped: " + (message or terminal.value))
+    notify_chain_terminal(chain.id, terminal.value, chain.error_message)
 
 
 async def on_build_job_failed_for_chain(db: Any, job: BuildJob, reason: str) -> None:
@@ -423,6 +425,7 @@ async def _advance_chain_after_stage_complete(db: Any, chain: BuildChain) -> Non
         chain.stage_skip_slots = 0
         chain.stage_publish_done = 0
         chain.stage_advance_after = None
+        notify_chain_terminal(chain.id, BuildChainStatus.SUCCESS.value, None)
         return
 
     chain.active_stage_index = nxt

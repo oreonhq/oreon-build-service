@@ -244,6 +244,19 @@ class Settings(BaseSettings):
     discord_webhook_url: Optional[str] = Field(default=None)
     security_discord_webhook_url: Optional[str] = Field(default=None)
 
+    ci_callback_url: Optional[str] = Field(
+        default=None,
+        description=(
+            "When set, the build service POSTs {chain_id, status, error_message} to this URL "
+            "whenever a build chain reaches a terminal state (success/failed/cancelled). "
+            "Used by oreon-server to update GitHub check runs without polling. Env CI_CALLBACK_URL."
+        ),
+    )
+    ci_callback_secret: Optional[str] = Field(
+        default=None,
+        description="Shared secret sent as X-CI-Callback-Secret header with each callback POST. Env CI_CALLBACK_SECRET.",
+    )
+
     watchdog_url: str = Field(default="http://localhost:8001", description="Public base URL for Oreon Watchdog")
     cve_scan_interval_minutes: int = Field(
         default=30,

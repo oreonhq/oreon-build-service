@@ -15,6 +15,8 @@ from oreon_build.api.schemas import (
     BuildJobResponse,
     BuildTrigger,
     BuildTriggerAccepted,
+    CIChainTrigger,
+    CIChainTriggerResponse,
     ChainBuildTrigger,
     ChainBuildTriggerResponse,
     ChainResumeRequest,
@@ -190,6 +192,7 @@ async def list_builds(
     db: DbSession,
     release_id: int | None = None,
     package_id: int | None = None,
+    chain_id: int | None = None,
     status: str | None = None,
     search: str | None = Query(None, max_length=200, description="Filter by job id, package name, release name, arch, status"),
     limit: int = Query(25, ge=1, le=1000),
@@ -221,6 +224,9 @@ async def list_builds(
     if package_id is not None:
         q = q.where(BuildJob.package_id == package_id)
         count_q = count_q.where(BuildJob.package_id == package_id)
+    if chain_id is not None:
+        q = q.where(BuildJob.chain_id == chain_id)
+        count_q = count_q.where(BuildJob.chain_id == chain_id)
     if status is not None:
         q = q.where(BuildJob.status == status)
         count_q = count_q.where(BuildJob.status == status)
@@ -385,6 +391,71 @@ async def trigger_chain_build_endpoint(
         jobs=[],
         accepted=True,
         message="Chain accepted. Stage jobs are being queued in the background.",
+    )
+
+
+@router.post("/ci-chain-trigger", response_model=CIChainTriggerResponse, status_code=status.HTTP_201_CREATED)
+async def ci_chain_trigger_endpoint(
+    data: CIChainTrigger,
+    request: Request,
+    db: DbSession,
+    user: CurrentUser,
+):
+    from oreon_build.services.build_chain import trigger_chain_build as run_chain_build
+    from oreon_build.services.build_trigger_bg import run_chain_trigger_enqueue, spawn
+    from oreon_build.services.distgit_order import compute_distgit_build_order_for_chain
+
+    rel_result = await db.execute(select(Release).where(Release.id == data.release_id))
+    release = rel_result.scalar_one_or_none()
+    if not release:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Release not found")
+
+    distgit_url = data.distgit_url or "https://github.com/oreonhq/rpm-specfiles.git"
+
+    order = await compute_distgit_build_order_for_chain(
+        releasename=release.releasename,
+        distgit_url=distgit_url,
+        distgit_branch=data.distgit_branch,
+        root_packages=data.packages,
+    )
+    if order.errors:
+        logger.warning("CI chain dependency resolution errors: %s", order.errors)
+    if not order.layers:
+        chain_spec = " ".join(data.packages)
+    else:
+        chain_spec = " : ".join(" ".join(layer) for layer in order.layers if layer)
+
+    if not chain_spec.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Dependency resolution produced empty chain spec.",
+        )
+
+    chain, _, _ = await run_chain_build(
+        db,
+        request,
+        user,
+        chain_spec=chain_spec,
+        release_id=data.release_id,
+        architectures=data.architectures,
+        preferred_mock_environment_id=None,
+        distgit_url=distgit_url,
+        distgit_branch=data.distgit_branch,
+        priority=data.priority,
+        defer_enqueue=True,
+    )
+    await db.commit()
+    spawn(run_chain_trigger_enqueue(chain.id))
+
+    stages_raw = chain.stages_json if isinstance(chain.stages_json, list) else []
+    stages: list[list[str]] = [[str(n) for n in grp] for grp in stages_raw if isinstance(grp, list)]
+    return CIChainTriggerResponse(
+        chain_id=chain.id,
+        chain_status=chain.status.value,
+        stages=stages,
+        chain_spec=chain.chain_spec,
+        accepted=True,
+        message="CI chain accepted. Dependencies resolved and stage jobs are being queued.",
     )
 
 
