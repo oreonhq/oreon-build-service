@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Build - Oreon Build Service</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" crossorigin="anonymous" referrerpolicy="no-referrer">
+  <link rel="stylesheet" href="/static/style.css?v=4">
+  <style>
+    .build-meta { margin-bottom: 1rem; }
+    .build-meta dl { display: grid; grid-template-columns: auto 1fr; gap: 0.25rem 1rem; }
+    .build-meta dt { color: var(--text-muted); }
+    .attempt-card { margin-bottom: 1rem; border: 1px solid var(--border); border-radius: 6px; padding: 0.75rem; }
+    .attempt-card h4 { margin: 0 0 0.5rem 0; }
+    .log-viewer { background: #1e1e1e; color: #d4d4d4; padding: 1rem; border-radius: 4px; overflow: auto; max-height: 70vh; font-family: ui-monospace, monospace; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
+    .log-placeholder { color: var(--text-muted); font-style: italic; }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <a href="/" class="header-logo-link"><img src="/static/obslogo.png" alt="Oreon Build Service" class="header-logo" /></a>
+    <nav></nav>
+  </header>
+  <main class="main">
+    <section class="card">
+      <h2>Build <span id="job-id">—</span></h2>
+      <div id="build-loading" class="build-meta">Loading</div>
+      <div id="build-meta" class="build-meta" style="display:none;"></div>
+      <div id="build-error" style="display:none; color: var(--danger, #c00);"></div>
+      <h3 style="margin-top:1.5rem;">Attempts</h3>
+      <div id="attempts-list"></div>
+    </section>
+  </main>
+  <script src="/static/app.js?v=13"></script>
+  <script>
+    (function() {
+      const api = window.oreonApi;
+      function getJobId() {
+        var params = new URLSearchParams(window.location.search);
+        return params.get('job_id') || '';
+      }
+      function escapeHtml(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; }
+      function escapeAttr(s) { return escapeHtml(s || '').replace(/"/g, '&quot;'); }
+      function statusClass(s) {
+        if (s === 'success' || s === 'skipped') return 'badge success';
+        if (s === 'failed' || s === 'cancelled') return 'badge failed';
+        if (s === 'running' || s === 'queued') return 'badge running';
+        return 'badge pending';
+      }
+      function formatElapsed(ms) {
+        if (ms == null || ms < 0 || !isFinite(ms)) return '—';
+        var sec = Math.floor(ms / 1000);
+        var h = Math.floor(sec / 3600);
+        var m = Math.floor((sec % 3600) / 60);
+        var s = sec % 60;
+        if (h > 0) return h + 'h ' + m + 'm';
+        if (m > 0) return m + 'm ' + s + 's';
+        return s + 's';
+      }
+      var LOG_POLL_MS = 15000;
+      function stopLogPoll() {
+        if (window.__oreonLogPollTimer) {
+          clearInterval(window.__oreonLogPollTimer);
+          window.__oreonLogPollTimer = null;
+        }
+      }
+      function startLogPoll(attemptId, pre, card) {
+        stopLogPoll();
+        if (!pre || !card) return;
+        var st = (card.getAttribute('data-attempt-status') || '').toLowerCase();
+        if (st !== 'running' && st !== 'queued') return;
+        window.__oreonLogPollTimer = setInterval(function() {
+          var live = (card.getAttribute('data-attempt-status') || '').toLowerCase();
+          if (live !== 'running' && live !== 'queued') {
+            stopLogPoll();
+            return;
+          }
+          if (pre.style.display === 'none') return;
+          fetchAttemptLogTail(attemptId, pre, true);
+        }, LOG_POLL_MS);
+      }
+      function fetchAttemptLogTail(attemptId, pre, silent) {
+        if (!silent) {
+          pre.style.display = 'block';
+          pre.textContent = 'Loading';
+        }
+        return api.get('/logs/attempts/' + attemptId + '/tail?lines=2000').then(function(r) {
+          var lines = (r && r.lines) ? r.lines : [];
+          var atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 80;
+          pre.textContent = lines.join('\n') || '(empty log)';
+          pre.dataset.loaded = '1';
+          if (silent && atBottom) pre.scrollTop = pre.scrollHeight;
+        }).catch(function(e) {
+          if (!silent) {
+            pre.textContent = 'Log not available: ' + (e.message || 'Log not yet uploaded or build did not produce a log.');
+            pre.dataset.loaded = '1';
+          }
+        });
+      }
+      function refreshAttemptElapsed(container) {
+        if (!container) return;
+        var now = Date.now();
+        container.querySelectorAll('.attempt-card').forEach(function(card) {
+          var st = card.getAttribute('data-attempt-status') || '';
+          var started = card.getAttribute('data-started-at') || '';
+          var el = card.querySelector('.attempt-elapsed-live');
+          if (!el) return;
+          if (st !== 'running' && st !== 'queued') {
+            el.textContent = '';
+            el.style.display = 'none';
+            return;
+          }
+          var t0 = Date.parse(started);
+          if (isNaN(t0)) {
+            el.textContent = '';
+            return;
+          }
+          el.style.display = '';
+          el.innerHTML = '<small>Elapsed (wall clock): ' + escapeHtml(formatElapsed(now - t0)) + '</small>';
+        });
+      }
+      function loadBuild() {
+        var jobId = getJobId();
+        if (!jobId) {
+          document.getElementById('build-loading').style.display = 'none';
+          document.getElementById('build-error').style.display = 'block';
+          document.getElementById('build-error').textContent = 'Missing job_id in URL.';
+          return;
+        }
+        document.getElementById('job-id').textContent = '#' + jobId;
+        Promise.all([
+          api.get('/builds/jobs/' + jobId),
+          api.get('/packages?limit=500').catch(function() { return { items: [] }; }),
+          api.get('/releases?limit=500').catch(function() { return { items: [] }; })
+        ]).then(function(results) {
+          var job = results[0];
+          var packages = (results[1] && results[1].items) ? results[1].items : [];
+          var releases = (results[2] && results[2].items) ? results[2].items : [];
+          document.getElementById('build-loading').style.display = 'none';
+          document.getElementById('build-meta').style.display = 'block';
+          var pkg = packages.find(function(p) { return p.id === job.package_id; });
+          var rel = releases.find(function(r) { return r.id === job.release_id; });
+          var pkgName = (job.package_name || '').trim() || ((pkg && pkg.name) ? String(pkg.name).trim() : '');
+          var relName = (job.release_name || '').trim() || ((rel && rel.releasename) ? String(rel.releasename).trim() : '');
+          var pkgLabel = pkgName ? escapeHtml(pkgName) + ' (' + job.package_id + ')' : ('#' + (job.package_id || '—'));
+          var relLabel = relName ? escapeHtml(relName) + ' (' + job.release_id + ')' : ('#' + (job.release_id || '—'));
+          var jobDisp = window.oreonJobDisplayStatus ? window.oreonJobDisplayStatus(job) : String(job.status || '');
+          var meta = document.getElementById('build-meta');
+          var signingRow = window.oreonSigningKeyHtml
+            ? '<dt>Signing</dt><dd>' + window.oreonSigningKeyHtml(job.signing_status) + '</dd>'
+            : '';
+          meta.innerHTML = '<dl><dt>Package</dt><dd>' + pkgLabel + '</dd>' +
+            '<dt>Release</dt><dd>' + relLabel + '</dd>' +
+            '<dt>Architecture</dt><dd>' + escapeHtml(job.architecture || '—') + '</dd>' +
+            '<dt>Status</dt><dd><span class="' + statusClass(jobDisp) + '">' + escapeHtml(jobDisp) + '</span></dd>' +
+            signingRow +
+            '<dt>Created</dt><dd>' + (job.created_at || '').slice(0, 19) + '</dd>' +
+            '<dt>Completed</dt><dd>' + (job.completed_at ? job.completed_at.slice(0, 19) : '—') + '</dd></dl>';
+          return api.get('/builds/jobs/' + jobId + '/attempts');
+        }).then(function(attempts) {
+          var list = Array.isArray(attempts) ? attempts : [];
+          var container = document.getElementById('attempts-list');
+          if (!list.length) {
+            container.innerHTML = '<p class="log-placeholder">No attempts yet.</p>';
+            return;
+          }
+          container.innerHTML = list.map(function(a, idx) {
+            var logId = 'log-' + a.id;
+            var st = (a.status || '').toLowerCase();
+            var adisp = window.oreonJobDisplayStatus
+              ? window.oreonJobDisplayStatus({ display_status: a.display_status, status: a.status })
+              : st;
+            var signingLine = window.oreonSigningKeyHtml
+              ? '<div style="margin-top:0.35rem">' + window.oreonSigningKeyHtml(a.signing_status) + '</div>'
+              : '';
+            var workerLine = '';
+            if (a.worker_name || a.worker_id) {
+              var who = a.worker_name ? escapeHtml(a.worker_name) : ('#' + a.worker_id);
+              var hb = a.worker_last_heartbeat ? a.worker_last_heartbeat.slice(0, 19) : '—';
+              workerLine = '<div><small>Worker: ' + who + ' &nbsp; Last heartbeat (UTC): ' + hb + '</small></div>';
+            }
+            return '<div class="attempt-card" data-attempt-id="' + a.id + '" data-attempt-status="' + escapeAttr(st) + '" data-started-at="' + escapeAttr(a.started_at || '') + '">' +
+              '<h4>Attempt #' + (a.attempt_number || (idx + 1)) + ' <span class="' + statusClass(adisp) + '">' + escapeHtml(adisp) + '</span></h4>' +
+              signingLine +
+              workerLine +
+              '<div class="attempt-elapsed-live" style="color:var(--text-muted);"></div>' +
+              '<div><small>Started: ' + (a.started_at ? a.started_at.slice(0, 19) : '—') + ' &nbsp; Finished: ' + (a.finished_at ? a.finished_at.slice(0, 19) : '—') + '</small></div>' +
+              '<div class="artifacts" id="artifacts-' + a.id + '" style="margin-top:0.5rem; font-size:0.9rem; color:var(--text-muted);">Artifacts: loading</div>' +
+              '<div style="margin-top:0.5rem;display:flex;gap:0.35rem;flex-wrap:wrap;align-items:center;">' +
+              '<button type="button" class="btn load-log" data-attempt-id="' + a.id + '">View log</button>' +
+              '<button type="button" class="btn refresh-log" data-attempt-id="' + a.id + '">Refresh log</button></div>' +
+              '<pre id="' + logId + '" class="log-viewer" style="display:none; margin-top:0.5rem;"></pre>' +
+              '</div>';
+          }).join('');
+          refreshAttemptElapsed(container);
+          if (window.__oreonBuildElapsedTimer) clearInterval(window.__oreonBuildElapsedTimer);
+          window.__oreonBuildElapsedTimer = setInterval(function() { refreshAttemptElapsed(container); }, 30000);
+          container.querySelectorAll('.load-log').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+              var attemptId = btn.dataset.attemptId;
+              var pre = document.getElementById('log-' + attemptId);
+              var card = btn.closest('.attempt-card');
+              if (!pre) return;
+              if (pre.dataset.loaded === '1') {
+                var showing = pre.style.display === 'none';
+                pre.style.display = showing ? 'block' : 'none';
+                if (showing) startLogPoll(attemptId, pre, card);
+                else stopLogPoll();
+                return;
+              }
+              oreonWithLoading(btn, function() {
+                return fetchAttemptLogTail(attemptId, pre, false).then(function() {
+                  startLogPoll(attemptId, pre, card);
+                });
+              });
+            });
+          });
+          container.querySelectorAll('.refresh-log').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+              var attemptId = btn.dataset.attemptId;
+              var pre = document.getElementById('log-' + attemptId);
+              var card = btn.closest('.attempt-card');
+              if (!pre) return;
+              oreonWithLoading(btn, function() {
+                return fetchAttemptLogTail(attemptId, pre, false).then(function() {
+                  startLogPoll(attemptId, pre, card);
+                });
+              });
+            });
+          });
+          // Load artifacts (including signing status) for each attempt
+          list.forEach(function(a) {
+            var placeholder = document.getElementById('artifacts-' + a.id);
+            if (!placeholder) return;
+            api.get('/builds/attempts/' + a.id + '/artifacts').then(function(arts) {
+              var arr = Array.isArray(arts) ? arts : [];
+              if (!arr.length) {
+                placeholder.textContent = 'Artifacts: none';
+                return;
+              }
+              var rows = arr.map(function(ar) {
+                var signed = ar.is_signed ? 'Yes' : 'No';
+                return '<tr><td>' + escapeHtml(ar.filename || '') + '</td><td>' + signed + '</td></tr>';
+              }).join('');
+              placeholder.innerHTML = '<table class="table-compact"><thead><tr><th>Name</th><th>Signed</th></tr></thead><tbody>' + rows + '</tbody></table>';
+              placeholder.style.color = '';
+            }).catch(function() {
+              placeholder.textContent = 'Artifacts: failed to load';
+            });
+          });
+        }).catch(function(e) {
+          document.getElementById('build-loading').style.display = 'none';
+          document.getElementById('build-error').style.display = 'block';
+          document.getElementById('build-error').textContent = 'Failed to load build: ' + (e.message || e);
+        });
+      }
+      loadBuild();
+    })();
+  </script>
+</body>
+</html>

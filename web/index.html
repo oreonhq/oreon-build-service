@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Oreon Build Service</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" crossorigin="anonymous" referrerpolicy="no-referrer">
+  <link rel="stylesheet" href="/static/style.css?v=4">
+</head>
+<body>
+  <header class="header">
+    <a href="/" class="header-logo-link"><img src="/static/obslogo.png" alt="Oreon Build Service" class="header-logo" /></a>
+    <nav></nav>
+  </header>
+  <main class="main">
+    <section class="card">
+      <h2>Dashboard</h2>
+      <p id="dashboard-hint">Oreon build system. View-only for guests; login to trigger builds, create releases/packages, enroll workers, and manage mock environments.</p>
+      <div class="stats">
+        <div class="stat"><span id="stat-builds">-</span> Builds</div>
+        <div class="stat"><span id="stat-packages">-</span> Packages</div>
+        <div class="stat"><span id="stat-releases">-</span> Releases</div>
+        <div class="stat"><span id="stat-workers">-</span> Workers</div>
+      </div>
+    </section>
+    <section class="card" id="dashboard-builds-card">
+      <h2>Recent builds</h2>
+      <p style="color:var(--text-muted); font-size:0.9rem; margin-top:0.25rem;">Latest jobs across all releases and packages.</p>
+      <div id="dashboard-builds"></div>
+    </section>
+    <section class="card" id="dashboard-releases-card">
+      <h2>Releases & workers</h2>
+      <p style="color:var(--text-muted); font-size:0.9rem; margin-top:0.25rem;">Active releases with enrolled workers by architecture.</p>
+      <div id="dashboard-releases"></div>
+    </section>
+  </main>
+  <footer class="footer">Oreon Build Service</footer>
+  <script src="/static/app.js?v=13"></script>
+  <script>
+    (function() {
+      const api = window.oreonApi || {};
+      function updateHint() {
+        var el = document.getElementById('dashboard-hint');
+        if (el && api.token) el.textContent = 'Oreon build system. You can trigger builds, create releases/packages, enroll workers, and manage mock environments from the pages above.';
+        else if (el) el.textContent = 'Oreon build system. View-only for guests; login to trigger builds, create releases/packages, enroll workers, and manage mock environments.';
+      }
+      updateHint();
+      window.addEventListener('auth-change', updateHint);
+      function count(data) {
+        if (Array.isArray(data)) return data.length;
+        if (data && Array.isArray(data.items)) return data.items.length;
+        return 0;
+      }
+      async function loadStats() {
+        try {
+          const [buildsResp, packagesResp, releasesResp, workersResp] = await Promise.all([
+            api.get('/builds?limit=20'),
+            api.get('/packages?limit=500'),
+            api.get('/releases?limit=500'),
+            api.get('/workers?limit=500')
+          ]);
+          const builds = (buildsResp && buildsResp.items) ? buildsResp.items : [];
+          const packages = (packagesResp && packagesResp.items) ? packagesResp.items : [];
+          const releases = (releasesResp && releasesResp.items) ? releasesResp.items : [];
+          const workers = (workersResp && workersResp.items) ? workersResp.items : [];
+          document.getElementById('stat-builds').textContent = (buildsResp && typeof buildsResp.total === 'number') ? buildsResp.total : builds.length;
+          document.getElementById('stat-packages').textContent = (packagesResp && typeof packagesResp.total === 'number') ? packagesResp.total : packages.length;
+          document.getElementById('stat-releases').textContent = (releasesResp && typeof releasesResp.total === 'number') ? releasesResp.total : releases.length;
+          document.getElementById('stat-workers').textContent = (workersResp && typeof workersResp.total === 'number') ? workersResp.total : workers.length;
+
+          // Recent builds table
+          var buildsHost = document.getElementById('dashboard-builds');
+          function statusBadge(s) {
+            if (s === 'success' || s === 'skipped') return '<span class="badge success">' + s + '</span>';
+            if (s === 'failed' || s === 'cancelled') return '<span class="badge failed">' + s + '</span>';
+            if (s === 'running' || s === 'queued') return '<span class="badge running">' + s + '</span>';
+            return '<span class="badge pending">' + (s || 'pending') + '</span>';
+          }
+          function jobDisplayStatus(b) {
+            return window.oreonJobDisplayStatus ? window.oreonJobDisplayStatus(b) : String(b.status || '');
+          }
+          if (buildsHost) {
+            if (!builds.length) {
+              buildsHost.innerHTML = '<p style="color:var(--text-muted); font-size:0.9rem;">No builds yet.</p>';
+            } else {
+              var rows = builds.slice(0, 10).map(function(b) {
+                var pkg = packages.find(function(p) { return p.id === b.package_id; });
+                var rel = releases.find(function(r) { return r.id === b.release_id; });
+                var pkgName = (b.package_name || '').trim() || (pkg && (pkg.name || '').trim()) || '';
+                var relName = (b.release_name || '').trim() || (rel && (rel.releasename || '').trim()) || '';
+                var pkgLabel = pkgName ? (pkgName + ' (' + b.package_id + ')') : ('#' + b.package_id);
+                var relLabel = relName ? (relName + ' (' + b.release_id + ')') : ('#' + b.release_id);
+                var arch = b.architecture || '—';
+                var created = (b.created_at || '').slice(0, 19);
+                var sd = jobDisplayStatus(b);
+                var signCell = window.oreonSigningKeyHtml ? window.oreonSigningKeyHtml(b.signing_status) : '—';
+                return '<tr>'
+                  + '<td><a href="/build.html?job_id=' + b.id + '">#' + b.id + '</a></td>'
+                  + '<td>' + pkgLabel + '</td>'
+                  + '<td>' + relLabel + '</td>'
+                  + '<td>' + arch + '</td>'
+                  + '<td>' + statusBadge(sd) + '</td>'
+                  + '<td>' + signCell + '</td>'
+                  + '<td>' + created + '</td>'
+                  + '</tr>';
+              }).join('');
+              buildsHost.innerHTML = '<table class="table-compact"><thead><tr>'
+                + '<th>ID</th><th>Package</th><th>Release</th><th>Arch</th><th>Status</th><th>Signing</th><th>Created</th>'
+                + '</tr></thead><tbody>' + rows + '</tbody></table>';
+            }
+          }
+
+          // Releases + worker summary
+          var relHost = document.getElementById('dashboard-releases');
+          if (relHost) {
+            if (!releases.length) {
+              relHost.innerHTML = '<p style="color:var(--text-muted); font-size:0.9rem;">No releases defined.</p>';
+            } else {
+              var byRelease = {};
+              workers.forEach(function(w) {
+                if ((w.state || '') === 'offline') return;
+                var arch = (w.architecture || 'x86_64');
+                // Workers are global; just count by architecture
+                byRelease['_all'] = byRelease['_all'] || {};
+                byRelease['_all'][arch] = (byRelease['_all'][arch] || 0) + 1;
+              });
+              var rows = releases.map(function(r) {
+                var arches = (r.architectures || '').split(',').map(function(a) { return a.trim(); }).filter(Boolean);
+                var workerSummary = '';
+                var archCounts = byRelease['_all'] || {};
+                if (arches.length) {
+                  workerSummary = arches.map(function(a) {
+                    var cnt = archCounts[a] || 0;
+                    return a + ': ' + cnt;
+                  }).join(', ');
+                } else {
+                  var parts = Object.keys(archCounts).map(function(a) { return a + ': ' + archCounts[a]; });
+                  workerSummary = parts.join(', ') || '—';
+                }
+                return '<tr>'
+                  + '<td>' + r.id + '</td>'
+                  + '<td>' + (r.releasename || '') + '</td>'
+                  + '<td>' + (r.default_channel || 'dev') + '</td>'
+                  + '<td>' + (r.architectures || '') + '</td>'
+                  + '<td>' + (r.is_active ? 'Yes' : 'No') + '</td>'
+                  + '<td>' + workerSummary + '</td>'
+                  + '</tr>';
+              }).join('');
+              relHost.innerHTML = '<table class="table-compact"><thead><tr>'
+                + '<th>ID</th><th>Release</th><th>Default channel</th><th>Architectures</th><th>Active</th><th>Workers / arch</th>'
+                + '</tr></thead><tbody>' + rows + '</tbody></table>';
+            }
+          }
+        } catch (e) {
+          var el = document.getElementById('stat-builds');
+          if (el) el.textContent = '?';
+        }
+      }
+      loadStats();
+    })();
+  </script>
+</body>
+</html>

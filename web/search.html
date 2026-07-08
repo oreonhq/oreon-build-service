@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Search - Oreon Build Service</title>
+  <link rel="stylesheet" href="/static/style.css?v=5">
+</head>
+<body>
+  <header class="header">
+    <a href="/" class="header-logo-link"><img src="/static/obslogo.png" alt="Oreon Build Service" class="header-logo" /></a>
+    <nav></nav>
+  </header>
+  <main class="main">
+    <section class="card">
+      <h2>Search</h2>
+      <form class="form-group navbar-search-page" action="/search.html" method="get" style="margin-bottom:1rem;">
+        <input type="search" name="q" id="search-query" placeholder="Packages, builds, releases" autocomplete="off">
+        <button type="submit" class="btn primary">Search</button>
+      </form>
+      <div id="search-results"></div>
+    </section>
+  </main>
+  <script src="/static/app.js?v=14"></script>
+  <script>
+    (function() {
+      var api = window.oreonApi;
+      function escapeHtml(s) {
+        var d = document.createElement('div');
+        d.textContent = s == null ? '' : s;
+        return d.innerHTML;
+      }
+      function escapeAttr(s) {
+        return escapeHtml(s).replace(/"/g, '&quot;');
+      }
+      function syncNavSearch(q) {
+        var nav = document.getElementById('nav-search-q');
+        if (nav) nav.value = q;
+      }
+      function renderResults(data, q) {
+        var html = '';
+        if (data.packages && data.packages.length) {
+          html += '<h3>Packages</h3><ul>';
+          data.packages.forEach(function(p) {
+            var href = '/packages.html?search=' + encodeURIComponent(p.name || String(p.id));
+            html += '<li><a href="' + href + '">' + escapeHtml(p.name || '') + '</a> (ID ' + p.id + ')</li>';
+          });
+          html += '</ul>';
+        }
+        if (data.builds && data.builds.length) {
+          html += '<h3>Builds</h3><ul>';
+          data.builds.forEach(function(b) {
+            var label = 'Build #' + b.id;
+            if (b.package_name) label += ' — ' + b.package_name;
+            if (b.release_name) label += ' @ ' + b.release_name;
+            if (b.architecture) label += ' (' + b.architecture + ')';
+            if (b.status) label += ' [' + b.status + ']';
+            html += '<li><a href="/build.html?job_id=' + encodeURIComponent(b.id) + '">' + escapeHtml(label) + '</a></li>';
+          });
+          html += '</ul>';
+          html += '<p><a href="/builds.html?search=' + encodeURIComponent(q) + '">View all matching builds</a></p>';
+        }
+        if (data.releases && data.releases.length) {
+          html += '<h3>Releases</h3><ul>';
+          data.releases.forEach(function(r) {
+            html += '<li><a href="/releases.html">' + escapeHtml(r.name || '') + '</a> (ID ' + r.id + ')</li>';
+          });
+          html += '</ul>';
+        }
+        if (!html) html = '<p style="color:var(--text-muted);">No results for &ldquo;' + escapeHtml(q) + '&rdquo;.</p>';
+        document.getElementById('search-results').innerHTML = html;
+      }
+      function runSearch(q) {
+        var box = document.getElementById('search-query');
+        if (box) box.value = q;
+        syncNavSearch(q);
+        var out = document.getElementById('search-results');
+        if (!q) {
+          out.innerHTML = '<p style="color:var(--text-muted);">Enter a query and press Search, or use the search box in the navbar.</p>';
+          return;
+        }
+        out.innerHTML = '<p style="color:var(--text-muted);">Searching…</p>';
+        api.get('/search?q=' + encodeURIComponent(q) + '&limit=25').then(function(data) {
+          renderResults(data || {}, q);
+        }).catch(function(e) {
+          out.innerHTML = '<p style="color:var(--danger,#c00);">Search failed: ' + escapeHtml(window.oreonErrorMessage ? window.oreonErrorMessage(e) : (e.message || e)) + '</p>';
+        });
+      }
+      document.addEventListener('DOMContentLoaded', function() {
+        var params = new URLSearchParams(window.location.search);
+        var q = (params.get('q') || '').trim();
+        runSearch(q);
+        var form = document.querySelector('.navbar-search-page');
+        if (form) {
+          form.addEventListener('submit', function() {
+            syncNavSearch((document.getElementById('search-query') || {}).value || '');
+          });
+        }
+      });
+    })();
+  </script>
+</body>
+</html>

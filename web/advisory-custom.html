@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Security advisory - Oreon Watchdog</title>
+  <link rel="stylesheet" href="/static/style.css?v=5">
+</head>
+<body>
+  <header class="header" data-oreon-nav-skip="1">
+    <a href="/" class="header-logo-link"><img src="/static/owdlogo.png" alt="Oreon Watchdog" class="header-logo" style="height:32px; max-height:32px;"></a>
+    <nav></nav>
+  </header>
+
+  <main class="main">
+    <section class="card">
+      <div style="display:flex; gap:0.75rem; align-items:center; flex-wrap:wrap;">
+        <h2 id="advisory-heading" style="margin:0;">Loading...</h2>
+        <span id="advisory-status-badge" class="badge pending" style="display:none;"></span>
+      </div>
+      <div id="advisory-subtitle" style="margin-top:0.5rem; color:var(--text-muted); font-size:0.95rem;"></div>
+      <div id="advisory-content" style="margin-top:1rem;"></div>
+      <div id="advisory-edit-wrap" style="display:none; margin-top:1rem;"></div>
+      <div id="advisory-actions" style="margin-top:1rem; display:flex; gap:0.75rem; flex-wrap:wrap;"></div>
+    </section>
+  </main>
+
+  <script src="/static/app.js?v=13"></script>
+  <script src="/static/watchdog-release-checkboxes.js?v=1"></script>
+  <script>
+    (function() {
+      const api = window.oreonApi;
+      const headingEl = document.getElementById('advisory-heading');
+      const subtitleEl = document.getElementById('advisory-subtitle');
+      const statusBadge = document.getElementById('advisory-status-badge');
+      const contentEl = document.getElementById('advisory-content');
+      const editWrap = document.getElementById('advisory-edit-wrap');
+      const actionsEl = document.getElementById('advisory-actions');
+
+      var currentAd = null;
+      var allReleases = [];
+      var editing = false;
+
+      function esc(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; }
+      function decodeJwt(token) {
+        try {
+          var payload = token.split('.')[1];
+          payload = payload.replace(/-/g, '+').replace(/_/g, '/');
+          while (payload.length % 4) payload += '=';
+          return JSON.parse(atob(payload));
+        } catch (e) { return null; }
+      }
+      function canManageAdvisories() {
+        if (!api.token) return false;
+        var p = decodeJwt(api.token);
+        return !!(p && (p.role === 'admin' || p.role === 'maintainer'));
+      }
+
+      function advisoryIdFromPath() {
+        var parts = window.location.pathname.split('/');
+        return parseInt(parts[parts.length - 1], 10);
+      }
+
+      function setHeading(ad) {
+        var orsa = ad.errata_id || ('ORSA-' + ad.id);
+        headingEl.textContent = orsa;
+        document.title = orsa + ' - Oreon Watchdog';
+        subtitleEl.textContent = ad.title || '';
+      }
+
+      function renderView(ad) {
+        contentEl.style.display = 'block';
+        editWrap.style.display = 'none';
+        editing = false;
+
+        var handled = !!ad.is_handled;
+        statusBadge.style.display = 'inline-block';
+        statusBadge.className = 'badge ' + (handled ? 'success' : 'pending');
+        statusBadge.textContent = handled ? 'Resolved' : 'Unresolved';
+
+        var releases = (ad.affected_releases || []).map(function(r) {
+          return r.releasename || ('#' + r.release_id);
+        }).join(', ');
+        var upstream = ad.upstream_url
+          ? '<a href="' + esc(ad.upstream_url) + '" target="_blank" rel="noreferrer">Upstream</a>'
+          : '-';
+
+        contentEl.innerHTML =
+          '<div class="form-group" style="margin-bottom:0.75rem;">' +
+            '<div><b>Severity</b>: ' + esc(ad.severity || '-') + '</div>' +
+            '<div><b>CVE (optional)</b>: ' + esc(ad.cve_id || '-') + '</div>' +
+          '</div>' +
+          '<div><b>Summary</b><div style="color:var(--text-muted); white-space:pre-wrap; margin-top:0.25rem;">' +
+            esc(ad.summary || '-') + '</div></div>' +
+          '<div style="margin-top:0.75rem;"><b>Upstream</b>: ' + upstream + '</div>' +
+          '<div style="margin-top:0.75rem;"><b>Recommended fix</b><div style="color:var(--text-muted); white-space:pre-wrap; margin-top:0.25rem;">' +
+            esc(ad.recommended_fix || '-') + '</div></div>' +
+          '<div style="margin-top:0.75rem;"><b>Affected releases</b>: ' + esc(releases || '-') + '</div>';
+
+        renderActions(ad);
+      }
+
+      function renderEditForm(ad) {
+        contentEl.style.display = 'none';
+        editWrap.style.display = 'block';
+        editing = true;
+
+        var selectedIds = (ad.affected_releases || []).map(function(r) {
+          return r.release_id;
+        });
+
+        editWrap.innerHTML =
+          '<h3 style="margin:0 0 0.75rem;">Edit advisory</h3>' +
+          '<div class="form-group"><label>Title</label>' +
+          '<input type="text" id="edit-title" class="form-control" value="' + esc(ad.title || '') + '"></div>' +
+          '<div class="form-group"><label>CVE ID (optional)</label>' +
+          '<input type="text" id="edit-cve-id" class="form-control" value="' + esc(ad.cve_id || '') + '"></div>' +
+          '<div class="form-group"><label>Affected releases</label>' +
+          '<div class="advisory-release-hint">Tick every release this advisory applies to.</div>' +
+          '<div id="edit-releases" class="advisory-release-picks" role="group" aria-label="Affected releases"></div>' +
+          '<div class="form-group"><label>Severity (optional)</label>' +
+          '<input type="text" id="edit-severity" class="form-control" value="' + esc(ad.severity || '') + '"></div>' +
+          '<div class="form-group"><label>Upstream URL (optional)</label>' +
+          '<input type="text" id="edit-upstream-url" class="form-control" value="' + esc(ad.upstream_url || '') + '"></div>' +
+          '<div class="form-group"><label>Summary (optional)</label>' +
+          '<textarea id="edit-summary" class="form-control" rows="3">' + esc(ad.summary || '') + '</textarea></div>' +
+          '<div class="form-group"><label>Recommended fix steps</label>' +
+          '<textarea id="edit-recommended-fix" class="form-control" rows="3">' + esc(ad.recommended_fix || '') + '</textarea></div>' +
+          '<div id="edit-status" style="color:var(--text-muted); font-size:0.9rem; margin-top:0.5rem;"></div>';
+
+        window.oreonReleaseCheckboxes.render(
+          document.getElementById('edit-releases'),
+          allReleases,
+          selectedIds
+        );
+        renderActions(ad);
+      }
+
+      function renderActions(ad) {
+        actionsEl.innerHTML = '';
+        if (!canManageAdvisories()) return;
+
+        if (editing) {
+          var saveBtn = document.createElement('button');
+          saveBtn.type = 'button';
+          saveBtn.className = 'btn primary';
+          saveBtn.textContent = 'Save changes';
+          saveBtn.addEventListener('click', saveEdit);
+          var cancelBtn = document.createElement('button');
+          cancelBtn.type = 'button';
+          cancelBtn.className = 'btn';
+          cancelBtn.textContent = 'Cancel';
+          cancelBtn.addEventListener('click', function() {
+            renderView(currentAd);
+          });
+          actionsEl.appendChild(saveBtn);
+          actionsEl.appendChild(cancelBtn);
+          return;
+        }
+
+        var editBtn = document.createElement('button');
+        editBtn.type = 'button';
+        editBtn.className = 'btn';
+        editBtn.textContent = 'Edit';
+        editBtn.addEventListener('click', function() {
+          renderEditForm(currentAd);
+        });
+        actionsEl.appendChild(editBtn);
+
+        if (!ad.is_handled) {
+          var resolveBtn = document.createElement('button');
+          resolveBtn.type = 'button';
+          resolveBtn.className = 'btn primary';
+          resolveBtn.textContent = 'Resolve';
+          resolveBtn.addEventListener('click', function() {
+            actionsEl.innerHTML = '<span style="color:var(--text-muted);">Resolving...</span>';
+            api.post('/security/advisories/custom/' + ad.id + '/resolve', {}).then(function() {
+              load();
+            }).catch(function(e) {
+              actionsEl.innerHTML = '<span style="color:var(--text-muted);">Resolve failed: ' + esc(e.message || e) + '</span>';
+            });
+          });
+          actionsEl.appendChild(resolveBtn);
+        }
+      }
+
+      function saveEdit() {
+        var statusEl = document.getElementById('edit-status');
+        var title = (document.getElementById('edit-title').value || '').trim();
+        var cveId = (document.getElementById('edit-cve-id').value || '').trim();
+        var severity = (document.getElementById('edit-severity').value || '').trim();
+        var upstreamUrl = (document.getElementById('edit-upstream-url').value || '').trim();
+        var summary = (document.getElementById('edit-summary').value || '').trim();
+        var recommendedFix = (document.getElementById('edit-recommended-fix').value || '').trim();
+        var releaseIds = window.oreonReleaseCheckboxes.getSelectedIds(document.getElementById('edit-releases'));
+
+        if (!title) { alert('Title is required.'); return; }
+        if (!recommendedFix) { alert('Recommended fix steps are required.'); return; }
+        if (!releaseIds.length) { alert('Tick at least one affected release.'); return; }
+
+        if (statusEl) statusEl.textContent = 'Saving...';
+        api.patch('/security/advisories/custom/' + currentAd.id, {
+          title: title,
+          cve_id: cveId || null,
+          severity: severity || null,
+          upstream_url: upstreamUrl || null,
+          summary: summary || null,
+          recommended_fix: recommendedFix,
+          affected_release_ids: releaseIds
+        }).then(function(updated) {
+          currentAd = updated;
+          setHeading(updated);
+          renderView(updated);
+        }).catch(function(e) {
+          if (statusEl) statusEl.textContent = 'Save failed: ' + (e.message || e);
+        });
+      }
+
+      function loadReleases() {
+        return api.get('/security/releases').then(function(res) {
+          allReleases = window.oreonReleaseCheckboxes.dedupeReleases((res && res.items) ? res.items : []);
+        }).catch(function() {
+          allReleases = [];
+        });
+      }
+
+      async function load() {
+        var id = advisoryIdFromPath();
+        if (!id) return;
+        headingEl.textContent = 'Loading...';
+        subtitleEl.textContent = '';
+
+        try {
+          await loadReleases();
+          var ad = await api.get('/security/advisories/custom/' + id);
+          currentAd = ad;
+          setHeading(ad);
+          renderView(ad);
+        } catch (e) {
+          headingEl.textContent = 'Failed to load';
+          subtitleEl.textContent = e.message || String(e);
+          contentEl.innerHTML = '';
+          actionsEl.innerHTML = '';
+        }
+      }
+
+      window.addEventListener('auth-change', load);
+      load();
+    })();
+  </script>
+</body>
+</html>

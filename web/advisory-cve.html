@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CVE Advisory - Oreon Watchdog</title>
+  <link rel="stylesheet" href="/static/style.css?v=4">
+</head>
+<body>
+  <header class="header" data-oreon-nav-skip="1">
+    <a href="/" class="header-logo-link"><img src="/static/owdlogo.png" alt="Oreon Watchdog" class="header-logo" style="height:32px; max-height:32px;"></a>
+    <nav></nav>
+  </header>
+
+  <main class="main">
+    <section class="card">
+      <div style="display:flex; gap:0.75rem; align-items:center; flex-wrap:wrap;">
+        <h2 id="advisory-heading" style="margin:0;">Loading...</h2>
+        <span id="advisory-status-badge" class="badge pending" style="display:none;"></span>
+      </div>
+      <div id="advisory-title" style="margin-top:0.5rem; color:var(--text-muted); font-size:0.95rem;"></div>
+      <div id="advisory-content" style="margin-top:1rem;"></div>
+      <div id="advisory-actions" style="margin-top:1rem; display:flex; gap:0.75rem; flex-wrap:wrap;"></div>
+    </section>
+  </main>
+
+  <script src="/static/app.js?v=13"></script>
+  <script>
+    (function() {
+      const api = window.oreonApi;
+      const headingEl = document.getElementById('advisory-heading');
+      const statusBadge = document.getElementById('advisory-status-badge');
+      const contentEl = document.getElementById('advisory-content');
+      const titleEl = document.getElementById('advisory-title');
+      const actionsEl = document.getElementById('advisory-actions');
+
+      function esc(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; }
+      function decodeJwt(token) {
+        try {
+          var payload = token.split('.')[1];
+          payload = payload.replace(/-/g, '+').replace(/_/g, '/');
+          while (payload.length % 4) payload += '=';
+          var json = atob(payload);
+          return JSON.parse(json);
+        } catch (e) { return null; }
+      }
+      function canManageAdvisories() {
+        if (!api.token) return false;
+        var p = decodeJwt(api.token);
+        return !!(p && (p.role === 'admin' || p.role === 'maintainer'));
+      }
+      function isAuthed() {
+        return !!(api.token && api.token.length > 0);
+      }
+
+      var RESOLVE_REASONS = [
+        { value: '', label: 'Reason (optional)' },
+        { value: 'backport', label: 'Backport / distro patch' },
+        { value: 'upstream_bump', label: 'Upstream version bump' },
+        { value: 'false_positive', label: 'False positive' },
+        { value: 'mitigated', label: 'Mitigated elsewhere' },
+        { value: 'accepted_risk', label: 'Accepted risk' },
+        { value: 'other', label: 'Other' }
+      ];
+
+      function renderDetail(ad) {
+        actionsEl.innerHTML = '';
+        contentEl.innerHTML = '';
+        var orsa = ad.errata_id || ('ORSA-' + ad.id);
+        headingEl.textContent = orsa;
+        document.title = orsa + ' - Oreon Watchdog';
+        titleEl.textContent = ad.cve_id ? ('CVE: ' + ad.cve_id) : (ad.bulletin_title || '');
+
+        var handled = !!ad.is_handled;
+        statusBadge.style.display = 'inline-block';
+        statusBadge.className = 'badge ' + (handled ? 'success' : 'pending');
+        statusBadge.textContent = handled ? 'Resolved' : 'Unresolved';
+
+        var releases = (ad.affected_releases || []).map(function(r) {
+          return r.releasename || ('#' + r.release_id);
+        }).join(', ');
+
+        var upstream = ad.upstream_url ? '<a href="' + esc(ad.upstream_url) + '" target="_blank" rel="noreferrer">Upstream</a>' : '-';
+        var fix = esc(ad.recommended_fix || '-');
+        var summary = ad.summary ? esc(ad.summary) : '-';
+        var osvFixed = ad.osv_fixed_version ? esc(ad.osv_fixed_version) : '—';
+        var shipped = esc(ad.package_version || '-');
+        var resolutionBlock = '';
+        if (handled) {
+          resolutionBlock =
+            '<div style="margin-top:0.75rem;" class="form-group">' +
+            '<div><span style="font-weight:600;">Handled as</span>: ' + esc(ad.handled_reason || '—') + '</div>' +
+            (ad.handled_notes ? '<div style="margin-top:0.35rem;"><span style="font-weight:600;">Notes</span><div style="color:var(--text-muted); white-space:pre-wrap;">' + esc(ad.handled_notes) + '</div></div>' : '') +
+            '</div>';
+        }
+
+        contentEl.innerHTML =
+          '<div class="form-group" style="margin-bottom:0.75rem;">' +
+            '<div><span style="font-weight:600;">Package</span> ' + esc(ad.package_name || '-') + '</div>' +
+            '<div><span style="font-weight:600;">Shipped NEVR</span> ' + shipped + '</div>' +
+            '<div><span style="font-weight:600;">Fixed version hint</span> ' + osvFixed + '</div>' +
+            '<div style="margin-top:0.35rem; color:var(--text-muted); font-size:0.88rem;">If your release is patched but the version string is below the upstream fixed version, resolve this row as backport and describe the fix in notes.</div>' +
+            '<div><span style="font-weight:600;">Severity</span> ' + esc(ad.severity || '-') + '</div>' +
+          '</div>' +
+          '<div><span style="font-weight:600;">Summary</span><div style="color:var(--text-muted); white-space:pre-wrap; margin-top:0.25rem;">' + summary + '</div></div>' +
+          '<div style="margin-top:0.75rem;"><span style="font-weight:600;">Upstream</span> ' + upstream + '</div>' +
+          '<div style="margin-top:0.75rem;"><span style="font-weight:600;">Recommended fix</span> ' + fix + '</div>' +
+          '<div style="margin-top:0.75rem;"><span style="font-weight:600;">Affected Oreon releases</span> ' + esc(releases || '-') + '</div>' +
+          resolutionBlock;
+
+        if (!handled && canManageAdvisories()) {
+          var wrap = document.createElement('div');
+          wrap.className = 'form-group';
+          wrap.style.marginTop = '0.75rem';
+          var sel = document.createElement('select');
+          sel.className = 'form-control';
+          sel.id = 'cve-resolve-reason';
+          RESOLVE_REASONS.forEach(function(opt) {
+            var o = document.createElement('option');
+            o.value = opt.value;
+            o.textContent = opt.label;
+            sel.appendChild(o);
+          });
+          var ta = document.createElement('textarea');
+          ta.className = 'form-control';
+          ta.id = 'cve-resolve-notes';
+          ta.rows = 3;
+          ta.placeholder = 'e.g. RHSA- backport, commit hash, or why this is a false positive';
+          var btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'btn primary';
+          btn.textContent = 'Mark resolved';
+          var statusLine = document.createElement('div');
+          statusLine.style.color = 'var(--text-muted)';
+          statusLine.style.marginTop = '0.5rem';
+          btn.addEventListener('click', function() {
+            var body = {};
+            var rv = (sel.value || '').trim();
+            if (rv) body.reason = rv;
+            var nv = (ta.value || '').trim();
+            if (nv) body.notes = nv;
+            btn.disabled = true;
+            sel.disabled = true;
+            ta.disabled = true;
+            statusLine.textContent = 'Saving';
+            api.post('/security/advisories/cve/' + ad.id + '/resolve', body).then(function() {
+              load();
+            }).catch(function(e) {
+              btn.disabled = false;
+              sel.disabled = false;
+              ta.disabled = false;
+              statusLine.textContent = 'Resolve failed: ' + (e.message || e);
+            });
+          });
+          var lbl1 = document.createElement('label');
+          lbl1.textContent = 'Resolution';
+          lbl1.style.display = 'block';
+          lbl1.style.marginBottom = '0.35rem';
+          var lbl2 = document.createElement('label');
+          lbl2.textContent = 'Notes (optional)';
+          lbl2.style.display = 'block';
+          lbl2.style.marginTop = '0.5rem';
+          lbl2.style.marginBottom = '0.35rem';
+          wrap.appendChild(lbl1);
+          wrap.appendChild(sel);
+          wrap.appendChild(lbl2);
+          wrap.appendChild(ta);
+          wrap.appendChild(document.createElement('br'));
+          wrap.appendChild(btn);
+          statusLine.style.minHeight = '1.25rem';
+          wrap.appendChild(statusLine);
+          actionsEl.appendChild(wrap);
+        }
+      }
+
+      async function load() {
+        var parts = window.location.pathname.split('/');
+        var idStr = parts[parts.length - 1];
+        var id = parseInt(idStr, 10);
+        if (!id) return;
+        titleEl.textContent = 'Loading';
+
+        try {
+          var ad = await api.get('/security/advisories/cve/' + id);
+          renderDetail(ad);
+        } catch (e) {
+          titleEl.textContent = 'Failed: ' + (e.message || e);
+        }
+      }
+
+      window.addEventListener('auth-change', load);
+      load();
+    })();
+  </script>
+</body>
+</html>
+

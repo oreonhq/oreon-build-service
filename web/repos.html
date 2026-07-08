@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Repositories - Oreon Build Service</title>
+  <link rel="stylesheet" href="/static/style.css?v=4">
+</head>
+<body>
+  <header class="header">
+    <a href="/" class="header-logo-link"><img src="/static/obslogo.png" alt="Oreon Build Service" class="header-logo" /></a>
+    <nav></nav>
+  </header>
+  <main class="main">
+    <section class="card">
+      <h2>Repository Status</h2>
+      <p>Repository layout is on R2: &lt;bucket&gt;/&lt;releasename&gt;/&lt;channel&gt;/&lt;basearch&gt;/ (RPMS, repodata).</p>
+      <p id="repo-regen-wrap" style="display:none;">
+        <button type="button" class="btn primary" id="btn-regen-all-repodata">Regenerate Repository Metadata for All Releases</button>
+        <button type="button" class="btn" id="btn-regen-full-repodata">Full repodata regen</button>
+        <span id="repo-regen-status" style="color:var(--text-muted);"></span>
+      </p>
+      <pre id="repo-status">Loading...</pre>
+    </section>
+  </main>
+  <script src="/static/app.js?v=13"></script>
+  <script>
+    (function() {
+      var api = window.oreonApi;
+      function loadStatus() {
+        api.get('/repos/status').then(function(data) {
+          document.getElementById('repo-status').textContent = JSON.stringify(data, null, 2);
+        }).catch(function() { document.getElementById('repo-status').textContent = 'Failed to load'; });
+      }
+      function updateRegenUi() {
+        var wrap = document.getElementById('repo-regen-wrap');
+        if (!wrap) return;
+        wrap.style.display = api.isAdmin() ? 'block' : 'none';
+      }
+      function queueRegen(btn, path, confirmMsg) {
+        if (!api.isAdmin()) return;
+        if (!confirm(confirmMsg)) return;
+        var st = document.getElementById('repo-regen-status');
+        st.textContent = 'Starting';
+        oreonWithLoading(btn, function() {
+          return api.post(path, {}).then(function(r) {
+            var msg;
+            if (r && r.status === 'queued') {
+              msg = 'Queued on server (' + (r.prefix_count != null ? r.prefix_count : '?') + ' prefixes). ';
+              msg += (r.message || 'Watch API logs for when it finishes.');
+            } else {
+              msg = 'Done. Refreshed ' + (r.refreshed ? r.refreshed.length : 0) + ', skipped (no RPMs) ' + (r.skipped_no_rpms ? r.skipped_no_rpms.length : 0);
+              if (r.failed && r.failed.length) {
+                msg += '. Failures: ' + r.failed.length + ' (see response). First: ' + (r.failed[0].detail || r.failed[0].kind || '');
+              }
+              if (r.not_attempted && r.not_attempted.length) {
+                msg += '. Not attempted after disk error: ' + r.not_attempted.length;
+              }
+              msg += '.';
+            }
+            st.textContent = msg;
+            loadStatus();
+          }).catch(function(e) {
+            st.textContent = 'Failed: ' + e.message;
+          });
+        });
+      }
+      document.getElementById('btn-regen-all-repodata').addEventListener('click', function() {
+        queueRegen(
+          this,
+          '/repos/regenerate-metadata',
+          'Regenerate repodata on R2 for every known release prefix? Empty repos are skipped. The API queues this on the server (can take a long time). Uses ~/.oreon/repo-tmp for createrepo unless OREON_REPO_TMPDIR is set. Check API logs for completion.'
+        );
+      });
+      document.getElementById('btn-regen-full-repodata').addEventListener('click', function() {
+        queueRegen(
+          this,
+          '/repos/regenerate-metadata-full',
+          'Full repodata regen for every known release prefix? This clears createrepo cache and rescans all RPMs per prefix. Much slower than a normal refresh. Use when old packages have checksum mismatches. Check API logs for completion.'
+        );
+      });
+      loadStatus();
+      updateRegenUi();
+      window.addEventListener('auth-change', function() { updateRegenUi(); });
+    })();
+  </script>
+</body>
+</html>

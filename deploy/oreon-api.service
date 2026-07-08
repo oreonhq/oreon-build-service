@@ -1,0 +1,16 @@
+[Unit]
+Description=Oreon Build Service API
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=oreon-build
+Group=oreon-build
+WorkingDirectory=/opt/oreon-build-service
+EnvironmentFile=/opt/oreon-build-service/.env
+ExecStart=/opt/oreon-build-service/venv/bin/python -m uvicorn oreon_build.api.main:app --host 0.0.0.0 --port 8000
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
