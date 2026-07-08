@@ -64,6 +64,33 @@ def done_slots_from_job_rows(
     return out
 
 
+def newest_done_slots_from_lineage(
+    lineage: list[int],
+    rows: list[tuple[int, int, str, str]],
+) -> set[tuple[int, str]]:
+    rank = {cid: i for i, cid in enumerate(lineage)}
+    by_key: dict[tuple[int, str], list[tuple[int, str]]] = {}
+    for cid, package_id, arch, status in rows:
+        canon = normalize_machine_arch(arch or "")
+        if not canon:
+            continue
+        key = (int(package_id), canon)
+        by_key.setdefault(key, []).append((rank.get(int(cid), 10**9), (status or "").lower()))
+    out: set[tuple[int, str]] = set()
+    for key, items in by_key.items():
+        best_ok = None
+        for r, st in items:
+            if st in ("success", "skipped"):
+                if best_ok is None or r < best_ok:
+                    best_ok = r
+        if best_ok is None:
+            continue
+        newer_fail = any(r < best_ok and st == "failed" for r, st in items)
+        if not newer_fail:
+            out.add(key)
+    return out
+
+
 def _chain_stage_settle_sec() -> int:
     raw = (os.environ.get("OREON_CHAIN_STAGE_SETTLE_SEC") or "30").strip()
     try:
@@ -145,30 +172,51 @@ async def _first_incomplete_stage_index(db: Any, chain: BuildChain) -> int:
     return first_incomplete_stage_index_from_states(len(stages), by_stage)
 
 
+async def _resume_lineage_chain_ids(db: Any, start_chain_id: int) -> list[int]:
+    out: list[int] = []
+    seen: set[int] = set()
+    cur: int | None = int(start_chain_id)
+    while cur is not None and cur not in seen:
+        seen.add(cur)
+        out.append(cur)
+        chain = await db.get(BuildChain, cur)
+        if chain is None:
+            break
+        opt = _options_dict(chain)
+        raw = opt.get("resumed_from_chain_id")
+        if raw is None or raw == "":
+            break
+        try:
+            cur = int(raw)
+        except (TypeError, ValueError):
+            break
+    return out
+
+
 async def _old_chain_done_slots(
     db: Any,
     chain_id: int,
     stage_index: int,
 ) -> set[tuple[int, str]]:
+    lineage = await _resume_lineage_chain_ids(db, chain_id)
+    if not lineage:
+        return set()
     jobs_r = await db.execute(
-        select(BuildJob, BuildTarget.architecture)
+        select(BuildJob.chain_id, BuildJob.package_id, BuildTarget.architecture, BuildJob.status)
         .join(BuildTarget, BuildJob.target_id == BuildTarget.id)
         .where(
-            BuildJob.chain_id == chain_id,
+            BuildJob.chain_id.in_(lineage),
             BuildJob.chain_stage_index == stage_index,
-            BuildJob.status.in_((BuildStatus.SUCCESS, BuildStatus.SKIPPED)),
+            BuildJob.package_id.isnot(None),
         )
     )
-    out: set[tuple[int, str]] = set()
-    for job, arch in jobs_r.all():
-        if job.package_id is None:
+    rows: list[tuple[int, int, str, str]] = []
+    for cid, package_id, arch, status in jobs_r.all():
+        if package_id is None:
             continue
-        out.update(
-            done_slots_from_job_rows(
-                [(int(job.package_id), str(arch or ""), job.status.value)]
-            )
-        )
-    return out
+        st = status.value if hasattr(status, "value") else str(status)
+        rows.append((int(cid), int(package_id), str(arch or ""), st))
+    return newest_done_slots_from_lineage(lineage, rows)
 
 
 def distgit_new_package_dict(
@@ -1005,7 +1053,9 @@ async def enqueue_resumed_chain_stages(db: Any, chain_id: int, from_chain_id: in
         BuildChainStatus.CANCELLED,
     ):
         skip_set = await _old_chain_done_slots(db, from_chain_id, stage)
-        await _enqueue_publish_for_unpublished_success_jobs(db, from_chain_id, stage)
+        lineage_ids = await _resume_lineage_chain_ids(db, from_chain_id)
+        for anc_id in lineage_ids:
+            await _enqueue_publish_for_unpublished_success_jobs(db, anc_id, stage)
         await _enqueue_chain_stage_jobs(
             db,
             chain,
