@@ -17,3 +17,11 @@ def r2_publish_branch(release: Release | None) -> str:
     if release is None:
         return "dev"
     return default_repo_branch_segment(getattr(release, "default_repo_branch", None))
+
+
+def release_distgit_branch(release: Release | None) -> str:
+    if release is None:
+        return "main"
+    raw = getattr(release, "default_distgit_branch", None)
+    s = (str(raw).strip() if raw else "") or "main"
+    return s[:128]
