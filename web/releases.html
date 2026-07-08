@@ -38,6 +38,10 @@
           <input type="text" id="create-default-repo-branch" placeholder="e.g. dev" maxlength="32" value="dev" title="Folder under releasename/ where builds are published">
         </div>
         <div class="form-group">
+          <label>Default specfiles Git branch</label>
+          <input type="text" id="create-default-distgit-branch" placeholder="e.g. main" maxlength="128" value="main" title="Default branch in oreonhq/rpm-specfiles for distgit builds">
+        </div>
+        <div class="form-group">
           <label>Description (optional)</label>
           <input type="text" id="create-description" placeholder="Optional description">
         </div>
@@ -58,7 +62,7 @@
       </div>
       <table class="table-list">
         <thead>
-          <tr><th class="col-checkbox"><input type="checkbox" id="releases-select-all" title="Select all on this page"></th><th>ID</th><th>Release name</th><th>Architectures</th><th>Default channel</th><th>Repo folder</th><th>Active</th><th>Actions</th></tr>
+          <tr><th class="col-checkbox"><input type="checkbox" id="releases-select-all" title="Select all on this page"></th><th>ID</th><th>Release name</th><th>Architectures</th><th>Default channel</th><th>Repo folder</th><th>Git branch</th><th>Active</th><th>Actions</th></tr>
         </thead>
         <tbody id="releases-tbody"></tbody>
       </table>
@@ -86,6 +90,10 @@
         <div class="form-group">
           <label>Repo path folder (R2, not Git)</label>
           <input type="text" id="edit-default-repo-branch" placeholder="e.g. dev" maxlength="32" title="Folder under releasename/ where builds are published">
+        </div>
+        <div class="form-group">
+          <label>Default specfiles Git branch</label>
+          <input type="text" id="edit-default-distgit-branch" placeholder="e.g. main" maxlength="128" title="Default branch in oreonhq/rpm-specfiles for distgit builds">
         </div>
         <div class="form-group">
           <label>Default mock environment</label>
@@ -160,9 +168,10 @@
           var canAct = api.isAdmin();
           tbody.innerHTML = list.map(function(r) {
             var repoBr = r.default_repo_branch || 'dev';
-            var actions = canAct ? '<button type="button" class="btn edit-rel" data-id="' + r.id + '" data-desc="' + escapeAttr(r.description) + '" data-arch="' + escapeAttr(r.architectures) + '" data-channel="' + (r.default_channel || 'dev') + '" data-repo-branch="' + escapeAttr(repoBr) + '" data-active="' + (r.is_active ? '1' : '0') + '" data-default-mock-env="' + (r.default_mock_environment_id || '') + '">Edit</button> <button type="button" class="btn delete-rel" data-id="' + r.id + '" data-name="' + escapeAttr(r.releasename) + '">Delete</button>' : '-';
-            return '<tr><td class="col-checkbox"><input type="checkbox" class="rel-row-cb" data-id="' + r.id + '"></td><td>' + r.id + '</td><td>' + escapeHtml(r.releasename || '') + '</td><td>' + escapeHtml(r.architectures || '') + '</td><td>' + (r.default_channel || '') + '</td><td>' + escapeHtml(repoBr) + '</td><td>' + (r.is_active ? 'Yes' : 'No') + '</td><td>' + actions + '</td></tr>';
-          }).join('') || '<tr><td colspan="8">No releases</td></tr>';
+            var gitBr = r.default_distgit_branch || 'main';
+            var actions = canAct ? '<button type="button" class="btn edit-rel" data-id="' + r.id + '" data-desc="' + escapeAttr(r.description) + '" data-arch="' + escapeAttr(r.architectures) + '" data-channel="' + (r.default_channel || 'dev') + '" data-repo-branch="' + escapeAttr(repoBr) + '" data-distgit-branch="' + escapeAttr(gitBr) + '" data-active="' + (r.is_active ? '1' : '0') + '" data-default-mock-env="' + (r.default_mock_environment_id || '') + '">Edit</button> <button type="button" class="btn delete-rel" data-id="' + r.id + '" data-name="' + escapeAttr(r.releasename) + '">Delete</button>' : '-';
+            return '<tr><td class="col-checkbox"><input type="checkbox" class="rel-row-cb" data-id="' + r.id + '"></td><td>' + r.id + '</td><td>' + escapeHtml(r.releasename || '') + '</td><td>' + escapeHtml(r.architectures || '') + '</td><td>' + (r.default_channel || '') + '</td><td>' + escapeHtml(repoBr) + '</td><td>' + escapeHtml(gitBr) + '</td><td>' + (r.is_active ? 'Yes' : 'No') + '</td><td>' + actions + '</td></tr>';
+          }).join('') || '<tr><td colspan="9">No releases</td></tr>';
           tbody.querySelectorAll('.edit-rel').forEach(function(btn) {
             btn.addEventListener('click', function() {
               var releaseId = btn.dataset.id;
@@ -172,6 +181,7 @@
               document.getElementById('edit-release-arch').value = btn.dataset.arch || '';
               document.getElementById('edit-release-channel').value = btn.dataset.channel || 'dev';
               document.getElementById('edit-default-repo-branch').value = btn.dataset.repoBranch || 'dev';
+              document.getElementById('edit-default-distgit-branch').value = btn.dataset.distgitBranch || 'main';
               document.getElementById('edit-release-active').checked = btn.dataset.active === '1';
               var mockSel = document.getElementById('edit-release-mock-env');
               mockSel.innerHTML = '<option value="">None (use package preference or highest priority)</option>';
@@ -203,7 +213,7 @@
           releasesTableSel.refresh();
         }).catch(function() {
           var tbody = document.getElementById('releases-tbody');
-          if (tbody) tbody.innerHTML = '<tr><td colspan="8">Failed to load</td></tr>';
+          if (tbody) tbody.innerHTML = '<tr><td colspan="9">Failed to load</td></tr>';
         });
       }
       (function initReleasesPagination() {
@@ -224,6 +234,7 @@
             architectures: document.getElementById('edit-release-arch').value.trim() || null,
             default_channel: document.getElementById('edit-release-channel').value,
             default_repo_branch: document.getElementById('edit-default-repo-branch').value.trim() || null,
+            default_distgit_branch: document.getElementById('edit-default-distgit-branch').value.trim() || null,
             default_mock_environment_id: mockEnvVal ? parseInt(mockEnvVal, 10) : null,
             is_active: document.getElementById('edit-release-active').checked
           }).then(function() { document.getElementById('edit-release-modal').classList.remove('open'); load(); }).catch(function(e) { alert('Failed: ' + e.message); });
@@ -235,8 +246,8 @@
         var arch = document.getElementById('create-architectures').value.trim();
         if (!name || !arch) { alert('Release name and architectures are required.'); return; }
         oreonWithLoading(btn, function() {
-          return api.post('/releases', { releasename: name, architectures: arch, default_channel: document.getElementById('create-default-channel').value, default_repo_branch: document.getElementById('create-default-repo-branch').value.trim() || 'dev', description: document.getElementById('create-description').value.trim() || null, base_repos: [] })
-            .then(function() { load(); document.getElementById('create-releasename').value = ''; document.getElementById('create-description').value = ''; document.getElementById('create-default-repo-branch').value = 'dev'; alert('Release created.'); })
+          return api.post('/releases', { releasename: name, architectures: arch, default_channel: document.getElementById('create-default-channel').value, default_repo_branch: document.getElementById('create-default-repo-branch').value.trim() || 'dev', default_distgit_branch: document.getElementById('create-default-distgit-branch').value.trim() || 'main', description: document.getElementById('create-description').value.trim() || null, base_repos: [] })
+            .then(function() { load(); document.getElementById('create-releasename').value = ''; document.getElementById('create-description').value = ''; document.getElementById('create-default-repo-branch').value = 'dev'; document.getElementById('create-default-distgit-branch').value = 'main'; alert('Release created.'); })
             .catch(function(e) { alert('Failed: ' + e.message); });
         });
       });
