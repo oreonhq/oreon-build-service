@@ -13,7 +13,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
 from oreon_build.core.chain_build_spec import parse_chain_build_spec
 from oreon_build.core.machine_arch import normalize_machine_arch
-from oreon_build.core.repo_branch import r2_publish_branch
+from oreon_build.core.repo_branch import r2_publish_branch, release_distgit_branch
 from oreon_build.models import (
     BuildAttempt,
     BuildChain,
@@ -41,6 +41,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_ARCH = ["x86_64", "aarch64"]
+
+
+def _job_build_terminal_ok(status: BuildStatus) -> bool:
+    return status in (BuildStatus.SUCCESS, BuildStatus.SKIPPED)
 
 
 def _chain_stage_settle_sec() -> int:
@@ -115,8 +119,11 @@ async def _first_incomplete_stage_index(db: Any, chain: BuildChain) -> int:
         if job.chain_stage_index is None:
             continue
         idx = int(job.chain_stage_index)
-        build_ok = job.status == BuildStatus.SUCCESS
-        published = build_ok and await _job_has_chain_publish_receipt(db, chain.id, job)
+        build_ok = _job_build_terminal_ok(job.status)
+        published = build_ok and (
+            job.status == BuildStatus.SKIPPED
+            or await _job_has_chain_publish_receipt(db, chain.id, job)
+        )
         by_stage.setdefault(idx, []).append((build_ok, published))
     return first_incomplete_stage_index_from_states(len(stages), by_stage)
 
@@ -130,7 +137,7 @@ async def _old_chain_success_slots(
         select(BuildJob).where(
             BuildJob.chain_id == chain_id,
             BuildJob.chain_stage_index == stage_index,
-            BuildJob.status == BuildStatus.SUCCESS,
+            BuildJob.status.in_((BuildStatus.SUCCESS, BuildStatus.SKIPPED)),
         )
     )
     out: set[tuple[int, int]] = set()
@@ -242,7 +249,7 @@ def _infer_github_html_url_from_distgit(url: str) -> str | None:
 
 
 async def _cancel_job_and_running_attempts(db: Any, job: BuildJob, note: str) -> None:
-    if job.status in (BuildStatus.SUCCESS, BuildStatus.FAILED, BuildStatus.CANCELLED):
+    if job.status in (BuildStatus.SUCCESS, BuildStatus.SKIPPED, BuildStatus.FAILED, BuildStatus.CANCELLED):
         return
     job.status = BuildStatus.CANCELLED
     att_r = await db.execute(
@@ -587,7 +594,7 @@ async def trigger_chain_build(
         )
 
     dg_url = (distgit_url or "https://github.com/oreonhq/rpm-specfiles.git").strip()
-    dg_branch = (distgit_branch or "main").strip()
+    dg_branch = (distgit_branch or release_distgit_branch(release)).strip()
 
     chain_options: dict[str, Any] = {
         "architectures": arches,

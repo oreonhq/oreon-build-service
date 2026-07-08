@@ -7,6 +7,7 @@ from typing import Any
 from sqlalchemy import select
 
 from oreon_build.api.schemas import BuildTrigger, DistgitBatchTrigger, NewPackageForBuild, SourceTypeSchema
+from oreon_build.core.repo_branch import release_distgit_branch
 from oreon_build.db.session import async_session_maker
 from oreon_build.models import Account, Release
 from oreon_build.services.build_trigger_exec import execute_build_trigger
@@ -66,7 +67,7 @@ async def run_distgit_batch(payload: dict[str, Any], user_id: int, ip: str | Non
             return
         releasename = (release.releasename or "").strip()
         dg_url = (data.distgit_url or "https://github.com/oreonhq/rpm-specfiles.git").strip()
-        dg_branch = (data.distgit_branch or "main").strip()
+        dg_branch = (data.distgit_branch or release_distgit_branch(release)).strip()
 
         queued = 0
         skipped = 0
