@@ -35,6 +35,7 @@ class Release(Base):
         nullable=False,
     )
     default_repo_branch: Mapped[str] = mapped_column(String(32), default="dev", nullable=False)
+    default_distgit_branch: Mapped[str] = mapped_column(String(128), default="main", nullable=False)
     default_mock_environment_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("mock_environments.id", ondelete="SET NULL"), nullable=True
     )
