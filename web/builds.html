@@ -137,7 +137,7 @@
           </div>
           <div class="form-group">
             <label>Specfiles Git branch</label>
-            <input type="text" id="distgit-branch-input" class="form-control" placeholder="main" maxlength="128">
+            <input type="text" id="distgit-branch-input" class="form-control" placeholder="select a release first" maxlength="128">
             <p style="color:var(--text-muted); font-size:0.85rem; margin-top:0.25rem;">Branch in oreonhq/rpm-specfiles. Defaults from the release but you can override to test before merging.</p>
           </div>
           <div class="form-group">
@@ -207,7 +207,16 @@
       }
       function loadOptions() {
         api.get('/packages?limit=500').then(function(r) { packages = (r && r.items) ? r.items : []; renderPackageList(); }).catch(function() { packages = []; });
-        api.get('/releases?limit=500').then(function(r) { releases = (r && r.items) ? r.items : []; renderReleaseList(); renderReleaseListNew(); }).catch(function() { releases = []; });
+        api.get('/releases?limit=500').then(function(r) {
+          releases = (r && r.items) ? r.items : [];
+          if (releases.length === 1) {
+            selectedReleaseIdNew = Number(releases[0].id);
+            fillMockEnvsForRelease(selectedReleaseIdNew);
+          }
+          renderReleaseList();
+          renderReleaseListNew();
+          updateDistgitBranchFromRelease();
+        }).catch(function() { releases = []; updateDistgitBranchFromRelease(); });
       }
       // (helper makeSearchableSelect was removed; selects are wired manually below)
       function escapeHtml(s) {
@@ -344,7 +353,8 @@
       })();
       function renderReleaseListNew() {
         var trigger = document.getElementById('release-new-trigger');
-        if (trigger) trigger.textContent = selectedReleaseIdNew ? (releases.find(function(r) { return r.id === selectedReleaseIdNew; }) || {}).releasename || 'Release #' + selectedReleaseIdNew : 'Select release...';
+        if (trigger) trigger.textContent = selectedReleaseIdNew ? (releaseById(selectedReleaseIdNew) || {}).releasename || 'Release #' + selectedReleaseIdNew : 'Select release...';
+        updateDistgitBranchFromRelease();
       }
       function fillMockEnvsForRelease(releaseId) {
         var sel = document.getElementById('new-package-mock-env');
@@ -359,18 +369,22 @@
         }).catch(function() {});
       }
 
+      function releaseById(id) {
+        if (id == null || id === '') return null;
+        return releases.find(function(r) { return r.id == id; }) || null;
+      }
       function getDistgitBranch() {
         var el = document.getElementById('distgit-branch-input');
         var v = el && el.value ? el.value.trim() : '';
         if (v) return v;
-        var rel = releases.find(function(r) { return r.id === selectedReleaseIdNew; });
-        return (rel && rel.default_distgit_branch) ? String(rel.default_distgit_branch).trim() : 'main';
+        var rel = releaseById(selectedReleaseIdNew);
+        return rel ? String(rel.default_distgit_branch || 'main').trim() : 'main';
       }
       function updateDistgitBranchFromRelease() {
         var el = document.getElementById('distgit-branch-input');
         if (!el) return;
-        var rel = releases.find(function(r) { return r.id === selectedReleaseIdNew; });
-        el.value = (rel && rel.default_distgit_branch) ? rel.default_distgit_branch : 'main';
+        var rel = releaseById(selectedReleaseIdNew);
+        el.value = rel ? String(rel.default_distgit_branch || 'main').trim() : '';
       }
 
       (function initBuildModeTabs() {
@@ -381,6 +395,7 @@
             var mode = tab.dataset.mode;
             document.getElementById('build-existing-block').style.display = mode === 'existing' ? 'block' : 'none';
             document.getElementById('build-new-block').style.display = mode === 'new' ? 'block' : 'none';
+            if (mode === 'new') updateDistgitBranchFromRelease();
           });
         });
       })();
@@ -411,7 +426,13 @@
           listEl.innerHTML = releases.filter(function(r) { return !q || (r.releasename || '').toLowerCase().indexOf(q) >= 0; })
             .map(function(r) { return '<div class="search-select-option" data-id="' + r.id + '">' + escapeHtml(r.releasename || '') + ' <span style="color:var(--text-muted)">(#' + r.id + ')</span></div>'; }).join('') || '<div class="search-select-option" style="cursor:default;color:var(--text-muted)">No matches</div>';
           listEl.querySelectorAll('.search-select-option[data-id]').forEach(function(opt) {
-            opt.addEventListener('click', function() { selectedReleaseIdNew = parseInt(opt.dataset.id, 10); renderReleaseListNew(); fillMockEnvsForRelease(selectedReleaseIdNew); updateDistgitBranchFromRelease(); container.classList.remove('open'); if (search) search.value = ''; });
+            opt.addEventListener('click', function() {
+              selectedReleaseIdNew = Number(opt.dataset.id);
+              renderReleaseListNew();
+              fillMockEnvsForRelease(selectedReleaseIdNew);
+              container.classList.remove('open');
+              if (search) search.value = '';
+            });
           });
         }
         if (trigger) trigger.addEventListener('click', function(e) { e.stopPropagation(); container.classList.toggle('open'); if (container.classList.contains('open')) { renderList(search ? search.value : ''); if (search) search.focus(); } });
@@ -788,7 +809,7 @@
             .map(function(s) { return s.trim(); })
             .filter(function(s) { return !!s; });
           if (!pkgNames.length) { alert('Enter at least one package name.'); return; }
-          var rel = releases.find(function(r) { return r.id === selectedReleaseIdNew; });
+          var rel = releaseById(selectedReleaseIdNew);
           var releasename = rel && rel.releasename ? rel.releasename.trim() : '';
           if (!releasename) { alert('Selected release is missing a releasename.'); return; }
         var batchBody = {
