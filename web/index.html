@@ -71,7 +71,7 @@
           // Recent builds table
           var buildsHost = document.getElementById('dashboard-builds');
           function statusBadge(s) {
-            if (s === 'success') return '<span class="badge success">success</span>';
+            if (s === 'success' || s === 'skipped') return '<span class="badge success">' + s + '</span>';
             if (s === 'failed' || s === 'cancelled') return '<span class="badge failed">' + s + '</span>';
             if (s === 'running' || s === 'queued') return '<span class="badge running">' + s + '</span>';
             return '<span class="badge pending">' + (s || 'pending') + '</span>';
