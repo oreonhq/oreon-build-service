@@ -42,7 +42,7 @@
       function escapeHtml(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; }
       function escapeAttr(s) { return escapeHtml(s || '').replace(/"/g, '&quot;'); }
       function statusClass(s) {
-        if (s === 'success') return 'badge success';
+        if (s === 'success' || s === 'skipped') return 'badge success';
         if (s === 'failed' || s === 'cancelled') return 'badge failed';
         if (s === 'running' || s === 'queued') return 'badge running';
         return 'badge pending';
