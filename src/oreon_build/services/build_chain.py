@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from fastapi import HTTPException, Request, status
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm.attributes import flag_modified
 
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
@@ -21,6 +22,7 @@ from oreon_build.models import (
     BuildChainStatus,
     BuildJob,
     BuildStatus,
+    BuildTarget,
     MockEnvironment,
     Package,
     PackageVersion,
@@ -45,6 +47,21 @@ DEFAULT_ARCH = ["x86_64", "aarch64"]
 
 def _job_build_terminal_ok(status: BuildStatus) -> bool:
     return status in (BuildStatus.SUCCESS, BuildStatus.SKIPPED)
+
+
+def done_slots_from_job_rows(
+    rows: list[tuple[int, str, str]],
+) -> set[tuple[int, str]]:
+    out: set[tuple[int, str]] = set()
+    for package_id, arch, status in rows:
+        st = (status or "").lower()
+        if st not in ("success", "skipped"):
+            continue
+        canon = normalize_machine_arch(arch or "")
+        if not canon:
+            continue
+        out.add((int(package_id), canon))
+    return out
 
 
 def _chain_stage_settle_sec() -> int:
@@ -128,24 +145,29 @@ async def _first_incomplete_stage_index(db: Any, chain: BuildChain) -> int:
     return first_incomplete_stage_index_from_states(len(stages), by_stage)
 
 
-async def _old_chain_success_slots(
+async def _old_chain_done_slots(
     db: Any,
     chain_id: int,
     stage_index: int,
-) -> set[tuple[int, int]]:
+) -> set[tuple[int, str]]:
     jobs_r = await db.execute(
-        select(BuildJob).where(
+        select(BuildJob, BuildTarget.architecture)
+        .join(BuildTarget, BuildJob.target_id == BuildTarget.id)
+        .where(
             BuildJob.chain_id == chain_id,
             BuildJob.chain_stage_index == stage_index,
             BuildJob.status.in_((BuildStatus.SUCCESS, BuildStatus.SKIPPED)),
         )
     )
-    out: set[tuple[int, int]] = set()
-    for job in jobs_r.scalars().all():
-        if job.package_id is None or job.target_id is None:
+    out: set[tuple[int, str]] = set()
+    for job, arch in jobs_r.all():
+        if job.package_id is None:
             continue
-        if await _job_has_chain_publish_receipt(db, chain_id, job):
-            out.add((int(job.package_id), int(job.target_id)))
+        out.update(
+            done_slots_from_job_rows(
+                [(int(job.package_id), str(arch or ""), job.status.value)]
+            )
+        )
     return out
 
 
@@ -398,7 +420,7 @@ async def _enqueue_chain_stage_jobs(
     priority: int,
     triggered_by_id: int | None,
     request: Request | None,
-    skip_package_target_slots: set[tuple[int, int]] | None = None,
+    skip_package_arch_slots: set[tuple[int, str]] | None = None,
     advance_if_stage_satisfied_by_skips: bool = False,
 ) -> list[BuildJob]:
     stages: list[list[str]] = chain.stages_json if isinstance(chain.stages_json, list) else []
@@ -424,7 +446,7 @@ async def _enqueue_chain_stage_jobs(
     skip_slots = 0
     publish_branch = r2_publish_branch(release)
     releasename = (release.releasename or "").strip()
-    skip_slots_set = skip_package_target_slots or set()
+    skip_slots_set = skip_package_arch_slots or set()
 
     for pkg_name in pkgs:
         existing_r = await db.execute(select(Package).where(Package.name == pkg_name))
@@ -490,7 +512,7 @@ async def _enqueue_chain_stage_jobs(
             if not workers_by_arch.get(canon, False):
                 continue
             target = await get_or_create_build_target(db, chain.release_id, canon, pref_mock)
-            if (package_id, target.id) in skip_slots_set:
+            if (package_id, canon) in skip_slots_set:
                 skip_slots += 1
                 continue
             expected_jobs += 1
@@ -783,6 +805,45 @@ async def advance_settled_chains() -> None:
         await db.commit()
 
 
+async def _enqueue_publish_for_unpublished_success_jobs(
+    db: Any,
+    chain_id: int,
+    stage_index: int,
+) -> None:
+    jobs_r = await db.execute(
+        select(BuildJob).where(
+            BuildJob.chain_id == chain_id,
+            BuildJob.chain_stage_index == stage_index,
+            BuildJob.status == BuildStatus.SUCCESS,
+        )
+    )
+    for job in jobs_r.scalars().all():
+        if await _job_has_chain_publish_receipt(db, chain_id, job):
+            continue
+        att_id = await db.scalar(
+            select(BuildAttempt.id)
+            .where(
+                BuildAttempt.build_job_id == job.id,
+                BuildAttempt.status == BuildStatus.SUCCESS,
+            )
+            .order_by(BuildAttempt.id.desc())
+            .limit(1)
+        )
+        if not att_id:
+            continue
+        existing = await db.scalar(
+            select(PublishTask.id).where(PublishTask.attempt_id == att_id).limit(1)
+        )
+        if existing:
+            continue
+        stmt = (
+            pg_insert(PublishTask.__table__)
+            .values(kind="repo_publish", attempt_id=att_id, build_job_id=job.id)
+            .on_conflict_do_nothing(index_elements=["attempt_id"])
+        )
+        await db.execute(stmt)
+
+
 async def resume_chain_from_previous(
     db: Any,
     request: Request,
@@ -943,7 +1004,8 @@ async def enqueue_resumed_chain_stages(db: Any, chain_id: int, from_chain_id: in
         BuildChainStatus.SUCCESS,
         BuildChainStatus.CANCELLED,
     ):
-        skip_set = await _old_chain_success_slots(db, from_chain_id, stage) if stage == resume_start else set()
+        skip_set = await _old_chain_done_slots(db, from_chain_id, stage)
+        await _enqueue_publish_for_unpublished_success_jobs(db, from_chain_id, stage)
         await _enqueue_chain_stage_jobs(
             db,
             chain,
@@ -955,7 +1017,7 @@ async def enqueue_resumed_chain_stages(db: Any, chain_id: int, from_chain_id: in
             priority=priority,
             triggered_by_id=chain.triggered_by_id,
             request=None,
-            skip_package_target_slots=skip_set,
+            skip_package_arch_slots=skip_set,
             advance_if_stage_satisfied_by_skips=True,
         )
         if chain.status in (BuildChainStatus.FAILED, BuildChainStatus.SUCCESS, BuildChainStatus.CANCELLED):
