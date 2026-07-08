@@ -11,7 +11,7 @@ from oreon_build.api.schemas import (
     ReleaseUpdate,
 )
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
-from oreon_build.core.repo_branch import r2_publish_branch
+from oreon_build.core.repo_branch import r2_publish_branch, release_distgit_branch
 from oreon_build.models import Release, ReleaseChannel, ReleaseRepo
 
 router = APIRouter(prefix="/releases", tags=["releases"])
@@ -25,6 +25,7 @@ def _release_to_response(r: Release) -> ReleaseResponse:
         architectures=r.architectures,
         default_channel=r.default_channel.value,
         default_repo_branch=r2_publish_branch(r),
+        default_distgit_branch=release_distgit_branch(r),
         default_mock_environment_id=r.default_mock_environment_id,
         is_active=r.is_active,
         created_at=r.created_at,
@@ -75,12 +76,14 @@ async def create_release(
     if result.scalar_one_or_none():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Releasename already exists")
     drb = (data.default_repo_branch or "dev").strip()[:32] or "dev"
+    dgb = (data.default_distgit_branch or "main").strip()[:128] or "main"
     release = Release(
         releasename=data.releasename,
         description=data.description,
         architectures=data.architectures,
         default_channel=ReleaseChannel(data.default_channel.value),
         default_repo_branch=drb,
+        default_distgit_branch=dgb,
         is_active=True,
     )
     db.add(release)
@@ -135,6 +138,9 @@ async def update_release(
     if data.default_repo_branch is not None:
         s = data.default_repo_branch.strip()[:32]
         release.default_repo_branch = s or "dev"
+    if data.default_distgit_branch is not None:
+        s = data.default_distgit_branch.strip()[:128]
+        release.default_distgit_branch = s or "main"
     if data.default_mock_environment_id is not None:
         release.default_mock_environment_id = data.default_mock_environment_id
     elif "default_mock_environment_id" in (data.model_fields_set or set()) and data.default_mock_environment_id is None:
