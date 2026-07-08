@@ -65,6 +65,11 @@ class ReleaseCreate(BaseModel):
         max_length=32,
         description="R2 folder under releasename/ for built RPMs (usually dev); not a Git branch name",
     )
+    default_distgit_branch: str = Field(
+        default="main",
+        max_length=128,
+        description="Default Git branch in oreonhq/rpm-specfiles for distgit builds",
+    )
     base_repos: List[ReleaseRepoCreate] = []
 
 
@@ -73,6 +78,7 @@ class ReleaseUpdate(BaseModel):
     architectures: Optional[str] = None
     default_channel: Optional[ReleaseChannelSchema] = None
     default_repo_branch: Optional[str] = Field(None, max_length=32)
+    default_distgit_branch: Optional[str] = Field(None, max_length=128)
     default_mock_environment_id: Optional[int] = None
     is_active: Optional[bool] = None
     base_repos: Optional[List[ReleaseRepoCreate]] = None
@@ -95,6 +101,7 @@ class ReleaseResponse(BaseModel):
     architectures: str
     default_channel: str
     default_repo_branch: str
+    default_distgit_branch: str
     default_mock_environment_id: Optional[int] = None
     is_active: bool
     created_at: datetime

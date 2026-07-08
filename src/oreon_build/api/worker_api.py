@@ -26,6 +26,7 @@ from oreon_build.api.deps import DbSession
 from oreon_build.config import get_settings
 from oreon_build.core.machine_arch import sql_arch_match_values
 from oreon_build.core.repo_branch import r2_publish_branch
+from oreon_build.core.build_result import normalize_terminal_build_status
 from oreon_build.services.worker_token_resolve import resolve_worker_for_token
 from oreon_build.core.audit import log_audit
 from sqlalchemy.orm import selectinload
@@ -1605,7 +1606,9 @@ async def report_result(
         await _burst_vm_stop_check()
         return {"status": "ok", "job_cancelled": True}
 
-    if str(payload.status).lower() == "failed":
+    terminal_st = normalize_terminal_build_status(str(payload.status), payload.error_message)
+
+    if terminal_st == "failed":
         prior_art_count = await db.scalar(
             select(func.count(Artifact.id)).where(Artifact.build_attempt_id == attempt_id)
         )
@@ -1677,9 +1680,9 @@ async def report_result(
                 await _burst_vm_stop_check()
                 return {"status": "ok", "repaired_stale_failure": True}
 
-    attempt.status = BuildStatus(payload.status)
+    attempt.status = BuildStatus(terminal_st)
     attempt.finished_at = datetime.now(timezone.utc)
-    st_l = str(payload.status).lower()
+    st_l = terminal_st
     if st_l == "success":
         attempt.signing_status = "signed"
     elif st_l in ("failed", "cancelled"):
@@ -1688,7 +1691,7 @@ async def report_result(
         attempt.error_message = payload.error_message
     if payload.log_r2_key:
         attempt.log_r2_key = payload.log_r2_key
-    job.status = BuildStatus(payload.status)
+    job.status = BuildStatus(terminal_st)
     job.completed_at = attempt.finished_at
     await db.flush()
     await sync_worker_state_after_attempt_finished(db, worker)
@@ -1722,7 +1725,7 @@ async def report_result(
         await db.execute(stmt)
     await db.commit()
 
-    if str(payload.status).lower() == "success":
+    if terminal_st == "success":
         try:
             pkg_result = await db.execute(select(Package).where(Package.id == job.package_id))
             pkg = pkg_result.scalar_one_or_none()
