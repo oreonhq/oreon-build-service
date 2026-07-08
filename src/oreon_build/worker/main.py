@@ -658,6 +658,25 @@ def _post_worker_build_result(
     attempt_id: int,
     json_body: dict,
 ) -> httpx.Response:
+    from oreon_build.core.build_result import (
+        find_architecture_excluded_line,
+        normalize_terminal_build_status,
+    )
+
+    err = json_body.get("error_message")
+    hit = find_architecture_excluded_line(err if isinstance(err, str) else None)
+    if hit:
+        json_body = dict(json_body)
+        json_body["error_message"] = hit[:2000]
+        err = json_body["error_message"]
+    st = normalize_terminal_build_status(
+        str(json_body.get("status") or ""),
+        err if isinstance(err, str) else None,
+    )
+    if st != str(json_body.get("status") or "").lower():
+        json_body = dict(json_body)
+        json_body["status"] = st
+
     def _do() -> httpx.Response:
         return session.post(
             f"{controller_url}/api/worker/result/{attempt_id}",
