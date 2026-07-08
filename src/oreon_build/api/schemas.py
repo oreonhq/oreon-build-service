@@ -334,6 +334,42 @@ class ChainResumeRequest(BaseModel):
     from_chain_id: int = Field(..., ge=1, description="Previous build chain id (failed, cancelled, or success)")
 
 
+class CIChainTrigger(BaseModel):
+
+    packages: List[str] = Field(
+        ...,
+        min_length=1,
+        description="Package names whose spec files changed in the PR. Dependencies are auto-resolved.",
+    )
+    distgit_branch: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        description="Git branch to build from (the PR head branch).",
+    )
+    release_id: int = Field(..., description="Release to build for")
+    architectures: List[str] = Field(
+        default=["x86_64", "aarch64"],
+        description="Architectures to build for",
+    )
+    distgit_url: Optional[str] = Field(
+        None,
+        max_length=1024,
+        description="Git URL for distgit spec repo (default oreonhq/rpm-specfiles)",
+    )
+    priority: int = 0
+
+
+class CIChainTriggerResponse(BaseModel):
+
+    chain_id: int
+    chain_status: str
+    stages: List[List[str]]
+    chain_spec: str
+    accepted: bool = True
+    message: Optional[str] = None
+
+
 class BuildJobResponse(BaseModel):
     id: int
     package_id: int
