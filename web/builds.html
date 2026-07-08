@@ -75,8 +75,6 @@
               <button type="button" class="source-type-tab" data-type="scm">SCM</button>
               <button type="button" class="source-type-tab" data-type="distgit">DistGit</button>
               <button type="button" class="source-type-tab" data-type="chainbuild">Chain build</button>
-              <button type="button" class="source-type-tab" data-type="checklist">Checklist</button>
-              <button type="button" class="source-type-tab" data-type="layers">Layers</button>
             </div>
             <div id="source-url-panel" class="source-panel">
               <label>Source URL(s)</label>
@@ -126,39 +124,6 @@
                 </div>
               </div>
             </div>
-            <div id="source-checklist-panel" class="source-panel" style="display:none;">
-              <p style="color:var(--text-muted); font-size:0.85rem; margin-bottom:0.5rem;">
-                Scans <code>oreonhq/rpm-specfiles</code> for packages that have a spec file, are not dead,
-                and have not yet been successfully built for the selected release. Select the ones you want to build.
-              </p>
-              <button type="button" class="btn" id="btn-load-checklist" style="margin-bottom:0.75rem;">Load unbuilt packages</button>
-              <div id="checklist-status" style="color:var(--text-muted); font-size:0.85rem; margin-bottom:0.5rem;"></div>
-              <div id="checklist-toolbar" style="display:none; margin-bottom:0.5rem; align-items:center; gap:0.5rem; flex-wrap:wrap;">
-                <button type="button" class="btn" id="btn-checklist-all">Select all</button>
-                <button type="button" class="btn" id="btn-checklist-none">Select none</button>
-                <input type="text" id="checklist-filter" class="form-control" placeholder="Filter packages..." style="width:14rem;">
-                <span id="checklist-count" style="color:var(--text-muted); font-size:0.85rem;"></span>
-              </div>
-              <div id="checklist-list" style="max-height:320px; overflow-y:auto; border:1px solid var(--border-color,#ddd); border-radius:4px; padding:0.4rem 0.5rem; display:none;"></div>
-            </div>
-            <div id="source-layers-panel" class="source-panel" style="display:none;">
-              <p style="color:var(--text-muted); font-size:0.85rem; margin-bottom:0.75rem;">
-                Same distgit layout as Checklist, but packages are grouped by rpmbuild-order layer (parallel groups).
-                Finished means at least one successful build for this release, same as the checklist. You can still tick finished rows, nothing is grayed out or disabled.
-              </p>
-              <button type="button" class="btn" id="btn-load-layers" style="margin-bottom:0.75rem;">Load layers</button>
-              <div id="layers-status" style="color:var(--text-muted); font-size:0.85rem; margin-bottom:0.5rem;"></div>
-              <div id="layers-toolbar" style="display:none; margin-bottom:0.5rem; align-items:center; gap:0.5rem; flex-wrap:wrap;">
-                <button type="button" class="btn" id="btn-layers-all">Select all</button>
-                <button type="button" class="btn" id="btn-layers-none">Select none</button>
-                <label style="display:inline-flex; align-items:center; gap:0.35rem; font-size:0.9rem; cursor:pointer;">
-                  <input type="checkbox" id="layers-hide-finished"> Hide already finished builds
-                </label>
-                <input type="text" id="layers-filter" class="form-control" placeholder="Filter packages..." style="width:14rem;">
-                <span id="layers-count" style="color:var(--text-muted); font-size:0.85rem;"></span>
-              </div>
-              <div id="layers-list" style="max-height:360px; overflow-y:auto; border:1px solid var(--border-color,#ddd); border-radius:4px; padding:0.4rem 0.5rem; display:none;"></div>
-            </div>
           </div>
           <div class="form-group">
             <label>Release</label>
@@ -169,6 +134,11 @@
                 <div class="search-select-list" id="release-new-list"></div>
               </div>
             </div>
+          </div>
+          <div class="form-group">
+            <label>Specfiles Git branch</label>
+            <input type="text" id="distgit-branch-input" class="form-control" placeholder="main" maxlength="128">
+            <p style="color:var(--text-muted); font-size:0.85rem; margin-top:0.25rem;">Branch in oreonhq/rpm-specfiles. Defaults from the release but you can override to test before merging.</p>
           </div>
           <div class="form-group">
             <label>Mock environment (optional)</label>
@@ -185,7 +155,6 @@
             </div>
           </div>
           <button type="button" class="btn primary" id="btn-create-and-build">Create package and trigger build</button>
-          <button type="button" class="btn primary" id="btn-trigger-checklist-builds" style="display:none;">Build selected packages</button>
         </div>
       </div>
       <div id="chain-build-alert" role="alert"></div>
@@ -390,6 +359,20 @@
         }).catch(function() {});
       }
 
+      function getDistgitBranch() {
+        var el = document.getElementById('distgit-branch-input');
+        var v = el && el.value ? el.value.trim() : '';
+        if (v) return v;
+        var rel = releases.find(function(r) { return r.id === selectedReleaseIdNew; });
+        return (rel && rel.default_distgit_branch) ? String(rel.default_distgit_branch).trim() : 'main';
+      }
+      function updateDistgitBranchFromRelease() {
+        var el = document.getElementById('distgit-branch-input');
+        if (!el) return;
+        var rel = releases.find(function(r) { return r.id === selectedReleaseIdNew; });
+        el.value = (rel && rel.default_distgit_branch) ? rel.default_distgit_branch : 'main';
+      }
+
       (function initBuildModeTabs() {
         document.querySelectorAll('.build-mode-tab').forEach(function(tab) {
           tab.addEventListener('click', function() {
@@ -407,15 +390,6 @@
           document.querySelectorAll('.source-panel').forEach(function(p) { p.style.display = 'none'; });
           var panel = document.getElementById('source-' + type + '-panel');
           if (panel) panel.style.display = 'block';
-          var createBtn = document.getElementById('btn-create-and-build');
-          var checklistBtn = document.getElementById('btn-trigger-checklist-builds');
-          if (type === 'checklist' || type === 'layers') {
-            if (createBtn) createBtn.style.display = 'none';
-            if (checklistBtn) checklistBtn.style.display = '';
-          } else {
-            if (createBtn) createBtn.style.display = '';
-            if (checklistBtn) checklistBtn.style.display = 'none';
-          }
         }
         document.querySelectorAll('.source-type-tab').forEach(function(tab) {
           tab.addEventListener('click', function() {
@@ -426,315 +400,6 @@
         });
       })();
 
-      // ---- Checklist logic ----
-      var checklistPackages = [];
-      var checklistLoaded = false;
-
-      function updateChecklistCount() {
-        var checked = document.querySelectorAll('#checklist-list .cl-cb:checked').length;
-        var total = document.querySelectorAll('#checklist-list .cl-cb').length;
-        var el = document.getElementById('checklist-count');
-        if (el) el.textContent = checked + ' of ' + total + ' selected';
-      }
-
-      function renderChecklistItems(filter) {
-        var list = document.getElementById('checklist-list');
-        if (!list) return;
-        var q = (filter || '').toLowerCase().trim();
-        var visible = checklistPackages.filter(function(p) { return !q || p.name.toLowerCase().indexOf(q) >= 0; });
-        if (!visible.length) {
-          list.innerHTML = '<div style="color:var(--text-muted); padding:0.5rem;">No packages match the filter.</div>';
-          updateChecklistCount();
-          return;
-        }
-        list.innerHTML = visible.map(function(p) {
-          return '<label style="display:flex; align-items:center; gap:0.5rem; padding:0.2rem 0; cursor:pointer;">'
-            + '<input type="checkbox" class="cl-cb" data-name="' + escapeAttr(p.name) + '" data-spec="' + escapeAttr(p.spec_path) + '">'
-            + '<span>' + escapeHtml(p.name) + '</span>'
-            + '</label>';
-        }).join('');
-        list.querySelectorAll('.cl-cb').forEach(function(cb) {
-          cb.addEventListener('change', updateChecklistCount);
-        });
-        updateChecklistCount();
-      }
-
-      document.getElementById('btn-load-checklist').addEventListener('click', function() {
-        if (!selectedReleaseIdNew) { alert('Select a release first.'); return; }
-        var btn = this;
-        var status = document.getElementById('checklist-status');
-        var toolbar = document.getElementById('checklist-toolbar');
-        var list = document.getElementById('checklist-list');
-        if (status) status.textContent = 'Loading from GitHub...';
-        if (toolbar) toolbar.style.display = 'none';
-        if (list) list.style.display = 'none';
-        oreonWithLoading(btn, function() { return api.get('/builds/distgit-checklist?release_id=' + selectedReleaseIdNew).then(function(data) {
-          checklistPackages = (data && data.packages) ? data.packages : [];
-          checklistLoaded = true;
-          var msg = checklistPackages.length + ' unbuilt package(s) found';
-          if (data.already_built_count) msg += ' (' + data.already_built_count + ' already built, excluded)';
-          if (data.truncated) msg += ' — WARNING: GitHub tree was truncated, list may be incomplete';
-          if (status) status.textContent = msg;
-          var filterEl = document.getElementById('checklist-filter');
-          renderChecklistItems(filterEl ? filterEl.value : '');
-          if (toolbar) { toolbar.style.display = 'flex'; }
-          if (list) list.style.display = 'block';
-        }).catch(function(e) {
-          if (status) status.textContent = 'Failed to load: ' + (e.message || e);
-        }); }); // end oreonWithLoading
-      });
-
-      document.getElementById('btn-checklist-all').addEventListener('click', function() {
-        document.querySelectorAll('#checklist-list .cl-cb').forEach(function(cb) { cb.checked = true; });
-        updateChecklistCount();
-      });
-      document.getElementById('btn-checklist-none').addEventListener('click', function() {
-        document.querySelectorAll('#checklist-list .cl-cb').forEach(function(cb) { cb.checked = false; });
-        updateChecklistCount();
-      });
-      (function() {
-        var fi = document.getElementById('checklist-filter');
-        if (fi && window.oreonDebounce) {
-          fi.addEventListener('input', window.oreonDebounce(function() { renderChecklistItems(fi.value); }, 200));
-        } else if (fi) {
-          fi.addEventListener('input', function() { renderChecklistItems(fi.value); });
-        }
-      })();
-
-      // ---- Layers (rpmbuild-order checklist) ----
-      var layersPackages = [];
-      var layersLoaded = false;
-      var layersDistgit = { url: 'https://github.com/oreonhq/rpm-specfiles.git', branch: 'main' };
-
-      function updateLayersCount() {
-        var checked = document.querySelectorAll('#layers-list .ly-cb:checked').length;
-        var total = document.querySelectorAll('#layers-list .ly-cb').length;
-        var el = document.getElementById('layers-count');
-        if (el) el.textContent = checked + ' of ' + total + ' selected';
-      }
-
-      function renderLayersItems() {
-        var list = document.getElementById('layers-list');
-        if (!list) return;
-        var q = (document.getElementById('layers-filter') && document.getElementById('layers-filter').value || '').toLowerCase().trim();
-        var hideDone = document.getElementById('layers-hide-finished') && document.getElementById('layers-hide-finished').checked;
-        var parts = [];
-        var firstHead = true;
-        layersPackages.forEach(function(layer, li) {
-          var shown = layer.filter(function(p) {
-            if (hideDone && p.finished) return false;
-            if (q && (p.name || '').toLowerCase().indexOf(q) < 0) return false;
-            return true;
-          });
-          if (!shown.length) return;
-          var headSt = firstHead
-            ? 'font-weight:600; padding:0.35rem 0.25rem 0.15rem 0; margin:0;'
-            : 'font-weight:600; padding:0.35rem 0.25rem 0.15rem 0; margin-top:0.35rem; border-top:1px solid var(--border-color,#e5e5e5);';
-          firstHead = false;
-          parts.push('<div class="layers-layer-head" style="' + headSt + '">Layer ' + (li + 1) + '</div>');
-          shown.forEach(function(p) {
-            var tag = p.finished ? ' <span style="color:var(--text-muted); font-size:0.82em;">(built)</span>' : '';
-            parts.push(
-              '<label class="layers-row" style="display:flex; align-items:center; gap:0.5rem; padding:0.2rem 0; cursor:pointer;">'
-              + '<input type="checkbox" class="ly-cb" data-name="' + escapeAttr(p.name) + '" data-spec="' + escapeAttr(p.spec_path) + '">'
-              + '<span>' + escapeHtml(p.name) + tag + '</span>'
-              + '</label>'
-            );
-          });
-        });
-        if (!parts.length) {
-          list.innerHTML = '<div style="color:var(--text-muted); padding:0.5rem;">No packages to show. Turn off &quot;Hide already finished&quot; or clear the filter.</div>';
-          updateLayersCount();
-          return;
-        }
-        list.innerHTML = parts.join('');
-        list.querySelectorAll('.ly-cb').forEach(function(cb) {
-          cb.addEventListener('change', updateLayersCount);
-        });
-        updateLayersCount();
-      }
-
-      document.getElementById('btn-load-layers').addEventListener('click', function() {
-        if (!selectedReleaseIdNew) { alert('Select a release first.'); return; }
-        var btn = this;
-        var status = document.getElementById('layers-status');
-        var toolbar = document.getElementById('layers-toolbar');
-        var list = document.getElementById('layers-list');
-        if (status) status.textContent = 'Computing build order from distgit...';
-        if (toolbar) toolbar.style.display = 'none';
-        if (list) list.style.display = 'none';
-        oreonWithLoading(btn, function() {
-          return api.get('/builds/layers-checklist?release_id=' + selectedReleaseIdNew).then(function(data) {
-            layersPackages = (data && data.layers) ? data.layers : [];
-            layersLoaded = true;
-            if (data && data.distgit_url) layersDistgit.url = String(data.distgit_url).trim();
-            if (data && data.distgit_branch) layersDistgit.branch = String(data.distgit_branch).trim();
-            var pkgCount = layersPackages.reduce(function(n, L) { return n + L.length; }, 0);
-            var msg = pkgCount + ' package(s) in ' + layersPackages.length + ' layer(s)';
-            if (data && data.errors && data.errors.length) msg += ' — warnings: ' + data.errors.slice(0, 3).join('; ');
-            if (data && data.cycle_warning) msg += ' — cycle warning from resolver';
-            if (status) status.textContent = msg;
-            renderLayersItems();
-            if (toolbar) toolbar.style.display = 'flex';
-            if (list) list.style.display = 'block';
-          }).catch(function(e) {
-            if (status) status.textContent = 'Failed to load: ' + (e.message || e);
-          });
-        });
-      });
-
-      document.getElementById('btn-layers-all').addEventListener('click', function() {
-        document.querySelectorAll('#layers-list .ly-cb').forEach(function(cb) { cb.checked = true; });
-        updateLayersCount();
-      });
-      document.getElementById('btn-layers-none').addEventListener('click', function() {
-        document.querySelectorAll('#layers-list .ly-cb').forEach(function(cb) { cb.checked = false; });
-        updateLayersCount();
-      });
-      (function() {
-        var fi = document.getElementById('layers-filter');
-        if (fi && window.oreonDebounce) {
-          fi.addEventListener('input', window.oreonDebounce(function() { renderLayersItems(); }, 200));
-        } else if (fi) {
-          fi.addEventListener('input', function() { renderLayersItems(); });
-        }
-        var hf = document.getElementById('layers-hide-finished');
-        if (hf) hf.addEventListener('change', function() { renderLayersItems(); });
-      })();
-
-      (function initLayersDragSelect() {
-        var list = document.getElementById('layers-list');
-        if (!list) return;
-        var drag = { potential: false, active: false, moved: false, anchor: -1, want: true, startX: 0, startY: 0, suppressClick: false };
-
-        function flatRows() {
-          return Array.prototype.slice.call(list.querySelectorAll('.layers-row'));
-        }
-        function rowIndex(row) {
-          return flatRows().indexOf(row);
-        }
-        function applyRange(i0, i1, checked) {
-          var rows = flatRows();
-          var lo = Math.min(i0, i1), hi = Math.max(i0, i1);
-          for (var i = lo; i <= hi; i++) {
-            var cb = rows[i] && rows[i].querySelector('.ly-cb');
-            if (cb) cb.checked = checked;
-          }
-          updateLayersCount();
-        }
-
-        list.addEventListener('click', function(e) {
-          if (drag.suppressClick) {
-            e.preventDefault();
-            e.stopPropagation();
-            drag.suppressClick = false;
-          }
-        }, true);
-
-        function endDrag() {
-          if (drag.active && drag.moved) drag.suppressClick = true;
-          drag.potential = false;
-          drag.active = false;
-          drag.moved = false;
-          drag.anchor = -1;
-          list.style.userSelect = '';
-          document.removeEventListener('mousemove', onMove);
-          document.removeEventListener('mouseup', onUp);
-        }
-
-        function onMove(e) {
-          if (!drag.potential && !drag.active) return;
-          if (drag.potential && !drag.active) {
-            var dx = e.clientX - drag.startX, dy = e.clientY - drag.startY;
-            if (dx * dx + dy * dy < 25) return;
-            drag.active = true;
-            drag.moved = true;
-            list.style.userSelect = 'none';
-            var rows = flatRows();
-            var acb = rows[drag.anchor] && rows[drag.anchor].querySelector('.ly-cb');
-            if (acb) acb.checked = drag.want;
-            updateLayersCount();
-          }
-          if (!drag.active) return;
-          var el = document.elementFromPoint(e.clientX, e.clientY);
-          var row = el && el.closest && el.closest('.layers-row');
-          if (!row || !list.contains(row)) return;
-          var idx = rowIndex(row);
-          if (idx < 0 || drag.anchor < 0) return;
-          applyRange(drag.anchor, idx, drag.want);
-          e.preventDefault();
-        }
-
-        function onUp() {
-          endDrag();
-        }
-
-        list.addEventListener('mousedown', function(e) {
-          if (e.button !== 0) return;
-          if (e.target.classList && e.target.classList.contains('ly-cb')) return;
-          var row = e.target.closest && e.target.closest('.layers-row');
-          if (!row || !list.contains(row)) return;
-          var cb = row.querySelector('.ly-cb');
-          if (!cb) return;
-          drag.potential = true;
-          drag.moved = false;
-          drag.anchor = rowIndex(row);
-          drag.want = !cb.checked;
-          drag.startX = e.clientX;
-          drag.startY = e.clientY;
-          drag.active = false;
-          document.addEventListener('mousemove', onMove);
-          document.addEventListener('mouseup', onUp);
-        });
-      })();
-
-      document.getElementById('btn-trigger-checklist-builds').addEventListener('click', function() {
-        if (!selectedReleaseIdNew) { alert('Select a release.'); return; }
-        var _clBtn = this;
-        var selected;
-        if (currentSourceType === 'layers') {
-          selected = Array.from(document.querySelectorAll('#layers-list .ly-cb:checked'));
-        } else {
-          selected = Array.from(document.querySelectorAll('#checklist-list .cl-cb:checked'));
-        }
-        if (!selected.length) { alert('Check at least one package.'); return; }
-        var arches = getSelectedArchitecturesNew();
-        var mockIdVal = (document.getElementById('new-package-mock-env') && document.getElementById('new-package-mock-env').value || '').trim();
-        var rel = releases.find(function(r) { return r.id === selectedReleaseIdNew; });
-        var releasename = rel && rel.releasename ? rel.releasename.trim() : '';
-        if (!releasename) { alert('Selected release is missing a releasename.'); return; }
-        var repoUrl = currentSourceType === 'layers' && layersDistgit.url
-          ? layersDistgit.url
-          : 'https://github.com/oreonhq/rpm-specfiles.git';
-        var branch = currentSourceType === 'layers' && layersDistgit.branch
-          ? layersDistgit.branch
-          : 'main';
-        var batchBody = {
-          release_id: selectedReleaseIdNew,
-          architectures: arches,
-          skip_complete_arches: false,
-          packages: selected.map(function(cb) {
-            return { name: cb.dataset.name, spec_path: cb.dataset.spec || '' };
-          })
-        };
-        if (mockIdVal) batchBody.preferred_mock_environment_id = parseInt(mockIdVal, 10);
-        if (repoUrl !== 'https://github.com/oreonhq/rpm-specfiles.git') batchBody.distgit_url = repoUrl;
-        if (branch !== 'main') batchBody.distgit_branch = branch;
-        oreonWithLoading(_clBtn, function() {
-          return api.post('/builds/trigger-batch', batchBody)
-            .then(function(data) {
-              render();
-              var n = (data && data.package_count) ? data.package_count : selected.length;
-              alert(buildAcceptedMessage(data, 'Queued ' + n + ' package(s) in the background.'));
-              if (currentSourceType === 'checklist' && checklistLoaded) {
-                document.getElementById('btn-load-checklist').click();
-              } else if (currentSourceType === 'layers' && layersLoaded) {
-                document.getElementById('btn-load-layers').click();
-              }
-            })
-            .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
-        });
-      });
       (function initReleaseNewSelect() {
         var listEl = document.getElementById('release-new-list');
         if (!listEl) return;
@@ -746,7 +411,7 @@
           listEl.innerHTML = releases.filter(function(r) { return !q || (r.releasename || '').toLowerCase().indexOf(q) >= 0; })
             .map(function(r) { return '<div class="search-select-option" data-id="' + r.id + '">' + escapeHtml(r.releasename || '') + ' <span style="color:var(--text-muted)">(#' + r.id + ')</span></div>'; }).join('') || '<div class="search-select-option" style="cursor:default;color:var(--text-muted)">No matches</div>';
           listEl.querySelectorAll('.search-select-option[data-id]').forEach(function(opt) {
-            opt.addEventListener('click', function() { selectedReleaseIdNew = parseInt(opt.dataset.id, 10); renderReleaseListNew(); fillMockEnvsForRelease(selectedReleaseIdNew); container.classList.remove('open'); if (search) search.value = ''; });
+            opt.addEventListener('click', function() { selectedReleaseIdNew = parseInt(opt.dataset.id, 10); renderReleaseListNew(); fillMockEnvsForRelease(selectedReleaseIdNew); updateDistgitBranchFromRelease(); container.classList.remove('open'); if (search) search.value = ''; });
           });
         }
         if (trigger) trigger.addEventListener('click', function(e) { e.stopPropagation(); container.classList.toggle('open'); if (container.classList.contains('open')) { renderList(search ? search.value : ''); if (search) search.focus(); } });
@@ -757,7 +422,7 @@
       })();
 
       function statusClass(s) {
-        if (s === 'success') return 'badge success';
+        if (s === 'success' || s === 'skipped') return 'badge success';
         if (s === 'failed' || s === 'cancelled') return 'badge failed';
         if (s === 'running' || s === 'queued') return 'badge running';
         return 'badge pending';
@@ -1135,6 +800,7 @@
           })
         };
         if (mockIdVal) batchBody.preferred_mock_environment_id = parseInt(mockIdVal, 10);
+        batchBody.distgit_branch = getDistgitBranch();
         oreonWithLoading(_btn, function() {
           return api.post('/builds/trigger-batch', batchBody)
             .then(function(data) {
@@ -1152,7 +818,8 @@
           var chainBody = {
             chain_spec: chainRaw,
             release_id: selectedReleaseIdNew,
-            architectures: arches
+            architectures: arches,
+            distgit_branch: getDistgitBranch()
           };
           var mockChain = (document.getElementById('new-package-mock-env') && document.getElementById('new-package-mock-env').value || '').trim();
           if (mockChain) chainBody.preferred_mock_environment_id = parseInt(mockChain, 10);
