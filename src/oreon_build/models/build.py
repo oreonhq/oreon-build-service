@@ -4,7 +4,7 @@ import enum
 from datetime import datetime
 from typing import TYPE_CHECKING, List, Optional
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Integer, String, Text, func
+from sqlalchemy import DateTime, Enum, ForeignKey, Integer, JSON, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from oreon_build.db.base import Base
@@ -77,6 +77,7 @@ class BuildJob(Base):
     )
     rpmbuild_layer_index: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
     rpmbuild_wave_index: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    job_options: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
     package: Mapped["Package"] = relationship("Package", back_populates="build_jobs")
     release: Mapped["Release"] = relationship("Release", back_populates="build_jobs")
@@ -118,6 +119,8 @@ class BuildAttempt(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     mock_succeeded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     signing_status: Mapped[str] = mapped_column(String(32), default="not_started", nullable=False)
+    build_profile: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    rpmbuild_defines: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
     build_job: Mapped["BuildJob"] = relationship("BuildJob", back_populates="attempts")
     worker: Mapped[Optional["Worker"]] = relationship(
