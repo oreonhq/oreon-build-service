@@ -1088,6 +1088,19 @@ def _mock_rpmbuild_smp_define_args() -> list[str]:
         f"_smp_build_ncpus {n}",
     ]
 
+def _mock_rpmbuild_define_args(rpmbuild_defines: dict | None) -> list[str]:
+    out: list[str] = []
+    if not isinstance(rpmbuild_defines, dict):
+        return out
+    for key in sorted(rpmbuild_defines.keys()):
+        k = str(key).strip()
+        if not k:
+            continue
+        v = str(rpmbuild_defines.get(key) or "").strip()
+        out += ["--define", f"{k} {v}"]
+    return out
+
+
 def _mock_cmd_base(
     mock_config: str,
     mock_unique_ext: str | None,
@@ -1095,6 +1108,7 @@ def _mock_cmd_base(
     rpm_dist: str | None = None,
     *,
     attempt_id: int | None = None,
+    rpmbuild_defines: dict | None = None,
 ) -> list[str]:
     cmd: list[str] = ["mock", "-r", mock_config]
     if mock_unique_ext:
@@ -1104,6 +1118,7 @@ def _mock_cmd_base(
     for url in addrepo_baseurls:
         cmd += ["--addrepo", url]
     cmd += _mock_rpmbuild_smp_define_args()
+    cmd += _mock_rpmbuild_define_args(rpmbuild_defines)
     if rpm_dist:
         cmd += ["--define", f"dist {rpm_dist}"]
     return cmd
@@ -1640,6 +1655,7 @@ def _mock_build_srpm_from_spec(
     rpm_dist: str | None = None,
     attempt_id: int | None = None,
     live_out: MockLiveOutput | None = None,
+    rpmbuild_defines: dict | None = None,
 ) -> tuple[bool, Path | None, str, bool]:
     eff_mock_config = _mock_config_for_mixed_addrepos(
         mock_config,
@@ -1653,6 +1669,7 @@ def _mock_build_srpm_from_spec(
         addrepo_baseurls or [],
         rpm_dist=rpm_dist,
         attempt_id=attempt_id,
+        rpmbuild_defines=rpmbuild_defines,
     )
     cmd += [
         "--buildsrpm",
@@ -1687,6 +1704,7 @@ def _mock_rebuild_srpm(
     rpm_dist: str | None = None,
     attempt_id: int | None = None,
     live_out: MockLiveOutput | None = None,
+    rpmbuild_defines: dict | None = None,
 ) -> tuple[bool, str, bool]:
     eff_mock_config = _mock_config_for_mixed_addrepos(
         mock_config,
@@ -1700,6 +1718,7 @@ def _mock_rebuild_srpm(
         addrepo_baseurls or [],
         rpm_dist=rpm_dist,
         attempt_id=attempt_id,
+        rpmbuild_defines=rpmbuild_defines,
     )
     cmd += ["--rebuild", str(srpm_path), "--resultdir", str(result_dir)]
     rc, out = _run_with_abort(cmd, timeout_s=_mock_rebuild_timeout_sec(), abort_event=abort_event, live_out=live_out)
@@ -2074,6 +2093,17 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
         if rpm_dist:
             logger.info("mock rpmbuild dist for attempt %s: %s", attempt_id, rpm_dist)
 
+        raw_defines = job.get("rpmbuild_defines")
+        rpmbuild_defines = dict(raw_defines) if isinstance(raw_defines, dict) else {}
+        build_profile = str(job.get("build_profile") or "full").strip() or "full"
+        if rpmbuild_defines:
+            logger.info(
+                "mock rpmbuild defines for attempt %s profile=%s: %s",
+                attempt_id,
+                build_profile,
+                rpmbuild_defines,
+            )
+
         tmp_parent = _worker_temp_parent_dir()
         if tmp_parent:
             try:
@@ -2228,6 +2258,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                         rpm_dist=rpm_dist,
                         attempt_id=attempt_id,
                         live_out=srpm_live,
+                        rpmbuild_defines=rpmbuild_defines,
                     )
                 finally:
                     live_srpm_stop.set()
@@ -2313,6 +2344,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                     rpm_dist=rpm_dist,
                     attempt_id=attempt_id,
                     live_out=rebuild_live,
+                    rpmbuild_defines=rpmbuild_defines,
                 )
             finally:
                 live_rebuild_stop.set()
