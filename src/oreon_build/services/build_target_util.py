@@ -10,6 +10,55 @@ from sqlalchemy.exc import IntegrityError
 from oreon_build.models import BuildJob, BuildStatus, BuildTarget, MockEnvironment, Package, PackageVersion
 
 
+async def resolve_package_by_name(
+    db,
+    name: str,
+    *,
+    release_id: int | None = None,
+    chain_ids: list[int] | None = None,
+) -> Package | None:
+    pkg_name = (name or "").strip()
+    if not pkg_name:
+        return None
+    result = await db.execute(
+        select(Package).where(Package.name == pkg_name).order_by(Package.id.asc())
+    )
+    rows = list(result.scalars().all())
+    if not rows:
+        return None
+    if len(rows) == 1:
+        return rows[0]
+
+    prefer_ids: list[int] = []
+    if chain_ids:
+        chain_r = await db.execute(
+            select(BuildJob.package_id)
+            .join(Package, Package.id == BuildJob.package_id)
+            .where(Package.name == pkg_name, BuildJob.chain_id.in_(chain_ids))
+            .order_by(BuildJob.id.desc())
+        )
+        prefer_ids.extend(int(x) for x in chain_r.scalars().all() if x is not None)
+    if release_id is not None:
+        rel_r = await db.execute(
+            select(BuildJob.package_id)
+            .join(Package, Package.id == BuildJob.package_id)
+            .where(Package.name == pkg_name, BuildJob.release_id == release_id)
+            .order_by(BuildJob.id.desc())
+        )
+        prefer_ids.extend(int(x) for x in rel_r.scalars().all() if x is not None)
+
+    by_id = {p.id: p for p in rows}
+    seen: set[int] = set()
+    for pid in prefer_ids:
+        if pid in seen:
+            continue
+        seen.add(pid)
+        hit = by_id.get(pid)
+        if hit is not None:
+            return hit
+    return rows[0]
+
+
 async def get_or_create_build_target(
     db,
     release_id: int,
