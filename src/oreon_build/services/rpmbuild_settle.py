@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import bz2
 import gzip
+import io
 import logging
 import lzma
 import xml.etree.ElementTree as ET
@@ -26,6 +27,12 @@ def _decompress_if_needed(raw: bytes, key: str) -> bytes:
         return bz2.decompress(raw)
     if lk.endswith(".xz"):
         return lzma.decompress(raw)
+    if lk.endswith(".zst"):
+        import zstandard as zstd
+
+        dctx = zstd.ZstdDecompressor()
+        with dctx.stream_reader(io.BytesIO(raw)) as reader:
+            return reader.read()
     return raw
 
 
