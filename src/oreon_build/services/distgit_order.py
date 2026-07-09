@@ -18,7 +18,11 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
-from specfile import Specfile
+
+try:
+    from specfile import Specfile  # noqa: F401 — optional, used for deep parse
+except ImportError:
+    Specfile = None  # type: ignore[assignment, misc]
 
 from oreon_build.config import get_settings
 from oreon_build.services.r2 import get_r2_client
@@ -276,7 +280,8 @@ def _parse_spec_text(spec_text: str, filename_hint: str = "inline.spec") -> _Spe
                     continue
                 provided.add(tok)
     provided.add(source_name)
-    if (os.environ.get("OREON_SPECFILE_DEEP_PARSE") or "").strip().lower() not in ("1", "true", "yes", "on"):
+    deep_enabled = (os.environ.get("OREON_SPECFILE_DEEP_PARSE") or "").strip().lower() in ("1", "true", "yes", "on")
+    if not deep_enabled or Specfile is None:
         return _SpecParseResult(
             source_name=source_name,
             build_requires=br_out,
@@ -683,27 +688,25 @@ async def compute_distgit_build_order_for_chain(
         releasename,
         time.monotonic() - t_index,
     )
-    t_closure = time.monotonic()
-    specs_by_pkg, parsed_during_closure, cerr = await asyncio.to_thread(
-        _expand_chain_spec_closure,
-        root_packages,
-        all_names,
-        tarball,
-        releasename,
-        members=members,
+    root_set: set[str] = set()
+    for r in root_packages:
+        rn = (r or "").strip()
+        if rn:
+            root_set.add(rn)
+    unknown = sorted(rn for rn in root_set if rn not in all_names)
+    for rn in unknown:
+        err.append(f"chain root {rn!r} not found under {releasename}/ in distgit")
+    found = root_set & all_names
+    specs_by_pkg = _read_specs_from_tarball(
+        tarball, releasename, found, members=members
     )
     logger.info(
-        "distgit BR closure: %s specs from %s root(s) in %.1fs",
+        "distgit CI chain: %s specs from %s changed root(s) in %.1fs (no closure expansion)",
         len(specs_by_pkg),
-        len(root_packages),
-        time.monotonic() - t_closure,
+        len(found),
+        time.monotonic() - t_index,
     )
-    err.extend(cerr)
-    if parsed_during_closure and len(parsed_during_closure) >= len(specs_by_pkg):
-        parsed_by_source = parsed_during_closure
-        perr = []
-    else:
-        parsed_by_source, perr = await _parse_specs_parallel_async(specs_by_pkg)
+    parsed_by_source, perr = await _parse_specs_parallel_async(specs_by_pkg)
     err.extend(perr)
     return _distgit_order_from_parsed(
         releasename=releasename,
