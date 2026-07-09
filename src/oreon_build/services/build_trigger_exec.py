@@ -16,6 +16,7 @@ from oreon_build.services.build_target_util import (
     get_or_create_build_target,
     has_successful_build_for_target,
     latest_package_version_id,
+    resolve_package_by_name,
 )
 
 if TYPE_CHECKING:
@@ -99,8 +100,7 @@ async def execute_build_trigger(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Mock environment not found or does not belong to the selected release.",
                 )
-        existing_r = await db.execute(select(Package).where(Package.name == np.name))
-        existing_pkg = existing_r.scalar_one_or_none()
+        existing_pkg = await resolve_package_by_name(db, np.name, release_id=data.release_id)
         if existing_pkg:
             package_id = existing_pkg.id
             package_name = existing_pkg.name

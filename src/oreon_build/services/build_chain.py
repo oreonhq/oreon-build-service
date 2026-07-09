@@ -36,6 +36,7 @@ from oreon_build.services.ci_callback import notify_chain_terminal
 from oreon_build.services.build_target_util import (
     get_or_create_build_target,
     latest_package_version_id,
+    resolve_package_by_name,
 )
 
 if TYPE_CHECKING:
@@ -473,6 +474,7 @@ async def _enqueue_chain_stage_jobs(
     request: Request | None,
     skip_package_arch_slots: set[tuple[int, str]] | None = None,
     advance_if_stage_satisfied_by_skips: bool = False,
+    lineage_chain_ids: list[int] | None = None,
 ) -> list[BuildJob]:
     stages: list[list[str]] = chain.stages_json if isinstance(chain.stages_json, list) else []
     if stage_index < 0 or stage_index >= len(stages):
@@ -500,8 +502,12 @@ async def _enqueue_chain_stage_jobs(
     skip_slots_set = skip_package_arch_slots or set()
 
     for pkg_name in pkgs:
-        existing_r = await db.execute(select(Package).where(Package.name == pkg_name))
-        existing_pkg = existing_r.scalar_one_or_none()
+        existing_pkg = await resolve_package_by_name(
+            db,
+            pkg_name,
+            release_id=chain.release_id,
+            chain_ids=lineage_chain_ids,
+        )
         package_id: int
         package_version_id: int | None
         pref_mock: int | None
@@ -740,7 +746,9 @@ async def enqueue_chain_jobs_after_create(db: Any, chain_id: int) -> None:
         except (TypeError, ValueError):
             pref_pm = None
     dg_url = str(opt.get("distgit_url") or "https://github.com/oreonhq/rpm-specfiles.git").strip()
-    dg_branch = str(opt.get("distgit_branch") or "main").strip()
+    rr = await db.execute(select(Release).where(Release.id == chain.release_id))
+    release = rr.scalar_one_or_none()
+    dg_branch = str(opt.get("distgit_branch") or release_distgit_branch(release)).strip()
     await _enqueue_chain_stage_jobs(
         db,
         chain,
@@ -977,7 +985,9 @@ async def resume_chain_from_previous(
         )
 
     dg_url = str(opt.get("distgit_url") or "https://github.com/oreonhq/rpm-specfiles.git").strip()
-    dg_branch = str(opt.get("distgit_branch") or "main").strip()
+    rel_r = await db.execute(select(Release).where(Release.id == old.release_id))
+    release = rel_r.scalar_one_or_none()
+    dg_branch = str(opt.get("distgit_branch") or release_distgit_branch(release)).strip()
     priority = int(opt.get("priority") or 0)
     resume_start = resume_stage
 
@@ -1046,7 +1056,9 @@ async def enqueue_resumed_chain_stages(db: Any, chain_id: int, from_chain_id: in
         except (TypeError, ValueError):
             pref_pm = None
     dg_url = str(opt.get("distgit_url") or "https://github.com/oreonhq/rpm-specfiles.git").strip()
-    dg_branch = str(opt.get("distgit_branch") or "main").strip()
+    rel_r = await db.execute(select(Release).where(Release.id == chain.release_id))
+    release = rel_r.scalar_one_or_none()
+    dg_branch = str(opt.get("distgit_branch") or release_distgit_branch(release)).strip()
     priority = int(opt.get("priority") or 0)
 
     stage = resume_start
@@ -1072,6 +1084,7 @@ async def enqueue_resumed_chain_stages(db: Any, chain_id: int, from_chain_id: in
             request=None,
             skip_package_arch_slots=skip_set,
             advance_if_stage_satisfied_by_skips=True,
+            lineage_chain_ids=lineage_ids,
         )
         if chain.status in (BuildChainStatus.FAILED, BuildChainStatus.SUCCESS, BuildChainStatus.CANCELLED):
             break
