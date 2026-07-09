@@ -389,6 +389,12 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
         status=BuildStatus.RUNNING,
         started_at=datetime.now(timezone.utc),
     )
+    from oreon_build.services.build_pass import poll_payload_from_job
+
+    pass_info = poll_payload_from_job(job)
+    attempt.build_profile = str(pass_info.get("build_profile") or "full")
+    defines = pass_info.get("rpmbuild_defines")
+    attempt.rpmbuild_defines = dict(defines) if isinstance(defines, dict) else {}
     db.add(attempt)
     locked_worker.state = WorkerState.BUSY
     await db.flush()
@@ -479,6 +485,8 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
             "sources": sources,
             "mock_config": mock_config,
             "mock_additional_repos": mock_additional_repos,
+            "build_profile": pass_info.get("build_profile") or "full",
+            "rpmbuild_defines": pass_info.get("rpmbuild_defines") or {},
         },
     }
 
@@ -1698,8 +1706,16 @@ async def report_result(
         attempt.error_message = err_msg
     if payload.log_r2_key:
         attempt.log_r2_key = payload.log_r2_key
-    job.status = BuildStatus(terminal_st)
-    job.completed_at = attempt.finished_at
+    from oreon_build.services.build_pass import job_options_dict
+
+    job_opts = job_options_dict(job)
+    has_next = bool(str(job_opts.get("next_profile") or "").strip())
+    if terminal_st == "success" and has_next:
+        job.status = BuildStatus.PENDING
+        job.completed_at = None
+    else:
+        job.status = BuildStatus(terminal_st)
+        job.completed_at = attempt.finished_at
     await db.flush()
     await sync_worker_state_after_attempt_finished(db, worker)
     await db.commit()

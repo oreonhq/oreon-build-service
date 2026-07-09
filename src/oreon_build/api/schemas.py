@@ -327,6 +327,13 @@ class ChainBuildTrigger(BaseModel):
     )
     distgit_branch: Optional[str] = Field(None, max_length=128, description="Branch fragment in distgit URL")
     priority: int = 0
+    auto_resolve: bool = Field(
+        True,
+        description=(
+            "When true, treat chain_spec package names as roots and auto-resolve BuildRequires/Requires "
+            "closure, repo pruning, layer ordering, and bootstrap profiles. When false, use chain_spec stages literally."
+        ),
+    )
 
 
 class ChainResumeRequest(BaseModel):
@@ -440,6 +447,7 @@ class ChainStatusResponse(BaseModel):
     chain_spec: str
     error_message: Optional[str] = None
     job_count: int = 0
+    planning: bool = False
     releasename: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
