@@ -94,6 +94,8 @@ class _SpecParseResult:
     build_requires: list[str]
     provided_binary_names: set[str]
     build_requires_raw: list[str] = None  # type: ignore[assignment]
+    requires: list[str] = None  # type: ignore[assignment]
+    requires_raw: list[str] = None  # type: ignore[assignment]
     epoch: int = 0
     version: str = ""
     release: str = ""
@@ -101,6 +103,19 @@ class _SpecParseResult:
     def __post_init__(self) -> None:
         if self.build_requires_raw is None:
             self.build_requires_raw = list(self.build_requires)
+        if self.requires is None:
+            self.requires = []
+        if self.requires_raw is None:
+            self.requires_raw = list(self.requires)
+
+    def dependency_names(self) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for name in list(self.build_requires) + list(self.requires):
+            if name and name not in seen:
+                seen.add(name)
+                out.append(name)
+        return out
 
     def evr_canonical(self) -> str:
         ver = (self.version or "0").strip() or "0"
@@ -224,6 +239,9 @@ def _parse_spec_text(spec_text: str, filename_hint: str = "inline.spec") -> _Spe
     br_out: list[str] = []
     br_raw: list[str] = []
     br_seen: set[str] = set()
+    req_out: list[str] = []
+    req_raw: list[str] = []
+    req_seen: set[str] = set()
     provided: set[str] = set()
     source_name = Path(filename_hint).stem
     epoch = 0
@@ -273,6 +291,20 @@ def _parse_spec_text(spec_text: str, filename_hint: str = "inline.spec") -> _Spe
                 br_seen.add(tok)
                 br_out.append(tok)
             continue
+        if us.startswith("REQUIRES:"):
+            val = s.split(":", 1)[1]
+            expanded = _expand_rpm_macros(val, macros)
+            for chunk in expanded.replace("\n", ",").split(","):
+                line = chunk.strip()
+                if not line:
+                    continue
+                req_raw.append(line)
+            for tok in _extract_br_tokens_from_tag_value(expanded):
+                if tok in req_seen:
+                    continue
+                req_seen.add(tok)
+                req_out.append(tok)
+            continue
         if us.startswith("PROVIDES:"):
             val = s.split(":", 1)[1]
             for tok in _extract_br_tokens_from_tag_value(_expand_rpm_macros(val, macros)):
@@ -287,6 +319,8 @@ def _parse_spec_text(spec_text: str, filename_hint: str = "inline.spec") -> _Spe
             build_requires=br_out,
             provided_binary_names=provided,
             build_requires_raw=br_raw,
+            requires=req_out,
+            requires_raw=req_raw,
             epoch=epoch,
             version=version,
             release=release,
@@ -308,13 +342,20 @@ def _parse_spec_text(spec_text: str, filename_hint: str = "inline.spec") -> _Spe
                             continue
                         provided.add(tok)
                     continue
-                if lname != "buildrequires":
+                if lname == "buildrequires":
+                    for tok in _extract_br_tokens_from_tag_value(str(getattr(t, "value", "") or "")):
+                        if tok in br_seen:
+                            continue
+                        br_seen.add(tok)
+                        br_out.append(tok)
                     continue
-                for tok in _extract_br_tokens_from_tag_value(str(getattr(t, "value", "") or "")):
-                    if tok in br_seen:
-                        continue
-                    br_seen.add(tok)
-                    br_out.append(tok)
+                if lname == "requires":
+                    for tok in _extract_br_tokens_from_tag_value(str(getattr(t, "value", "") or "")):
+                        if tok in req_seen:
+                            continue
+                        req_seen.add(tok)
+                        req_out.append(tok)
+                    continue
         if not source_name:
             source_name = Path(filename_hint).stem
         provided.add(source_name)
@@ -330,6 +371,8 @@ def _parse_spec_text(spec_text: str, filename_hint: str = "inline.spec") -> _Spe
             build_requires=br_out,
             provided_binary_names=provided,
             build_requires_raw=br_raw,
+            requires=req_out,
+            requires_raw=req_raw,
             epoch=epoch,
             version=version,
             release=release,
@@ -341,6 +384,8 @@ def _parse_spec_text(spec_text: str, filename_hint: str = "inline.spec") -> _Spe
         build_requires=br_out,
         provided_binary_names=provided,
         build_requires_raw=br_raw,
+        requires=req_out,
+        requires_raw=req_raw,
         epoch=epoch,
         version=version,
         release=release,
@@ -461,6 +506,154 @@ def _chain_distgit_parse_wave_size() -> int:
     return max(8, min(n, 128))
 
 
+def _distgit_spec_raw_url(
+    owner: str,
+    repo: str,
+    distgit_branch: str,
+    releasename: str,
+    pkg: str,
+) -> str:
+    path = f"{releasename}/{pkg}/{pkg}.spec"
+    return f"https://raw.githubusercontent.com/{owner}/{repo}/{distgit_branch}/{path}"
+
+
+async def _fetch_distgit_specs_batch(
+    client: httpx.AsyncClient,
+    *,
+    owner: str,
+    repo: str,
+    distgit_branch: str,
+    releasename: str,
+    packages: list[str],
+) -> dict[str, str]:
+    if not packages:
+        return {}
+
+    async def one(pkg: str) -> tuple[str, str | None]:
+        url = _distgit_spec_raw_url(owner, repo, distgit_branch, releasename, pkg)
+        try:
+            r = await client.get(url)
+        except httpx.HTTPError:
+            return pkg, None
+        if r.status_code != 200:
+            return pkg, None
+        return pkg, r.text
+
+    results = await asyncio.gather(*(one(pkg) for pkg in packages))
+    return {pkg: text for pkg, text in results if text}
+
+
+async def expand_chain_spec_closure_sparse(
+    roots: list[str],
+    *,
+    releasename: str,
+    owner: str,
+    repo: str,
+    distgit_branch: str,
+    headers: dict[str, str],
+) -> tuple[dict[str, str], dict[str, _SpecParseResult], list[str]]:
+    err: list[str] = []
+    specs: dict[str, str] = {}
+    parsed_by_source: dict[str, _SpecParseResult] = {}
+    provider_map: dict[str, set[str]] = {}
+    known: set[str] = set()
+    needed: set[str] = set()
+    queue: deque[str] = deque()
+
+    for r in roots:
+        rn = (r or "").strip()
+        if not rn:
+            continue
+        needed.add(rn)
+        queue.append(rn)
+
+    max_parse = _chain_distgit_max_parse()
+    wave_size = _chain_distgit_parse_wave_size()
+    pool = _distgit_spec_parse_executor()
+    t0 = time.monotonic()
+    fetched = 0
+
+    timeout = httpx.Timeout(30.0, connect=10.0)
+    limits = httpx.Limits(max_connections=64, max_keepalive_connections=32)
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        headers=headers,
+        follow_redirects=True,
+        limits=limits,
+    ) as client:
+        while queue and len(needed) <= max_parse:
+            wave: list[str] = []
+            while queue and len(wave) < wave_size:
+                pkg = queue.popleft()
+                if pkg in parsed_by_source:
+                    continue
+                wave.append(pkg)
+            if not wave:
+                break
+
+            batch_specs = await _fetch_distgit_specs_batch(
+                client,
+                owner=owner,
+                repo=repo,
+                distgit_branch=distgit_branch,
+                releasename=releasename,
+                packages=wave,
+            )
+            fetched += len(batch_specs)
+            for pkg in wave:
+                if pkg not in batch_specs:
+                    if pkg in roots:
+                        err.append(f"chain root {pkg!r} not found under {releasename}/ in distgit")
+                    continue
+                known.add(pkg)
+
+            futures = {
+                pool.submit(_parse_spec_text, batch_specs[pkg], f"{pkg}.spec"): pkg
+                for pkg in batch_specs
+            }
+            for fut in as_completed(futures):
+                pkg = futures[fut]
+                try:
+                    parsed = fut.result()
+                except Exception as exc:
+                    err.append(f"{pkg}: parse failed ({type(exc).__name__}: {exc})")
+                    parsed = _SpecParseResult(
+                        source_name=pkg,
+                        build_requires=[],
+                        provided_binary_names={pkg},
+                        build_requires_raw=[],
+                    )
+                specs[pkg] = batch_specs[pkg]
+                parsed_by_source[pkg] = parsed
+                for cap, srcs in _provider_map_from_specs({pkg: parsed}).items():
+                    provider_map.setdefault(cap, set()).update(srcs)
+                for dep in parsed.dependency_names():
+                    provs = set(provider_map.get(dep) or set())
+                    provs.add(dep)
+                    for prov in provs:
+                        if prov in parsed_by_source or prov == pkg:
+                            continue
+                        if prov not in needed:
+                            needed.add(prov)
+                            queue.append(prov)
+
+    if len(needed) > max_parse:
+        err.append(
+            f"Chain distgit closure exceeded OREON_CHAIN_DISTGIT_MAX_PARSE ({max_parse}); narrow the chain spec."
+        )
+
+    logger.info(
+        "sparse distgit closure %s/%s: roots=%s fetched=%s parsed=%s in %.1fs",
+        releasename,
+        distgit_branch,
+        len([r for r in roots if (r or "").strip()]),
+        fetched,
+        len(parsed_by_source),
+        time.monotonic() - t0,
+    )
+    return specs, parsed_by_source, err
+
+
 async def _parse_specs_parallel_async(
     specs_by_pkg: dict[str, str],
 ) -> tuple[dict[str, _SpecParseResult], list[str]]:
@@ -505,8 +698,8 @@ def _distgit_order_from_parsed(
     provider_map = _provider_map_from_specs(parsed_by_source)
 
     for cons, parsed in parsed_by_source.items():
-        for br in parsed.build_requires:
-            providers = provider_map.get(br) or set()
+        for dep in parsed.dependency_names():
+            providers = provider_map.get(dep) or set()
             for prov in sorted(providers):
                 if prov not in names_set or prov == cons:
                     continue
@@ -516,7 +709,7 @@ def _distgit_order_from_parsed(
                     {
                         "from": cons,
                         "to": prov,
-                        "requirement": br,
+                        "requirement": dep,
                         "satisfied": False,
                         "type": "distgit_br",
                     }
@@ -614,10 +807,10 @@ def _expand_chain_spec_closure(
             parsed_by_source[pkg] = parsed
             for cap, srcs in _provider_map_from_specs({pkg: parsed}).items():
                 provider_map.setdefault(cap, set()).update(srcs)
-            for br in parsed.build_requires:
-                provs = set(provider_map.get(br) or set())
-                if br in names_set:
-                    provs.add(br)
+            for dep in parsed.dependency_names():
+                provs = set(provider_map.get(dep) or set())
+                if dep in names_set:
+                    provs.add(dep)
                 for prov in provs:
                     if prov not in names_set or prov == pkg:
                         continue
@@ -932,8 +1125,8 @@ async def compute_spec_tree_dependency_plan(
     deps_all: dict[str, set[str]] = {n: set() for n in names_set}
     rdeps_all: dict[str, set[str]] = {n: set() for n in names_set}
     for cons, parsed in parsed_by_source.items():
-        for br in parsed.build_requires:
-            providers = provider_map.get(br) or set()
+        for dep in parsed.dependency_names():
+            providers = provider_map.get(dep) or set()
             valid_providers = [p for p in providers if p in names_set and p != cons]
             if not valid_providers:
                 if br not in names_set:

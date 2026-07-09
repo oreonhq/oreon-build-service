@@ -38,6 +38,7 @@ from oreon_build.services.build_target_util import (
     latest_package_version_id,
     resolve_package_by_name,
 )
+from oreon_build.services.build_pass import apply_plan_to_job_options, package_plan_from_chain
 
 if TYPE_CHECKING:
     from oreon_build.models import Account
@@ -500,6 +501,8 @@ async def _enqueue_chain_stage_jobs(
     publish_branch = r2_publish_branch(release)
     releasename = (release.releasename or "").strip()
     skip_slots_set = skip_package_arch_slots or set()
+    chain_opt = _options_dict(chain)
+    pkg_plans = chain_opt.get("package_plans") if isinstance(chain_opt.get("package_plans"), dict) else {}
 
     for pkg_name in pkgs:
         existing_pkg = await resolve_package_by_name(
@@ -585,6 +588,7 @@ async def _enqueue_chain_stage_jobs(
                 chain_id=chain.id,
                 chain_stage_index=stage_index,
             )
+            apply_plan_to_job_options(job, package_plan_from_chain(chain_opt, pkg_name) or pkg_plans.get(pkg_name, {}))
             db.add(job)
             await db.flush()
             jobs_created.append(job)
@@ -631,6 +635,8 @@ async def trigger_chain_build(
     distgit_branch: str | None,
     priority: int,
     defer_enqueue: bool = False,
+    package_plans: dict[str, Any] | None = None,
+    plan_pending_roots: list[str] | None = None,
 ) -> tuple[BuildChain, list[BuildJob], bool]:
     stages = parse_chain_build_spec(chain_spec)
     rr = await db.execute(select(Release).where(Release.id == release_id))
@@ -682,6 +688,11 @@ async def trigger_chain_build(
         "preferred_mock_environment_id": preferred_mock_environment_id,
         "priority": priority,
     }
+    if package_plans:
+        chain_options["package_plans"] = package_plans
+    if plan_pending_roots is not None:
+        chain_options["plan_pending"] = True
+        chain_options["plan_roots"] = [str(r) for r in plan_pending_roots if r]
     chain = BuildChain(
         release_id=release_id,
         triggered_by_id=user.id,
@@ -729,6 +740,23 @@ async def trigger_chain_build(
     return chain, jobs, defer_enqueue
 
 
+def apply_automatic_plan_to_chain(
+    chain: BuildChain,
+    *,
+    chain_spec: str,
+    package_plans: dict[str, Any],
+) -> None:
+    spec = (chain_spec or "").strip()
+    chain.chain_spec = spec
+    chain.stages_json = parse_chain_build_spec(spec)
+    flag_modified(chain, "stages_json")
+    opt = _options_dict(chain)
+    opt["package_plans"] = package_plans
+    opt.pop("plan_pending", None)
+    opt.pop("plan_roots", None)
+    _set_chain_options(chain, opt)
+
+
 async def enqueue_chain_jobs_after_create(db: Any, chain_id: int) -> None:
     chain_r = await db.execute(select(BuildChain).where(BuildChain.id == chain_id).with_for_update())
     chain = chain_r.scalar_one_or_none()
@@ -736,6 +764,9 @@ async def enqueue_chain_jobs_after_create(db: Any, chain_id: int) -> None:
         logger.error("chain enqueue: chain_id=%s not found", chain_id)
         return
     opt = _options_dict(chain)
+    if opt.get("plan_pending"):
+        logger.info("chain_id=%s still planning, skipping enqueue", chain_id)
+        return
     arches = [str(x) for x in opt.get("architectures") or DEFAULT_ARCH]
     pm = opt.get("preferred_mock_environment_id")
     if pm is None or pm == "":
@@ -771,6 +802,7 @@ async def enqueue_chain_jobs_after_create(db: Any, chain_id: int) -> None:
 
 async def on_repo_publish_success_for_chain(attempt_id: int) -> None:
     from oreon_build.db.session import async_session_maker
+    from oreon_build.services.build_pass import schedule_next_pass_after_publish
 
     async with async_session_maker() as db:
         att_r = await db.execute(select(BuildAttempt).where(BuildAttempt.id == attempt_id))
@@ -779,7 +811,15 @@ async def on_repo_publish_success_for_chain(attempt_id: int) -> None:
             return
         job_r = await db.execute(select(BuildJob).where(BuildJob.id == att.build_job_id))
         job = job_r.scalar_one_or_none()
-        if not job or job.chain_id is None:
+        if not job:
+            return
+        if schedule_next_pass_after_publish(job):
+            from oreon_build.services.repo_capability_index import clear_repo_capability_cache
+
+            clear_repo_capability_cache()
+            await db.commit()
+            return
+        if job.chain_id is None:
             return
 
         chain_r = await db.execute(select(BuildChain).where(BuildChain.id == job.chain_id).with_for_update())
