@@ -29,11 +29,21 @@ _TERMINAL_STATUSES = (
     BuildStatus.SKIPPED,
 )
 
-async def reconcile_queue_inconsistencies(db: AsyncSession) -> tuple[int, int, int]:
+async def reconcile_queue_inconsistencies(
+    db: AsyncSession,
+) -> tuple[int, int, int, list[tuple[int, str]]]:
+    """Reconcile queue inconsistencies.
+
+    Returns (workers_fixed, jobs_fixed, attempts_fixed, chain_terminal_jobs)
+    where chain_terminal_jobs is a list of (build_job_id, reason) for jobs
+    that were marked terminal and belong to a chain — so the caller can fire
+    chain callbacks after the DB commit.
+    """
     now = datetime.now(timezone.utc)
     workers_fixed = 0
     jobs_fixed = 0
     attempts_fixed = 0
+    chain_terminal_jobs: list[tuple[int, str]] = []
 
     busy_orphan = await db.execute(
         select(Worker).where(
@@ -115,6 +125,8 @@ async def reconcile_queue_inconsistencies(db: AsyncSession) -> tuple[int, int, i
             job.status = BuildStatus.FAILED
             job.completed_at = now
             jobs_fixed += 1
+            if job.chain_id is not None:
+                chain_terminal_jobs.append((job.id, "Job had no attempts row (reconciled)"))
             logger.warning(
                 "Reconciled build_job id=%s from RUNNING to FAILED (no attempts row)",
                 job.id,
@@ -125,6 +137,8 @@ async def reconcile_queue_inconsistencies(db: AsyncSession) -> tuple[int, int, i
         job.status = latest.status
         job.completed_at = latest.finished_at or now
         jobs_fixed += 1
+        if job.chain_id is not None and latest.status in (BuildStatus.FAILED, BuildStatus.CANCELLED):
+            chain_terminal_jobs.append((job.id, f"Latest attempt {latest.id} was {latest.status.value}"))
         logger.warning(
             "Reconciled build_job id=%s from RUNNING to %s (latest attempt id=%s)",
             job.id,
@@ -197,9 +211,16 @@ async def reconcile_queue_inconsistencies(db: AsyncSession) -> tuple[int, int, i
             user_agent="controller",
         )
 
-    return workers_fixed, jobs_fixed, attempts_fixed
+    return workers_fixed, jobs_fixed, attempts_fixed, chain_terminal_jobs
 
-async def sweep_stale_running_builds(db: AsyncSession, settings: Settings) -> int:
+async def sweep_stale_running_builds(
+    db: AsyncSession, settings: Settings
+) -> tuple[int, list[tuple[int, str]]]:
+    """Sweep stale running builds.
+
+    Returns (updated_count, chain_terminal_jobs) where chain_terminal_jobs
+    is a list of (build_job_id, reason) for chain jobs that were marked FAILED.
+    """
     max_min = settings.build_stale_running_minutes
     hb_min = settings.build_stale_worker_heartbeat_minutes
     if max_min <= 0 and hb_min <= 0:
@@ -219,6 +240,7 @@ async def sweep_stale_running_builds(db: AsyncSession, settings: Settings) -> in
     )
     attempts = list(result.scalars().all())
     updated = 0
+    chain_terminal_jobs: list[tuple[int, str]] = []
 
     for att in attempts:
         ref = att.started_at or att.created_at
@@ -267,6 +289,8 @@ async def sweep_stale_running_builds(db: AsyncSession, settings: Settings) -> in
         if job is not None and job.status == BuildStatus.RUNNING:
             job.status = BuildStatus.FAILED
             job.completed_at = now
+            if job.chain_id is not None:
+                chain_terminal_jobs.append((job.id, msg))
 
         await db.flush()
         if w is not None:
@@ -287,7 +311,7 @@ async def sweep_stale_running_builds(db: AsyncSession, settings: Settings) -> in
     if updated:
         logger.warning("Marked %d stale RUNNING build attempt(s) as failed", updated)
 
-    return updated
+    return updated, chain_terminal_jobs
 
 async def _no_eligible_live_worker(
     db: AsyncSession, job: BuildJob, worker_offline_after_seconds: int
@@ -311,7 +335,14 @@ async def _no_eligible_live_worker(
     exists_live = await db.scalar(select(func.count()).select_from(q.subquery()))
     return (exists_live or 0) == 0
 
-async def sweep_stale_pending_builds(db: AsyncSession, settings: Settings) -> int:
+async def sweep_stale_pending_builds(
+    db: AsyncSession, settings: Settings
+) -> tuple[int, list[tuple[int, str]]]:
+    """Sweep stale pending builds.
+
+    Returns (updated_count, chain_terminal_jobs) where chain_terminal_jobs
+    is a list of (build_job_id, reason) for chain jobs that were marked FAILED.
+    """
     pend_min = settings.build_stale_pending_minutes
     if pend_min <= 0:
         return 0
@@ -327,6 +358,7 @@ async def sweep_stale_pending_builds(db: AsyncSession, settings: Settings) -> in
     )
     jobs = list(result.scalars().all())
     updated = 0
+    chain_terminal_jobs: list[tuple[int, str]] = []
 
     for job in jobs:
         if settings.build_stale_pending_require_no_eligible_worker:
@@ -352,6 +384,8 @@ async def sweep_stale_pending_builds(db: AsyncSession, settings: Settings) -> in
         job.status = BuildStatus.FAILED
         job.completed_at = now
         updated += 1
+        if job.chain_id is not None:
+            chain_terminal_jobs.append((job.id, reason))
         await db.flush()
         await log_audit(
             db,
@@ -373,4 +407,4 @@ async def sweep_stale_pending_builds(db: AsyncSession, settings: Settings) -> in
     if updated:
         logger.warning("Marked %d stale PENDING/QUEUED build job(s) as failed", updated)
 
-    return updated
+    return updated, chain_terminal_jobs
