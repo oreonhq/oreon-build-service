@@ -2,13 +2,35 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import Protocol
+
+from oreon_build.core.rpm_requires import rpm_requirement_primary_capabilities_from_value
+
+
+class _ReqCheck(Protocol):
+    def satisfies_requirement(self, dep: str) -> bool: ...
+
 
 _RE_BCOND_WITH = re.compile(r"^%\s*bcond_with\s+(\S+)", re.IGNORECASE)
 _RE_BCOND_WITHOUT = re.compile(r"^%\s*bcond_without\s+(\S+)", re.IGNORECASE)
-_RE_IF_WITH = re.compile(r"%if\s+.*?%\{?\??with_([a-zA-Z0-9_]+)", re.IGNORECASE)
+_RE_GLOBAL = re.compile(r"^%\s*global\s+(\S+)\s+(.+)$", re.IGNORECASE)
+_RE_DEFINE = re.compile(r"^%\s*define\s+(\S+)\s+(.+)$", re.IGNORECASE)
+_RE_IF = re.compile(r"^%\s*if\b(.*)$", re.IGNORECASE)
+_RE_IFARCH = re.compile(r"^%\s*ifarch\b(.*)$", re.IGNORECASE)
+_RE_IFNARCH = re.compile(r"^%\s*ifnarch\b(.*)$", re.IGNORECASE)
+_RE_ELSE = re.compile(r"^%\s*else\b", re.IGNORECASE)
+_RE_ENDIF = re.compile(r"^%\s*endif\b", re.IGNORECASE)
 _RE_BR_LINE = re.compile(r"^buildrequires\s*:\s*(.+)$", re.IGNORECASE)
 _RE_REQ_LINE = re.compile(r"^requires\s*:\s*(.+)$", re.IGNORECASE)
-_RE_BR_NAME = re.compile(r"^([A-Za-z0-9_][A-Za-z0-9+._-]*)")
+_RE_WITH_SPACE = re.compile(r"%\{?\??with\s+([A-Za-z0-9_]+)\}?", re.IGNORECASE)
+_RE_WITHOUT_SPACE = re.compile(r"%\{?\??without\s+([A-Za-z0-9_]+)\}?", re.IGNORECASE)
+_RE_WITH_US = re.compile(r"%\{?\??with_([A-Za-z0-9_]+)\}?", re.IGNORECASE)
+_RE_WITHOUT_US = re.compile(r"%\{?\??without_([A-Za-z0-9_]+)\}?", re.IGNORECASE)
+_RE_MACRO = re.compile(r"%\{?\??([A-Za-z0-9_]+)\}?")
+_RE_GATING_WITH = re.compile(
+    r"%\{?\??with[_\s]+([A-Za-z0-9_]+)\}?|%\{?\??without[_\s]+([A-Za-z0-9_]+)\}?",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -17,69 +39,288 @@ class SpecBcondInfo:
     conditional_brs: dict[str, set[str]] = field(default_factory=dict)
     unconditional_brs: set[str] = field(default_factory=set)
     unconditional_reqs: set[str] = field(default_factory=set)
+    macros: dict[str, str] = field(default_factory=dict)
 
 
 def _br_tokens(raw: str) -> list[str]:
-    out: list[str] = []
-    for chunk in (raw or "").replace("\n", ",").split(","):
-        token = chunk.strip()
-        if not token:
-            continue
-        if "=" in token:
-            token = token.split("=", 1)[0].strip()
-        m = _RE_BR_NAME.match(token)
-        if m:
-            name = m.group(1)
-            if not name.startswith(("rpmlib(", "/", "config(")):
-                out.append(name)
+    return rpm_requirement_primary_capabilities_from_value(raw)
+
+
+def default_distro_macros(releasename: str = "") -> dict[str, str]:
+    out = {
+        "oreon": "0",
+        "rhel": "0",
+        "fedora": "0",
+        "el": "0",
+        "centos": "0",
+        "python3_pkgversion": "3",
+        "python3_version": "3",
+    }
+    rel = (releasename or "").strip().lower()
+    m = re.search(r"oreon[_-]?(\d+)", rel)
+    if m:
+        out["oreon"] = m.group(1)
+    m = re.search(r"(?:^|[_\-])(?:el|rhel)(\d+)", rel)
+    if m:
+        out["rhel"] = m.group(1)
+        out["el"] = m.group(1)
+    m = re.search(r"(?:^|[_\-])f(?:edora)?[_-]?(\d+)", rel)
+    if m and "oreon" not in rel:
+        out["fedora"] = m.group(1)
     return out
 
 
-def parse_spec_bconds(spec_text: str) -> SpecBcondInfo:
+def _macro_value(name: str, macros: dict[str, str], bconds: dict[str, int]) -> str:
+    key = (name or "").strip()
+    if not key:
+        return "0"
+    if key.startswith("with_"):
+        if key in bconds:
+            return str(bconds[key])
+        if key in macros:
+            return str(macros[key])
+        return "0"
+    if key.startswith("without_"):
+        with_key = "with_" + key[len("without_") :]
+        on = int(str(_macro_value(with_key, macros, bconds) or "0") or 0)
+        return "0" if on else "1"
+    if key in macros:
+        return str(macros[key])
+    if key in bconds:
+        return str(bconds[key])
+    return "0"
+
+
+def _rewrite_with_forms(expr: str) -> str:
+    text = expr or ""
+    text = _RE_WITHOUT_SPACE.sub(lambda m: f"%{{without_{m.group(1)}}}", text)
+    text = _RE_WITH_SPACE.sub(lambda m: f"%{{with_{m.group(1)}}}", text)
+    return text
+
+
+def _expand_expr(expr: str, macros: dict[str, str], bconds: dict[str, int]) -> str:
+    text = _rewrite_with_forms(expr or "").strip()
+    if not text:
+        return "0"
+
+    def repl_without(m: re.Match[str]) -> str:
+        return _macro_value(f"without_{m.group(1)}", macros, bconds)
+
+    def repl_with(m: re.Match[str]) -> str:
+        return _macro_value(f"with_{m.group(1)}", macros, bconds)
+
+    def repl_macro(m: re.Match[str]) -> str:
+        return _macro_value(m.group(1), macros, bconds)
+
+    text = _RE_WITHOUT_US.sub(repl_without, text)
+    text = _RE_WITH_US.sub(repl_with, text)
+    text = _RE_MACRO.sub(repl_macro, text)
+    text = text.replace("||", " or ").replace("&&", " and ")
+    text = re.sub(r"(?i)\bnot\b", " not ", text)
+    # rpm uses ! as logical not (!0%{?bootstrap}); python needs "not"
+    text = re.sub(r"!\s*", " not ", text)
+    text = re.sub(r"[^0-9A-Za-z_.<>=!()\s]", " ", text)
+    return text
+
+
+def _normalize_numeric_tokens(expr: str) -> str:
+    def repl(m: re.Match[str]) -> str:
+        try:
+            return str(int(m.group(0)))
+        except ValueError:
+            return m.group(0)
+
+    return re.sub(r"\b[0-9]+\b", repl, expr or "")
+
+
+def _eval_condition(expr: str, macros: dict[str, str], bconds: dict[str, int]) -> bool:
+    expanded = _normalize_numeric_tokens(_expand_expr(expr, macros, bconds))
+    if not expanded.strip():
+        return False
+    try:
+        return bool(eval(expanded, {"__builtins__": {}}, {}))
+    except Exception:
+        return False
+
+
+def _arch_tokens(expr: str) -> set[str]:
+    return {t.lower() for t in re.findall(r"[A-Za-z0-9_]+", expr or "") if t}
+
+
+def _eval_ifarch(expr: str, target_arches: set[str] | None) -> bool:
+    listed = _arch_tokens(expr)
+    if not listed:
+        return True
+    if not target_arches:
+        return True
+    return bool(listed & {a.lower() for a in target_arches})
+
+
+def _eval_ifnarch(expr: str, target_arches: set[str] | None) -> bool:
+    listed = _arch_tokens(expr)
+    if not listed:
+        return True
+    if not target_arches:
+        return True
+    targets = {a.lower() for a in target_arches}
+    return bool(targets - listed)
+
+
+def _expand_macro_value(raw: str, macros: dict[str, str], bconds: dict[str, int]) -> str:
+    text = _rewrite_with_forms(raw or "").strip()
+    if not text:
+        return "0"
+
+    def repl(m: re.Match[str]) -> str:
+        return _macro_value(m.group(1), macros, bconds)
+
+    prev = None
+    for _ in range(8):
+        if text == prev:
+            break
+        prev = text
+        text = _RE_WITHOUT_US.sub(lambda m: _macro_value(f"without_{m.group(1)}", macros, bconds), text)
+        text = _RE_WITH_US.sub(lambda m: _macro_value(f"with_{m.group(1)}", macros, bconds), text)
+        text = _RE_MACRO.sub(repl, text)
+    text = _normalize_numeric_tokens(text.strip())
+    if re.fullmatch(r"[-+]?[0-9]+", text or ""):
+        return str(int(text or "0"))
+    low = text.lower()
+    if low in ("true", "yes", "on"):
+        return "1"
+    if low in ("false", "no", "off"):
+        return "0"
+    try:
+        return "1" if bool(eval(text, {"__builtins__": {}}, {})) else "0"
+    except Exception:
+        return text
+
+
+def _gating_bconds_from_expr(expr: str) -> set[str]:
+    out: set[str] = set()
+    text = _rewrite_with_forms(expr or "")
+    for m in _RE_GATING_WITH.finditer(text):
+        with_name = m.group(1)
+        without_name = m.group(2)
+        if with_name:
+            out.add(f"with_{with_name}")
+        if without_name:
+            out.add(f"with_{without_name}")
+    return out
+
+
+def parse_spec_bconds(
+    spec_text: str,
+    *,
+    distro_macros: dict[str, str] | None = None,
+    target_arches: set[str] | None = None,
+) -> SpecBcondInfo:
     info = SpecBcondInfo()
+    macros: dict[str, str] = dict(distro_macros or {})
+    info.macros = macros
+    bconds: dict[str, int] = {}
+    arches = {a.lower() for a in (target_arches or set()) if a}
     lines = (spec_text or "").splitlines()
-    depth = 0
-    active_bconds: set[str] = set()
+    # each frame: (active_bool, gating_bcond_keys)
+    stack: list[tuple[bool, frozenset[str]]] = []
+
+    def active() -> bool:
+        return all(fr[0] for fr in stack) if stack else True
+
+    def gating() -> set[str]:
+        out: set[str] = set()
+        for fr in stack:
+            if fr[0]:
+                out.update(fr[1])
+        return out
 
     for line in lines:
         s = line.strip()
         if not s or s.startswith("#"):
             continue
-        low = s.lower()
+
         m_w = _RE_BCOND_WITH.match(s)
         if m_w:
-            info.defaults[f"with_{m_w.group(1)}"] = 1
+            if active():
+                key = f"with_{m_w.group(1)}"
+                bconds[key] = 0
+                info.defaults[key] = 0
+                macros[key] = "0"
             continue
         m_wo = _RE_BCOND_WITHOUT.match(s)
         if m_wo:
-            info.defaults[f"with_{m_wo.group(1)}"] = 0
+            if active():
+                key = f"with_{m_wo.group(1)}"
+                bconds[key] = 1
+                info.defaults[key] = 1
+                macros[key] = "1"
             continue
-        if low.startswith("%if"):
-            depth += 1
-            active_bconds = set()
-            for m in _RE_IF_WITH.findall(s):
-                active_bconds.add(m if m.startswith("with_") else f"with_{m}")
+
+        m_g = _RE_GLOBAL.match(s) or _RE_DEFINE.match(s)
+        if m_g:
+            if active():
+                name = m_g.group(1).strip()
+                val = _expand_macro_value(m_g.group(2), macros, bconds)
+                macros[name] = val
+                if name.startswith("with_"):
+                    try:
+                        iv = int(val)
+                        info.defaults[name] = iv
+                        bconds[name] = iv
+                    except ValueError:
+                        pass
             continue
-        if low.startswith("%else"):
+
+        m_ia = _RE_IFARCH.match(s)
+        if m_ia:
+            parent = active()
+            ok = parent and _eval_ifarch(m_ia.group(1), arches or None)
+            stack.append((ok, frozenset()))
             continue
-        if low.startswith("%endif"):
-            depth = max(0, depth - 1)
-            if depth == 0:
-                active_bconds = set()
+        m_ina = _RE_IFNARCH.match(s)
+        if m_ina:
+            parent = active()
+            ok = parent and _eval_ifnarch(m_ina.group(1), arches or None)
+            stack.append((ok, frozenset()))
             continue
+        m_if = _RE_IF.match(s)
+        if m_if:
+            parent = active()
+            expr = m_if.group(1)
+            ok = parent and _eval_condition(expr, macros, bconds)
+            stack.append((ok, frozenset(_gating_bconds_from_expr(expr)) if ok else frozenset()))
+            continue
+        if _RE_ELSE.match(s):
+            if stack:
+                parent_ok = all(fr[0] for fr in stack[:-1]) if len(stack) > 1 else True
+                was_active, _gates = stack[-1]
+                stack[-1] = (parent_ok and (not was_active), frozenset())
+            continue
+        if _RE_ENDIF.match(s):
+            if stack:
+                stack.pop()
+            continue
+
+        if not active():
+            continue
+
         br_m = _RE_BR_LINE.match(s)
         req_m = _RE_REQ_LINE.match(s)
-        if br_m or req_m:
-            val = (br_m or req_m).group(1)  # type: ignore[union-attr]
-            for tok in _br_tokens(val):
-                if depth > 0 and active_bconds:
-                    for bc in active_bconds:
-                        key = bc if bc.startswith("with_") else f"with_{bc}"
-                        info.conditional_brs.setdefault(key, set()).add(tok)
-                elif br_m:
-                    info.unconditional_brs.add(tok)
-                else:
-                    info.unconditional_reqs.add(tok)
+        if not (br_m or req_m):
+            continue
+        val = (br_m or req_m).group(1)  # type: ignore[union-attr]
+        gates = gating()
+        for tok in _br_tokens(val):
+            if gates:
+                for key in gates:
+                    info.conditional_brs.setdefault(key, set()).add(tok)
+            elif br_m:
+                info.unconditional_brs.add(tok)
+            else:
+                info.unconditional_reqs.add(tok)
+
+    for key, val in bconds.items():
+        info.defaults.setdefault(key, val)
     return info
 
 
@@ -88,7 +329,7 @@ def active_brs(info: SpecBcondInfo, defines: dict[str, str]) -> set[str]:
     merged = {**{k: str(v) for k, v in info.defaults.items()}, **defines}
     for bc, brs in info.conditional_brs.items():
         key = bc if bc.startswith("with_") else f"with_{bc}"
-        val = merged.get(key, str(info.defaults.get(key, 1)))
+        val = merged.get(key, str(info.defaults.get(key, 0)))
         try:
             on = int(str(val).strip() or "0") != 0
         except ValueError:
@@ -98,13 +339,45 @@ def active_brs(info: SpecBcondInfo, defines: dict[str, str]) -> set[str]:
     return out
 
 
-def unsatisfied_brs(info: SpecBcondInfo, defines: dict[str, str], repo_caps: set[str]) -> set[str]:
-    return {br for br in active_brs(info, defines) if br not in repo_caps}
+def active_build_brs(info: SpecBcondInfo, defines: dict[str, str]) -> set[str]:
+    out = set(info.unconditional_brs)
+    merged = {**{k: str(v) for k, v in info.defaults.items()}, **defines}
+    for bc, brs in info.conditional_brs.items():
+        key = bc if bc.startswith("with_") else f"with_{bc}"
+        val = merged.get(key, str(info.defaults.get(key, 0)))
+        try:
+            on = int(str(val).strip() or "0") != 0
+        except ValueError:
+            on = str(val).strip().lower() in ("1", "true", "yes", "on")
+        if on:
+            out.update(brs)
+    return out
+
+
+def unsatisfied_brs(
+    info: SpecBcondInfo,
+    defines: dict[str, str],
+    repo_caps: set[str] | _ReqCheck,
+) -> set[str]:
+    out: set[str] = set()
+    for br in active_build_brs(info, defines):
+        if "%" in br:
+            continue
+        if isinstance(repo_caps, set):
+            if br not in repo_caps:
+                out.add(br)
+        elif not repo_caps.satisfies_requirement(br):
+            out.add(br)
+    return out
+
+
+def default_build_defines(info: SpecBcondInfo) -> dict[str, str]:
+    return {k: str(v) for k, v in info.defaults.items()}
 
 
 def solve_bootstrap_defines(
     info: SpecBcondInfo,
-    repo_caps: set[str],
+    repo_caps: set[str] | _ReqCheck,
 ) -> tuple[str, dict[str, str]]:
     defines: dict[str, str] = {k: str(v) for k, v in info.defaults.items()}
     missing = unsatisfied_brs(info, defines, repo_caps)
