@@ -318,7 +318,7 @@ class ChainBuildTrigger(BaseModel):
         description="Architectures to build for (same as single trigger)",
     )
     preferred_mock_environment_id: Optional[int] = Field(
-        None, description="Mock env for new distgit packages (must belong to the release)"
+        None, description="Mock env for this chain/batch (must belong to the release)"
     )
     distgit_url: Optional[str] = Field(
         None,

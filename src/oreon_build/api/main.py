@@ -137,6 +137,24 @@ async def lifespan(app: FastAPI):
         else:
             logger.exception("Skipping role/admin startup bootstrap due to startup DB error")
 
+    try:
+        from oreon_build.services.build_chain import cancel_interrupted_chain_planning
+
+        async with async_session_maker() as db:
+            try:
+                cancelled = await cancel_interrupted_chain_planning(db)
+                if cancelled:
+                    await db.commit()
+                    logger.info(
+                        "Cancelled interrupted chain planning chain_ids=%s",
+                        cancelled,
+                    )
+            except Exception:
+                await db.rollback()
+                raise
+    except Exception:
+        logger.exception("Failed cancelling interrupted chain planning on startup")
+
     sweep_task: asyncio.Task[None] | None = None
     publish_task: asyncio.Task[None] | None = None
 
