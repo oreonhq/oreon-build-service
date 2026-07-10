@@ -10,6 +10,21 @@ from sqlalchemy.exc import IntegrityError
 from oreon_build.models import BuildJob, BuildStatus, BuildTarget, MockEnvironment, Package, PackageVersion
 
 
+def resolve_mock_environment_id(
+    *,
+    trigger_mock_environment_id: int | None = None,
+    package_mock_environment_id: int | None = None,
+    release_default_mock_environment_id: int | None = None,
+) -> int | None:
+    if trigger_mock_environment_id is not None:
+        return int(trigger_mock_environment_id)
+    if package_mock_environment_id is not None:
+        return int(package_mock_environment_id)
+    if release_default_mock_environment_id is not None:
+        return int(release_default_mock_environment_id)
+    return None
+
+
 async def resolve_package_by_name(
     db,
     name: str,

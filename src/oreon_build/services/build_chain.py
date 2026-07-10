@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -36,6 +37,7 @@ from oreon_build.services.ci_callback import notify_chain_terminal
 from oreon_build.services.build_target_util import (
     get_or_create_build_target,
     latest_package_version_id,
+    resolve_mock_environment_id,
     resolve_package_by_name,
 )
 from oreon_build.services.build_pass import apply_plan_to_job_options, package_plan_from_chain
@@ -361,7 +363,13 @@ async def fail_chain(
     notify_chain_terminal(chain.id, terminal.value, chain.error_message)
 
 
-async def on_build_job_failed_for_chain(db: Any, job: BuildJob, reason: str) -> None:
+async def on_build_job_failed_for_chain(
+    db: Any,
+    job: BuildJob,
+    reason: str,
+    *,
+    package_name: str | None = None,
+) -> None:
     if job.chain_id is None:
         return
     cres = await db.execute(select(BuildChain).where(BuildChain.id == job.chain_id).with_for_update())
@@ -370,7 +378,31 @@ async def on_build_job_failed_for_chain(db: Any, job: BuildJob, reason: str) -> 
         return
     if job.chain_stage_index is not None and job.chain_stage_index != chain.active_stage_index:
         return
-    await fail_chain(db, chain, reason, terminal=BuildChainStatus.FAILED)
+    pkg = package_name
+    if not pkg and job.package is not None:
+        pkg = job.package.name
+    await fail_chain(db, chain, _summarize_chain_job_failure(pkg, reason), terminal=BuildChainStatus.FAILED)
+
+
+def _summarize_chain_job_failure(package_name: str | None, reason: str) -> str:
+    pkg = (package_name or "build").strip()
+    text = (reason or "").strip()
+    if len(text) > 7000:
+        text = text[-7000:]
+    headline = ""
+    for line in reversed(text.splitlines()):
+        s = line.strip()
+        if not s:
+            continue
+        if re.search(
+            r"(?i)(error:|failed|fatal|no matching package|not all dependencies|recipe failed|BUILD FAILED)",
+            s,
+        ):
+            headline = s[:800]
+            break
+    if headline:
+        return f"{pkg} failed: {headline}\n\n{text}"
+    return f"{pkg} failed:\n\n{text}"
 
 
 async def on_user_cancelled_chain_job(db: Any, job: BuildJob) -> None:
@@ -527,7 +559,11 @@ async def _enqueue_chain_stage_jobs(
                     distgit_url=distgit_url,
                     distgit_branch=distgit_branch,
                 )
-            pref_mock = preferred_mock_environment_id or existing_pkg.preferred_mock_environment_id
+            pref_mock = resolve_mock_environment_id(
+                trigger_mock_environment_id=preferred_mock_environment_id,
+                package_mock_environment_id=existing_pkg.preferred_mock_environment_id,
+                release_default_mock_environment_id=release.default_mock_environment_id,
+            )
         else:
             npd = distgit_new_package_dict(
                 pkg_name,
@@ -554,7 +590,11 @@ async def _enqueue_chain_stage_jobs(
             if npd.get("source_url"):
                 db.add(Source(package_version_id=pv.id, kind="distgit", url=npd["source_url"]))
             await db.flush()
-            pref_mock = npd["preferred_mock_environment_id"]
+            pref_mock = resolve_mock_environment_id(
+                trigger_mock_environment_id=preferred_mock_environment_id,
+                package_mock_environment_id=npd["preferred_mock_environment_id"],
+                release_default_mock_environment_id=release.default_mock_environment_id,
+            )
             if triggered_by_id is not None:
                 await log_audit(
                     db,
@@ -755,6 +795,35 @@ def apply_automatic_plan_to_chain(
     opt.pop("plan_pending", None)
     opt.pop("plan_roots", None)
     _set_chain_options(chain, opt)
+
+
+async def cancel_interrupted_chain_planning(db: Any) -> list[int]:
+    result = await db.execute(
+        select(BuildChain)
+        .where(
+            BuildChain.status.in_(
+                (BuildChainStatus.PENDING, BuildChainStatus.RUNNING),
+            )
+        )
+        .with_for_update()
+    )
+    cancelled_ids: list[int] = []
+    for chain in result.scalars():
+        opt = _options_dict(chain)
+        if not opt.get("plan_pending"):
+            continue
+        await fail_chain(
+            db,
+            chain,
+            "Cancelled: dependency planning did not finish before service restart",
+            terminal=BuildChainStatus.CANCELLED,
+        )
+        opt = _options_dict(chain)
+        opt.pop("plan_pending", None)
+        opt.pop("plan_roots", None)
+        _set_chain_options(chain, opt)
+        cancelled_ids.append(int(chain.id))
+    return cancelled_ids
 
 
 async def enqueue_chain_jobs_after_create(db: Any, chain_id: int) -> None:
@@ -1151,11 +1220,17 @@ async def notify_chain_job_terminal_after_result(
     if st not in ("failed", "cancelled"):
         return
     from oreon_build.db.session import async_session_maker
+    from sqlalchemy.orm import selectinload
 
     reason = (error_message or "").strip() or f"Build {st}"
     async with async_session_maker() as db:
-        job = await db.get(BuildJob, build_job_id)
+        job = await db.get(
+            BuildJob,
+            build_job_id,
+            options=[selectinload(BuildJob.package)],
+        )
         if job is None or job.chain_id is None:
             return
-        await on_build_job_failed_for_chain(db, job, reason)
+        pkg_name = job.package.name if job.package else None
+        await on_build_job_failed_for_chain(db, job, reason, package_name=pkg_name)
         await db.commit()

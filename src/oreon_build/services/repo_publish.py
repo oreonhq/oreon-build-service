@@ -69,17 +69,56 @@ def process_repo_publish_sync(
     prefix = repo_r2_prefix(releasename, branch, arch)
     with prefix_publish_lock(prefix):
         r2 = get_r2_client()
+        from oreon_build.services.publisher import (
+            _clear_createrepo_cache,
+            _ensure_stage_sidecar,
+            _persistent_repo_root,
+            _stage_container_for_prefix,
+            _write_staged_rpm,
+        )
+
+        container = _stage_container_for_prefix(prefix)
+        _ensure_stage_sidecar(container, prefix)
+        rpms_dir = _persistent_repo_root(prefix) / "RPMS"
+        rpms_dir.mkdir(parents=True, exist_ok=True)
+        staged_binaries: list[str] = []
 
         for a in payload_artifacts:
-            if a.r2_key and "/builds/" in a.r2_key and a.filename:
-                data = r2.get_object(a.r2_key)
-                if not data:
-                    continue
-                if a.filename.endswith(".src.rpm"):
-                    dest = src_r2_key(releasename, branch, a.filename)
-                else:
-                    dest = repo_rpms_key(releasename, branch, arch, a.filename)
-                r2.put_object(dest, data)
+            if not a.r2_key or not a.filename:
+                continue
+            fname = a.filename
+            key = a.r2_key
+            if fname.endswith(".src.rpm"):
+                dest = src_r2_key(releasename, branch, fname)
+                if "/builds/" in key:
+                    data = r2.get_object(key)
+                    if not data:
+                        continue
+                    r2.put_object(dest, data)
+                continue
+
+            dest = repo_rpms_key(releasename, branch, arch, fname)
+            data: bytes | None = None
+            if key == dest:
+                data = r2.get_object(key)
+            elif "/builds/" in key:
+                data = r2.get_object(key)
+                if data:
+                    r2.put_object(dest, data)
+            elif key.endswith(f"/RPMS/{fname}") and f"/{branch}/" in key:
+                data = r2.get_object(key)
+                if data and key != dest:
+                    r2.put_object(dest, data)
+            if not data:
+                logger.warning(
+                    "repo publish %s: skip artifact with unknown r2_key=%r filename=%r",
+                    prefix,
+                    key,
+                    fname,
+                )
+                continue
+            _write_staged_rpm(rpms_dir / fname, data)
+            staged_binaries.append(fname)
 
         keep = {a.filename for a in payload_artifacts if a.filename}
         _prune_superseded_repo_objects(
@@ -90,7 +129,11 @@ def process_repo_publish_sync(
             payload_artifacts=payload_artifacts,
         )
 
-        update_repodata_at_prefix(prefix)
+        if staged_binaries:
+            _clear_createrepo_cache(container)
+            update_repodata_at_prefix(prefix, staged_binaries=staged_binaries)
+        else:
+            logger.info("repo publish %s: no binary RPMs staged, skipping repodata update", prefix)
 
         for attempt_id in attempt_ids:
             exact_builds_prefix = f"{releasename}/builds/{attempt_id}/"

@@ -133,6 +133,22 @@ async def run_auto_chain_plan_and_enqueue(chain_id: int) -> None:
                 await db.commit()
         return
 
+    if plan.blocking_errors:
+        msg = "Dependency planning blocked:\n" + "\n".join(plan.blocking_errors[:40])
+        async with async_session_maker() as db:
+            chain_r = await db.execute(select(BuildChain).where(BuildChain.id == chain_id).with_for_update())
+            chain = chain_r.scalar_one_or_none()
+            if chain:
+                await fail_chain(db, chain, msg)
+                opt = _options_dict(chain)
+                opt.pop("plan_pending", None)
+                opt.pop("plan_roots", None)
+                if plan.errors:
+                    opt["plan_warnings"] = plan.errors[:80]
+                _set_chain_options(chain, opt)
+                await db.commit()
+        return
+
     if plan.errors:
         logger.warning("chain_id=%s plan warnings: %s", chain_id, plan.errors)
 

@@ -16,6 +16,7 @@ from oreon_build.services.build_target_util import (
     get_or_create_build_target,
     has_successful_build_for_target,
     latest_package_version_id,
+    resolve_mock_environment_id,
     resolve_package_by_name,
 )
 
@@ -85,6 +86,8 @@ async def execute_build_trigger(
     package_name: str | None = None
     package_version_id: int | None = data.package_version_id
     preferred_mock_environment_id: int | None = None
+    trigger_mock_environment_id: int | None = None
+    package_mock_environment_id: int | None = None
     account_id = user.id
     ip = ip_address if ip_address is not None else (get_client_ip(request) if request else None)
     ua = user_agent if user_agent is not None else (get_user_agent(request) if request else "api")
@@ -92,8 +95,11 @@ async def execute_build_trigger(
     if data.new_package:
         np = data.new_package
         package_name = np.name
-        if np.preferred_mock_environment_id:
-            me_r = await db.execute(select(MockEnvironment).where(MockEnvironment.id == np.preferred_mock_environment_id))
+        trigger_mock_environment_id = np.preferred_mock_environment_id
+        if trigger_mock_environment_id is not None:
+            me_r = await db.execute(
+                select(MockEnvironment).where(MockEnvironment.id == trigger_mock_environment_id)
+            )
             me = me_r.scalar_one_or_none()
             if not me or me.release_id != data.release_id:
                 raise HTTPException(
@@ -104,11 +110,7 @@ async def execute_build_trigger(
         if existing_pkg:
             package_id = existing_pkg.id
             package_name = existing_pkg.name
-            preferred_mock_environment_id = (
-                existing_pkg.preferred_mock_environment_id
-                if existing_pkg.preferred_mock_environment_id
-                else None
-            )
+            package_mock_environment_id = existing_pkg.preferred_mock_environment_id
         else:
             gh_url = np.github_html_url or infer_github_html_url_from_new_package(np)
             pkg = Package(
@@ -144,7 +146,7 @@ async def execute_build_trigger(
                 ip_address=ip,
                 user_agent=ua,
             )
-            preferred_mock_environment_id = np.preferred_mock_environment_id
+            package_mock_environment_id = np.preferred_mock_environment_id
     else:
         package_id = data.package_id
         rp = await db.execute(
@@ -154,7 +156,7 @@ async def execute_build_trigger(
         if not pkg:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Package not found")
         package_name = pkg.name
-        preferred_mock_environment_id = pkg.preferred_mock_environment_id if pkg.preferred_mock_environment_id else None
+        package_mock_environment_id = pkg.preferred_mock_environment_id
 
     rr = await db.execute(select(Release).where(Release.id == data.release_id))
     release_for_job = rr.scalar_one_or_none()
@@ -162,8 +164,11 @@ async def execute_build_trigger(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Release not found")
     publish_branch = r2_publish_branch(release_for_job)
 
-    if preferred_mock_environment_id is None and release_for_job.default_mock_environment_id:
-        preferred_mock_environment_id = release_for_job.default_mock_environment_id
+    preferred_mock_environment_id = resolve_mock_environment_id(
+        trigger_mock_environment_id=trigger_mock_environment_id,
+        package_mock_environment_id=package_mock_environment_id,
+        release_default_mock_environment_id=release_for_job.default_mock_environment_id,
+    )
 
     if package_version_id is None:
         package_version_id = await latest_package_version_id(db, package_id)
