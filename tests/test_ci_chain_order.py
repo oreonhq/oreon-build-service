@@ -34,7 +34,7 @@ _SPECS = {
 
 
 def _make_sparse_closure(specs: dict[str, str]):
-    async def inner(roots, *, releasename, owner, repo, distgit_branch, headers):
+    async def inner(roots, *, releasename, owner, repo, distgit_branch, headers, **kwargs):
         tarball = _make_mini_tarball(releasename, specs)
         all_names, members = _tarball_spec_member_index(tarball, releasename)
         return _expand_chain_spec_closure(
@@ -46,6 +46,14 @@ def _make_sparse_closure(specs: dict[str, str]):
         )
 
     return inner
+
+
+async def _noop_repo_expand(specs, parsed, repo, roots, **kwargs):
+    return specs, parsed, []
+
+
+async def _noop_br_expand(specs, parsed, repo, **kwargs):
+    return specs, parsed, [], set()
 
 
 @pytest.mark.asyncio
@@ -61,6 +69,14 @@ async def test_ci_chain_expands_missing_deps() -> None:
         patch(
             "oreon_build.services.build_planner.load_repo_capability_index",
             return_value=empty_repo,
+        ),
+        patch(
+            "oreon_build.services.build_planner.fetch_repo_transitive_extras_for_roots",
+            side_effect=_noop_repo_expand,
+        ),
+        patch(
+            "oreon_build.services.build_planner.expand_unsatisfied_build_dep_sources",
+            side_effect=_noop_br_expand,
         ),
     ):
         plan = await plan_automatic_chain(
@@ -91,6 +107,14 @@ async def test_ci_chain_orders_changed_packages_by_dependency() -> None:
             "oreon_build.services.build_planner.load_repo_capability_index",
             return_value=empty_repo,
         ),
+        patch(
+            "oreon_build.services.build_planner.fetch_repo_transitive_extras_for_roots",
+            side_effect=_noop_repo_expand,
+        ),
+        patch(
+            "oreon_build.services.build_planner.expand_unsatisfied_build_dep_sources",
+            side_effect=_noop_br_expand,
+        ),
     ):
         plan = await plan_automatic_chain(
             releasename=releasename,
@@ -120,6 +144,14 @@ async def test_ci_chain_independent_packages_same_layer() -> None:
         patch(
             "oreon_build.services.build_planner.load_repo_capability_index",
             return_value=empty_repo,
+        ),
+        patch(
+            "oreon_build.services.build_planner.fetch_repo_transitive_extras_for_roots",
+            side_effect=_noop_repo_expand,
+        ),
+        patch(
+            "oreon_build.services.build_planner.expand_unsatisfied_build_dep_sources",
+            side_effect=_noop_br_expand,
         ),
     ):
         plan = await plan_automatic_chain(
