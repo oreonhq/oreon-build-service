@@ -122,6 +122,32 @@ def test_sources_for_requirement_from_spec_providers() -> None:
     assert sources_for_requirement("allegro-devel", empty, provider_maps=[spec_providers]) == {"allegro"}
 
 
+def test_sources_for_unmet_cap_keeps_already_built_mapped_provider() -> None:
+    from oreon_build.core.rpm_requires import sources_for_requirement
+    from oreon_build.services.repo_capability_index import RepoCapabilityIndex
+
+    repo = RepoCapabilityIndex(
+        binary_names={"perl-CPAN-Meta-Requirements", "perl"},
+        provides={"perl(CPAN::Meta::Requirements)", "perl-CPAN-Meta-Requirements"},
+        capability_providers={
+            "perl(CPAN::Meta::Requirements)": {"perl-CPAN-Meta-Requirements"},
+            "perl-CPAN-Meta-Requirements": {"perl-CPAN-Meta-Requirements"},
+        },
+        binary_source={"perl-CPAN-Meta-Requirements": "perl"},
+        source_names={"perl"},
+    )
+    repo.finalize_lookups()
+    assert not repo.satisfies_requirement("perl(CPAN::Meta::Requirements::Range)")
+    distgit = {"perl(CPAN::Meta::Requirements::Range)": {"perl-CPAN-Meta-Requirements"}}
+    got = sources_for_requirement(
+        "perl(CPAN::Meta::Requirements::Range)",
+        repo,
+        provider_maps=[distgit],
+    )
+    assert "perl-CPAN-Meta-Requirements" in got
+    assert "perl" in got
+
+
 def test_indexed_provider_lookup_is_case_insensitive_and_fast() -> None:
     from oreon_build.core.rpm_requires import (
         _providers_from_maps,

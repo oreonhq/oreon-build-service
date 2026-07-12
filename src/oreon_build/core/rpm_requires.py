@@ -260,23 +260,22 @@ def sources_for_requirement(
     exact: bool = True,
     include_built_sources: bool = False,
 ) -> set[str]:
+    del include_built_sources
     if repo.satisfies_requirement(requirement):
         return set()
     maps = [m for m in (provider_maps or []) if m]
     out: set[str] = set()
-    _, op, _ver = parse_versioned_requirement(requirement)
-    # versioned unmet deps and arch-partial repo hits need rebuild of published providers
-    allow_built = include_built_sources or op is not None
     for cap in requirement_check_capabilities(requirement):
-        # repo method already returns sources for unmet/arch-partial caps, including built ones
         for src in repo.distgit_sources_for_capability(cap):
             if src and is_distgit_source_name(src):
                 out.add(src)
         for src in _providers_from_maps(cap, maps, exact=exact):
             if not src or not is_distgit_source_name(src):
                 continue
-            if allow_built or not repo.satisfies_source(src):
-                out.add(src)
+            out.add(src)
+            bsrc = getattr(repo, "binary_source", {}).get(src)
+            if bsrc and is_distgit_source_name(bsrc):
+                out.add(bsrc)
     return out
 
 
