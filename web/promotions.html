@@ -32,6 +32,7 @@
           <option value="pending" selected>Pending only</option>
           <option value="promoted_testing">Promoted to Testing</option>
           <option value="promoted_stable">Promoted to Stable</option>
+          <option value="missing_artifacts">Missing artifacts</option>
         </select>
       </div>
       <div class="list-toolbar">
@@ -66,16 +67,10 @@
         if (!confirm('Are you absolutely sure? This will promote everything pending to ' + label + ' and cannot be undone.')) return;
         var btn = document.getElementById(pathSuffix === 'to-testing' ? 'btn-promote-all-testing' : 'btn-promote-all-stable');
         oreonWithLoading(btn, function() {
-          return api.get('/promotions?status_filter=pending&limit=10000').then(function(data) {
-            var items = (data && data.items) ? data.items : [];
-            var chain = Promise.resolve();
-            items.forEach(function(p) {
-              if (p.status === 'pending') {
-                chain = chain.then(function() { return api.post('/promotions/' + p.id + '/' + pathSuffix); });
-              }
-            });
-            return chain;
-          }).then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+          return api.post('/promotions/bulk/' + pathSuffix, { all_pending: true }).then(function(data) {
+            alert((data && data.message) ? data.message : ('Queued ' + ((data && data.promotion_count) || 0) + ' promotions'));
+            load();
+          }).catch(function(e) { alert('Failed: ' + (window.oreonErrorMessage ? window.oreonErrorMessage(e) : e.message)); });
         });
       }
 
@@ -101,15 +96,21 @@
           btns.appendChild(clear);
           if (!api.token) return;
           function runPromote(btn, pathSuffix) {
-            var chain = Promise.resolve();
+            var pendingIds = [];
             ids.forEach(function(id) {
               var tr = tbody.querySelector('tr[data-id="' + id + '"]');
               var st = tr ? (tr.getAttribute('data-status') || '') : '';
-              if (st !== 'pending') return;
-              chain = chain.then(function() { return api.post('/promotions/' + id + '/' + pathSuffix); });
+              if (st === 'pending') pendingIds.push(Number(id));
             });
+            if (!pendingIds.length) {
+              alert('No pending promotions in selection');
+              return;
+            }
             oreonWithLoading(btn, function() {
-              return chain.then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
+              return api.post('/promotions/bulk/' + pathSuffix, { promotion_ids: pendingIds }).then(function(data) {
+                alert((data && data.message) ? data.message : ('Queued ' + pendingIds.length + ' promotions'));
+                load();
+              }).catch(function(e) { alert('Failed: ' + (window.oreonErrorMessage ? window.oreonErrorMessage(e) : e.message)); });
             });
           }
           var b1 = document.createElement('button');
