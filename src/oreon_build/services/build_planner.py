@@ -11,6 +11,7 @@ from oreon_build.core.rpm_requires import (
     _providers_from_maps,
     is_chain_plan_requirement,
     merge_provider_maps,
+    similar_sources_for_requirement,
     sources_for_requirement,
 )
 from oreon_build.core.spec_bcond import (
@@ -68,9 +69,20 @@ def _uncovered_plan_capabilities(
             continue
         if repo.satisfies_requirement(cap):
             continue
-        providers = sources_for_requirement(cap, repo, provider_maps=pmap)
+        providers = sources_for_requirement(cap, repo, provider_maps=pmap, exact=True)
         if providers:
             uncovered.append(cap)
+            continue
+        if getattr(repo, "has_capability_ci", None) and repo.has_capability_ci(cap):
+            uncovered.append(
+                f"{cap} (no exact Provide in repo; case-different name exists, fix BR or add Provides)"
+            )
+            continue
+        similar = similar_sources_for_requirement(cap, repo, provider_maps=pmap)
+        if similar:
+            uncovered.append(
+                f"{cap} (no exact Provide; similar source(s): {', '.join(sorted(similar))})"
+            )
         else:
             uncovered.append(f"{cap} (no distgit provider)")
     return uncovered
@@ -146,7 +158,7 @@ def _plan_slots_for_package(
             action="block",
             build_profile="full",
             rpmbuild_defines={},
-            reason=f"missing hard buildrequires: {', '.join(uncovered)}",
+            reason=f"missing hard buildrequires: {' | '.join(uncovered)}",
         )
 
     if force_build:
@@ -184,6 +196,43 @@ def _package_plan_dict(slot: PlannedPackage) -> dict[str, Any]:
     if slot.next_profile:
         out["next_profile"] = slot.next_profile
     return out
+
+
+def _provider_rebuild_force_sources(
+    packages: set[str],
+    parsed_by_source: dict[str, Any],
+    specs_by_pkg: dict[str, str],
+    repo_index: RepoCapabilityIndex,
+    distgit_providers: dict[str, set[str]] | None = None,
+    distro_macros: dict[str, str] | None = None,
+    target_arches: set[str] | None = None,
+) -> set[str]:
+    """Sources already in repo that must rebuild for unmet BRs (EVR or arch-partial)."""
+    from oreon_build.core.spec_bcond import active_build_brs, default_build_defines, parse_spec_bconds
+
+    out: set[str] = set()
+    provider_map = _merge_provider_maps(
+        _provider_map_from_specs(parsed_by_source), distgit_providers
+    )
+    for pkg in packages:
+        spec_text = specs_by_pkg.get(pkg) or ""
+        if not spec_text and pkg not in parsed_by_source:
+            continue
+        bcond = parse_spec_bconds(
+            spec_text, distro_macros=distro_macros, target_arches=target_arches
+        )
+        for br in active_build_brs(bcond, default_build_defines(bcond)):
+            if repo_index.satisfies_requirement(br):
+                continue
+            for src in sources_for_requirement(
+                br, repo_index, provider_maps=[provider_map], exact=True
+            ):
+                if repo_index.satisfies_source(src):
+                    out.add(src)
+    return out
+
+
+_version_rebuild_force_sources = _provider_rebuild_force_sources
 
 
 def _plan_all_slots(
@@ -453,62 +502,66 @@ def _collect_blocking_errors(
     distgit_needers: dict[str, set[str]],
     distgit_providers: dict[str, set[str]] | None = None,
 ) -> list[str]:
-    out: list[str] = []
-    seen: set[str] = set()
-    blocked = sorted(
-        pkg for pkg, slot in slots_by_name.items() if slot.action == "block" and pkg in required
-    )
-
-    def add(msg: str) -> None:
-        m = (msg or "").strip()
-        if not m or m in seen:
-            return
-        seen.add(m)
-        out.append(m)
-
-    for line in _missing_distgit_sources_for_required(
+    missing_lines = _missing_distgit_sources_for_required(
         releasename=releasename,
         required=required,
         missing_distgit=missing_distgit,
         needers=distgit_needers,
         plan_errors=plan_errors,
-    ):
-        add(line)
+    )
+    imports: list[str] = []
+    seen: set[str] = set()
 
-    distgit_srcs = {line.split(":", 1)[0].strip() for line in out if ": not in distgit at " in line}
+    def add_import(name: str) -> None:
+        n = (name or "").strip()
+        if not n or n in seen:
+            return
+        seen.add(n)
+        imports.append(n)
+
+    for line in missing_lines:
+        pkg = line.split(":", 1)[0].strip()
+        add_import(pkg)
+
+    blocked = sorted(
+        pkg for pkg, slot in slots_by_name.items() if slot.action == "block" and pkg in required
+    )
+    distgit_srcs = set(imports)
     provider_map = _merge_provider_maps(_provider_map_from_specs(parsed_by_source), distgit_providers)
-    import_caps: list[str] = []
-    other_blocks: list[str] = []
 
     for pkg in blocked:
         slot = slots_by_name[pkg]
         still = slot.reason
-        if still.startswith("missing hard buildrequires:"):
-            br_part = still.split(":", 1)[-1]
-            brs = [b.strip() for b in br_part.split(",") if b.strip()]
-            mapped: set[str] = set()
-            bare_brs: list[str] = []
-            pkg_import: list[str] = []
-            for br in brs:
-                no_prov = br.endswith("(no distgit provider)")
-                cap = br[: -len(" (no distgit provider)")].strip() if no_prov else br
-                bare_brs.append(cap)
-                if no_prov:
-                    pkg_import.append(cap)
-                    continue
-                mapped.update(sources_for_requirement(cap, repo_index, provider_maps=[provider_map]))
-            if mapped and mapped <= distgit_srcs and not pkg_import:
-                continue
-            if pkg_import:
-                import_caps.extend(pkg_import)
-                add(
-                    f"{pkg}: missing hard buildrequires with no distgit provider: "
-                    f"{', '.join(sorted(set(pkg_import)))}"
-                )
-            else:
-                other_blocks.append(f"{pkg}: missing hard buildrequires: {', '.join(bare_brs)}")
+        if not still.startswith("missing hard buildrequires:"):
             continue
-        other_blocks.append(f"{pkg}: {slot.reason}")
+        br_part = still.split(":", 1)[-1]
+        brs = [b.strip() for b in br_part.split(" | ") if b.strip()]
+        mapped: set[str] = set()
+        pkg_import: list[str] = []
+        for br in brs:
+            no_prov = (
+                "(no distgit provider)" in br
+                or "(no exact Provide" in br
+                or "case-different name exists" in br
+            )
+            if br.endswith("(no distgit provider)"):
+                cap = br[: -len(" (no distgit provider)")].strip()
+            elif "(no exact Provide" in br:
+                cap = br.split(" (no exact Provide", 1)[0].strip()
+            elif "case-different name exists" in br:
+                cap = br.split(" (no exact Provide", 1)[0].strip()
+            else:
+                cap = br
+            if no_prov:
+                pkg_import.append(cap)
+                continue
+            mapped.update(
+                sources_for_requirement(cap, repo_index, provider_maps=[provider_map], exact=True)
+            )
+        if mapped and mapped <= distgit_srcs and not pkg_import:
+            continue
+        for cap in pkg_import:
+            add_import(cap)
 
     for msg in build_errs:
         pkg = (msg.split(":", 1)[0] or "").strip()
@@ -516,29 +569,11 @@ def _collect_blocking_errors(
             continue
         if ": not in distgit at " in msg:
             continue
-        add(msg)
+        # keep rare non-import blockers as literal lines
+        if pkg and pkg not in seen:
+            add_import(pkg)
 
-    if import_caps or distgit_srcs:
-        if roots and distgit_srcs:
-            add(
-                f"{roots[0]}: import into rpm-specfiles then retry: "
-                f"{', '.join(sorted(distgit_srcs)[:12])}"
-            )
-        if import_caps:
-            uniq = sorted(set(import_caps))
-            add(
-                f"{roots[0] if roots else releasename}: import into rpm-specfiles the package(s) that "
-                f"Provide: {', '.join(uniq[:12])} then retry"
-            )
-        return out
-
-    for msg in other_blocks:
-        add(msg)
-    if blocked and roots:
-        add(
-            f"{roots[0]}: required dependencies cannot be built: {', '.join(blocked[:12])}"
-        )
-    return out
+    return imports
 
 
 def _build_layers(
@@ -605,6 +640,7 @@ async def plan_automatic_chain(
     root_packages: list[str],
     architectures: list[str],
     headers: dict[str, str],
+    capability_extra_branches: list[str] | None = None,
 ) -> BuildPlanResult:
     errors: list[str] = []
     t0 = time.monotonic()
@@ -634,11 +670,14 @@ async def plan_automatic_chain(
     owner, distgit_repo = gr
     arches = {a.lower() for a in (architectures or []) if a} or None
 
+    extra_branches = [b for b in (capability_extra_branches or []) if (b or "").strip()]
     repo_index = await asyncio.to_thread(
-        load_repo_capability_index,
-        releasename,
-        repo_branch,
-        architectures,
+        lambda: load_repo_capability_index(
+            releasename,
+            repo_branch,
+            architectures,
+            extra_branches=extra_branches or None,
+        )
     )
 
     specs_by_pkg, parsed_by_source, perr = await expand_chain_spec_closure_sparse(
@@ -742,6 +781,16 @@ async def plan_automatic_chain(
             scope_packages=required | set(parsed_by_source.keys()),
             distro_macros=distro_macros,
             target_arches=arches,
+        )
+        force_set |= await asyncio.to_thread(
+            _provider_rebuild_force_sources,
+            required | force_set | set(parsed_by_source.keys()),
+            parsed_by_source,
+            specs_by_pkg,
+            repo_index,
+            distgit_providers,
+            distro_macros,
+            arches,
         )
 
         selected, skipped, slots_by_name = await asyncio.to_thread(
@@ -926,6 +975,7 @@ async def fetch_and_plan_automatic_chain(
     root_packages: list[str],
     architectures: list[str],
     headers: dict[str, str],
+    capability_extra_branches: list[str] | None = None,
 ) -> tuple[BuildPlanResult, list[str]]:
     plan = await plan_automatic_chain(
         releasename=releasename,
@@ -935,5 +985,6 @@ async def fetch_and_plan_automatic_chain(
         root_packages=root_packages,
         architectures=architectures,
         headers=headers,
+        capability_extra_branches=capability_extra_branches,
     )
     return plan, []

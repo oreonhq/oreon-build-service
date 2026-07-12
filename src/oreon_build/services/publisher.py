@@ -461,6 +461,10 @@ def _sync_rpms_dir_from_r2(
         if not data:
             raise RuntimeError(f"missing or empty RPM object at {key!r}, aborting repodata update")
         _write_staged_rpm(dest, data)
+        if dest.stat().st_size != len(data):
+            raise RuntimeError(
+                f"local RPM write size mismatch for {dest}: got {dest.stat().st_size} expected {len(data)}"
+            )
         fetched += 1
         if etag and _r2_etag_strong_content_md5(etag):
             etag_cache[fname] = etag
@@ -473,6 +477,47 @@ def _sync_rpms_dir_from_r2(
         logger.info("Fetched %d new/changed RPMs from R2 under %s", fetched, rpms_prefix)
 
     return len(wanted), fetched
+
+
+def _repair_corrupt_local_rpms(
+    client: R2Client,
+    rpms_prefix: str,
+    rpms_dir: Path,
+) -> int:
+    if not rpms_dir.is_dir():
+        return 0
+    repaired = 0
+    removed = 0
+    for path in list(rpms_dir.glob("*.rpm")):
+        try:
+            sz = path.stat().st_size
+        except OSError:
+            continue
+        bad = sz <= 0
+        if not bad:
+            continue
+        key = f"{rpms_prefix}{path.name}"
+        data = client.get_object(key)
+        if data:
+            _write_staged_rpm(path, data)
+            if path.stat().st_size == len(data) and path.stat().st_size > 0:
+                repaired += 1
+                logger.warning("Re-fetched corrupt local RPM from R2: %s (%s bytes)", path.name, len(data))
+                continue
+        try:
+            path.unlink()
+            removed += 1
+            logger.warning("Removed unreadable local RPM %s (size=%s)", path.name, sz)
+        except OSError as e:
+            logger.warning("Could not remove corrupt local RPM %s: %s", path, e)
+    if repaired or removed:
+        logger.info(
+            "Local RPM repair under %s repaired=%s removed=%s",
+            rpms_dir,
+            repaired,
+            removed,
+        )
+    return repaired + removed
 
 def _list_repodata_keys(client: R2Client, r2_prefix: str) -> list[str]:
     repodata_prefix = f"{r2_prefix}/repodata/"
@@ -654,19 +699,41 @@ def _run_createrepo(
         if comps_file is not None and comps_file.exists():
             cmd += ["--groupfile", str(comps_file)]
         try:
-            subprocess.run(
+            proc = subprocess.run(
                 cmd,
-                check=True,
+                check=False,
                 stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
                 timeout=timeout_s,
             )
         except subprocess.TimeoutExpired as e:
             raise RuntimeError(
                 f"createrepo_c timed out after {timeout_s}s for repo_root={repo_dir} workers={workers}"
             ) from e
+        stderr = (proc.stderr or "").strip()
+        stdout = (proc.stdout or "").strip()
+        if stderr:
+            for line in stderr.splitlines()[-40:]:
+                logger.warning("createrepo_c: %s", line)
+        if stdout:
+            for line in stdout.splitlines()[-20:]:
+                logger.info("createrepo_c: %s", line)
         repomd = repo_dir / "repodata" / "repomd.xml"
+        if proc.returncode != 0:
+            if proc.returncode == 2 and repomd.exists() and repomd.stat().st_size > 0:
+                logger.warning(
+                    "createrepo_c exited %s with invalid-package warnings but wrote %s; continuing",
+                    proc.returncode,
+                    repomd,
+                )
+            else:
+                detail = stderr or stdout or f"exit {proc.returncode}"
+                raise RuntimeError(
+                    f"createrepo_c failed repo_root={repo_dir} workers={workers}: {detail}"
+                )
         if not repomd.exists():
-            raise RuntimeError(f"createrepo_c reported success but {repomd} is missing")
+            raise RuntimeError(f"createrepo_c finished but {repomd} is missing")
         logger.info("createrepo_c finished repo_root=%s workers=%s update=%s", repo_dir, workers, use_update)
 
     _cleanup_tmp_repodata()
@@ -795,27 +862,46 @@ def update_repodata_at_prefix(
                     rpm_count, _synced = _sync_rpms_dir_from_r2(
                         client, rpms_prefix, rpms_dir, container=container
                     )
-                _ensure_local_repodata_baseline(
-                    client, r2_prefix, repo_root, min_packages=len(rpm_keys)
-                )
-                _refresh_staged_rpms_from_r2(
-                    client, rpms_prefix, rpms_dir, staged, container=container
-                )
-                logger.info(
-                    "Staged repodata update %s staged=%s local_rpms=%s",
-                    r2_prefix,
-                    len(staged),
-                    rpm_count,
-                )
+                try:
+                    _ensure_local_repodata_baseline(
+                        client, r2_prefix, repo_root, min_packages=len(rpm_keys)
+                    )
+                    staged_force_full = False
+                except RuntimeError as e:
+                    logger.warning(
+                        "%s; falling back to full createrepo for %s",
+                        e,
+                        r2_prefix,
+                    )
+                    staged_force_full = True
+                if staged_force_full:
+                    logger.info(
+                        "Full createrepo for %s after mirror sync local_rpms=%s (skipping per-RPM staged refresh of %s files)",
+                        r2_prefix,
+                        rpm_count,
+                        len(staged),
+                    )
+                else:
+                    _refresh_staged_rpms_from_r2(
+                        client, rpms_prefix, rpms_dir, staged, container=container
+                    )
+                    logger.info(
+                        "Staged repodata update %s staged=%s local_rpms=%s",
+                        r2_prefix,
+                        len(staged),
+                        rpm_count,
+                    )
+                _repair_corrupt_local_rpms(client, rpms_prefix, rpms_dir)
                 if container is not None:
                     _clear_createrepo_cache(container)
-                _run_createrepo(repo_root, container=container, force_full=False)
+                _run_createrepo(repo_root, container=container, force_full=staged_force_full)
             elif local_mirror_ready and force_full:
                 logger.info(
                     "Local-only full repodata regen %s rpms=%s (skipping R2 RPM sync)",
                     r2_prefix,
                     rpm_count,
                 )
+                _repair_corrupt_local_rpms(client, rpms_prefix, rpms_dir)
                 if container is not None:
                     _clear_createrepo_cache(container)
                 _run_createrepo(repo_root, container=container, force_full=True)
@@ -830,6 +916,7 @@ def update_repodata_at_prefix(
                     if repodata_local:
                         logger.info("No RPM changes at %s, skipping createrepo_c", r2_prefix)
                         return True
+                _repair_corrupt_local_rpms(client, rpms_prefix, rpms_dir)
                 if container is not None:
                     _clear_createrepo_cache(container)
                 _run_createrepo(repo_root, container=container, force_full=force_full)

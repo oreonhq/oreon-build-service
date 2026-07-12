@@ -35,6 +35,7 @@ from oreon_build.core.rpm_requires import (
     requirement_check_capabilities,
     rpm_requirement_capabilities_from_value,
     rpm_requirement_primary,
+    rpm_requirement_tokens_from_value,
     sources_for_requirement,
     _pkgconfig_glob_match,
     _providers_from_maps,
@@ -256,7 +257,7 @@ def dependency_capabilities(parsed: _SpecParseResult) -> list[str]:
         caps.append(c)
 
     for raw in list(parsed.build_requires_raw or []) + list(parsed.requires_raw or []):
-        for cap in rpm_requirement_capabilities_from_value(raw):
+        for cap in rpm_requirement_tokens_from_value(raw):
             add(cap)
     for name in parsed.dependency_names():
         add(name)
@@ -304,12 +305,13 @@ def iter_plan_capabilities(
 
     for cap in seeds:
         add_requirement(cap)
-        # only walk repo transitive gaps for BRs mock will install (-devel and friends).
-        # do not treat the source's own Requires / subpackage Requires as build blockers.
-        walk_transitive = not (cap.startswith("(") and cap.endswith(")")) and (
-            cap.endswith("-devel") or cap.startswith("pkgconfig(")
-        )
-        if walk_transitive and repo.satisfies_requirement(cap):
+        primary = rpm_requirement_primary(cap) or cap
+        walk_closure = repo.satisfies_requirement(cap)
+        if not walk_closure:
+            any_arch = getattr(repo, "has_capability_any_arch", None)
+            if callable(any_arch) and any_arch(primary):
+                walk_closure = True
+        if walk_closure:
             for miss in repo.transitive_unsatisfied(cap):
                 if is_chain_plan_requirement(miss):
                     add(miss)
@@ -570,6 +572,22 @@ def clear_distgit_tarball_cache() -> None:
     _tarball_cache.clear()
 
 
+def _perl_provide_from_package_name(pkg: str) -> str | None:
+    """Fedora-style perl-Foo-Bar packages auto-Provide perl(Foo::Bar)."""
+    n = (pkg or "").strip()
+    if not n.startswith("perl-"):
+        return None
+    rest = n[5:]
+    if not rest or rest[0].isdigit():
+        return None
+    low = rest.lower()
+    if low in {"interpreter", "libs", "macros", "devel", "generators", "doc", "homedir"}:
+        return None
+    if low.endswith(("-tests", "-doc", "-debuginfo", "-debugsource")):
+        return None
+    return f"perl({rest.replace('-', '::')})"
+
+
 @dataclass
 class DistgitProvidesIndex:
     package_names: frozenset[str]
@@ -578,9 +596,12 @@ class DistgitProvidesIndex:
 
     def indexed_providers(self) -> dict[str, set[str]]:
         if self._indexed is None:
-            self._indexed = index_provider_map(
-                {k: set(v) for k, v in self.capability_providers.items()}
-            )
+            raw = {k: set(v) for k, v in self.capability_providers.items()}
+            for pkg in self.package_names:
+                perl_cap = _perl_provide_from_package_name(pkg)
+                if perl_cap:
+                    raw.setdefault(perl_cap, set()).add(pkg)
+            self._indexed = index_provider_map(raw)
         return self._indexed
 
 
@@ -588,7 +609,7 @@ _PROVIDES_INDEX_CACHE: dict[tuple[str, str, str, str, str], tuple[float, Distgit
 _provides_index_tasks: dict[tuple[str, str, str, str, str], asyncio.Task[DistgitProvidesIndex | None]] = {}
 _PACKAGE_NAMES_CACHE: dict[tuple[str, str, str, str], tuple[float, frozenset[str]]] = {}
 _PACKAGE_NAMES_CACHE_TTL_SEC = 1800.0
-_PROVIDES_INDEX_DISK_VERSION = "v2"
+_PROVIDES_INDEX_DISK_VERSION = "v3"
 
 
 def _so_file_provides(libstem: str) -> set[str]:
@@ -626,7 +647,6 @@ def _provides_match_capability(capability: str, provided: set[str]) -> bool:
         if base == pl or base.startswith(pl + ".") or pl.startswith(base + "."):
             return True
     return False
-
 
 
 def _lightweight_provides_from_spec_text(pkg: str, spec_text: str) -> set[str]:
@@ -679,6 +699,10 @@ def _lightweight_provides_from_spec_text(pkg: str, spec_text: str) -> set[str]:
             if m and "%" not in m.group(1):
                 provided.update(_so_file_provides(m.group(1)))
     provided.add(source_name)
+    for name in (pkg, source_name):
+        perl_cap = _perl_provide_from_package_name(name)
+        if perl_cap:
+            provided.add(perl_cap)
     return provided
 
 
@@ -1555,7 +1579,7 @@ def _warm_provides_index_lookup(capability: str) -> set[str]:
         return set()
     out: set[str] = set()
     now = time.monotonic()
-    for (_owner, _repo, _branch, _rel, _sha), (ts, index) in list(_PROVIDES_INDEX_CACHE.items()):
+    for _key, (ts, index) in list(_PROVIDES_INDEX_CACHE.items()):
         if now - ts >= _TARBALL_CACHE_TTL_SEC:
             continue
         out.update(_providers_from_maps(cap, [distgit_providers_dict(index)]))
@@ -1714,7 +1738,10 @@ def _provides_index_is_warm(
     owner: str, repo: str, distgit_branch: str, releasename: str
 ) -> bool:
     now = time.monotonic()
-    for (o, r, b, rel, _sha), (ts, _index) in _PROVIDES_INDEX_CACHE.items():
+    for key, (ts, _index) in _PROVIDES_INDEX_CACHE.items():
+        if len(key) < 4:
+            continue
+        o, r, b, rel = key[0], key[1], key[2], key[3]
         if o == owner and r == repo and b == distgit_branch and rel == releasename:
             if now - ts < _TARBALL_CACHE_TTL_SEC:
                 return True

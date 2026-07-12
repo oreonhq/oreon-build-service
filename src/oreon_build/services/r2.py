@@ -74,8 +74,33 @@ class R2Client:
                 return None
             raise
 
+    def copy_object(self, src_key: str, dest_key: str) -> bool:
+        if src_key == dest_key:
+            return self.object_exists(src_key)
+        try:
+            self._client.copy_object(
+                Bucket=self.bucket,
+                CopySource={"Bucket": self.bucket, "Key": src_key},
+                Key=dest_key,
+            )
+            return True
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("404", "NoSuchKey", "NotFound", "NoSuchBucket"):
+                return False
+            raise
+
     def delete_object(self, key: str) -> None:
         self._client.delete_object(Bucket=self.bucket, Key=key)
+
+    def delete_objects(self, keys: list[str]) -> None:
+        uniq = [k for k in dict.fromkeys(keys) if k]
+        for i in range(0, len(uniq), 1000):
+            chunk = uniq[i : i + 1000]
+            self._client.delete_objects(
+                Bucket=self.bucket,
+                Delete={"Objects": [{"Key": k} for k in chunk], "Quiet": True},
+            )
 
     def list_objects(self, prefix: str, max_keys: int = 1000) -> list[dict]:
         paginator = self._client.get_paginator("list_objects_v2")

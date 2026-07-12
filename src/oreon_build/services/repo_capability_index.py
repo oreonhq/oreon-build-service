@@ -11,9 +11,14 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
 from oreon_build.core.rpm_requires import (
+    evr_satisfies,
     is_arch_qualified_rpm_dependency,
+    is_distgit_source_name,
+    parse_versioned_requirement,
     requirement_check_capabilities,
+    rpm_evr_compare,
     rpm_requirement_primary,
+    split_requirement_evr,
 )
 from oreon_build.services.r2 import get_r2_client
 
@@ -21,6 +26,42 @@ logger = logging.getLogger(__name__)
 
 _CACHE_TTL_SEC = 300.0
 _cache: dict[tuple[str, str, str], tuple[float, RepoCapabilityIndex]] = {}
+
+_RE_REPO_CHANNEL = re.compile(
+    r"/(?P<rel>[^/]+)/(?P<channel>dev|testing|stable)/(?:\$basearch|\$arch|x86_64|aarch64|noarch|src)(?:/|$)",
+    re.IGNORECASE,
+)
+
+
+_REPO_CHANNELS = ("dev", "testing", "stable")
+
+
+def default_capability_extra_branches(publish_branch: str | None) -> list[str]:
+    pub = (publish_branch or "dev").strip() or "dev"
+    return [c for c in _REPO_CHANNELS if c != pub]
+
+
+def repo_channels_from_mock_urls(releasename: str, urls: list[str] | None) -> list[str]:
+    rel = (releasename or "").strip().strip("/")
+    if not rel or not urls:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in urls:
+        u = str(raw or "").strip()
+        if not u:
+            continue
+        m = _RE_REPO_CHANNEL.search(u)
+        if not m:
+            continue
+        if (m.group("rel") or "").strip() != rel:
+            continue
+        ch = (m.group("channel") or "").strip().lower()
+        if not ch or ch in seen:
+            continue
+        seen.add(ch)
+        out.append(ch)
+    return out
 
 _RE_RICH_IF = re.compile(r"^(.*?)\s+(if|unless)\s+(.*)$", re.IGNORECASE | re.DOTALL)
 _RE_RICH_OR = re.compile(r"\s+or\s+", re.IGNORECASE)
@@ -47,6 +88,7 @@ class RepoCapabilityIndex:
     binary_names: set[str] = field(default_factory=set)
     provides: set[str] = field(default_factory=set)
     capability_providers: dict[str, set[str]] = field(default_factory=dict)
+    capability_evrs: dict[str, list[tuple[str, str, str]]] = field(default_factory=dict)
     binary_requires: dict[str, set[str]] = field(default_factory=dict)
     binary_source: dict[str, str] = field(default_factory=dict)
     _caps_lower: set[str] = field(default_factory=set, repr=False)
@@ -70,16 +112,36 @@ class RepoCapabilityIndex:
         return self._all_caps or set()
 
     def has_capability(self, name: str) -> bool:
+        """Exact capability match (dnf installability). No casefold."""
         n = (name or "").strip()
         if not n:
             return False
         if is_rpmlib_requirement(n):
             return True
+        if self._all_caps is None:
+            self.finalize_lookups()
         if n in self.provides or n in self.binary_names or n in self.source_names:
+            return True
+        return False
+
+    def has_capability_ci(self, name: str) -> bool:
+        """Case-insensitive presence. Discovery only, not installability."""
+        n = (name or "").strip()
+        if not n:
+            return False
+        if is_rpmlib_requirement(n):
+            return True
+        if self.has_capability(n):
             return True
         if not self._caps_lower:
             self.finalize_lookups()
         return n.lower() in self._caps_lower
+
+    def _capability_evrs_for(self, name: str) -> list[tuple[str, str, str]]:
+        n = (name or "").strip()
+        if not n:
+            return []
+        return list(self.capability_evrs.get(n) or [])
 
     def satisfies_requirement(self, dep: str) -> bool:
         d = (dep or "").strip()
@@ -89,10 +151,38 @@ class RepoCapabilityIndex:
             return True
         if is_rich_dependency(d):
             return self._satisfies_rich_dependency(d)
-        for cap in requirement_check_capabilities(d):
-            if self.has_capability(cap):
-                return True
-        return False
+        name, op, ver = parse_versioned_requirement(d)
+        if not name:
+            return False
+        if not self.has_capability(name):
+            # also try expanded aliases (pkgconfig inner etc) without version
+            if op is None:
+                for cap in requirement_check_capabilities(d):
+                    if self.has_capability(cap):
+                        return True
+            return False
+        if op is None or ver is None:
+            return True
+        need = split_requirement_evr(ver)
+        evrs = self._capability_evrs_for(name)
+        if not evrs:
+            # name exists but no EVR recorded - treat versioned dep as unmet
+            return False
+        return any(evr_satisfies(op, evr, need) for evr in evrs)
+
+    def providers_for(self, cap: str, *, exact: bool = True) -> set[str]:
+        c = (cap or "").strip()
+        if not c:
+            return set()
+        if not self._providers_by_lower:
+            self.finalize_lookups()
+        out: set[str] = set()
+        if c in self.binary_names:
+            out.add(c)
+        out.update(self.capability_providers.get(c, set()))
+        if not exact:
+            out.update(self._providers_by_lower.get(c.lower(), set()))
+        return out
 
     def _leaf_capability_present(self, tok: str) -> bool:
         t = (tok or "").strip()
@@ -191,19 +281,6 @@ class RepoCapabilityIndex:
             return True
         return self.has_capability(n)
 
-    def providers_for(self, cap: str) -> set[str]:
-        c = (cap or "").strip()
-        if not c:
-            return set()
-        if not self._providers_by_lower:
-            self.finalize_lookups()
-        out: set[str] = set()
-        if c in self.binary_names:
-            out.add(c)
-        out.update(self.capability_providers.get(c, set()))
-        out.update(self._providers_by_lower.get(c.lower(), set()))
-        return out
-
     def transitive_unsatisfied(self, cap: str) -> set[str]:
         root = (cap or "").strip()
         if not root:
@@ -228,13 +305,29 @@ class RepoCapabilityIndex:
                     missing.add(leaf)
                 continue
             if not self.has_capability(c):
-                # arch-qualified names are install metadata; check base form too
+                # arch-qualified names are install metadata check base form too
                 from oreon_build.core.rpm_requires import rpm_arch_qualified_base
 
                 base = rpm_arch_qualified_base(c)
                 if base and self.has_capability(base):
                     continue
                 if any(self.has_capability(cap) for cap in requirement_check_capabilities(c)):
+                    continue
+                # arch-partial binary: still walk Requires from the arches that have it
+                pkgs = set(self.providers_for(c))
+                if c in self.binary_requires:
+                    pkgs.add(c)
+                walked = False
+                for pkg in pkgs:
+                    reqs = self.binary_requires.get(pkg, set())
+                    if not reqs:
+                        continue
+                    walked = True
+                    for req in reqs:
+                        if req not in seen:
+                            stack.append(req)
+                if walked or self.has_capability_any_arch(c):
+                    missing.add(c)
                     continue
                 missing.add(c)
                 continue
@@ -320,15 +413,42 @@ class RepoCapabilityIndex:
     def missing_runtime_caps_for_requirement(self, cap: str) -> set[str]:
         return set(self.transitive_unsatisfied(cap))
 
+    def has_capability_any_arch(self, name: str) -> bool:
+        """True when primary metadata saw this on at least one arch/channel."""
+        n = (name or "").strip()
+        if not n:
+            return False
+        if self.has_capability(n):
+            return True
+        if n in self.binary_source or n in self.binary_requires:
+            return True
+        if self.capability_providers.get(n):
+            return True
+        return False
+
     def distgit_sources_for_capability(self, cap: str) -> set[str]:
+        """Source packages that can produce an unmet capability.
+
+        Includes already-published sources. Needed when a subpackage exists on only
+        some arches (intersection drops it) or an EVR bump is required.
+        """
         c = (cap or "").strip()
-        if not c or self.satisfies_source(c) or is_rpmlib_requirement(c) or is_rich_dependency(c):
+        if not c or is_rpmlib_requirement(c) or is_rich_dependency(c):
+            return set()
+        if self.has_capability(c):
             return set()
         out: set[str] = set()
+        direct = self.binary_source.get(c)
+        if direct and is_distgit_source_name(direct):
+            out.add(direct)
         for pkg in self.providers_for(c):
             src = self.binary_source.get(pkg)
-            if src and not self.satisfies_source(src):
+            if src and is_distgit_source_name(src):
                 out.add(src)
+            elif is_distgit_source_name(pkg) and (
+                pkg in self.source_names or pkg in self.binary_source.values()
+            ):
+                out.add(pkg)
         return out
 
 
@@ -441,6 +561,23 @@ def _resolve_primary_key(repo_prefix: str, repomd_raw: bytes) -> str | None:
     return _resolve_repodata_key(repo_prefix, repomd_raw, "primary")
 
 
+def _add_capability_evr(
+    index: RepoCapabilityIndex,
+    name: str,
+    epoch: str | None,
+    ver: str | None,
+    rel: str | None,
+) -> None:
+    n = (name or "").strip()
+    v = (ver or "").strip()
+    if not n or not v:
+        return
+    evr = ((epoch or "0").strip() or "0", v, (rel or "").strip())
+    bucket = index.capability_evrs.setdefault(n, [])
+    if evr not in bucket:
+        bucket.append(evr)
+
+
 def _ingest_primary_xml(index: RepoCapabilityIndex, primary_xml: bytes) -> None:
     try:
         root = ET.fromstring(primary_xml)
@@ -451,10 +588,15 @@ def _ingest_primary_xml(index: RepoCapabilityIndex, primary_xml: bytes) -> None:
         if arch == "src":
             continue
         name = (pkg.findtext("{*}name") or "").strip()
+        ver_node = pkg.find("{*}version")
+        pkg_epoch = (ver_node.attrib.get("epoch") if ver_node is not None else None) or "0"
+        pkg_ver = (ver_node.attrib.get("ver") if ver_node is not None else None) or ""
+        pkg_rel = (ver_node.attrib.get("rel") if ver_node is not None else None) or ""
         if name:
             index.binary_names.add(name)
             index.provides.add(name)
             index.capability_providers.setdefault(name, set()).add(name)
+            _add_capability_evr(index, name, pkg_epoch, pkg_ver, pkg_rel)
         sourcerpm = (pkg.findtext(".//{*}sourcerpm") or "").strip()
         if sourcerpm.endswith(".src.rpm") and name:
             src = sourcerpm[:-8].rsplit("-", 2)[0]
@@ -463,10 +605,18 @@ def _ingest_primary_xml(index: RepoCapabilityIndex, primary_xml: bytes) -> None:
                 index.binary_source[name] = src
         for entry in pkg.findall(".//{*}provides/{*}entry"):
             prov = (entry.attrib.get("name") or "").strip()
-            if prov:
-                index.provides.add(prov)
-                if name:
-                    index.capability_providers.setdefault(prov, set()).add(name)
+            if not prov:
+                continue
+            index.provides.add(prov)
+            if name:
+                index.capability_providers.setdefault(prov, set()).add(name)
+            _add_capability_evr(
+                index,
+                prov,
+                entry.attrib.get("epoch") or pkg_epoch,
+                entry.attrib.get("ver") or pkg_ver,
+                entry.attrib.get("rel") or "",
+            )
         for entry in pkg.findall(".//{*}requires/{*}entry"):
             req = (entry.attrib.get("name") or "").strip()
             if req and name:
@@ -526,19 +676,56 @@ def _load_arch_primary(releasename: str, branch: str, arch: str) -> RepoCapabili
     return _load_arch_metadata(releasename, branch, arch)
 
 
+def _copy_index_fields(dst: RepoCapabilityIndex, src: RepoCapabilityIndex) -> None:
+    dst.binary_names.update(src.binary_names)
+    dst.provides.update(src.provides)
+    dst.source_names.update(src.source_names)
+    for cap, pkgs in src.capability_providers.items():
+        dst.capability_providers.setdefault(cap, set()).update(pkgs)
+    for cap, evrs in src.capability_evrs.items():
+        bucket = dst.capability_evrs.setdefault(cap, [])
+        for evr in evrs:
+            if evr not in bucket:
+                bucket.append(evr)
+    for pkg, reqs in src.binary_requires.items():
+        dst.binary_requires.setdefault(pkg, set()).update(reqs)
+    dst.binary_source.update(src.binary_source)
+
+
+def _best_evr(evrs: list[tuple[str, str, str]]) -> tuple[str, str, str] | None:
+    if not evrs:
+        return None
+    best = evrs[0]
+    for evr in evrs[1:]:
+        if rpm_evr_compare(evr, best) > 0:
+            best = evr
+    return best
+
+
+def _worst_evr(evrs: list[tuple[str, str, str]]) -> tuple[str, str, str] | None:
+    if not evrs:
+        return None
+    worst = evrs[0]
+    for evr in evrs[1:]:
+        if rpm_evr_compare(evr, worst) < 0:
+            worst = evr
+    return worst
+
+
+def _union_indexes(parts: list[RepoCapabilityIndex]) -> RepoCapabilityIndex:
+    index = RepoCapabilityIndex()
+    for part in parts:
+        _copy_index_fields(index, part)
+    return index
+
+
 def _merge_arch_indexes(parts: list[RepoCapabilityIndex]) -> RepoCapabilityIndex:
     index = RepoCapabilityIndex()
     if not parts:
         index.finalize_lookups()
         return index
     if len(parts) == 1:
-        part = parts[0]
-        index.binary_names.update(part.binary_names)
-        index.provides.update(part.provides)
-        index.source_names.update(part.source_names)
-        index.capability_providers.update({k: set(v) for k, v in part.capability_providers.items()})
-        index.binary_requires.update({k: set(v) for k, v in part.binary_requires.items()})
-        index.binary_source.update(part.binary_source)
+        _copy_index_fields(index, parts[0])
         index.finalize_lookups()
         return index
 
@@ -558,6 +745,16 @@ def _merge_arch_indexes(parts: list[RepoCapabilityIndex]) -> RepoCapabilityIndex
         for pkg, reqs in part.binary_requires.items():
             index.binary_requires.setdefault(pkg, set()).update(reqs)
         index.binary_source.update(part.binary_source)
+    # multi-arch version floor: best EVR on each arch, then weakest arch wins
+    for cap in common_provides:
+        per_arch_best: list[tuple[str, str, str]] = []
+        for part in parts:
+            best = _best_evr(list(part.capability_evrs.get(cap) or []))
+            if best is not None:
+                per_arch_best.append(best)
+        floor = _worst_evr(per_arch_best)
+        if floor is not None:
+            index.capability_evrs[cap] = [floor]
     index.finalize_lookups()
     return index
 
@@ -566,28 +763,43 @@ def load_repo_capability_index(
     releasename: str,
     branch: str,
     architectures: list[str],
+    *,
+    extra_branches: list[str] | None = None,
 ) -> RepoCapabilityIndex:
     """
     Multi-arch index. A capability is only "satisfied" if every target arch has it.
     Unioning arches was wrong: aarch64-only dbus-c++ made x86_64 plans skip the BR.
+
+    extra_branches are unioned per-arch with the publish branch. Mock often installs
+    from testing while builds still publish into dest, so planning must see both.
     """
     rel = (releasename or "").strip()
-    br = (branch or "dev").strip()
+    branches: list[str] = []
+    for raw in [(branch or "dev").strip(), *((extra_branches or []))]:
+        b = (raw or "").strip()
+        if b and b not in branches:
+            branches.append(b)
+    if not branches:
+        branches = ["dev"]
     arches = sorted({(a or "").strip() for a in architectures if (a or "").strip()})
     arch_key = ",".join(arches)
-    cache_key = (rel, br, arch_key)
+    branch_key = "+".join(branches)
+    cache_key = (rel, branch_key, arch_key)
     now = time.monotonic()
     hit = _cache.get(cache_key)
     if hit and now - hit[0] < _CACHE_TTL_SEC:
         return hit[1]
 
-    parts = [_load_arch_metadata(rel, br, a) for a in arches]
+    parts: list[RepoCapabilityIndex] = []
+    for a in arches:
+        per_branch = [_load_arch_metadata(rel, b, a) for b in branches]
+        parts.append(_union_indexes(per_branch) if len(per_branch) > 1 else (per_branch[0] if per_branch else RepoCapabilityIndex()))
     index = _merge_arch_indexes(parts)
     _cache[cache_key] = (now, index)
     logger.info(
         "repo capability index %s/%s arches=%s sources=%s binaries=%s provides=%s",
         rel,
-        br,
+        branch_key,
         arch_key or "(none)",
         len(index.source_names),
         len(index.binary_names),
