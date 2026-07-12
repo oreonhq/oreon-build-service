@@ -600,6 +600,17 @@ class PromotionResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class BulkPromoteRequest(BaseModel):
+    promotion_ids: Optional[List[int]] = None
+    all_pending: bool = False
+
+
+class BulkPromoteAccepted(BaseModel):
+    status: str = "accepted"
+    message: str
+    promotion_count: int
+
+
 class RepositoryResponse(BaseModel):
     id: int
     release_id: int
