@@ -88,6 +88,14 @@ def test_chain_plan_requirement_filters_rpm_primary_noise() -> None:
     assert is_chain_plan_requirement("ld-linux-x86-64.so.2()(64bit)") is False
     assert is_chain_plan_requirement("(llvm-libs(x86-64) or llvm22-libs(x86-64))") is False
     assert is_chain_plan_requirement("(sdubby > 1.0-3 if sdubby)") is False
+    assert is_chain_plan_requirement("--modversion") is False
+    assert is_chain_plan_requirement("-n") is False
+    assert is_chain_plan_requirement("echo") is False
+    assert is_chain_plan_requirement("bad") is False
+    assert is_chain_plan_requirement("0/pppd/patchlevel.h") is False
+    assert is_chain_plan_requirement("'s/^#define'") is False
+    assert is_chain_plan_requirement("/usr/bin/pkg-config") is True
+    assert is_chain_plan_requirement("python3-devel") is True
     assert is_arch_qualified_rpm_dependency("allegro(x86-64)") is True
     assert rpm_arch_qualified_base("allegro(x86-64)") == "allegro"
     assert is_low_level_runtime_requirement("libm.so.6(GLIBC_2.2.5)(64bit)") is True
@@ -126,13 +134,13 @@ def test_indexed_provider_lookup_is_case_insensitive_and_fast() -> None:
     huge["libIL.so"] = {"DevIL"}
     indexed = index_provider_map(huge)
     assert isinstance(indexed["__lower__"], dict)
-    assert _providers_from_maps("gtkmm24-devel", [indexed]) == {"gtkmm24"}
-    assert _providers_from_maps("libIL.so.1()(64bit)", [indexed]) == {"DevIL"}
+    assert _providers_from_maps("gtkmm24-devel", [indexed], exact=False) == {"gtkmm24"}
+    assert _providers_from_maps("libIL.so.1()(64bit)", [indexed], exact=False) == {"DevIL"}
 
     merged = merge_provider_maps(indexed, {"Extra": {"x"}})
     assert isinstance(merged["__lower__"], dict)
     assert "__lower__" not in merged["__lower__"]
-    assert _providers_from_maps("extra", [merged]) == {"x"}
+    assert _providers_from_maps("extra", [merged], exact=False) == {"x"}
     # old seed path did setdefault("__lower__", set()) which corrupts the index
     corrupted = dict(indexed)
     corrupted["__lower__"] = {"poison"}

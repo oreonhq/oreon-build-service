@@ -299,6 +299,40 @@ def test_multi_arch_merge_requires_capability_on_every_arch() -> None:
     assert merged2.distgit_sources_for_capability("dbus-c++-devel") == {"dbus-c++"}
 
 
+def test_arch_partial_subpackage_maps_to_built_source() -> None:
+    # libquadmath-devel only on x86, gcc source already published on both
+    x86 = RepoCapabilityIndex(
+        binary_names={"gcc", "libquadmath-devel"},
+        provides={"gcc", "libquadmath-devel"},
+        capability_providers={
+            "gcc": {"gcc"},
+            "libquadmath-devel": {"libquadmath-devel"},
+        },
+        binary_source={"gcc": "gcc", "libquadmath-devel": "gcc"},
+        binary_requires={"libquadmath-devel": {"libquadmath", "glibc-devel"}},
+        source_names={"gcc"},
+        capability_evrs={"gcc": [("0", "16", "1")], "libquadmath-devel": [("0", "16", "1")]},
+    )
+    aarch = RepoCapabilityIndex(
+        binary_names={"gcc"},
+        provides={"gcc"},
+        capability_providers={"gcc": {"gcc"}},
+        binary_source={"gcc": "gcc"},
+        source_names={"gcc"},
+        capability_evrs={"gcc": [("0", "16", "1")]},
+    )
+    merged = _merge_arch_indexes([x86, aarch])
+    assert merged.satisfies_requirement("libquadmath-devel") is False
+    assert merged.has_capability_any_arch("libquadmath-devel") is True
+    assert merged.distgit_sources_for_capability("libquadmath-devel") == {"gcc"}
+    from oreon_build.core.rpm_requires import sources_for_requirement
+
+    assert sources_for_requirement("libquadmath-devel", merged) == {"gcc"}
+    miss = merged.transitive_unsatisfied("libquadmath-devel")
+    assert "libquadmath-devel" in miss
+    assert "libquadmath" in miss or "glibc-devel" in miss
+
+
 def test_rich_or_dep_uses_arch_unqualified_leaves() -> None:
     repo = RepoCapabilityIndex(
         binary_names={"llvm-libs"},
@@ -379,3 +413,103 @@ def test_iter_plan_capabilities_expands_unsatisfied_rich_not_whole_string() -> N
     assert not any(c.startswith("(") for c in caps)
     assert "sdubby" not in caps
     assert "llvm-libs" not in caps
+
+
+def test_satisfies_requirement_is_case_sensitive_like_dnf() -> None:
+    repo = RepoCapabilityIndex(
+        binary_names={"packagekit-qt6-devel"},
+        provides={"packagekit-qt6-devel", "pkgconfig(packagekitqt6)"},
+        capability_providers={"packagekit-qt6-devel": {"packagekit-qt6-devel"}},
+        binary_source={"packagekit-qt6-devel": "packagekit-qt"},
+        source_names={"packagekit-qt"},
+    )
+    repo.finalize_lookups()
+    assert repo.satisfies_requirement("packagekit-qt6-devel") is True
+    assert repo.satisfies_requirement("PackageKit-Qt6-devel") is False
+    assert repo.has_capability_ci("PackageKit-Qt6-devel") is True
+
+
+def test_uncovered_flags_case_mismatch_when_repo_has_similar_binary() -> None:
+    from oreon_build.core.spec_bcond import parse_spec_bconds
+    from oreon_build.services.build_planner import _uncovered_plan_capabilities
+    from oreon_build.services.distgit_order import _parse_spec_text
+
+    repo = RepoCapabilityIndex(
+        binary_names={"packagekit-qt6-devel"},
+        provides={"packagekit-qt6-devel"},
+        capability_providers={"packagekit-qt6-devel": {"packagekit-qt6-devel"}},
+        binary_source={"packagekit-qt6-devel": "packagekit-qt"},
+        source_names={"packagekit-qt"},
+    )
+    repo.finalize_lookups()
+    spec = (
+        "Name: plasma-desktop\nVersion: 1\nRelease: 1\n"
+        "BuildRequires: PackageKit-Qt6-devel\n"
+        "Provides: plasma-desktop\n"
+    )
+    parsed = _parse_spec_text(spec, "plasma-desktop.spec")
+    bcond = parse_spec_bconds(spec)
+    bad = _uncovered_plan_capabilities(parsed, bcond, repo, {"plasma-desktop"}, [{}])
+    assert len(bad) == 1
+    assert "PackageKit-Qt6-devel" in bad[0]
+    assert "case-different" in bad[0]
+
+
+def test_repo_channels_from_mock_urls() -> None:
+    from oreon_build.services.repo_capability_index import (
+        default_capability_extra_branches,
+        repo_channels_from_mock_urls,
+    )
+
+    urls = [
+        "https://repo-us.oreonhq.com/oreon-11-rp1/testing/$basearch",
+        "https://repo-us.oreonhq.com/oreon-11-rp1/stable/x86_64",
+        "https://example.com/other-rel/testing/$basearch",
+    ]
+    assert repo_channels_from_mock_urls("oreon-11-rp1", urls) == ["testing", "stable"]
+    assert repo_channels_from_mock_urls("missing", urls) == []
+    assert default_capability_extra_branches("dev") == ["testing", "stable"]
+    assert default_capability_extra_branches("testing") == ["dev", "stable"]
+
+
+def test_union_indexes_merges_channel_provides() -> None:
+    from oreon_build.services.repo_capability_index import RepoCapabilityIndex, _union_indexes
+
+    dest = RepoCapabilityIndex(
+        binary_names={"foo"},
+        provides={"foo"},
+        capability_providers={"foo": {"foo"}},
+        source_names={"foo"},
+    )
+    testing = RepoCapabilityIndex(
+        binary_names={"python3-devel"},
+        provides={"python3-devel", "pkgconfig(libsystemd)"},
+        capability_providers={
+            "python3-devel": {"python3-devel"},
+            "pkgconfig(libsystemd)": {"systemd-devel"},
+        },
+        binary_source={"python3-devel": "python3.14", "systemd-devel": "systemd"},
+        source_names={"python3.14", "systemd"},
+    )
+    merged = _union_indexes([dest, testing])
+    merged.finalize_lookups()
+    assert merged.has_capability("foo")
+    assert merged.has_capability("python3-devel")
+    assert merged.has_capability("pkgconfig(libsystemd)")
+    assert merged.satisfies_requirement("python3-devel")
+
+
+def test_satisfies_requirement_checks_provide_evr() -> None:
+    repo = RepoCapabilityIndex(
+        binary_names={"wayland-protocols-devel"},
+        provides={"wayland-protocols-devel"},
+        capability_providers={"wayland-protocols-devel": {"wayland-protocols-devel"}},
+        capability_evrs={"wayland-protocols-devel": [("0", "1.47", "1.or11")]},
+        binary_source={"wayland-protocols-devel": "wayland-protocols"},
+        source_names={"wayland-protocols"},
+    )
+    repo.finalize_lookups()
+    assert repo.satisfies_requirement("wayland-protocols-devel")
+    assert repo.satisfies_requirement("wayland-protocols-devel >= 1.47")
+    assert not repo.satisfies_requirement("wayland-protocols-devel >= 1.48")
+    assert not repo.satisfies_requirement("wayland-protocols-devel > 1.47")

@@ -30,6 +30,29 @@ Name: libxml++
     assert "pkgconfig(*)" not in provided
 
 
+def test_perl_package_name_maps_to_virtual_provide() -> None:
+    from oreon_build.services.distgit_order import (
+        _perl_provide_from_package_name,
+        distgit_providers_dict,
+    )
+
+    assert _perl_provide_from_package_name("perl-Any-URI-Escape") == "perl(Any::URI::Escape)"
+    assert _perl_provide_from_package_name("perl-URI") == "perl(URI)"
+    assert _perl_provide_from_package_name("perl-interpreter") is None
+    assert _perl_provide_from_package_name("perl-URI-tests") is None
+
+    spec = "Name: perl-Any-URI-Escape\nVersion: 0.01\n%files\n%{perl_vendorlib}/Any*\n"
+    provided = _lightweight_provides_from_spec_text("perl-Any-URI-Escape", spec)
+    assert "perl(Any::URI::Escape)" in provided
+    assert _provides_match_capability("perl(Any::URI::Escape)", provided)
+
+    idx = DistgitProvidesIndex(
+        package_names=frozenset({"perl-Any-URI-Escape"}),
+        capability_providers={},
+    )
+    assert "perl-Any-URI-Escape" in distgit_providers_dict(idx).get("perl(Any::URI::Escape)", set())
+
+
 def test_lightweight_soname_from_files() -> None:
     spec = """
 Name: DevIL

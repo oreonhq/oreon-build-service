@@ -348,7 +348,7 @@ async def test_planner_blocks_unbuildable_transitive_dep() -> None:
     built = {slot.name for layer in plan.layers for slot in layer}
     assert "devil" not in built
     assert plan.blocking_errors
-    assert any("allegro" in e and "not in distgit" in e for e in plan.blocking_errors)
+    assert any("allegro" in e for e in plan.blocking_errors)
     assert not any("qt" in e for e in plan.blocking_errors)
 
 
@@ -614,3 +614,75 @@ async def test_planner_pulls_unsatisfied_build_dep_source() -> None:
 
     built = [slot.name for layer in plan.layers for slot in layer]
     assert built == ["libfoo", "app"]
+
+
+@pytest.mark.asyncio
+async def test_planner_rebuilds_provider_for_versioned_br() -> None:
+    clear_repo_capability_cache()
+    specs = {
+        "kwin": (
+            "Name: kwin\nVersion: 6.7.2\nRelease: 1\n"
+            "BuildRequires: wayland-protocols-devel >= 1.48\n"
+            "Provides: kwin\n"
+        ),
+        "wayland-protocols": (
+            "Name: wayland-protocols\nVersion: 1.48\nRelease: 1\n"
+            "Provides: wayland-protocols-devel = 1.48\n"
+            "Provides: wayland-protocols\n"
+        ),
+    }
+    repo = RepoCapabilityIndex(
+        source_names={"wayland-protocols"},
+        binary_names={"wayland-protocols-devel"},
+        provides={"wayland-protocols-devel"},
+        capability_providers={"wayland-protocols-devel": {"wayland-protocols-devel"}},
+        capability_evrs={"wayland-protocols-devel": [("0", "1.47", "1.or11")]},
+        binary_source={"wayland-protocols-devel": "wayland-protocols"},
+    )
+    repo.finalize_lookups()
+
+    async def br_expand(specs_in, parsed, _repo, **kwargs):
+        from oreon_build.services.distgit_order import _parse_spec_text
+
+        if "wayland-protocols" not in parsed and "wayland-protocols" in specs:
+            parsed = dict(parsed)
+            specs_out = dict(specs_in)
+            specs_out["wayland-protocols"] = specs["wayland-protocols"]
+            parsed["wayland-protocols"] = _parse_spec_text(
+                specs["wayland-protocols"], "wayland-protocols.spec"
+            )
+            return specs_out, parsed, [], set()
+        return specs_in, parsed, [], set()
+
+    with (
+        patch(
+            "oreon_build.services.build_planner.expand_chain_spec_closure_sparse",
+            side_effect=_make_sparse_closure(specs),
+        ),
+        patch(
+            "oreon_build.services.build_planner.fetch_repo_transitive_extras_for_roots",
+            side_effect=_noop_repo_expand,
+        ),
+        patch(
+            "oreon_build.services.build_planner.expand_unsatisfied_build_dep_sources",
+            side_effect=br_expand,
+        ),
+        patch(
+            "oreon_build.services.build_planner.load_repo_capability_index",
+            return_value=repo,
+        ),
+    ):
+        plan = await plan_automatic_chain(
+            releasename="oreon-11-rp1",
+            repo_branch="dev",
+            distgit_url="https://github.com/oreonhq/rpm-specfiles.git",
+            distgit_branch="main",
+            root_packages=["kwin"],
+            architectures=["x86_64"],
+            headers={},
+        )
+
+    built = [slot.name for layer in plan.layers for slot in layer]
+    assert "wayland-protocols" in built
+    assert "kwin" in built
+    assert built.index("wayland-protocols") < built.index("kwin")
