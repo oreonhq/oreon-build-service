@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from oreon_build.core.rpm_requires import rpm_requirement_primary_capabilities_from_value
+from oreon_build.core.rpm_requires import rpm_requirement_tokens_from_value
 
 
 class _ReqCheck(Protocol):
@@ -43,7 +43,27 @@ class SpecBcondInfo:
 
 
 def _br_tokens(raw: str) -> list[str]:
-    return rpm_requirement_primary_capabilities_from_value(raw)
+    return rpm_requirement_tokens_from_value(raw)
+
+
+def _expand_br_macros(value: str, macros: dict[str, str], *, max_rounds: int = 16) -> str:
+    out = value or ""
+    for _ in range(max_rounds):
+        changed = False
+
+        def repl(match: re.Match[str]) -> str:
+            nonlocal changed
+            key = match.group(1)
+            if key in macros:
+                changed = True
+                return str(macros[key])
+            return match.group(0)
+
+        new = _RE_MACRO.sub(repl, out)
+        if not changed:
+            break
+        out = new
+    return out
 
 
 def default_distro_macros(releasename: str = "") -> dict[str, str]:
@@ -304,13 +324,20 @@ def parse_spec_bconds(
         if not active():
             continue
 
+        if s.upper().startswith("NAME:"):
+            val = (s.split(":", 1)[1] or "").strip()
+            if val and "%" not in val:
+                macros["name"] = val
+            continue
         br_m = _RE_BR_LINE.match(s)
         req_m = _RE_REQ_LINE.match(s)
         if not (br_m or req_m):
             continue
-        val = (br_m or req_m).group(1)  # type: ignore[union-attr]
+        val = _expand_br_macros((br_m or req_m).group(1), macros)  # type: ignore[union-attr]
         gates = gating()
         for tok in _br_tokens(val):
+            if "%" in tok:
+                continue
             if gates:
                 for key in gates:
                     info.conditional_brs.setdefault(key, set()).add(tok)

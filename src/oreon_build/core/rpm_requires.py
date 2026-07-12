@@ -5,6 +5,9 @@ from typing import Any
 
 _RE_VERSION_TRIM = re.compile(r"\s+(?=[<>=])")
 _RE_VERSIONED = re.compile(r"\s[<>=]")
+_RE_VERSIONED_REQ = re.compile(
+    r"^(?P<name>.+?)\s*(?P<op><=|>=|==|!=|<|>|=)\s*(?P<ver>\S+)\s*$"
+)
 _RE_RPM_ARCH_QUAL = re.compile(
     r"^(.+)\((?:x86-64|aarch-64|aarch64|i686|noarch|ppc64le|s390x)\)$",
     re.IGNORECASE,
@@ -47,9 +50,20 @@ def is_chain_plan_requirement(cap: str) -> bool:
         return False
     if c.startswith("(") and c.endswith(")"):
         return False
-    if is_low_level_runtime_requirement(c):
+    name, _op, _ver = parse_versioned_requirement(c)
+    check = name or c
+    if is_low_level_runtime_requirement(check):
         return False
-    if is_arch_qualified_rpm_dependency(c):
+    if is_arch_qualified_rpm_dependency(check):
+        return False
+    # shell / sed / flag fragments wrongly split out of macros
+    if check.startswith("-"):
+        return False
+    if any(ch in check for ch in ("'", '"', "\\", "`", "$", "|", ";", "{", "}")):
+        return False
+    if re.match(r"^\d+/", check):
+        return False
+    if check in {"echo", "bad", "grep", "sed", "awk", "true", "false", "test", "then", "else", "fi"}:
         return False
     return True
 
@@ -126,7 +140,12 @@ def _soname_lookup_keys(cap: str) -> list[str]:
     return out
 
 
-def _providers_from_maps(cap: str, provider_maps: list[dict[str, set[str]]]) -> set[str]:
+def _providers_from_maps(
+    cap: str,
+    provider_maps: list[dict[str, set[str]]],
+    *,
+    exact: bool = True,
+) -> set[str]:
     c = (cap or "").strip()
     if not c:
         return set()
@@ -143,6 +162,18 @@ def _providers_from_maps(cap: str, provider_maps: list[dict[str, set[str]]]) -> 
         if hit:
             out.update(hit)
         lower_index = pmap.get("__lower__")
+        if exact:
+            for sk in soname_keys:
+                hit = pmap.get(sk)
+                if hit:
+                    out.update(hit)
+            if need_pkgconfig_glob:
+                for key, srcs in pmap.items():
+                    if key == "__lower__":
+                        continue
+                    if _pkgconfig_glob_match(c, key):
+                        out.update(srcs)
+            continue
         if isinstance(lower_index, dict):
             hit = lower_index.get(cl)
             if hit:
@@ -158,7 +189,6 @@ def _providers_from_maps(cap: str, provider_maps: list[dict[str, set[str]]]) -> 
                     if _pkgconfig_glob_match(c, key):
                         out.update(srcs)
             continue
-        # legacy maps without lower index: exact + targeted only
         for sk in soname_keys:
             hit = pmap.get(sk)
             if hit:
@@ -227,19 +257,38 @@ def sources_for_requirement(
     repo: Any,
     *,
     provider_maps: list[dict[str, set[str]]] | None = None,
+    exact: bool = True,
+    include_built_sources: bool = False,
 ) -> set[str]:
     if repo.satisfies_requirement(requirement):
         return set()
     maps = [m for m in (provider_maps or []) if m]
     out: set[str] = set()
+    _, op, _ver = parse_versioned_requirement(requirement)
+    # versioned unmet deps and arch-partial repo hits need rebuild of published providers
+    allow_built = include_built_sources or op is not None
     for cap in requirement_check_capabilities(requirement):
+        # repo method already returns sources for unmet/arch-partial caps, including built ones
         for src in repo.distgit_sources_for_capability(cap):
-            if src and is_distgit_source_name(src) and not repo.satisfies_source(src):
+            if src and is_distgit_source_name(src):
                 out.add(src)
-        for src in _providers_from_maps(cap, maps):
-            if src and is_distgit_source_name(src) and not repo.satisfies_source(src):
+        for src in _providers_from_maps(cap, maps, exact=exact):
+            if not src or not is_distgit_source_name(src):
+                continue
+            if allow_built or not repo.satisfies_source(src):
                 out.add(src)
     return out
+
+
+def similar_sources_for_requirement(
+    requirement: str,
+    repo: Any,
+    *,
+    provider_maps: list[dict[str, set[str]]] | None = None,
+) -> set[str]:
+    return sources_for_requirement(
+        requirement, repo, provider_maps=provider_maps, exact=False
+    )
 
 
 def rpm_requirement_primary(requirement: str) -> str | None:
@@ -254,6 +303,90 @@ def rpm_requirement_primary(requirement: str) -> str | None:
     if "%" in base:
         return None
     return base
+
+
+def parse_versioned_requirement(requirement: str) -> tuple[str | None, str | None, str | None]:
+    """Return (name, op, version). op/version are None when unversioned."""
+    raw = (requirement or "").strip()
+    if not raw or (raw.startswith("(") and raw.endswith(")")):
+        return None, None, None
+    m = _RE_VERSIONED_REQ.match(raw)
+    if not m:
+        primary = rpm_requirement_primary(raw)
+        return primary, None, None
+    name = (m.group("name") or "").strip()
+    op = (m.group("op") or "").strip()
+    ver = (m.group("ver") or "").strip()
+    if not name or "%" in name or not ver or "%" in ver:
+        primary = rpm_requirement_primary(raw)
+        return primary, None, None
+    if op == "==":
+        op = "="
+    return name, op, ver
+
+
+def split_requirement_evr(version: str) -> tuple[str, str, str]:
+    """Parse epoch:version-release or version into (epoch, ver, rel)."""
+    raw = (version or "").strip()
+    if not raw:
+        return "0", "", ""
+    epoch = "0"
+    rest = raw
+    if ":" in raw:
+        left, right = raw.split(":", 1)
+        if left.isdigit():
+            epoch = left
+            rest = right
+    ver = rest
+    rel = ""
+    if "-" in rest:
+        # only split release if it looks like NEVRA release (avoid busting versions with dashes carefully)
+        # RPM versions rarely have dashes; releases do. Use rsplit once.
+        ver, rel = rest.rsplit("-", 1)
+    return epoch, ver, rel
+
+
+def rpm_evr_compare(a: tuple[str, str, str], b: tuple[str, str, str]) -> int:
+    import rpm
+
+    return int(rpm.labelCompare(tuple(a), tuple(b)))
+
+
+def evr_satisfies(op: str, provide_evr: tuple[str, str, str], need_evr: tuple[str, str, str]) -> bool:
+    # version-only req (no release): compare epoch+version only, like dnf for "pkg >= 1.48"
+    if need_evr[2] == "":
+        provide_evr = (provide_evr[0], provide_evr[1], "")
+        need_evr = (need_evr[0], need_evr[1], "")
+    cmp = rpm_evr_compare(provide_evr, need_evr)
+    if op in ("=", "==", "eq"):
+        return cmp == 0
+    if op in (">=", "ge"):
+        return cmp >= 0
+    if op in (">", "gt"):
+        return cmp > 0
+    if op in ("<=", "le"):
+        return cmp <= 0
+    if op in ("<", "lt"):
+        return cmp < 0
+    if op in ("!=", "ne"):
+        return cmp != 0
+    return False
+
+
+def rpm_requirement_tokens_from_value(value: str) -> list[str]:
+    """Requirement tokens kept with version operators when present."""
+    caps: list[str] = []
+    seen: set[str] = set()
+    for chunk in _requirement_chunks(value):
+        tok = " ".join((chunk or "").split())
+        if not tok or tok in seen:
+            continue
+        primary = rpm_requirement_primary(tok)
+        if not primary:
+            continue
+        seen.add(tok)
+        caps.append(tok)
+    return caps
 
 
 def rpm_requirement_capabilities(requirement: str) -> list[str]:
