@@ -410,8 +410,46 @@ class RepoCapabilityIndex:
                         stack.append(nxt)
         return out
 
+    def missing_caps_on_provider_path(self, cap: str) -> set[str]:
+        """Unsatisfied Requires reached from preferred providers of cap (dnf install path)."""
+        root = (cap or "").strip()
+        if not root or is_rpmlib_requirement(root) or is_rich_dependency(root):
+            return set()
+        if not self._caps_lower:
+            self.finalize_lookups()
+        missing: set[str] = set()
+        if not self.satisfies_requirement(root):
+            if is_rich_dependency(root):
+                missing.update(self.rich_dependency_missing_leaves(root))
+            else:
+                missing.add(root)
+            return missing
+        seen_pkgs: set[str] = set()
+        stack = list(self.providers_for(root))
+        if root in self.binary_requires:
+            stack.append(root)
+        while stack:
+            pkg = stack.pop()
+            if pkg in seen_pkgs:
+                continue
+            seen_pkgs.add(pkg)
+            current_src = self.binary_source.get(pkg)
+            for req in self.binary_requires.get(pkg, set()):
+                if is_rpmlib_requirement(req):
+                    continue
+                if is_rich_dependency(req):
+                    missing.update(self.rich_dependency_missing_leaves(req))
+                    continue
+                if not self.satisfies_requirement(req):
+                    missing.add(req)
+                    continue
+                for nxt in self._providers_to_follow(req, current_src):
+                    if nxt not in seen_pkgs:
+                        stack.append(nxt)
+        return missing
+
     def missing_runtime_caps_for_requirement(self, cap: str) -> set[str]:
-        return set(self.transitive_unsatisfied(cap))
+        return set(self.missing_caps_on_provider_path(cap) or self.transitive_unsatisfied(cap))
 
     def has_capability_any_arch(self, name: str) -> bool:
         """True when primary metadata saw this on at least one arch/channel."""
@@ -426,16 +464,10 @@ class RepoCapabilityIndex:
             return True
         return False
 
-    def distgit_sources_for_capability(self, cap: str) -> set[str]:
-        """Source packages that can produce an unmet capability.
-
-        Includes already-published sources. Needed when a subpackage exists on only
-        some arches (intersection drops it) or an EVR bump is required.
-        """
+    def owner_sources_for_capability(self, cap: str) -> set[str]:
+        """Source packages owning a provide, including published uninstallable ones."""
         c = (cap or "").strip()
         if not c or is_rpmlib_requirement(c) or is_rich_dependency(c):
-            return set()
-        if self.has_capability(c):
             return set()
         out: set[str] = set()
         direct = self.binary_source.get(c)
@@ -450,6 +482,19 @@ class RepoCapabilityIndex:
             ):
                 out.add(pkg)
         return out
+
+    def distgit_sources_for_capability(self, cap: str) -> set[str]:
+        """Source packages that can produce an unmet capability.
+
+        Includes already-published sources. Needed when a subpackage exists on only
+        some arches (intersection drops it) or an EVR bump is required.
+        """
+        c = (cap or "").strip()
+        if not c or is_rpmlib_requirement(c) or is_rich_dependency(c):
+            return set()
+        if self.has_capability(c):
+            return set()
+        return self.owner_sources_for_capability(c)
 
 
 def _dedupe_caps(caps: list[str]) -> list[str]:

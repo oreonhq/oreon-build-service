@@ -14,6 +14,9 @@ from oreon_build.services.build_trigger_exec import execute_build_trigger
 
 logger = logging.getLogger(__name__)
 
+# one heavy plan at a time — dual kernel/plasma planning OOMs the API
+_plan_lock = asyncio.Lock()
+
 
 def _log_task_result(task: asyncio.Task[None]) -> None:
     try:
@@ -191,7 +194,9 @@ async def run_auto_chain_plan_and_enqueue(chain_id: int) -> None:
         headers["Authorization"] = f"Bearer {token}"
 
     try:
-        plan, t_errs = await fetch_and_plan_automatic_chain(headers=headers, **plan_params)
+        async with _plan_lock:
+            logger.info("chain_id=%s acquiring plan lock", chain_id)
+            plan, t_errs = await fetch_and_plan_automatic_chain(headers=headers, **plan_params)
     except Exception:
         logger.exception("auto chain plan failed chain_id=%s", chain_id)
         await _fail_chain_planning(chain_id, "Dependency planning failed")

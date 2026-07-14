@@ -797,33 +797,26 @@ def apply_automatic_plan_to_chain(
     _set_chain_options(chain, opt)
 
 
-async def cancel_interrupted_chain_planning(db: Any) -> list[int]:
+async def list_interrupted_chain_planning(db: Any) -> list[int]:
+    """Chains still waiting on dependency planning after a crash/restart."""
     result = await db.execute(
-        select(BuildChain)
-        .where(
+        select(BuildChain).where(
             BuildChain.status.in_(
                 (BuildChainStatus.PENDING, BuildChainStatus.RUNNING),
             )
         )
-        .with_for_update()
     )
-    cancelled_ids: list[int] = []
+    out: list[int] = []
     for chain in result.scalars():
         opt = _options_dict(chain)
-        if not opt.get("plan_pending"):
-            continue
-        await fail_chain(
-            db,
-            chain,
-            "Cancelled: dependency planning did not finish before service restart",
-            terminal=BuildChainStatus.CANCELLED,
-        )
-        opt = _options_dict(chain)
-        opt.pop("plan_pending", None)
-        opt.pop("plan_roots", None)
-        _set_chain_options(chain, opt)
-        cancelled_ids.append(int(chain.id))
-    return cancelled_ids
+        if opt.get("plan_pending") and opt.get("plan_roots"):
+            out.append(int(chain.id))
+    return out
+
+
+async def cancel_interrupted_chain_planning(db: Any) -> list[int]:
+    # legacy name: resume planning instead of cancelling
+    return await list_interrupted_chain_planning(db)
 
 
 async def enqueue_chain_jobs_after_create(db: Any, chain_id: int) -> None:

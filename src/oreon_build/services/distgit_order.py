@@ -424,6 +424,10 @@ def _parse_spec_text(
             req_out.append(tok)
             req_raw.append(tok)
     provided.add(source_name)
+    for name in (source_name,):
+        perl_cap = _perl_provide_from_package_name(name)
+        if perl_cap:
+            provided.add(perl_cap)
     in_files = False
     for line in (spec_text or "").splitlines():
         s = line.strip()
@@ -478,7 +482,18 @@ def _kahn_layers(
         ready = sorted(n for n in remaining if in_deg.get(n, 0) == 0)
         if not ready:
             cycle = True
-            ready = [sorted(remaining)[0]]
+            # Prefer packages closest to buildable (lowest remaining indegree).
+            # Alphabetical picks consumers like "biber" before "perl-*" providers.
+            ready = [
+                min(
+                    remaining,
+                    key=lambda n: (
+                        in_deg.get(n, 0),
+                        -sum(1 for d in rdeps.get(n, set()) if d in remaining),
+                        n,
+                    ),
+                )
+            ]
         layers.append(ready)
         for n in ready:
             remaining.discard(n)
@@ -588,6 +603,32 @@ def _perl_provide_from_package_name(pkg: str) -> str | None:
     return f"perl({rest.replace('-', '::')})"
 
 
+def _python_dist_provides_from_package_name(pkg: str) -> set[str]:
+    """python3-foo-bar / python-foo -> python3dist(foo-bar) (+ underscore form)."""
+    n = (pkg or "").strip()
+    out: set[str] = set()
+    for prefix in ("python3-", "python-"):
+        if not n.startswith(prefix) or len(n) <= len(prefix):
+            continue
+        rest = n[len(prefix) :]
+        if not rest or rest[0].isdigit():
+            continue
+        low = rest.lower()
+        if low in {"devel", "libs", "pip", "setuptools-wheel", "rpm-macros"}:
+            # still invent for setuptools itself; skip only pure tooling splits that never
+            # match python3dist(name) from py3_dist
+            pass
+        if low.endswith(("-debuginfo", "-debugsource")):
+            continue
+        out.add(f"python3dist({rest})")
+        dashed = rest.replace("_", "-")
+        unders = rest.replace("-", "_")
+        out.add(f"python3dist({dashed})")
+        out.add(f"python3dist({unders})")
+        break
+    return out
+
+
 @dataclass
 class DistgitProvidesIndex:
     package_names: frozenset[str]
@@ -601,6 +642,8 @@ class DistgitProvidesIndex:
                 perl_cap = _perl_provide_from_package_name(pkg)
                 if perl_cap:
                     raw.setdefault(perl_cap, set()).add(pkg)
+                for py_cap in _python_dist_provides_from_package_name(pkg):
+                    raw.setdefault(py_cap, set()).add(pkg)
             self._indexed = index_provider_map(raw)
         return self._indexed
 
@@ -609,7 +652,7 @@ _PROVIDES_INDEX_CACHE: dict[tuple[str, str, str, str, str], tuple[float, Distgit
 _provides_index_tasks: dict[tuple[str, str, str, str, str], asyncio.Task[DistgitProvidesIndex | None]] = {}
 _PACKAGE_NAMES_CACHE: dict[tuple[str, str, str, str], tuple[float, frozenset[str]]] = {}
 _PACKAGE_NAMES_CACHE_TTL_SEC = 1800.0
-_PROVIDES_INDEX_DISK_VERSION = "v3"
+_PROVIDES_INDEX_DISK_VERSION = "v5"
 
 
 def _so_file_provides(libstem: str) -> set[str]:
@@ -653,6 +696,11 @@ def _lightweight_provides_from_spec_text(pkg: str, spec_text: str) -> set[str]:
     provided: set[str] = {pkg}
     source_name = pkg
     macros = dict(default_distro_macros(""))
+    macros.setdefault("_bindir", "/usr/bin")
+    macros.setdefault("_sbindir", "/usr/sbin")
+    macros.setdefault("_libexecdir", "/usr/libexec")
+    macros.setdefault("_libdir", "/usr/lib64")
+    macros.setdefault("_prefix", "/usr")
     macros.update(_parse_spec_macro_table(spec_text))
     macros["name"] = pkg
     in_files = False
@@ -698,11 +746,20 @@ def _lightweight_provides_from_spec_text(pkg: str, spec_text: str) -> set[str]:
             m = _RE_SO_FILE.search(expanded)
             if m and "%" not in m.group(1):
                 provided.update(_so_file_provides(m.group(1)))
+        # absolute file paths from %files (same solv surface mock uses via filelists)
+        if "%" not in expanded:
+            path = expanded.split()[0] if expanded.split() else ""
+            if path.startswith("/") and "*" not in path and "?" not in path:
+                provided.add(path)
+                base = path.rsplit("/", 1)[-1]
+                if base and "." not in base:
+                    provided.add(base)
     provided.add(source_name)
     for name in (pkg, source_name):
         perl_cap = _perl_provide_from_package_name(name)
         if perl_cap:
             provided.add(perl_cap)
+        provided.update(_python_dist_provides_from_package_name(name))
     return provided
 
 
@@ -1410,7 +1467,14 @@ def _repo_transitive_miss_sources(
     provider_sources: set[str] = set()
     maps = [distgit_providers] if distgit_providers else []
     for walk_cap in _repo_caps_to_walk(repo, cap):
-        for miss in repo.transitive_unsatisfied(walk_cap):
+        path_miss = getattr(repo, "missing_caps_on_provider_path", None)
+        if callable(path_miss):
+            misses = set(path_miss(walk_cap) or ())
+        else:
+            misses = set(repo.transitive_unsatisfied(walk_cap))
+        if not misses and not repo.satisfies_requirement(walk_cap):
+            misses = set(repo.transitive_unsatisfied(walk_cap)) or {walk_cap}
+        for miss in misses:
             missing_caps.add(miss)
             provider_sources.update(repo.distgit_sources_for_capability(miss))
             provider_sources.update(_providers_from_maps(miss, maps))
@@ -1423,6 +1487,7 @@ def _collect_repo_transitive_candidates(
     *,
     scope_packages: set[str] | None = None,
     distgit_providers: dict[str, set[str]] | None = None,
+    solver: Any | None = None,
 ) -> set[str]:
     candidates: set[str] = set()
     if scope_packages is not None:
@@ -1436,40 +1501,50 @@ def _collect_repo_transitive_candidates(
 
     scope_map = _provider_map_from_specs(parsed_by_source)
     provider_maps = [scope_map, distgit_providers or {}]
-    seen_brs: set[str] = set()
+    missing_caps: set[str] = set()
+    br_fp_cache: dict[tuple[str, ...], Any] = {}
 
-    for _pkg, parsed in pkg_iter:
-        for cap in dependency_capabilities(parsed):
-            if cap in seen_brs:
+    if solver is not None:
+        for _pkg, parsed in pkg_iter:
+            leaf_ok: list[str] = []
+            for cap in dependency_capabilities(parsed):
+                if "%" in cap:
+                    continue
+                if repo.satisfies_requirement(cap):
+                    leaf_ok.append(cap)
+                else:
+                    missing_caps.add(cap)
+            if not leaf_ok:
                 continue
-            seen_brs.add(cap)
-            _missing_caps, provider_sources = _repo_transitive_miss_sources(
+            key = tuple(sorted(set(leaf_ok)))
+            result = br_fp_cache.get(key)
+            if result is None:
+                result = solver.resolve(key)
+                br_fp_cache[key] = result
+            if not result.ok:
+                missing_caps.update(result.missing_provides or key)
+    else:
+        seen_brs: set[str] = set()
+        for _pkg, parsed in pkg_iter:
+            for cap in dependency_capabilities(parsed):
+                if "%" in cap or cap in seen_brs:
+                    continue
+                seen_brs.add(cap)
+                # leaf holes only. pathwalk fans the whole distro into candidates.
+                if not repo.satisfies_requirement(cap):
+                    missing_caps.add(cap)
+
+    for miss in missing_caps:
+        candidates.update(
+            sources_for_requirement(
+                miss,
                 repo,
-                cap,
-                distgit_providers=distgit_providers,
+                provider_maps=provider_maps,
             )
-            candidates.update(provider_sources)
-            for miss in _missing_caps:
-                candidates.update(
-                    sources_for_requirement(
-                        miss,
-                        repo,
-                        provider_maps=provider_maps,
-                    )
-                )
-                # also take direct github/distgit provider hits for the missing runtime cap
-                for src in _providers_from_maps(miss, provider_maps):
-                    if src and is_distgit_source_name(src) and not repo.satisfies_source(src):
-                        candidates.add(src)
-            if repo.satisfies_requirement(cap):
-                continue
-            candidates.update(
-                sources_for_requirement(
-                    cap,
-                    repo,
-                    provider_maps=provider_maps,
-                )
-            )
+        )
+        for src in _providers_from_maps(miss, provider_maps):
+            if src and is_distgit_source_name(src):
+                candidates.add(src)
 
     return {c for c in candidates if c and is_distgit_source_name(c)}
 
@@ -1966,6 +2041,7 @@ def _collect_unsatisfied_build_dep_sources(
     scope_packages: set[str] | None = None,
     distro_macros: dict[str, str] | None = None,
     target_arches: set[str] | None = None,
+    solver: Any | None = None,
 ) -> set[str]:
     out: set[str] = set()
     chain_providers = _provider_map_from_specs(parsed_by_source)
@@ -1974,26 +2050,63 @@ def _collect_unsatisfied_build_dep_sources(
         if scope_packages is not None
         else sorted(parsed_by_source.keys())
     )
-    for pkg in pkg_iter:
-        if pkg not in parsed_by_source:
-            continue
-        spec_text = specs_by_pkg.get(pkg) or ""
-        if not spec_text:
-            continue
-        bcond = parse_spec_bconds(
-            spec_text, distro_macros=distro_macros, target_arches=target_arches
-        )
-        for cap in iter_plan_capabilities(parsed_by_source[pkg], bcond, repo):
-            if "%" in cap:
+    misses: set[str] = set()
+    br_fp_cache: dict[tuple[str, ...], Any] = {}
+
+    if solver is not None:
+        for pkg in pkg_iter:
+            if pkg not in parsed_by_source:
                 continue
-            out.update(
-                _distgit_fetch_candidates_for_br(
-                    cap,
-                    repo,
-                    distgit_providers=distgit_providers,
-                    chain_providers=chain_providers,
-                )
+            spec_text = specs_by_pkg.get(pkg) or ""
+            if not spec_text:
+                continue
+            bcond = parse_spec_bconds(
+                spec_text, distro_macros=distro_macros, target_arches=target_arches
             )
+            leaf_ok: list[str] = []
+            for cap in iter_plan_capabilities(parsed_by_source[pkg], bcond, repo):
+                if "%" in cap:
+                    continue
+                if repo.satisfies_requirement(cap):
+                    leaf_ok.append(cap)
+                else:
+                    misses.add(cap)
+            if not leaf_ok:
+                continue
+            key = tuple(sorted(set(leaf_ok)))
+            result = br_fp_cache.get(key)
+            if result is None:
+                result = solver.resolve(key)
+                br_fp_cache[key] = result
+            if not result.ok:
+                misses.update(result.missing_provides or key)
+    else:
+        for pkg in pkg_iter:
+            if pkg not in parsed_by_source:
+                continue
+            spec_text = specs_by_pkg.get(pkg) or ""
+            if not spec_text:
+                continue
+            bcond = parse_spec_bconds(
+                spec_text, distro_macros=distro_macros, target_arches=target_arches
+            )
+            for cap in iter_plan_capabilities(parsed_by_source[pkg], bcond, repo):
+                if "%" in cap:
+                    continue
+                # leaf holes only. pathwalk of every installable BR fans out into
+                # the whole distro (perl/texlive/ghc...). dnf force covers that.
+                if not repo.satisfies_requirement(cap):
+                    misses.add(cap)
+
+    for miss in misses:
+        out.update(
+            _distgit_fetch_candidates_for_br(
+                miss,
+                repo,
+                distgit_providers=distgit_providers,
+                chain_providers=chain_providers,
+            )
+        )
     return out
 
 
@@ -2033,6 +2146,7 @@ async def expand_unsatisfied_build_dep_sources(
     distgit_providers: dict[str, set[str]] | None = None,
     scope_packages: set[str] | None = None,
     target_arches: set[str] | None = None,
+    solver: Any | None = None,
 ) -> tuple[dict[str, str], dict[str, _SpecParseResult], list[str], set[str]]:
     err: list[str] = []
     missing_distgit: set[str] = set()
@@ -2101,7 +2215,14 @@ async def expand_unsatisfied_build_dep_sources(
                 scope_packages=active_scope,
                 distro_macros=distro_macros,
                 target_arches=arches,
+                solver=solver,
             )
+            if active_scope is not None:
+                candidates |= {
+                    p
+                    for p in active_scope
+                    if p and is_distgit_source_name(p) and p not in parsed_by_source
+                }
             needers = await asyncio.to_thread(
                 _distgit_source_needers,
                 specs,
@@ -2117,6 +2238,16 @@ async def expand_unsatisfied_build_dep_sources(
             )
             if not to_fetch or len(parsed_by_source) >= max_parse:
                 break
+            logger.info(
+                "builddep expand wave %s %s/%s: candidates=%s to_fetch=%s scope=%s parsed=%s",
+                wave_num,
+                releasename,
+                distgit_branch,
+                len(candidates),
+                len(to_fetch),
+                len(active_scope or ()),
+                len(parsed_by_source),
+            )
             batch_specs = await _fetch_distgit_specs_batch(
                 client,
                 owner=owner,
@@ -2155,9 +2286,8 @@ async def expand_unsatisfied_build_dep_sources(
                     )
                 specs[pkg] = batch_specs[pkg]
                 parsed_by_source[pkg] = parsed
-            # newly fetched packages must be walked for their own BRs
-            if active_scope is not None:
-                active_scope.update(batch_specs.keys())
+            # do NOT grow active_scope to every fetched provider. that walks their
+            # BRs and sucks in the whole distro. forced packages reenter via scope.
 
     logger.info(
         "unsatisfied builddep distgit %s/%s: fetched=%s parsed=%s in %.1fs",
@@ -2183,6 +2313,7 @@ async def fetch_repo_transitive_extras_for_roots(
     headers: dict[str, str],
     distgit_providers: dict[str, set[str]] | None = None,
     target_arches: set[str] | None = None,
+    solver: Any | None = None,
 ) -> tuple[dict[str, str], dict[str, _SpecParseResult], list[str]]:
     err: list[str] = []
     root_set = {(r or "").strip() for r in roots if (r or "").strip()}
@@ -2229,6 +2360,7 @@ async def fetch_repo_transitive_extras_for_roots(
                 repo,
                 scope_packages=root_set,
                 distgit_providers=providers,
+                solver=solver,
             )
             to_fetch = sorted(c for c in candidates if c not in parsed_by_source)
             if not to_fetch:
