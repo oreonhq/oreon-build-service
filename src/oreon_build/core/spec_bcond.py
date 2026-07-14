@@ -26,6 +26,13 @@ _RE_WITH_SPACE = re.compile(r"%\{?\??with\s+([A-Za-z0-9_]+)\}?", re.IGNORECASE)
 _RE_WITHOUT_SPACE = re.compile(r"%\{?\??without\s+([A-Za-z0-9_]+)\}?", re.IGNORECASE)
 _RE_WITH_US = re.compile(r"%\{?\??with_([A-Za-z0-9_]+)\}?", re.IGNORECASE)
 _RE_WITHOUT_US = re.compile(r"%\{?\??without_([A-Za-z0-9_]+)\}?", re.IGNORECASE)
+_RE_DEFINED = re.compile(r"%\{defined\s+([A-Za-z0-9_]+)\}", re.IGNORECASE)
+_RE_PY_DIST = re.compile(r"%\{(py\d*_?dist|python3_dist)\s+([^}]+)\}", re.IGNORECASE)
+# rpm %{?name} / %{?name:body} / %{!?name:body}  (do before bare %{name})
+_RE_COND_MACRO = re.compile(
+    r"%\{(?P<bang>!?)\?(?P<name>[A-Za-z0-9_]+)(?::(?P<body>[^}]*))?\}",
+    re.IGNORECASE,
+)
 _RE_MACRO = re.compile(r"%\{?\??([A-Za-z0-9_]+)\}?")
 _RE_GATING_WITH = re.compile(
     r"%\{?\??with[_\s]+([A-Za-z0-9_]+)\}?|%\{?\??without[_\s]+([A-Za-z0-9_]+)\}?",
@@ -46,8 +53,75 @@ def _br_tokens(raw: str) -> list[str]:
     return rpm_requirement_tokens_from_value(raw)
 
 
+def _expand_py_dist_macros(value: str) -> str:
+    """%{py3_dist foo bar} -> python3dist(foo) python3dist(bar) (Fedora rpm macro)."""
+
+    def repl(m: re.Match[str]) -> str:
+        kind = (m.group(1) or "").lower().replace("_", "")
+        names = [n for n in (m.group(2) or "").split() if n and "%" not in n]
+        if not names:
+            return ""
+        if kind.startswith("py2"):
+            prefix = "python2dist"
+        else:
+            prefix = "python3dist"
+        return " ".join(f"{prefix}({n})" for n in names)
+
+    return _RE_PY_DIST.sub(repl, value or "")
+
+
+def _expand_defined_macros(
+    text: str, macros: dict[str, str], bconds: dict[str, int]
+) -> str:
+    def repl(m: re.Match[str]) -> str:
+        name = (m.group(1) or "").strip()
+        if name in macros or name in bconds:
+            return "1"
+        return "0"
+
+    return _RE_DEFINED.sub(repl, text or "")
+
+
+def _macro_is_defined(name: str, macros: dict[str, str], bconds: dict[str, int]) -> bool:
+    key = (name or "").strip()
+    if not key:
+        return False
+    return key in macros or key in bconds
+
+
+def _expand_conditional_macros(
+    text: str, macros: dict[str, str], bconds: dict[str, int], *, max_rounds: int = 16
+) -> str:
+    """rpm %{?name} / %{?name:body} / %{!?name:body}"""
+
+    out = text or ""
+    for _ in range(max_rounds):
+        def repl(m: re.Match[str]) -> str:
+            name = (m.group("name") or "").strip()
+            body = m.group("body")
+            bang = bool(m.group("bang"))
+            defined = _macro_is_defined(name, macros, bconds)
+            take = (not defined) if bang else defined
+            if not take:
+                return ""
+            if body is not None:
+                return body
+            if name in macros:
+                return str(macros[name])
+            if name in bconds:
+                return str(bconds[name])
+            return ""
+
+        new = _RE_COND_MACRO.sub(repl, out)
+        if new == out:
+            break
+        out = new
+    return out
+
+
 def _expand_br_macros(value: str, macros: dict[str, str], *, max_rounds: int = 16) -> str:
-    out = value or ""
+    out = _expand_py_dist_macros(value or "")
+    out = _expand_conditional_macros(out, macros, {})
     for _ in range(max_rounds):
         changed = False
 
@@ -60,7 +134,9 @@ def _expand_br_macros(value: str, macros: dict[str, str], *, max_rounds: int = 1
             return match.group(0)
 
         new = _RE_MACRO.sub(repl, out)
-        if not changed:
+        new = _expand_py_dist_macros(new)
+        new = _expand_conditional_macros(new, macros, {})
+        if not changed and new == out:
             break
         out = new
     return out
@@ -122,6 +198,10 @@ def _expand_expr(expr: str, macros: dict[str, str], bconds: dict[str, int]) -> s
     text = _rewrite_with_forms(expr or "").strip()
     if not text:
         return "0"
+    text = _expand_defined_macros(text, macros, bconds)
+    text = _expand_py_dist_macros(text)
+    # must run before ! -> not, or %{!?foo:1} becomes garbage
+    text = _expand_conditional_macros(text, macros, bconds)
 
     def repl_without(m: re.Match[str]) -> str:
         return _macro_value(f"without_{m.group(1)}", macros, bconds)
@@ -157,8 +237,11 @@ def _eval_condition(expr: str, macros: dict[str, str], bconds: dict[str, int]) -
     expanded = _normalize_numeric_tokens(_expand_expr(expr, macros, bconds))
     if not expanded.strip():
         return False
+    cleaned = re.sub(r"[^0-9A-Za-z_.<>=!()\s]", " ", expanded)
+    if not cleaned.strip():
+        return False
     try:
-        return bool(eval(expanded, {"__builtins__": {}}, {}))
+        return bool(eval(cleaned, {"__builtins__": {}}, {}))
     except Exception:
         return False
 
@@ -199,6 +282,7 @@ def _expand_macro_value(raw: str, macros: dict[str, str], bconds: dict[str, int]
         if text == prev:
             break
         prev = text
+        text = _expand_conditional_macros(text, macros, bconds)
         text = _RE_WITHOUT_US.sub(lambda m: _macro_value(f"without_{m.group(1)}", macros, bconds), text)
         text = _RE_WITH_US.sub(lambda m: _macro_value(f"with_{m.group(1)}", macros, bconds), text)
         text = _RE_MACRO.sub(repl, text)
@@ -211,7 +295,10 @@ def _expand_macro_value(raw: str, macros: dict[str, str], bconds: dict[str, int]
     if low in ("false", "no", "off"):
         return "0"
     try:
-        return "1" if bool(eval(text, {"__builtins__": {}}, {})) else "0"
+        cleaned = re.sub(r"[^0-9A-Za-z_.<>=!()\s]", " ", text)
+        if not cleaned.strip():
+            return text
+        return "1" if bool(eval(cleaned, {"__builtins__": {}}, {})) else "0"
     except Exception:
         return text
 

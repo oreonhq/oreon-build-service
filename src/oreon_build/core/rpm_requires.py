@@ -252,6 +252,33 @@ def add_capability_providers(
 
 
 
+def sources_providing_requirement(
+    requirement: str,
+    repo: Any,
+    *,
+    provider_maps: list[dict[str, set[str]]] | None = None,
+    exact: bool = True,
+) -> set[str]:
+    """Sources that Provide a capability, even when the provide already exists but is uninstallable."""
+    maps = [m for m in (provider_maps or []) if m]
+    out: set[str] = set()
+    owner_fn = getattr(repo, "owner_sources_for_capability", None)
+    for cap in requirement_check_capabilities(requirement):
+        if callable(owner_fn):
+            for src in owner_fn(cap) or ():
+                if src and is_distgit_source_name(src):
+                    out.add(src)
+        else:
+            for src in repo.distgit_sources_for_capability(cap):
+                if src and is_distgit_source_name(src):
+                    out.add(src)
+        for src in _providers_from_maps(cap, maps, exact=exact):
+            if not src or not is_distgit_source_name(src):
+                continue
+            out.add(src)
+    return out
+
+
 def sources_for_requirement(
     requirement: str,
     repo: Any,
@@ -263,20 +290,9 @@ def sources_for_requirement(
     del include_built_sources
     if repo.satisfies_requirement(requirement):
         return set()
-    maps = [m for m in (provider_maps or []) if m]
-    out: set[str] = set()
-    for cap in requirement_check_capabilities(requirement):
-        for src in repo.distgit_sources_for_capability(cap):
-            if src and is_distgit_source_name(src):
-                out.add(src)
-        for src in _providers_from_maps(cap, maps, exact=exact):
-            if not src or not is_distgit_source_name(src):
-                continue
-            out.add(src)
-            bsrc = getattr(repo, "binary_source", {}).get(src)
-            if bsrc and is_distgit_source_name(bsrc):
-                out.add(bsrc)
-    return out
+    return sources_providing_requirement(
+        requirement, repo, provider_maps=provider_maps, exact=exact
+    )
 
 
 def similar_sources_for_requirement(
@@ -400,7 +416,7 @@ def rpm_requirement_capabilities(requirement: str) -> list[str]:
     inner = (m.group(2) or "").strip()
     if not inner or "%" in inner:
         return out
-    # only expand inners that are useful provider aliases, never python3dist/rpm_macro
+    # expand inners that are useful provider aliases
     if kind in ("pkgconfig", "cmake", "mvn") or kind.startswith("pkgconfig"):
         out.append(inner)
     return out
@@ -515,4 +531,18 @@ def requirement_check_capabilities(requirement: str) -> list[str]:
             continue
         if ":" in cap and not cap.startswith(("/", "pkgconfig(", "mvn(")):
             add(f"mvn({cap})")
+        # /usr/bin/npm also resolves via Provide: npm / package name npm
+        if cap.startswith("/") and not cap.endswith("/"):
+            base = cap.rsplit("/", 1)[-1].strip()
+            if base and base not in {".", ".."} and "%" not in base:
+                add(base)
+        m = re.match(r"^(python3(?:\.\d+)?dist)\(([^)]+)\)$", cap, re.IGNORECASE)
+        if m:
+            inner = (m.group(2) or "").strip()
+            if inner and "%" not in inner:
+                # convention: python3dist(foo_bar) <-> python3-foo-bar / python-foo-bar
+                dashed = inner.replace("_", "-")
+                unders = inner.replace("-", "_")
+                for name in (f"python3-{dashed}", f"python-{dashed}", f"python3-{unders}", f"python-{unders}"):
+                    add(name)
     return caps
