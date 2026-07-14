@@ -64,15 +64,16 @@ def test_broken_runtime_pulls_provider_not_consumer() -> None:
             "im.spec",
         ),
     }
+    # leaf-only. install holes on published BRs are force/dnf's job, not distro pathwalk.
     cands = _collect_repo_transitive_candidates(
         parsed,
         repo,
         scope_packages={"im"},
         distgit_providers={"libIL.so.1()(64bit)": {"DevIL"}},
     )
-    assert "DevIL" in cands
+    assert "DevIL" not in cands
     assert "graphviz" not in cands
-    assert "libIL.so.1()(64bit)" not in cands
+    assert repo.missing_caps_on_provider_path("pkgconfig(libcgraph)") == {"libIL.so.1()(64bit)"}
 
 
 def test_satisfied_br_still_detects_missing_runtime_provider() -> None:
@@ -106,8 +107,8 @@ def test_satisfied_br_still_detects_missing_runtime_provider() -> None:
         scope_packages={"ImageMagick"},
         distgit_providers={"libIL.so.1()(64bit)": {"DevIL"}},
     )
-    assert "DevIL" in cands
-    assert "graphviz" not in cands
+    assert "DevIL" not in cands
+    assert "libIL.so.1()(64bit)" in repo.missing_caps_on_provider_path("pkgconfig(libcgraph)")
 
 
 def test_path_scoped_broken_runtime_ignores_unrelated_consumers() -> None:

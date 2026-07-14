@@ -106,6 +106,46 @@ Name: python-qt5
     assert "python3-qt5-devel" in provided
 
 
+def test_lightweight_bindir_and_python_dist_invent() -> None:
+    node_spec = """
+Name: nodejs22
+Provides: npm
+%files
+%{_bindir}/node
+%{_bindir}/npm
+"""
+    provided = _lightweight_provides_from_spec_text("nodejs22", node_spec)
+    assert "/usr/bin/npm" in provided
+    assert "/usr/bin/node" in provided
+    assert "npm" in provided
+    assert "node" in provided
+
+    py_spec = """
+Name: python-setuptools
+%package -n python3-setuptools
+"""
+    py_prov = _lightweight_provides_from_spec_text("python-setuptools", py_spec)
+    assert "python3dist(setuptools)" in py_prov
+    idx = DistgitProvidesIndex(
+        package_names=frozenset(["python-setuptools", "nodejs22"]),
+        capability_providers={
+            "/usr/bin/npm": frozenset(["nodejs22"]),
+            "npm": frozenset(["nodejs22"]),
+            "python3-setuptools": frozenset(["python-setuptools"]),
+        },
+    )
+    mapped = idx.indexed_providers()
+    assert "nodejs22" in mapped.get("/usr/bin/npm", set()) | mapped.get("__lower__", {}).get(
+        "/usr/bin/npm".lower(), set()
+    )
+    from oreon_build.core.rpm_requires import _providers_from_maps
+
+    assert _providers_from_maps("python3dist(setuptools)", [mapped], exact=True) == {
+        "python-setuptools"
+    }
+    assert _providers_from_maps("/usr/bin/npm", [mapped], exact=True) == {"nodejs22"}
+
+
 def test_search_queries_are_literal_provides() -> None:
     qs = _search_queries_for_capability("oreonhq", "rpm-specfiles", "oreon-11-rp1", "pkgconfig(Qt5Core)")
     assert any("Provides: pkgconfig(Qt5Core)" in q for q in qs)

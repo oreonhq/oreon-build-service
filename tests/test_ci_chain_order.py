@@ -9,6 +9,7 @@ import pytest
 from oreon_build.services.build_planner import plan_automatic_chain
 from oreon_build.services.distgit_order import (
     _expand_chain_spec_closure,
+    _kahn_layers,
     _tarball_spec_member_index,
 )
 from oreon_build.services.repo_capability_index import RepoCapabilityIndex
@@ -166,3 +167,27 @@ async def test_ci_chain_independent_packages_same_layer() -> None:
 
     assert len(plan.layers) == 1
     assert {slot.name for slot in plan.layers[0]} == {"c", "d"}
+
+
+def test_kahn_cycle_break_prefers_providers_over_consumers() -> None:
+    # biber-like consumer depends on perl pkgs that cycle among themselves.
+    # Alphabetical cycle break used to schedule "biber" first.
+    names = {"biber", "perl-A", "perl-B", "perl-C", "texlive-foo"}
+    deps = {
+        "biber": {"perl-A", "perl-B", "perl-C"},
+        "perl-A": {"perl-B"},
+        "perl-B": {"perl-C"},
+        "perl-C": {"perl-A"},
+        "texlive-foo": set(),
+    }
+    rdeps = {n: set() for n in names}
+    for cons, provs in deps.items():
+        for p in provs:
+            rdeps[p].add(cons)
+    layers, cyc = _kahn_layers(names, deps, rdeps)
+    assert cyc is True
+    flat = [n for layer in layers for n in layer]
+    assert flat.index("texlive-foo") < flat.index("biber")
+    assert flat.index("perl-A") < flat.index("biber")
+    assert flat.index("perl-B") < flat.index("biber")
+    assert flat.index("perl-C") < flat.index("biber")

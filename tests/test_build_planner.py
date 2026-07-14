@@ -686,3 +686,176 @@ async def test_planner_rebuilds_provider_for_versioned_br() -> None:
     assert "wayland-protocols" in built
     assert "kwin" in built
     assert built.index("wayland-protocols") < built.index("kwin")
+
+
+@pytest.mark.asyncio
+async def test_planner_orders_optional_perl_brs_before_test_simple() -> None:
+    clear_repo_capability_cache()
+    specs = {
+        "perl-Test-Simple": (
+            "Name: perl-Test-Simple\nVersion: 1\nRelease: 1\n"
+            "%global perl_bootstrap 1\n"
+            "%if %{defined perl_bootstrap}\n"
+            "%bcond_without optional_test\n"
+            "%else\n"
+            "%bcond_with optional_test\n"
+            "%endif\n"
+            "%if %{with optional_test}\n"
+            "BuildRequires: perl(JSON::MaybeXS)\n"
+            "BuildRequires: perl(Test::Class)\n"
+            "BuildRequires: perl(Test::Script)\n"
+            "%endif\n"
+            "Provides: perl(Test::Simple)\n"
+        ),
+        "perl-JSON-MaybeXS": (
+            "Name: perl-JSON-MaybeXS\nVersion: 1\nRelease: 1\n"
+            "Provides: perl(JSON::MaybeXS)\n"
+            "Provides: perl-JSON-MaybeXS\n"
+        ),
+        "perl-Test-Class": (
+            "Name: perl-Test-Class\nVersion: 1\nRelease: 1\n"
+            "Provides: perl(Test::Class)\n"
+            "Provides: perl-Test-Class\n"
+        ),
+        "perl-Test-Script": (
+            "Name: perl-Test-Script\nVersion: 1\nRelease: 1\n"
+            "Provides: perl(Test::Script)\n"
+            "Provides: perl-Test-Script\n"
+        ),
+    }
+    empty_repo = RepoCapabilityIndex()
+    empty_repo.finalize_lookups()
+
+    async def br_expand(specs_in, parsed, repo_index, **kwargs):
+        from oreon_build.services.distgit_order import _parse_spec_text
+
+        out_specs = dict(specs_in)
+        out_parsed = dict(parsed)
+        for name in ("perl-JSON-MaybeXS", "perl-Test-Class", "perl-Test-Script"):
+            if name not in out_parsed and name in specs:
+                out_specs[name] = specs[name]
+                out_parsed[name] = _parse_spec_text(specs[name], f"{name}.spec")
+        return out_specs, out_parsed, [], set()
+
+    with (
+        patch(
+            "oreon_build.services.build_planner.expand_chain_spec_closure_sparse",
+            side_effect=_make_sparse_closure(specs),
+        ),
+        patch(
+            "oreon_build.services.build_planner.fetch_repo_transitive_extras_for_roots",
+            side_effect=_noop_repo_expand,
+        ),
+        patch(
+            "oreon_build.services.build_planner.expand_unsatisfied_build_dep_sources",
+            side_effect=br_expand,
+        ),
+        patch(
+            "oreon_build.services.build_planner.load_repo_capability_index",
+            return_value=empty_repo,
+        ),
+    ):
+        plan = await plan_automatic_chain(
+            releasename="oreon-11-rp1",
+            repo_branch="dev",
+            distgit_url="https://github.com/oreonhq/rpm-specfiles.git",
+            distgit_branch="main",
+            root_packages=["perl-Test-Simple"],
+            architectures=["x86_64"],
+            headers={},
+        )
+
+    built = [slot.name for layer in plan.layers for slot in layer]
+    assert not plan.blocking_errors, plan.blocking_errors
+    for dep in ("perl-JSON-MaybeXS", "perl-Test-Class", "perl-Test-Script"):
+        assert dep in built
+        assert built.index(dep) < built.index("perl-Test-Simple")
+
+
+@pytest.mark.asyncio
+async def test_planner_maps_path_br_to_nodejs_sources() -> None:
+    clear_repo_capability_cache()
+    specs = {
+        "app": (
+            "Name: app\nVersion: 1\nRelease: 1\n"
+            "BuildRequires: /usr/bin/npm\n"
+            "BuildRequires: /usr/bin/node\n"
+            "Provides: app\n"
+        ),
+        "nodejs22": (
+            "Name: nodejs22\nVersion: 1\nRelease: 1\n"
+            "Provides: npm\n"
+            "Provides: node\n"
+            "%files\n"
+            "%{_bindir}/npm\n"
+            "%{_bindir}/node\n"
+        ),
+    }
+    empty_repo = RepoCapabilityIndex()
+    empty_repo.finalize_lookups()
+
+    async def provides_idx(**kwargs):
+        from oreon_build.services.distgit_order import DistgitProvidesIndex
+
+        return DistgitProvidesIndex(
+            package_names=frozenset(specs),
+            capability_providers={
+                "/usr/bin/npm": frozenset(["nodejs22"]),
+                "/usr/bin/node": frozenset(["nodejs22"]),
+                "npm": frozenset(["nodejs22"]),
+                "node": frozenset(["nodejs22"]),
+            },
+        )
+
+    async def br_expand(specs_in, parsed, repo_index, **kwargs):
+        from oreon_build.services.distgit_order import _parse_spec_text
+
+        if "nodejs22" not in parsed:
+            out = dict(specs_in)
+            outp = dict(parsed)
+            out["nodejs22"] = specs["nodejs22"]
+            outp["nodejs22"] = _parse_spec_text(specs["nodejs22"], "nodejs22.spec")
+            return out, outp, [], set()
+        return specs_in, parsed, [], set()
+
+    with (
+        patch(
+            "oreon_build.services.distgit_order.get_distgit_provides_index_cached",
+            side_effect=provides_idx,
+        ),
+        patch(
+            "oreon_build.services.build_planner.get_distgit_provides_index_cached",
+            side_effect=provides_idx,
+        ),
+        patch(
+            "oreon_build.services.build_planner.expand_chain_spec_closure_sparse",
+            side_effect=_make_sparse_closure(specs),
+        ),
+        patch(
+            "oreon_build.services.build_planner.fetch_repo_transitive_extras_for_roots",
+            side_effect=_noop_repo_expand,
+        ),
+        patch(
+            "oreon_build.services.build_planner.expand_unsatisfied_build_dep_sources",
+            side_effect=br_expand,
+        ),
+        patch(
+            "oreon_build.services.build_planner.load_repo_capability_index",
+            return_value=empty_repo,
+        ),
+    ):
+        plan = await plan_automatic_chain(
+            releasename="oreon-11-rp1",
+            repo_branch="dev",
+            distgit_url="https://github.com/oreonhq/rpm-specfiles.git",
+            distgit_branch="main",
+            root_packages=["app"],
+            architectures=["x86_64"],
+            headers={},
+        )
+
+    built = [slot.name for layer in plan.layers for slot in layer]
+    assert not plan.blocking_errors, plan.blocking_errors
+    assert "nodejs22" in built
+    assert built.index("nodejs22") < built.index("app")
+    assert not any("/usr/bin/" in e for e in plan.blocking_errors)

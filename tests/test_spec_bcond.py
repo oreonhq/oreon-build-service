@@ -119,6 +119,79 @@ BuildRequires: python3
     assert "libffado-devel" not in s390.unconditional_brs
 
 
+def test_defined_macro_enables_oreon_bcond_without_optional() -> None:
+    spec = """
+%if %{defined perl_bootstrap}
+%bcond_without optional_test
+%else
+%bcond_with optional_test
+%endif
+%if %{with optional_test}
+BuildRequires: perl(JSON::MaybeXS)
+BuildRequires: perl(Test::Class)
+BuildRequires: perl(Test::Script)
+%endif
+BuildRequires: perl(ExtUtils::MakeMaker)
+"""
+    macros = default_distro_macros("oreon-11-rp1")
+    macros["perl_bootstrap"] = "1"
+    info = parse_spec_bconds(spec, distro_macros=macros)
+    assert info.defaults.get("with_optional_test") == 1
+    brs = active_build_brs(info, default_build_defines(info))
+    assert "perl(JSON::MaybeXS)" in brs
+    assert "perl(Test::Class)" in brs
+    assert "perl(Test::Script)" in brs
+
+
+def test_py3_dist_macro_expands_in_buildrequires() -> None:
+    spec = """
+BuildRequires: %{py3_dist setuptools jinja2}
+BuildRequires: make
+"""
+    info = parse_spec_bconds(spec, distro_macros=default_distro_macros("oreon-11-rp1"))
+    brs = active_build_brs(info, {})
+    assert "python3dist(setuptools)" in brs
+    assert "python3dist(jinja2)" in brs
+    assert "setuptools" not in brs
+    assert "jinja2}" not in brs
+    assert "make" in brs
+
+
+def test_negated_optional_macro_enables_extra_test_brs() -> None:
+    # rpm 0%{!?perl_bootstrap:1} == 01 when perl_bootstrap unset
+    spec = """
+%if ! (0%{?rhel})
+%bcond_without perl_B_Keywords_enables_extra_test
+%else
+%bcond_with perl_B_Keywords_enables_extra_test
+%endif
+BuildRequires: perl(Test::More)
+%if 0%{!?perl_bootstrap:1} && %{with perl_B_Keywords_enables_extra_test}
+BuildRequires: perl(Perl::MinimumVersion) >= 1.20
+BuildRequires: perl(Test::Kwalitee)
+BuildRequires: perl(Test::MinimumVersion) >= 0.008
+BuildRequires: perl(Text::CSV_XS)
+%endif
+"""
+    macros = default_distro_macros("oreon-11-rp1")
+    info = parse_spec_bconds(spec, distro_macros=macros)
+    assert info.defaults.get("with_perl_B_Keywords_enables_extra_test") == 1
+    brs = active_build_brs(info, default_build_defines(info))
+    assert "perl(Test::More)" in brs
+    assert "perl(Perl::MinimumVersion) >= 1.20" in brs
+    assert "perl(Test::Kwalitee)" in brs
+    assert "perl(Test::MinimumVersion) >= 0.008" in brs
+    assert "perl(Text::CSV_XS)" in brs
+
+    macros2 = dict(macros)
+    macros2["perl_bootstrap"] = "1"
+    info2 = parse_spec_bconds(spec, distro_macros=macros2)
+    brs2 = active_build_brs(info2, default_build_defines(info2))
+    assert "perl(Test::More)" in brs2
+    assert "perl(Test::Kwalitee)" not in brs2
+    assert "perl(Text::CSV_XS)" not in brs2
+
+
 def test_graphviz_style_globals_disable_optional_brs() -> None:
     spec = """
 %bcond_with guile
