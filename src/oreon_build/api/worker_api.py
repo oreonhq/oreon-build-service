@@ -29,6 +29,7 @@ from oreon_build.core.repo_branch import r2_publish_branch
 from oreon_build.core.build_result import (
     find_architecture_excluded_line,
     normalize_terminal_build_status,
+    prepare_build_error_message,
 )
 from oreon_build.services.worker_token_resolve import resolve_worker_for_token
 from oreon_build.core.audit import log_audit
@@ -1047,8 +1048,9 @@ def _prune_superseded_repo_objects(
     arch: str,
     keep_artifact_filenames: set[str],
     payload_artifacts: list[ArtifactPayload],
-) -> None:
+) -> list[str]:
     r2 = get_r2_client()
+    pruned: list[str] = []
 
     binary_names: set[str] = set()
     src_names: set[str] = set()
@@ -1095,6 +1097,7 @@ def _prune_superseded_repo_objects(
             old_name = _rpm_name_from_bytes(data) if data else None
         if old_name and old_name in binary_names:
             r2.delete_object(key)
+            pruned.append(base)
             logger.info("Pruned superseded binary RPM %s", key)
 
     src_prefix = f"{releasename}/{branch}/src/"
@@ -1115,6 +1118,7 @@ def _prune_superseded_repo_objects(
             old_name = _rpm_name_from_bytes(data) if data else None
         if old_name and old_name in src_names:
             r2.delete_object(key)
+            pruned.append(base)
             logger.info("Pruned superseded SRPM %s", key)
 
     def _enforce_single_version(prefix: str, *, src: bool) -> None:
@@ -1148,14 +1152,16 @@ def _prune_superseded_repo_objects(
                 ),
             )
             keep_key = keep_item[0]
-            for key, _base, _lm in items:
+            for key, base, _lm in items:
                 if key == keep_key:
                     continue
                 r2.delete_object(key)
+                pruned.append(base)
                 logger.info("Pruned old %s RPM (single-version policy) %s", "SRPM" if src else "binary", key)
 
     _enforce_single_version(bin_prefix, src=False)
     _enforce_single_version(src_prefix, src=True)
+    return pruned
 
 _BUILD_LOG_PUT_CONTENT_TYPE = "text/plain; charset=utf-8"
 
@@ -1618,9 +1624,31 @@ async def report_result(
         return {"status": "ok", "job_cancelled": True}
 
     err_msg = payload.error_message
+    if isinstance(err_msg, str) and err_msg.strip():
+        err_msg = prepare_build_error_message(err_msg)
     arch_line = find_architecture_excluded_line(err_msg)
     if arch_line:
         err_msg = arch_line
+    elif (
+        str(payload.status or "").lower() == "failed"
+        and (payload.log_r2_key or attempt.log_r2_key)
+    ):
+        log_key = payload.log_r2_key or attempt.log_r2_key
+        try:
+            raw = await asyncio.to_thread(get_r2_client().get_object, log_key)
+            if raw:
+                tail = raw.decode("utf-8", errors="replace")
+                if len(tail) > 256_000:
+                    tail = tail[-256_000:]
+                hit = find_architecture_excluded_line(tail)
+                if hit:
+                    err_msg = hit
+        except Exception:
+            logger.exception(
+                "arch-exclude log scan failed attempt_id=%s key=%s",
+                attempt_id,
+                log_key,
+            )
     terminal_st = normalize_terminal_build_status(str(payload.status), err_msg)
 
     if terminal_st == "failed":
@@ -1729,6 +1757,13 @@ async def report_result(
             await notify_chain_job_terminal_after_result(job.id, st_l, err_msg)
         except Exception:
             logger.exception("chain notify after terminal job result job_id=%s", job.id)
+    elif st_l == "skipped":
+        try:
+            from oreon_build.services.build_chain import notify_chain_job_skipped_after_result
+
+            await notify_chain_job_skipped_after_result(attempt_id)
+        except Exception:
+            logger.exception("chain notify after skipped job result job_id=%s", job.id)
     for a in payload.artifacts:
         stmt = (
             pg_insert(Artifact.__table__)
