@@ -193,6 +193,7 @@ async def list_builds(
     release_id: int | None = None,
     package_id: int | None = None,
     chain_id: int | None = None,
+    side_tag_id: int | None = None,
     status: str | None = None,
     search: str | None = Query(None, max_length=200, description="Filter by job id, package name, release name, arch, status"),
     limit: int = Query(25, ge=1, le=1000),
@@ -227,6 +228,9 @@ async def list_builds(
     if chain_id is not None:
         q = q.where(BuildJob.chain_id == chain_id)
         count_q = count_q.where(BuildJob.chain_id == chain_id)
+    if side_tag_id is not None:
+        q = q.where(BuildJob.side_tag_id == side_tag_id)
+        count_q = count_q.where(BuildJob.side_tag_id == side_tag_id)
     if status is not None:
         q = q.where(BuildJob.status == status)
         count_q = count_q.where(BuildJob.status == status)
@@ -396,6 +400,7 @@ async def trigger_chain_build_endpoint(
             user,
             chain_spec=placeholder_spec,
             release_id=release_id,
+            side_tag_id=int(data.side_tag_id),
             architectures=architectures,
             preferred_mock_environment_id=pref_mock,
             distgit_url=distgit_url,
@@ -419,6 +424,7 @@ async def trigger_chain_build_endpoint(
             user,
             chain_spec=chain_spec,
             release_id=release_id,
+            side_tag_id=int(data.side_tag_id),
             architectures=architectures,
             preferred_mock_environment_id=pref_mock,
             distgit_url=distgit_url,
@@ -469,6 +475,21 @@ async def ci_chain_trigger_endpoint(
     if not root_packages:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No packages provided")
 
+    from oreon_build.models import SideTagCreatedFrom
+    from oreon_build.services.side_tags import ensure_side_tag
+
+    if data.side_tag_id is not None:
+        side_tag_id = int(data.side_tag_id)
+    else:
+        tag = await ensure_side_tag(
+            db,
+            release_id=release_id,
+            name=distgit_branch,
+            owner_account_id=user.id,
+            created_from=SideTagCreatedFrom.GITHUB_PR,
+        )
+        side_tag_id = tag.id
+
     placeholder_spec = " ".join(root_packages)
     chain, _, _ = await run_chain_build(
         db,
@@ -476,6 +497,7 @@ async def ci_chain_trigger_endpoint(
         user,
         chain_spec=placeholder_spec,
         release_id=release_id,
+        side_tag_id=side_tag_id,
         architectures=architectures,
         preferred_mock_environment_id=None,
         distgit_url=distgit_url,
@@ -683,12 +705,14 @@ async def upload_and_trigger(
     name: str | None = Form(None, max_length=256),
     description: str | None = Form(None),
     release_id: int = Form(...),
+    side_tag_id: int = Form(...),
     preferred_mock_environment_id: int | None = Form(None),
     architectures: str = Form("x86_64,aarch64", description="Comma-separated, e.g. x86_64,aarch64"),
     files: list[UploadFile] = File(...),
 ):
     from datetime import datetime, timezone
     from oreon_build.models import BuildAttempt, MockEnvironment, Package, PackageVersion, Release, Source
+    from oreon_build.services.side_tags import bump_side_tag_activity, resolve_required_side_tag
 
     if not files:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least one file (SRPM or .spec) required")
@@ -776,6 +800,9 @@ async def upload_and_trigger(
         user_agent=get_user_agent(request),
     )
 
+    side_tag = await resolve_required_side_tag(
+        db, release_id=release_id, side_tag_id=side_tag_id, user=user, require_access=True
+    )
     arch_list = [a.strip() for a in architectures.split(",") if a.strip()] or DEFAULT_ARCHITECTURES
     if not arch_list:
         raise HTTPException(
@@ -803,7 +830,8 @@ async def upload_and_trigger(
             status=BuildStatus.PENDING,
             priority=0,
             triggered_by_id=user.id,
-            branch=r2_publish_branch(release),
+            branch=side_tag.name,
+            side_tag_id=side_tag.id,
         )
         db.add(job)
         await db.flush()
@@ -829,6 +857,7 @@ async def upload_and_trigger(
         )
         logger.warning("build.upload trigger rejected release_id=%s package_id=%s %s", release_id, pkg.id, detail)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+    await bump_side_tag_activity(db, side_tag.id)
     first = jobs_created[0]
     payload = await _job_to_response(db, first)
     return JSONResponse(
@@ -854,6 +883,12 @@ async def _job_to_response(
         arch = r.scalars().one_or_none()
     package_name = await db.scalar(select(Package.name).where(Package.id == job.package_id))
     release_name = await db.scalar(select(Release.releasename).where(Release.id == job.release_id))
+    side_tag_name = None
+    st_id = getattr(job, "side_tag_id", None)
+    if st_id:
+        from oreon_build.models import SideTag
+
+        side_tag_name = await db.scalar(select(SideTag.name).where(SideTag.id == st_id))
     return BuildJobResponse(
         id=job.id,
         package_id=job.package_id,
@@ -870,6 +905,9 @@ async def _job_to_response(
         created_at=job.created_at,
         completed_at=job.completed_at,
         chain_id=getattr(job, "chain_id", None),
+        side_tag_id=st_id,
+        side_tag_name=side_tag_name,
+        branch=getattr(job, "branch", None),
         chain_stage_index=getattr(job, "chain_stage_index", None),
         rpmbuild_plan_id=getattr(job, "rpmbuild_plan_id", None),
         rpmbuild_layer_index=getattr(job, "rpmbuild_layer_index", None),
