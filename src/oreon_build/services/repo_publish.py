@@ -121,13 +121,22 @@ def process_repo_publish_sync(
             staged_binaries.append(fname)
 
         keep = {a.filename for a in payload_artifacts if a.filename}
-        _prune_superseded_repo_objects(
+        pruned = _prune_superseded_repo_objects(
             releasename=releasename,
             branch=branch,
             arch=arch,
             keep_artifact_filenames=keep,
             payload_artifacts=payload_artifacts,
         )
+        for fn in pruned:
+            if not fn or fn.endswith(".src.rpm"):
+                continue
+            local = rpms_dir / fn
+            if local.is_file():
+                try:
+                    local.unlink()
+                except OSError:
+                    pass
 
         if staged_binaries:
             _clear_createrepo_cache(container)

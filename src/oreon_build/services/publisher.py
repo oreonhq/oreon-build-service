@@ -583,6 +583,39 @@ def _sync_repodata_from_r2(client: R2Client, r2_prefix: str, repodata_dir: Path)
     return written
 
 
+def _drop_local_rpms_not_in_wanted(
+    rpms_dir: Path,
+    wanted: set[str],
+    *,
+    container: Path | None = None,
+) -> list[str]:
+    """Remove local stage RPMs that are gone from R2.
+
+    Prune deletes R2 objects but warm-stage publishes used to skip a full
+    mirror sync, so createrepo --update kept advertising the dead NEVRAs.
+    """
+    if not rpms_dir.is_dir():
+        return []
+    dropped: list[str] = []
+    for path in list(rpms_dir.glob("*.rpm")):
+        if path.name in wanted:
+            continue
+        try:
+            path.unlink()
+            dropped.append(path.name)
+        except OSError as e:
+            logger.warning("Could not remove stale local RPM %s: %s", path, e)
+    if dropped:
+        _invalidate_etag_cache_entries(container, set(dropped))
+        logger.info(
+            "Dropped %s local RPMs absent from R2 under %s (sample=%s)",
+            len(dropped),
+            rpms_dir,
+            dropped[:8],
+        )
+    return dropped
+
+
 def _invalidate_etag_cache_entries(container: Path | None, filenames: set[str]) -> None:
     if not container or not filenames:
         return
@@ -857,11 +890,18 @@ def update_repodata_at_prefix(
             rpm_count = local_rpm_count or len(rpm_keys)
 
             if staged:
+                wanted = {k.split("/")[-1] for k in rpm_keys}
                 if not local_mirror_ready:
                     _progress(f"{r2_prefix} syncing RPM mirror for staged publish")
                     rpm_count, _synced = _sync_rpms_dir_from_r2(
                         client, rpms_prefix, rpms_dir, container=container
                     )
+                else:
+                    # prune deletes R2 only. drop dead locals or --update keeps ghosts.
+                    _drop_local_rpms_not_in_wanted(
+                        rpms_dir, wanted, container=container
+                    )
+                    rpm_count = sum(1 for _ in rpms_dir.glob("*.rpm")) if rpms_dir.is_dir() else 0
                 try:
                     _ensure_local_repodata_baseline(
                         client, r2_prefix, repo_root, min_packages=len(rpm_keys)

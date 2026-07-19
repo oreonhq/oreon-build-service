@@ -5,7 +5,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable
 
 from oreon_build.core.rpm_requires import (
     _providers_from_maps,
@@ -214,13 +214,13 @@ def _plan_slots_for_package(
                     defines[key] = "0"
             profile = "bootstrap"
         if defines or profile == "bootstrap":
-            defines.setdefault("perl_bootstrap", "1")
-            if any(
-                "optional_test" in k or "extra_test" in k or "enables_" in k
-                for k in defines
-            ):
-                defines["oreon"] = "0"
             profile = "bootstrap"
+            # specs often do `%if %{with X} || (0%{?oreon} >= N)` so with_=0 alone
+            # still enables the block under Oreon mock macros. kill oreon for this pass.
+            if any(
+                k.startswith("with_") and str(v).strip() == "0" for k, v in defines.items()
+            ) and (distro_macros or {}).get("oreon"):
+                defines["oreon"] = "0"
         else:
             profile = "full"
             defines = {}
@@ -280,13 +280,19 @@ def _slots_to_chain_spec(layers: list[list[PlannedPackage]]) -> str:
     return " : ".join(" ".join(grp) for grp in stage_groups)
 
 
-def _package_plan_dict(slot: PlannedPackage) -> dict[str, Any]:
+def _package_plan_dict(
+    slot: PlannedPackage,
+    *,
+    exclusive_arches: set[str] | None = None,
+) -> dict[str, Any]:
     out: dict[str, Any] = {
         "build_profile": slot.build_profile,
         "rpmbuild_defines": dict(slot.rpmbuild_defines),
     }
     if slot.next_profile:
         out["next_profile"] = slot.next_profile
+    if exclusive_arches:
+        out["exclusive_arches"] = sorted(a for a in exclusive_arches if a)
     return out
 
 
@@ -345,6 +351,181 @@ def _overlay_provides_for_sources(
     return out
 
 
+def _map_resolve_failures_to_sources(
+    misses: Iterable[str],
+    broken_bins: Iterable[str],
+    repo_index: RepoCapabilityIndex,
+    provider_map: dict[str, set[str]],
+) -> set[str]:
+    """Map depsolve holes to sources that can actually repair them.
+
+    Missing Provides → distgit providers of that capability.
+    Broken binaries are only forced when they themselves Provide a missing
+    capability (Provide hole like CMR Range). A package that merely Requires
+    missing caps (perl-Coro → BDB) is not a repair target.
+    """
+    out: set[str] = set()
+    miss_list = [
+        str(miss)
+        for miss in misses
+        if is_chain_plan_requirement(str(miss))
+    ]
+    providers_by_miss: dict[str, set[str]] = {}
+    for miss in miss_list:
+        providers = {
+            src
+            for src in sources_providing_requirement(
+                miss, repo_index, provider_maps=[provider_map], exact=True
+            )
+            if is_distgit_source_name(src)
+        }
+        providers_by_miss[miss] = providers
+        out.update(providers)
+
+    for bin_name in broken_bins:
+        name = (bin_name or "").strip()
+        if not name:
+            continue
+        src = repo_index.binary_source.get(name) or ""
+        if not src and repo_index.satisfies_source(name):
+            src = name
+        if not src and is_distgit_source_name(name):
+            src = name
+        if not src:
+            continue
+        if not is_distgit_source_name(src):
+            continue
+        if not miss_list:
+            out.add(src)
+            continue
+        if any(src in providers_by_miss.get(miss, ()) for miss in miss_list):
+            out.add(src)
+    return out
+
+
+def _uncovered_resolve_misses(
+    misses: Iterable[str],
+    repo_index: RepoCapabilityIndex,
+    provider_map: dict[str, set[str]],
+) -> list[str]:
+    out: list[str] = []
+    for miss in misses:
+        m = str(miss)
+        if not is_chain_plan_requirement(m):
+            continue
+        providers = sources_providing_requirement(
+            m, repo_index, provider_maps=[provider_map], exact=True
+        )
+        if not any(is_distgit_source_name(src) for src in providers):
+            out.append(m)
+    return out
+
+
+def _repo_truth_repair_plan(
+    selected: list[str],
+    provider_force: set[str],
+    parsed_by_source: dict[str, Any],
+    specs_by_pkg: dict[str, str],
+    repo_index: RepoCapabilityIndex,
+    distgit_providers: dict[str, set[str]] | None,
+    distro_macros: dict[str, str] | None,
+    target_arches: set[str] | None,
+    solver: MultiArchRepoSolver,
+) -> tuple[dict[str, set[str]], set[str]]:
+    from oreon_build.core.spec_bcond import (
+        active_build_brs,
+        default_build_defines,
+        parse_spec_bconds,
+        solve_bootstrap_defines,
+    )
+
+    provider_map = _merge_provider_maps(
+        _provider_map_from_specs(parsed_by_source), distgit_providers
+    )
+    selected_set = set(selected)
+    repair_set = {s for s in provider_force if s}
+    repair_ok = repair_set | selected_set
+    edges: dict[str, set[str]] = {}
+    blocked: set[str] = set()
+    br_fp_cache: dict[tuple[str, ...], Any] = {}
+
+    solver.set_overlay({})
+
+    for pkg in selected:
+        if pkg in repair_set:
+            continue
+        spec_text = specs_by_pkg.get(pkg) or ""
+        if not spec_text and pkg not in parsed_by_source:
+            continue
+        bcond = parse_spec_bconds(
+            spec_text, distro_macros=distro_macros, target_arches=target_arches
+        )
+        defines = default_build_defines(bcond)
+        _prof, toggled = solve_bootstrap_defines(bcond, repo_index)
+        if toggled:
+            defines = dict(defines)
+            defines.update(toggled)
+            if any(str(v).strip() == "0" for k, v in toggled.items() if k.startswith("with_")):
+                if (distro_macros or {}).get("oreon"):
+                    defines["oreon"] = "0"
+        hard_brs = [
+            br for br in active_build_brs(bcond, defines) if is_chain_plan_requirement(br)
+        ]
+        if not hard_brs:
+            continue
+        key = tuple(sorted(set(hard_brs)))
+        result = br_fp_cache.get(key)
+        if result is None:
+            result = solver.resolve(key)
+            br_fp_cache[key] = result
+        if result.ok:
+            continue
+        real_miss = set(result.missing_provides or ())
+        if not real_miss and result.problems:
+            from oreon_build.services.repo_solver import parse_depsolve_missing
+
+            real_miss = parse_depsolve_missing(result.problems)
+        miss_set = set(real_miss) if real_miss else set(key)
+        if _uncovered_resolve_misses(miss_set, repo_index, provider_map):
+            blocked.add(pkg)
+            continue
+        mapped = _map_resolve_failures_to_sources(
+            miss_set,
+            result.broken_binaries or (),
+            repo_index,
+            provider_map,
+        )
+        repair = {s for s in mapped if s in repair_ok and s != pkg}
+        covered = True
+        for miss in miss_set:
+            if not is_chain_plan_requirement(str(miss)):
+                continue
+            providers = {
+                src
+                for src in sources_providing_requirement(
+                    str(miss), repo_index, provider_maps=[provider_map], exact=True
+                )
+                if is_distgit_source_name(src)
+            }
+            if not (providers & repair_ok):
+                covered = False
+                break
+        if repair and covered:
+            edges[pkg] = repair
+            continue
+        blocked.add(pkg)
+
+    logger.info(
+        "repo-truth gate: selected=%s provider_force=%s edges=%s blocked=%s br_sets=%s",
+        len(selected),
+        len(repair_set),
+        len(edges),
+        len(blocked),
+        len(br_fp_cache),
+    )
+    return edges, blocked
+
+
 def _provider_rebuild_force_sources(
     packages: set[str],
     parsed_by_source: dict[str, Any],
@@ -362,7 +543,12 @@ def _provider_rebuild_force_sources(
     Returns (force_sources, every_pkg_ok, pkgs_with_failed_resolve, fetch_sources).
     fetch_sources are distgit providers not yet published (expand must fetch them).
     """
-    from oreon_build.core.spec_bcond import active_build_brs, default_build_defines, parse_spec_bconds
+    from oreon_build.core.spec_bcond import (
+        active_build_brs,
+        default_build_defines,
+        parse_spec_bconds,
+        solve_bootstrap_defines,
+    )
 
     out: set[str] = set()
     fetch: set[str] = set()
@@ -380,6 +566,14 @@ def _provider_rebuild_force_sources(
         if not src or not is_distgit_source_name(src):
             return
         if repo_index.satisfies_source(src):
+            # already published at a usable NEVRA and dnf can install it.
+            # rebuilding "because something else is broken" just burns cycles.
+            if solver is not None:
+                try:
+                    if solver.can_install([src]):
+                        return
+                except Exception:
+                    pass
             out.add(src)
         else:
             fetch.add(src)
@@ -387,6 +581,12 @@ def _provider_rebuild_force_sources(
     def _map_miss(miss: str) -> None:
         if not is_chain_plan_requirement(miss):
             return
+        if solver is not None:
+            try:
+                if solver.can_install([miss]):
+                    return
+            except Exception:
+                pass
         for src in sources_providing_requirement(
             miss, repo_index, provider_maps=[provider_map], exact=True
         ):
@@ -401,7 +601,16 @@ def _provider_rebuild_force_sources(
         )
         leaf_misses: list[str] = []
         leaf_ok: list[str] = []
-        for br in active_build_brs(bcond, default_build_defines(bcond)):
+        defines = default_build_defines(bcond)
+        if solver is not None:
+            _prof, toggled = solve_bootstrap_defines(bcond, repo_index)
+            if toggled:
+                defines = dict(defines)
+                defines.update(toggled)
+                if any(str(v).strip() == "0" for k, v in toggled.items() if k.startswith("with_")):
+                    if (distro_macros or {}).get("oreon"):
+                        defines["oreon"] = "0"
+        for br in active_build_brs(bcond, defines):
             if not is_chain_plan_requirement(br):
                 continue
             if repo_index.satisfies_requirement(br):
@@ -424,26 +633,52 @@ def _provider_rebuild_force_sources(
             if not result.ok:
                 all_ok = False
                 bad_pkgs.add(pkg)
-                misses.extend(result.missing_provides or key)
+                real_miss = set(result.missing_provides or ())
+                if not real_miss and result.problems:
+                    from oreon_build.services.repo_solver import parse_depsolve_missing
+
+                    real_miss = parse_depsolve_missing(result.problems)
+                misses.extend(real_miss)
                 broken_bins |= set(result.broken_binaries or ())
 
         for miss in misses:
             _map_miss(miss)
 
-        for bin_name in broken_bins:
-            src = repo_index.binary_source.get(bin_name) or ""
-            if not src and repo_index.satisfies_source(bin_name):
-                src = bin_name
-            if not src:
-                # binary name often matches the source for noarch perl modules
-                for hit in sources_providing_requirement(
-                    bin_name, repo_index, provider_maps=[provider_map], exact=True
+        if broken_bins:
+            miss_providers = {
+                miss: {
+                    src
+                    for src in sources_providing_requirement(
+                        miss, repo_index, provider_maps=[provider_map], exact=True
+                    )
+                    if is_distgit_source_name(src)
+                }
+                for miss in misses
+                if is_chain_plan_requirement(miss)
+            }
+            for bin_name in broken_bins:
+                name = (bin_name or "").strip()
+                if not name:
+                    continue
+                if solver is not None:
+                    try:
+                        if solver.can_install([name]):
+                            continue
+                    except Exception:
+                        pass
+                src = repo_index.binary_source.get(name) or ""
+                if not src and repo_index.satisfies_source(name):
+                    src = name
+                if not src and is_distgit_source_name(name):
+                    src = name
+                if not src:
+                    continue
+                # only rebuild broken bins that Provide a missing cap (CMR Range hole)
+                if miss_providers and not any(
+                    src in provs for provs in miss_providers.values()
                 ):
-                    _add_force_src(hit)
-                if repo_index.satisfies_source(bin_name) or bin_name in parsed_by_source:
-                    _add_force_src(bin_name)
-                continue
-            _add_force_src(src)
+                    continue
+                _add_force_src(src)
 
     if solver is not None:
         logger.info(
@@ -615,10 +850,12 @@ def _build_layers(
     repo_index: RepoCapabilityIndex,
     distgit_providers: dict[str, set[str]] | None = None,
     force_set: set[str] | None = None,
+    repair_edges: dict[str, set[str]] | None = None,
+    provider_force: set[str] | None = None,
 ) -> tuple[list[list[PlannedPackage]], bool, list[str]]:
     errors: list[str] = []
     names_set = set(selected)
-    force = {f for f in (force_set or ()) if f in names_set}
+    repair = {f for f in (provider_force if provider_force is not None else (force_set or ())) if f in names_set}
     deps: dict[str, set[str]] = {n: set() for n in names_set}
     rdeps: dict[str, set[str]] = {n: set() for n in names_set}
     provider_map = _merge_provider_maps(_provider_map_from_specs(parsed_by_source), distgit_providers)
@@ -658,9 +895,15 @@ def _build_layers(
                 for src in _providers_from_maps(miss, [distgit_providers or {}]):
                     _edge(cons, src)
 
-    # force rebuilds for uninstallable provides must finish before dependents
-    # that only look leaf-ok under a fake overlay
-    for cons in names_set - force:
+    for cons, sources in (repair_edges or {}).items():
+        if cons not in names_set:
+            continue
+        for src in sources:
+            _edge(cons, src)
+
+    for cons in names_set:
+        if cons in repair:
+            continue
         parsed = parsed_by_source.get(cons)
         if not parsed:
             continue
@@ -672,7 +915,7 @@ def _build_layers(
                 for src in sources_providing_requirement(
                     miss, repo_index, provider_maps=[provider_map], exact=True
                 ):
-                    if src in force:
+                    if src in repair:
                         _edge(cons, src)
 
     layers_raw, cyc = _kahn_layers(names_set, deps, rdeps) if names_set else ([], False)
@@ -696,12 +939,14 @@ def _required_package_set(
     distro_macros: dict[str, str] | None = None,
     target_arches: set[str] | None = None,
     specs_by_pkg: dict[str, str] | None = None,
+    *,
+    pathwalk_satisfied: bool = True,
 ) -> set[str]:
     """roots + selected + unmet dep providers already fetched.
 
-    Pathwalk only for packages we are actually building (roots/selected). That
-    finds uninstallable published deps without sucking every parsed package into
-    a distro-wide BFS.
+    Pathwalk on satisfied root BRs finds uninstallable published deps when no
+    dnf solver is available. With a solver, force/truth-gate own that job and
+    pathwalk only fans the chain into unrelated leaf modules.
     """
     root_set = {(r or "").strip() for r in roots if (r or "").strip()}
     selected_set = {(s or "").strip() for s in selected if (s or "").strip()}
@@ -711,14 +956,13 @@ def _required_package_set(
     provider_map = _merge_provider_maps(
         _provider_map_from_specs(parsed_by_source), distgit_providers
     )
-    build_focus = set(root_set) | set(selected_set)
 
     while queue:
         pkg = queue.pop()
         parsed = parsed_by_source.get(pkg)
         if not parsed:
             continue
-        walk = pkg in root_set
+        walk = bool(pathwalk_satisfied) and pkg in root_set
         for dep in dependency_capabilities(parsed):
             dep = (dep or "").strip()
             if not dep or "%" in dep:
@@ -753,6 +997,8 @@ def _prune_unneeded_selected(
     parsed_by_source: dict[str, Any],
     repo_index: RepoCapabilityIndex,
     distgit_providers: dict[str, set[str]] | None = None,
+    *,
+    pathwalk_satisfied: bool = True,
 ) -> list[str]:
     required = _required_package_set(
         roots,
@@ -760,6 +1006,7 @@ def _prune_unneeded_selected(
         parsed_by_source,
         repo_index,
         distgit_providers,
+        pathwalk_satisfied=pathwalk_satisfied,
     )
     return [p for p in selected if p in required]
 
@@ -1046,6 +1293,7 @@ async def plan_automatic_chain(
 
     repo_caps = repo_index.all_caps
     force_set = set(roots)
+    provider_force: set[str] = set()
     skipped: list[str] = []
     slots_by_name: dict[str, PlannedPackage] = {}
     selected: list[str] = []
@@ -1067,12 +1315,14 @@ async def plan_automatic_chain(
             distro_macros,
             arches,
             specs_by_pkg,
+            pathwalk_satisfied=solver is None,
         )
         logger.info(
-            "plan round parsed=%s required=%s force=%s selected=%s pending_fetch=%s",
+            "plan round parsed=%s required=%s force=%s provider_force=%s selected=%s pending_fetch=%s",
             len(parsed_by_source),
             len(required),
             len(force_set),
+            len(provider_force),
             len(selected),
             len(pending_fetch),
         )
@@ -1111,22 +1361,25 @@ async def plan_automatic_chain(
             target_arches=arches,
         )
 
-        # leaf/EVR force first (no depsolve)
+        # no-solver leaf force only. with a solver this pass is harmful: index
+        # holes force published installable pkgs before dnf can say theyre fine.
         force_scope = required | force_set
-        leaf_force, _, _, leaf_fetch = await asyncio.to_thread(
-            _provider_rebuild_force_sources,
-            force_scope,
-            parsed_by_source,
-            specs_by_pkg,
-            repo_index,
-            distgit_providers,
-            distro_macros,
-            arches,
-            None,
-            walk_provider_path=solver is None,
-        )
-        force_set |= leaf_force
-        pending_fetch |= leaf_fetch - set(parsed_by_source.keys())
+        if solver is None:
+            leaf_force, _, _, leaf_fetch = await asyncio.to_thread(
+                _provider_rebuild_force_sources,
+                force_scope,
+                parsed_by_source,
+                specs_by_pkg,
+                repo_index,
+                distgit_providers,
+                distro_macros,
+                arches,
+                None,
+                walk_provider_path=True,
+            )
+            force_set |= leaf_force
+            provider_force |= leaf_force
+            pending_fetch |= leaf_fetch - set(parsed_by_source.keys())
 
         install_ok = True
         solver_failed: set[str] = set()
@@ -1168,6 +1421,7 @@ async def plan_automatic_chain(
                 pending_fetch |= more_fetch - set(parsed_by_source.keys())
                 new_pub = added - before
                 force_set |= added
+                provider_force |= added
                 if install_ok or not new_pub:
                     break
 
@@ -1207,6 +1461,7 @@ async def plan_automatic_chain(
             parsed_by_source,
             repo_index,
             distgit_providers,
+            pathwalk_satisfied=solver is None,
         )
         if (
             len(parsed_by_source) == parsed_before
@@ -1219,6 +1474,65 @@ async def plan_automatic_chain(
         if slot.action == "block" and pkg in required:
             errors.append(f"{pkg}: {slot.reason}")
 
+    repair_edges: dict[str, set[str]] = {}
+    if solver is not None and selected:
+        repair_edges, truth_blocked = await asyncio.to_thread(
+            _repo_truth_repair_plan,
+            selected,
+            provider_force,
+            parsed_by_source,
+            specs_by_pkg,
+            repo_index,
+            distgit_providers,
+            distro_macros,
+            arches,
+            solver,
+        )
+        if truth_blocked:
+            for pkg in sorted(truth_blocked):
+                slots_by_name[pkg] = PlannedPackage(
+                    name=pkg,
+                    action="block",
+                    build_profile="full",
+                    rpmbuild_defines={},
+                    reason=(
+                        "dnf cannot install hard buildrequires under current repos; "
+                        "no selected force rebuild repairs the hole"
+                    ),
+                )
+                errors.append(f"{pkg}: {slots_by_name[pkg].reason}")
+            selected = [p for p in selected if p not in truth_blocked]
+        # pull provider_force targets into selected before dropping edges
+        needed_providers = {
+            src
+            for srcs in repair_edges.values()
+            for src in srcs
+            if src not in selected and src in provider_force and src in parsed_by_source
+        }
+        for src in sorted(needed_providers):
+            spec_text = specs_by_pkg.get(src, "")
+            slot = _plan_slots_for_package(
+                src,
+                spec_text,
+                repo_index,
+                parsed=parsed_by_source.get(src),
+                force_build=True,
+                repo_caps=repo_caps,
+                distro_macros=distro_macros,
+                target_arches=arches,
+            )
+            slots_by_name[src] = slot
+            if slot.action == "build":
+                selected.append(src)
+                force_set.add(src)
+        selected_set = set(selected)
+        repair_edges = {
+            cons: {s for s in srcs if s in selected_set}
+            for cons, srcs in repair_edges.items()
+            if cons in selected_set
+        }
+        repair_edges = {c: s for c, s in repair_edges.items() if s}
+
     required = await asyncio.to_thread(
         _required_package_set,
         roots,
@@ -1229,6 +1543,7 @@ async def plan_automatic_chain(
         distro_macros,
         arches,
         specs_by_pkg,
+        pathwalk_satisfied=solver is None,
     )
 
     blocking_errors = await asyncio.to_thread(
@@ -1310,11 +1625,16 @@ async def plan_automatic_chain(
         repo_index,
         distgit_providers,
         force_set,
+        repair_edges,
+        provider_force,
     )
     errors.extend(layer_errs)
 
     package_plans = {
-        name: _package_plan_dict(slot)
+        name: _package_plan_dict(
+            slot,
+            exclusive_arches=getattr(parsed_by_source.get(name), "exclusive_arches", None),
+        )
         for name, slot in slots_by_name.items()
         if slot.action == "build" and name in set(selected)
     }

@@ -10,15 +10,31 @@ from sqlalchemy.exc import IntegrityError
 from oreon_build.models import BuildJob, BuildStatus, BuildTarget, MockEnvironment, Package, PackageVersion
 
 
+def is_bootstrap_mock_environment(
+    *,
+    name: str | None = None,
+    config_name: str | None = None,
+) -> bool:
+    """Fedora/EL bootstrap chroots used to seed Oreon, not the release target mock."""
+    n = (name or "").strip().lower()
+    c = (config_name or "").strip().lower()
+    if "bootstrap" in n:
+        return True
+    if c.startswith("fedora-") or c.startswith("centos-") or c.startswith("epel-"):
+        return True
+    return False
+
+
 def resolve_mock_environment_id(
     *,
     trigger_mock_environment_id: int | None = None,
     package_mock_environment_id: int | None = None,
     release_default_mock_environment_id: int | None = None,
+    ignore_package_mock: bool = False,
 ) -> int | None:
     if trigger_mock_environment_id is not None:
         return int(trigger_mock_environment_id)
-    if package_mock_environment_id is not None:
+    if not ignore_package_mock and package_mock_environment_id is not None:
         return int(package_mock_environment_id)
     if release_default_mock_environment_id is not None:
         return int(release_default_mock_environment_id)

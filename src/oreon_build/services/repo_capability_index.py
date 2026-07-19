@@ -86,6 +86,10 @@ def is_rich_dependency(req: str) -> bool:
 class RepoCapabilityIndex:
     source_names: set[str] = field(default_factory=set)
     binary_names: set[str] = field(default_factory=set)
+    # union across arches. skip/rebuild uses these so ExclusiveArch pkgs already
+    # on one arch are not treated as missing for the whole multi-arch plan.
+    source_names_any: set[str] = field(default_factory=set)
+    binary_names_any: set[str] = field(default_factory=set)
     provides: set[str] = field(default_factory=set)
     capability_providers: dict[str, set[str]] = field(default_factory=dict)
     capability_evrs: dict[str, list[tuple[str, str, str]]] = field(default_factory=dict)
@@ -278,6 +282,8 @@ class RepoCapabilityIndex:
         if not n:
             return False
         if n in self.source_names or n in self.binary_names:
+            return True
+        if n in self.source_names_any or n in self.binary_names_any:
             return True
         return self.has_capability(n)
 
@@ -725,6 +731,8 @@ def _copy_index_fields(dst: RepoCapabilityIndex, src: RepoCapabilityIndex) -> No
     dst.binary_names.update(src.binary_names)
     dst.provides.update(src.provides)
     dst.source_names.update(src.source_names)
+    dst.binary_names_any.update(src.binary_names_any or src.binary_names)
+    dst.source_names_any.update(src.source_names_any or src.source_names)
     for cap, pkgs in src.capability_providers.items():
         dst.capability_providers.setdefault(cap, set()).update(pkgs)
     for cap, evrs in src.capability_evrs.items():
@@ -771,12 +779,21 @@ def _merge_arch_indexes(parts: list[RepoCapabilityIndex]) -> RepoCapabilityIndex
         return index
     if len(parts) == 1:
         _copy_index_fields(index, parts[0])
+        if not index.source_names_any:
+            index.source_names_any = set(index.source_names)
+        if not index.binary_names_any:
+            index.binary_names_any = set(index.binary_names)
         index.finalize_lookups()
         return index
 
     common_bins = set(parts[0].binary_names)
     common_provides = set(parts[0].provides)
     common_sources = set(parts[0].source_names)
+    any_bins: set[str] = set()
+    any_sources: set[str] = set()
+    for part in parts:
+        any_bins |= part.binary_names
+        any_sources |= part.source_names
     for part in parts[1:]:
         common_bins &= part.binary_names
         common_provides &= part.provides
@@ -784,6 +801,8 @@ def _merge_arch_indexes(parts: list[RepoCapabilityIndex]) -> RepoCapabilityIndex
     index.binary_names = common_bins
     index.provides = common_provides
     index.source_names = common_sources
+    index.binary_names_any = any_bins
+    index.source_names_any = any_sources
     for part in parts:
         for cap, pkgs in part.capability_providers.items():
             index.capability_providers.setdefault(cap, set()).update(pkgs)

@@ -486,8 +486,26 @@ class OreonRepoSolver:
         return set(self.resolve(requirements).missing_provides)
 
 
+def is_arch_unavailable_failure(result: SolveResult) -> bool:
+    """True when dnf has no package for this arch (ExclusiveArch / missing), not a depsolve hole."""
+    if result.ok:
+        return False
+    text = (result.problems or "").lower()
+    if "nothing provides" in text:
+        return False
+    if "problem:" in text and "needed by" in text:
+        return False
+    if "none of the providers can be installed" in text:
+        return False
+    if "no match for argument" in text:
+        return True
+    if "no matching package to install" in text and "problem:" not in text:
+        return True
+    return False
+
+
 class MultiArchRepoSolver:
-    """Requirement is installable only when every target arch solves."""
+    """Requirement installable when every arch succeeds or only ExclusiveArch gaps remain."""
 
     def __init__(self, solvers: list[OreonRepoSolver]) -> None:
         self.solvers = solvers
@@ -507,7 +525,6 @@ class MultiArchRepoSolver:
     def set_overlay(self, packages: dict[str, Iterable[str]]) -> None:
         if not self.solvers:
             return
-        # one rpmbuild/createrepo, share the dir across arches
         primary = self.solvers[0]
         primary.set_overlay(packages)
         for s in self.solvers[1:]:
@@ -525,20 +542,38 @@ class MultiArchRepoSolver:
         missing: set[str] = set()
         broken: set[str] = set()
         problems: list[str] = []
-        ok = True
+        ok_count = 0
+        hard_fail = False
+        soft_fail = False
         with ThreadPoolExecutor(max_workers=len(self.solvers)) as pool:
             futs = {pool.submit(s.resolve, reqs): s for s in self.solvers}
             for fut in as_completed(futs):
                 s = futs[fut]
                 r = fut.result()
-                if not r.ok:
-                    ok = False
-                    missing |= r.missing_provides
-                    broken |= r.broken_binaries
-                    if r.problems:
-                        problems.append(f"[{s.arch}] {r.problems}")
+                if r.ok:
+                    ok_count += 1
+                    continue
+                if is_arch_unavailable_failure(r):
+                    soft_fail = True
+                    continue
+                hard_fail = True
+                missing |= r.missing_provides
+                broken |= r.broken_binaries
+                if r.problems:
+                    problems.append(f"[{s.arch}] {r.problems}")
+
+        # ExclusiveArch: package exists on some arches, absent on others → ok
+        if not hard_fail and ok_count > 0:
+            return SolveResult(ok=True)
+        if not hard_fail and soft_fail and ok_count == 0:
+            # absent on every planned arch → real missing
+            return SolveResult(
+                ok=False,
+                missing_provides=set(str(x).strip() for x in reqs if str(x).strip()),
+                problems="No match for argument on any target arch",
+            )
         return SolveResult(
-            ok=ok,
+            ok=not hard_fail and ok_count > 0,
             missing_provides=missing,
             broken_binaries=broken,
             problems="\n".join(problems),

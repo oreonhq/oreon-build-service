@@ -120,6 +120,7 @@ class _SpecParseResult:
     epoch: int = 0
     version: str = ""
     release: str = ""
+    exclusive_arches: set[str] | None = None
 
     def __post_init__(self) -> None:
         if self.build_requires_raw is None:
@@ -366,6 +367,7 @@ def _parse_spec_text(
     epoch = 0
     version = ""
     release = ""
+    exclusive_arches: set[str] | None = None
     macros = dict(distro_macros or {})
     macros.update(_parse_spec_macro_table(spec_text))
     arches = {a.lower() for a in (target_arches or set()) if a}
@@ -381,6 +383,16 @@ def _parse_spec_text(
             if val and "%" not in val:
                 source_name = val
                 macros["name"] = val
+            continue
+        if us.startswith("EXCLUSIVEARCH:"):
+            val = _expand_rpm_macros(s.split(":", 1)[1].strip(), macros)
+            toks = {
+                t.lower()
+                for t in re.split(r"[\s,]+", val)
+                if t and "%" not in t and t.lower() not in {"noarch"}
+            }
+            if toks:
+                exclusive_arches = (exclusive_arches or set()) | toks
             continue
         if us.startswith("%PACKAGE "):
             opts = s.split(None, 1)[1].strip() if len(s.split(None, 1)) > 1 else ""
@@ -459,6 +471,7 @@ def _parse_spec_text(
         epoch=epoch,
         version=version,
         release=release,
+        exclusive_arches=exclusive_arches,
     )
 
 
