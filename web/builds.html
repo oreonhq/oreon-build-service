@@ -6,16 +6,6 @@
   <title>Builds - Oreon Build Service</title>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" crossorigin="anonymous" referrerpolicy="no-referrer">
   <link rel="stylesheet" href="/static/style.css?v=4">
-  <style>
-    #chain-build-alert { display: none; margin: 1rem 0; padding: 1rem 1.1rem; border-radius: 6px; border: 1px solid var(--border); }
-    #chain-build-alert.chain-alert-error { background: rgba(220,53,69,0.08); border-color: rgba(220,53,69,0.45); }
-    #chain-build-alert.chain-alert-info { background: rgba(13,110,253,0.08); border-color: rgba(13,110,253,0.35); }
-    #chain-build-alert.chain-alert-success { background: rgba(25,135,84,0.08); border-color: rgba(25,135,84,0.35); }
-    #chain-build-alert h3 { margin: 0 0 0.5rem 0; font-size: 1.05rem; }
-    #chain-build-alert .chain-alert-actions { margin-top: 0.75rem; display: flex; flex-wrap: wrap; gap: 0.5rem; }
-    #chain-build-alert .chain-cap-scroll { max-height: 16rem; overflow: auto; background: #1e1e1e; color: #eee; padding: 0.6rem 0.8rem; border-radius: 4px; font-family: ui-monospace, monospace; font-size: 12px; margin-top: 0.5rem; }
-    #chain-build-alert .chain-cap-scroll li { margin: 0.12rem 0; }
-  </style>
 </head>
 <body>
   <header class="header">
@@ -25,142 +15,7 @@
   <main class="main">
     <section class="card">
       <h2>Builds</h2>
-      <p id="builds-hint">View build jobs and attempts. Login to trigger or retry builds.</p>
-      <div id="trigger-build-section" class="card" style="display:none; margin-bottom:1rem;">
-        <h3 style="margin-top:0;">Trigger build</h3>
-        <div class="build-mode-tabs" style="margin-bottom:1rem;">
-          <button type="button" class="build-mode-tab active" data-mode="existing">Build existing package</button>
-          <button type="button" class="build-mode-tab" data-mode="new">New package + build</button>
-        </div>
-
-        <div id="build-existing-block">
-          <p style="color:var(--text-muted); font-size:0.9rem;">Pick a <a href="/packages.html">package</a> and <a href="/releases.html">release</a>.</p>
-          <div class="form-group">
-            <label>Package</label>
-            <div id="package-search-select" class="search-select">
-              <button type="button" class="search-select-trigger" id="package-trigger">Select package...</button>
-              <div class="search-select-panel" id="package-panel">
-                <input type="text" class="search-select-search" id="package-search" placeholder="Search packages...">
-                <div class="search-select-list" id="package-list"></div>
-              </div>
-            </div>
-          </div>
-          <div class="form-group">
-            <label>Release</label>
-            <div id="release-search-select" class="search-select">
-              <button type="button" class="search-select-trigger" id="release-trigger">Select release...</button>
-              <div class="search-select-panel" id="release-panel">
-                <input type="text" class="search-select-search" id="release-search" placeholder="Search releases...">
-                <div class="search-select-list" id="release-list"></div>
-              </div>
-            </div>
-          </div>
-          <div class="form-group">
-            <label>Architectures</label>
-            <div class="arch-checkboxes" style="display:flex; gap:1rem;">
-              <label><input type="checkbox" id="arch-x86_64-existing" checked> x86_64</label>
-              <label><input type="checkbox" id="arch-aarch64-existing" checked> aarch64</label>
-            </div>
-          </div>
-          <button type="button" class="btn primary" id="btn-trigger-build">Trigger build</button>
-        </div>
-
-        <div id="build-new-block" style="display:none;">
-          <p style="color:var(--text-muted); font-size:0.9rem;">Create a package and trigger a build in one step. Package name and description come from the specfile (Upload) or from the source.</p>
-          <div class="form-group">
-            <label>1. Select the source type</label>
-            <div class="source-type-tabs" style="display:flex; gap:0.25rem; flex-wrap:wrap; margin-bottom:0.5rem;">
-              <button type="button" class="source-type-tab active" data-type="url">From URLs</button>
-              <button type="button" class="source-type-tab" data-type="upload">Upload</button>
-              <button type="button" class="source-type-tab" data-type="scm">SCM</button>
-              <button type="button" class="source-type-tab" data-type="distgit">DistGit</button>
-              <button type="button" class="source-type-tab" data-type="chainbuild">Chain build</button>
-            </div>
-            <div id="source-url-panel" class="source-panel">
-              <label>Source URL(s)</label>
-              <input type="text" id="source-url-input" class="form-control" placeholder="https://... (one URL or comma-separated)">
-            </div>
-            <div id="source-upload-panel" class="source-panel" style="display:none;">
-              <p style="color:var(--text-muted); margin-bottom:0.5rem;">Upload SRPM and/or .spec files. Worker will build from the SRPM (or from spec + sources when provided).</p>
-              <label>SRPM or .spec file(s)</label>
-              <input type="file" id="source-upload-files" class="form-control" accept=".src.rpm,.spec" multiple>
-            </div>
-            <div id="source-scm-panel" class="source-panel" style="display:none;">
-              <label>Repository URL</label>
-              <input type="text" id="source-scm-url" class="form-control" placeholder="https://github.com/org/repo.git#branch:path">
-              <label style="margin-top:0.5rem;">Branch (optional)</label>
-              <input type="text" id="source-scm-branch" class="form-control" placeholder="main">
-            </div>
-            <div id="source-distgit-panel" class="source-panel" style="display:none;">
-              <label>DistGit (rpm-specfiles on GitHub)</label>
-              <p style="color:var(--text-muted); font-size:0.85rem; margin-bottom:0.5rem;">
-                Uses the <code>oreonhq/rpm-specfiles</code> repository. For each package name,
-                the specfile path will be <code>&lt;release-name&gt;/&lt;package&gt;/&lt;package&gt;.spec</code>
-                (release name comes from the selected release).
-              </p>
-              <div class="form-group">
-                <label>Package names</label>
-                <textarea id="distgit-packages" class="form-control" rows="3" placeholder="Example:&#10;389-ds-base&#10;another-package"></textarea>
-                <p style="color:var(--text-muted); font-size:0.8rem; margin-top:0.25rem;">
-                  Enter one or more package names (one per line or separated by spaces). A build will be triggered for each.
-                </p>
-              </div>
-            </div>
-            <div id="source-chainbuild-panel" class="source-panel" style="display:none;">
-            <label>Chain build</label>
-              <p style="color:var(--text-muted); font-size:0.85rem; margin-bottom:0.5rem;">
-                List package names (spaces). With auto-resolve on, the service walks BuildRequires and Requires,
-                skips what is already in the Oreon repo, orders layers, and can run bootstrap then full passes.
-                Turn off auto-resolve to set stages yourself with colons.
-              </p>
-              <label class="inline-check-label" style="display:flex; align-items:center; gap:0.5rem; font-weight:400; margin-bottom:0.5rem; cursor:pointer; color:var(--text);">
-                <input type="checkbox" id="chainbuild-auto-resolve" checked style="width:auto; min-width:0; max-width:none; margin:0; flex:0 0 auto;">
-                <span>Auto-resolve dependencies (BuildRequires + Requires)</span>
-              </label>
-              <textarea id="chainbuild-spec" class="form-control" rows="4" placeholder="Example roots:&#10;firefox&#10;&#10;Manual stages (auto-resolve off):&#10;kactivities kdelibs : kde-workspace"></textarea>
-              <div style="margin-top:0.75rem; padding-top:0.75rem; border-top:1px solid var(--border-color,#e5e5e5);">
-                <span style="font-size:0.9rem; font-weight:500;">Resume from a previous chain</span>
-                <p style="color:var(--text-muted); font-size:0.82rem; margin:0.3rem 0 0.45rem 0;">Starts a new chain with the same spec and picks up from the first stage that did not fully finish. Slots that already built and published in the old chain are not re-queued.</p>
-                <div style="display:flex; flex-wrap:wrap; gap:0.5rem; align-items:center;">
-                  <input type="number" id="chain-resume-from-id" class="form-control" style="width:7rem; min-width:0;" min="1" step="1" placeholder="chain id">
-                  <button type="button" class="btn" id="btn-chain-resume">Resume as new chain</button>
-                </div>
-              </div>
-            </div>
-          </div>
-          <div class="form-group">
-            <label>Release</label>
-            <div id="release-new-select" class="search-select">
-              <button type="button" class="search-select-trigger" id="release-new-trigger">Select release...</button>
-              <div class="search-select-panel" id="release-new-panel">
-                <input type="text" class="search-select-search" id="release-new-search" placeholder="Search releases...">
-                <div class="search-select-list" id="release-new-list"></div>
-              </div>
-            </div>
-          </div>
-          <div class="form-group">
-            <label>Specfiles Git branch</label>
-            <input type="text" id="distgit-branch-input" class="form-control" placeholder="select a release first" maxlength="128">
-            <p style="color:var(--text-muted); font-size:0.85rem; margin-top:0.25rem;">Branch in oreonhq/rpm-specfiles. Defaults from the release but you can override to test before merging.</p>
-          </div>
-          <div class="form-group">
-            <label>Mock environment (optional)</label>
-            <select id="new-package-mock-env" class="form-control">
-              <option value="">Use release default</option>
-            </select>
-            <p style="color:var(--text-muted); font-size:0.85rem; margin-top:0.25rem;">Select a release first; mock envs apply to both x86_64 and aarch64.</p>
-          </div>
-          <div class="form-group">
-            <label>Architectures</label>
-            <div class="arch-checkboxes" style="display:flex; gap:1rem;">
-              <label><input type="checkbox" id="arch-x86_64-new" checked> x86_64</label>
-              <label><input type="checkbox" id="arch-aarch64-new" checked> aarch64</label>
-            </div>
-          </div>
-          <button type="button" class="btn primary" id="btn-create-and-build">Create package and trigger build</button>
-        </div>
-      </div>
-      <div id="chain-build-alert" role="alert"></div>
+      <p id="builds-hint">All build jobs. Trigger new work from a <a href="/side-tags.html">side tag</a>.</p>
       <div class="form-group" style="margin-bottom:1rem;">
         <label>Filter</label>
         <input type="text" id="builds-filter" placeholder="Filter by ID, package, release, arch, status" style="padding:0.4rem; width:100%; max-width:20rem;">
@@ -186,108 +41,46 @@
       </div>
       <table class="table-list">
         <thead>
-          <tr><th class="col-checkbox"><input type="checkbox" id="builds-select-all" title="Select all on this page"></th><th>ID</th><th>Package</th><th>Release</th><th>Arch</th><th>Status</th><th>Signing</th><th>Chain</th><th>Created</th><th>Actions</th></tr>
+          <tr>
+            <th class="col-checkbox"><input type="checkbox" id="builds-select-all" title="Select all on this page"></th>
+            <th>ID</th>
+            <th>Package</th>
+            <th>Release</th>
+            <th>Side tag</th>
+            <th>Arch</th>
+            <th>Status</th>
+            <th>Signing</th>
+            <th>Chain</th>
+            <th>Created</th>
+            <th>Actions</th>
+          </tr>
         </thead>
         <tbody id="builds-tbody"></tbody>
       </table>
     </section>
   </main>
-  <script src="/static/app.js?v=13"></script>
+  <script src="/static/app.js?v=16"></script>
   <script>
     (function() {
       const api = window.oreonApi;
-      var packages = [], releases = [];
-      var selectedPackageId = null, selectedReleaseId = null, selectedReleaseIdNew = null;
-      var currentSourceType = 'url';
+      var buildsPage = 0, buildsPageSize = 25, buildsTotal = 0;
+      var RETRY_ALREADY_MESSAGE = 'This package has already been retried, if the status has not changed, it could take a little bit. If you are sure you want to retry again, reload the page and try again.';
+      var retriedBuildJobIds = new Set();
 
-      function updateLoggedInUI() {
-        const hint = document.getElementById('builds-hint');
-        const section = document.getElementById('trigger-build-section');
-        if (api.token && hint) hint.textContent = 'View build jobs and attempts. You can trigger or retry builds.';
-        else if (hint) hint.textContent = 'View build jobs and attempts. Login to trigger or retry builds.';
-        if (section) section.style.display = api.token ? 'block' : 'none';
-        if (api.token) loadOptions();
-      }
-      function loadOptions() {
-        api.get('/packages?limit=500').then(function(r) { packages = (r && r.items) ? r.items : []; renderPackageList(); }).catch(function() { packages = []; });
-        api.get('/releases?limit=500').then(function(r) {
-          releases = (r && r.items) ? r.items : [];
-          if (releases.length === 1) {
-            selectedReleaseIdNew = Number(releases[0].id);
-            fillMockEnvsForRelease(selectedReleaseIdNew);
-          }
-          renderReleaseList();
-          renderReleaseListNew();
-          updateDistgitBranchFromRelease();
-        }).catch(function() { releases = []; updateDistgitBranchFromRelease(); });
-      }
-      // (helper makeSearchableSelect was removed; selects are wired manually below)
       function escapeHtml(s) {
         var d = document.createElement('div');
-        d.textContent = s == null ? '' : String(s).replace(/\u2026/g, '');
+        d.textContent = s == null ? '' : String(s);
         return d.innerHTML;
       }
       function escapeAttr(s) { return escapeHtml(s).replace(/"/g, '&quot;'); }
-      var chainPollTimer = null;
-      var watchedChainId = null;
-      function stopChainPoll() {
-        if (chainPollTimer) { clearInterval(chainPollTimer); chainPollTimer = null; }
+      function statusClass(s) {
+        if (s === 'success' || s === 'skipped') return 'badge success';
+        if (s === 'failed' || s === 'cancelled') return 'badge failed';
+        if (s === 'running' || s === 'queued') return 'badge running';
+        return 'badge pending';
       }
-      function showChainAlert(kind, title, bodyHtml) {
-        var el = document.getElementById('chain-build-alert');
-        if (!el) return;
-        el.style.display = 'block';
-        el.className = 'chain-alert-' + (kind || 'info');
-        var buildsHref = '/builds.html' + (watchedChainId ? ('?chain_id=' + encodeURIComponent(watchedChainId)) : '');
-        el.innerHTML = '<h3>' + escapeHtml(title) + '</h3>' + bodyHtml +
-          '<div class="chain-alert-actions"><a class="btn primary" href="' + buildsHref + '">View chain jobs</a>' +
-          '<button type="button" class="btn" id="chain-alert-dismiss">Dismiss</button></div>';
-        var dismiss = document.getElementById('chain-alert-dismiss');
-        if (dismiss) dismiss.onclick = function() { el.style.display = 'none'; stopChainPoll(); };
-      }
-      function renderChainAlertFromStatus(data) {
-        if (!data) return;
-        watchedChainId = data.chain_id;
-        var st = (data.status || '').toLowerCase();
-        if (st === 'failed' || st === 'cancelled') {
-          var err = (data.error_message || '').trim();
-          showChainAlert('error', 'Chain ' + data.chain_id + ' failed',
-            (err ? '<pre style="white-space:pre-wrap;font-size:0.88rem;margin:0 0 0.75rem 0;background:transparent;color:inherit;">' + escapeHtml(err) + '</pre>' : ''));
-          stopChainPoll();
-          return;
-        }
-        if (st === 'success') {
-          showChainAlert('success', 'Chain ' + data.chain_id + ' finished', '<p>All stages completed.</p>');
-          stopChainPoll();
-          return;
-        }
-        if (data.planning) {
-          showChainAlert('info', 'Chain ' + data.chain_id + ': planning dependencies',
-            '<p>Fetching distgit specs and resolving build order. Jobs queue when this finishes.</p>');
-          return;
-        }
-        showChainAlert('info', 'Chain ' + data.chain_id + ': ' + st,
-          '<p>Jobs on this chain: ' + (data.job_count != null ? data.job_count : 0) + '</p>');
-      }
-      function pollChainStatus(chainId) {
-        watchedChainId = chainId;
-        stopChainPoll();
-        function tick() {
-          api.get('/builds/chain/' + chainId + '/status').then(function(data) {
-            renderChainAlertFromStatus(data);
-            if (data.status === 'failed' || data.status === 'cancelled' || data.status === 'success') {
-              render();
-            }
-          }).catch(function() {});
-        }
-        tick();
-        chainPollTimer = setInterval(tick, 6000);
-      }
-      function startWatchChainFromUrl() {
-        var params = new URLSearchParams(window.location.search);
-        var cid = parseInt(params.get('chain_id') || '', 10);
-        if (cid > 0) pollChainStatus(cid);
-      }
+      function markBuildJobRetried(jobId) { retriedBuildJobIds.add(String(jobId)); }
+      function isBuildJobRetried(jobId) { return retriedBuildJobIds.has(String(jobId)); }
       function copyTextToClipboard(text) {
         var t = String(text);
         if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -304,171 +97,7 @@
         document.body.removeChild(ta);
         return Promise.resolve(true);
       }
-      function findPackageIdByName(name) {
-        var want = (name || '').trim().toLowerCase();
-        if (!want) return null;
-        var p = packages.find(function(x) { return (x.name || '').trim().toLowerCase() === want; });
-        return p ? p.id : null;
-      }
-      function renderPackageList() {
-        var trigger = document.getElementById('package-trigger');
-        if (trigger) trigger.textContent = selectedPackageId ? (packages.find(function(p) { return p.id === selectedPackageId; }) || {}).name || 'Package #' + selectedPackageId : 'Select package...';
-      }
-      function renderReleaseList() {
-        var trigger = document.getElementById('release-trigger');
-        if (trigger) trigger.textContent = selectedReleaseId ? (releases.find(function(r) { return r.id === selectedReleaseId; }) || {}).releasename || 'Release #' + selectedReleaseId : 'Select release...';
-      }
 
-      (function initPackageSelect() {
-        var listEl = document.getElementById('package-list');
-        var container = document.getElementById('package-search-select');
-        var search = document.getElementById('package-search');
-        var trigger = document.getElementById('package-trigger');
-        function renderList(filter) {
-          var q = (filter || '').toLowerCase();
-          listEl.innerHTML = packages.filter(function(p) { return !q || (p.name || '').toLowerCase().indexOf(q) >= 0; })
-            .map(function(p) { return '<div class="search-select-option" data-id="' + p.id + '">' + escapeHtml(p.name || '') + ' <span style="color:var(--text-muted)">(#' + p.id + ')</span></div>'; }).join('') || '<div class="search-select-option" style="cursor:default;color:var(--text-muted)">No matches</div>';
-          listEl.querySelectorAll('.search-select-option[data-id]').forEach(function(opt) {
-            opt.addEventListener('click', function() { selectedPackageId = parseInt(opt.dataset.id, 10); renderPackageList(); container.classList.remove('open'); search.value = ''; });
-          });
-        }
-        trigger.addEventListener('click', function(e) { e.stopPropagation(); container.classList.toggle('open'); if (container.classList.contains('open')) { renderList(search.value); search.focus(); } });
-        search.addEventListener('input', function() { renderList(search.value); });
-        search.addEventListener('click', function(e) { e.stopPropagation(); });
-        document.addEventListener('click', function() { container.classList.remove('open'); });
-        document.getElementById('package-panel').addEventListener('click', function(e) { e.stopPropagation(); });
-        window.renderPackageOptions = renderList;
-      })();
-      (function initReleaseSelect() {
-        var listEl = document.getElementById('release-list');
-        var container = document.getElementById('release-search-select');
-        var search = document.getElementById('release-search');
-        var trigger = document.getElementById('release-trigger');
-        function renderList(filter) {
-          var q = (filter || '').toLowerCase();
-          listEl.innerHTML = releases.filter(function(r) { return !q || (r.releasename || '').toLowerCase().indexOf(q) >= 0; })
-            .map(function(r) { return '<div class="search-select-option" data-id="' + r.id + '">' + escapeHtml(r.releasename || '') + ' <span style="color:var(--text-muted)">(#' + r.id + ')</span></div>'; }).join('') || '<div class="search-select-option" style="cursor:default;color:var(--text-muted)">No matches</div>';
-          listEl.querySelectorAll('.search-select-option[data-id]').forEach(function(opt) {
-            opt.addEventListener('click', function() { selectedReleaseId = parseInt(opt.dataset.id, 10); renderReleaseList(); container.classList.remove('open'); search.value = ''; });
-          });
-        }
-        trigger.addEventListener('click', function(e) { e.stopPropagation(); container.classList.toggle('open'); if (container.classList.contains('open')) { renderList(search.value); search.focus(); } });
-        search.addEventListener('input', function() { renderList(search.value); });
-        search.addEventListener('click', function(e) { e.stopPropagation(); });
-        document.addEventListener('click', function() { container.classList.remove('open'); });
-        document.getElementById('release-panel').addEventListener('click', function(e) { e.stopPropagation(); });
-        window.renderReleaseOptions = renderList;
-      })();
-      function renderReleaseListNew() {
-        var trigger = document.getElementById('release-new-trigger');
-        if (trigger) trigger.textContent = selectedReleaseIdNew ? (releaseById(selectedReleaseIdNew) || {}).releasename || 'Release #' + selectedReleaseIdNew : 'Select release...';
-        updateDistgitBranchFromRelease();
-      }
-      function fillMockEnvsForRelease(releaseId) {
-        var sel = document.getElementById('new-package-mock-env');
-        if (!sel) return;
-        sel.innerHTML = '<option value="">Use release default</option>';
-        if (!releaseId) return;
-        api.get('/mock-environments?release_id=' + releaseId + '&limit=500').then(function(res) {
-          var arr = (res && res.items) ? res.items : [];
-          arr.forEach(function(m) {
-            sel.appendChild(new Option(m.name + ' (' + (m.config_name || '') + ')', m.id));
-          });
-        }).catch(function() {});
-      }
-
-      function releaseById(id) {
-        if (id == null || id === '') return null;
-        return releases.find(function(r) { return r.id == id; }) || null;
-      }
-      function getDistgitBranch() {
-        var el = document.getElementById('distgit-branch-input');
-        var v = el && el.value ? el.value.trim() : '';
-        if (v) return v;
-        var rel = releaseById(selectedReleaseIdNew);
-        return rel ? String(rel.default_distgit_branch || 'main').trim() : 'main';
-      }
-      function updateDistgitBranchFromRelease() {
-        var el = document.getElementById('distgit-branch-input');
-        if (!el) return;
-        var rel = releaseById(selectedReleaseIdNew);
-        el.value = rel ? String(rel.default_distgit_branch || 'main').trim() : '';
-      }
-
-      (function initBuildModeTabs() {
-        document.querySelectorAll('.build-mode-tab').forEach(function(tab) {
-          tab.addEventListener('click', function() {
-            document.querySelectorAll('.build-mode-tab').forEach(function(t) { t.classList.remove('active'); });
-            tab.classList.add('active');
-            var mode = tab.dataset.mode;
-            document.getElementById('build-existing-block').style.display = mode === 'existing' ? 'block' : 'none';
-            document.getElementById('build-new-block').style.display = mode === 'new' ? 'block' : 'none';
-            if (mode === 'new') updateDistgitBranchFromRelease();
-          });
-        });
-      })();
-      (function initSourceTypeTabs() {
-        function onSourceTypeChange(type) {
-          currentSourceType = type;
-          document.querySelectorAll('.source-panel').forEach(function(p) { p.style.display = 'none'; });
-          var panel = document.getElementById('source-' + type + '-panel');
-          if (panel) panel.style.display = 'block';
-        }
-        document.querySelectorAll('.source-type-tab').forEach(function(tab) {
-          tab.addEventListener('click', function() {
-            document.querySelectorAll('.source-type-tab').forEach(function(t) { t.classList.remove('active'); });
-            tab.classList.add('active');
-            onSourceTypeChange(tab.dataset.type);
-          });
-        });
-      })();
-
-      (function initReleaseNewSelect() {
-        var listEl = document.getElementById('release-new-list');
-        if (!listEl) return;
-        var container = document.getElementById('release-new-select');
-        var search = document.getElementById('release-new-search');
-        var trigger = document.getElementById('release-new-trigger');
-        function renderList(filter) {
-          var q = (filter || '').toLowerCase();
-          listEl.innerHTML = releases.filter(function(r) { return !q || (r.releasename || '').toLowerCase().indexOf(q) >= 0; })
-            .map(function(r) { return '<div class="search-select-option" data-id="' + r.id + '">' + escapeHtml(r.releasename || '') + ' <span style="color:var(--text-muted)">(#' + r.id + ')</span></div>'; }).join('') || '<div class="search-select-option" style="cursor:default;color:var(--text-muted)">No matches</div>';
-          listEl.querySelectorAll('.search-select-option[data-id]').forEach(function(opt) {
-            opt.addEventListener('click', function() {
-              selectedReleaseIdNew = Number(opt.dataset.id);
-              renderReleaseListNew();
-              fillMockEnvsForRelease(selectedReleaseIdNew);
-              container.classList.remove('open');
-              if (search) search.value = '';
-            });
-          });
-        }
-        if (trigger) trigger.addEventListener('click', function(e) { e.stopPropagation(); container.classList.toggle('open'); if (container.classList.contains('open')) { renderList(search ? search.value : ''); if (search) search.focus(); } });
-        if (search) search.addEventListener('input', function() { renderList(search.value); });
-        if (search) search.addEventListener('click', function(e) { e.stopPropagation(); });
-        document.addEventListener('click', function() { if (container) container.classList.remove('open'); });
-        var pnl = listEl.closest('.search-select-panel'); if (pnl) pnl.addEventListener('click', function(e) { e.stopPropagation(); });
-      })();
-
-      function statusClass(s) {
-        if (s === 'success' || s === 'skipped') return 'badge success';
-        if (s === 'failed' || s === 'cancelled') return 'badge failed';
-        if (s === 'running' || s === 'queued') return 'badge running';
-        return 'badge pending';
-      }
-
-      var RETRY_ALREADY_MESSAGE = 'This package has already been retried, if the status has not changed, it could take a little bit. If you are sure you want to retry again, reload the page and try again.';
-      var retriedBuildJobIds = new Set();
-      function markBuildJobRetried(jobId) {
-        retriedBuildJobIds.add(String(jobId));
-      }
-      function isBuildJobRetried(jobId) {
-        return retriedBuildJobIds.has(String(jobId));
-      }
-
-      var buildsPage = 0;
-      var buildsPageSize = 25;
-      var buildsTotal = 0;
       var buildsTableSel = window.oreonBindTableSelection(document.getElementById('builds-tbody'), {
         rowCheckboxSelector: '.build-row-cb',
         selectAll: document.getElementById('builds-select-all'),
@@ -497,17 +126,12 @@
               var tr = tbody.querySelector('tr[data-id="' + sid + '"]');
               var st = tr ? (tr.getAttribute('data-status') || '') : '';
               if (st === 'pending' || st === 'queued' || st === 'running') return;
-              if (isBuildJobRetried(sid)) {
-                sawAlreadyRetried = true;
-                return;
-              }
+              if (isBuildJobRetried(sid)) { sawAlreadyRetried = true; return; }
               chain = chain.then(function() {
                 return api.post('/builds/jobs/' + sid + '/retry').then(function() { markBuildJobRetried(sid); });
               });
             });
-            if (sawAlreadyRetried) {
-              alert(RETRY_ALREADY_MESSAGE);
-            }
+            if (sawAlreadyRetried) alert(RETRY_ALREADY_MESSAGE);
             chain.then(function() { render(); }).catch(function(e) { alert(e.message); });
           });
           btns.appendChild(retryBulk);
@@ -528,76 +152,65 @@
           btns.appendChild(cancelBulk);
         }
       });
+
       function render() {
         var offset = buildsPage * buildsPageSize;
         var bf = document.getElementById('builds-filter');
         var bq = (bf && bf.value) ? String(bf.value).trim() : '';
         var buildsUrl = '/builds?limit=' + buildsPageSize + '&offset=' + offset;
         if (bq) buildsUrl += '&search=' + encodeURIComponent(bq);
-        Promise.all([
-          api.get(buildsUrl),
-          api.get('/packages?limit=500').catch(function() { return { items: [] }; }),
-          api.get('/releases?limit=500').catch(function() { return { items: [] }; })
-        ]).then(function(results) {
-          var data = results[0];
-          var packagesList = (results[1] && results[1].items) ? results[1].items : [];
-          var releasesList = (results[2] && results[2].items) ? results[2].items : [];
+        api.get(buildsUrl).then(function(data) {
           const tbody = document.getElementById('builds-tbody');
           if (!tbody) return;
           var jobs = (data && data.items) ? data.items : [];
           buildsTotal = (data && typeof data.total === 'number') ? data.total : 0;
-          function packageLabel(j) {
-            var fromJob = (j.package_name || '').trim();
-            if (fromJob) return escapeHtml(fromJob) + ' (' + j.package_id + ')';
-            var pkg = packagesList.find(function(p) { return p.id === j.package_id; });
-            var name = pkg ? (pkg.name || '').trim() : '';
-            return name ? escapeHtml(name) + ' (' + j.package_id + ')' : ('#' + j.package_id);
-          }
-          function releaseLabel(j) {
-            var fromJob = (j.release_name || '').trim();
-            if (fromJob) return escapeHtml(fromJob) + ' (' + j.release_id + ')';
-            var rel = releasesList.find(function(r) { return r.id === j.release_id; });
-            var name = rel ? (rel.releasename || '').trim() : '';
-            return name ? escapeHtml(name) + ' (' + j.release_id + ')' : ('#' + j.release_id);
-          }
           tbody.innerHTML = jobs.map(function(j) {
             const canAct = api.token;
-            var cancelBtn = (canAct && (j.status === 'pending' || j.status === 'queued' || j.status === 'running')) ? ' <button type="button" class="btn cancel-build" data-id="' + j.id + '">Cancel</button>' : '';
+            var cancelBtn = (canAct && (j.status === 'pending' || j.status === 'queued' || j.status === 'running'))
+              ? ' <button type="button" class="btn cancel-build" data-id="' + j.id + '">Cancel</button>' : '';
             var retryEligible = canAct && j.status !== 'pending' && j.status !== 'queued' && j.status !== 'running';
             var retryUsed = retryEligible && isBuildJobRetried(j.id);
             var retryBtn = '';
             if (retryEligible) {
-              if (retryUsed) {
-                retryBtn = ' <button type="button" class="btn retry" data-id="' + j.id + '" disabled title="Reload the page to retry again">Retried</button>';
-              } else {
-                retryBtn = ' <button type="button" class="btn retry" data-id="' + j.id + '">Retry</button>';
-              }
+              retryBtn = retryUsed
+                ? ' <button type="button" class="btn retry" data-id="' + j.id + '" disabled title="Reload the page to retry again">Retried</button>'
+                : ' <button type="button" class="btn retry" data-id="' + j.id + '">Retry</button>';
             }
             var arch = (j.architecture != null && j.architecture !== '') ? j.architecture : '—';
             var sd = window.oreonJobDisplayStatus ? window.oreonJobDisplayStatus(j) : String(j.status || '');
             var signCell = window.oreonSigningKeyHtml ? window.oreonSigningKeyHtml(j.signing_status) : '—';
+            var pkg = escapeHtml(j.package_name || '') + (j.package_id != null ? ' <span style="color:var(--text-muted)">(' + j.package_id + ')</span>' : '');
+            var rel = escapeHtml(j.release_name || '') + (j.release_id != null ? ' <span style="color:var(--text-muted)">(' + j.release_id + ')</span>' : '');
+            var sideTag = '—';
+            if (j.side_tag_id != null) {
+              sideTag = '<a href="/side-tag.html?id=' + j.side_tag_id + '">' + escapeHtml(j.side_tag_name || ('#' + j.side_tag_id)) + '</a>';
+            } else if (j.branch) {
+              sideTag = '<span style="color:var(--text-muted)">' + escapeHtml(j.branch) + '</span>';
+            }
             var chainPart = '—';
             if (j.chain_id != null && j.chain_id !== undefined) {
               var chainIdStr = String(j.chain_id);
               var stgNote = (j.chain_stage_index != null && j.chain_stage_index !== undefined)
-                ? ' <span style="color:var(--text-muted); font-size:0.85em" title="Chain stage index">(S' + j.chain_stage_index + ')</span>'
-                : '';
-              var copyChainBtn = '<button type="button" class="btn copy-chain-id" data-chain-id="' + escapeAttr(chainIdStr) + '" title="Copy chain id" style="padding:0.2rem 0.45rem; font-size:0.8rem; margin-left:0.3rem; vertical-align:middle;">Copy</button>';
+                ? ' <span style="color:var(--text-muted); font-size:0.85em">(S' + j.chain_stage_index + ')</span>' : '';
+              var copyChainBtn = '<button type="button" class="btn copy-chain-id" data-chain-id="' + escapeAttr(chainIdStr) + '" title="Copy chain id" style="padding:0.2rem 0.45rem; font-size:0.8rem; margin-left:0.3rem;">Copy</button>';
               var resumeChainBtn = canAct
-                ? '<button type="button" class="btn chain-resume-row" data-chain-id="' + escapeAttr(chainIdStr) + '" title="Resume from last incomplete stage" style="padding:0.2rem 0.5rem; font-size:0.8rem; margin-left:0.2rem; vertical-align:middle;">Resume chain</button>'
+                ? '<button type="button" class="btn chain-resume-row" data-chain-id="' + escapeAttr(chainIdStr) + '" style="padding:0.2rem 0.5rem; font-size:0.8rem; margin-left:0.2rem;">Resume chain</button>'
                 : '';
-              var chainLogLink = '';
-              chainPart = chainIdStr + stgNote + copyChainBtn + chainLogLink + resumeChainBtn;
+              chainPart = chainIdStr + stgNote + copyChainBtn + resumeChainBtn;
             }
-            return '<tr data-id="' + j.id + '" data-status="' + escapeAttr(j.status || '') + '"><td class="col-checkbox"><input type="checkbox" class="build-row-cb" data-id="' + j.id + '"></td><td>' + j.id + '</td><td>' + packageLabel(j) + '</td><td>' + releaseLabel(j) + '</td><td>' + arch + '</td><td><span class="' + statusClass(sd) + '">' + escapeHtml(sd) + '</span></td><td>' + signCell + '</td><td style="white-space:normal; max-width:16rem;">' + chainPart + '</td><td>' + (j.created_at || '').slice(0,19) + '</td><td><a href="/build.html?job_id=' + j.id + '">View</a>' + retryBtn + cancelBtn + '</td></tr>';
-          }).join('') || '<tr><td colspan="10">No builds</td></tr>';
+            return '<tr data-id="' + j.id + '" data-status="' + escapeAttr(j.status || '') + '">' +
+              '<td class="col-checkbox"><input type="checkbox" class="build-row-cb" data-id="' + j.id + '"></td>' +
+              '<td>' + j.id + '</td><td>' + pkg + '</td><td>' + rel + '</td><td>' + sideTag + '</td><td>' + arch + '</td>' +
+              '<td><span class="' + statusClass(sd) + '">' + escapeHtml(sd) + '</span></td>' +
+              '<td>' + signCell + '</td><td style="white-space:normal; max-width:16rem;">' + chainPart + '</td>' +
+              '<td>' + (j.created_at || '').slice(0, 19) + '</td>' +
+              '<td><a href="/build.html?job_id=' + j.id + '">View</a>' + retryBtn + cancelBtn + '</td></tr>';
+          }).join('') || '<tr><td colspan="11">No builds</td></tr>';
+
           tbody.querySelectorAll('.retry:not([disabled])').forEach(function(btn) {
             btn.addEventListener('click', function() {
               var jid = String(btn.dataset.id);
-              if (isBuildJobRetried(jid)) {
-                alert(RETRY_ALREADY_MESSAGE);
-                return;
-              }
+              if (isBuildJobRetried(jid)) { alert(RETRY_ALREADY_MESSAGE); return; }
               oreonWithLoading(btn, function() {
                 return api.post('/builds/jobs/' + jid + '/retry')
                   .then(function() { markBuildJobRetried(jid); render(); })
@@ -620,26 +233,18 @@
                 var prev = btn.textContent;
                 btn.textContent = 'Copied';
                 btn.disabled = true;
-                setTimeout(function() {
-                  btn.textContent = prev;
-                  btn.disabled = false;
-                }, 1200);
-              }).catch(function() { alert('Could not copy. Chain id: ' + raw); });
+                setTimeout(function() { btn.textContent = prev; btn.disabled = false; }, 1200);
+              });
             });
           });
           tbody.querySelectorAll('.chain-resume-row').forEach(function(btn) {
             btn.addEventListener('click', function() {
               if (!api.token) { alert('Log in to resume a chain.'); return; }
-              var raw = btn.getAttribute('data-chain-id');
-              var fromId = parseInt(raw, 10);
-              if (!fromId || fromId < 1) { return; }
+              var fromId = parseInt(btn.getAttribute('data-chain-id'), 10);
+              if (!fromId) return;
               oreonWithLoading(btn, function() {
                 return api.post('/builds/chain-resume', { from_chain_id: fromId })
-                  .then(function(data) {
-                    render();
-                    followNewChain(data);
-                    alert(buildAcceptedMessage(data, 'Resumed as chain ' + (data && data.chain_id) + '.'));
-                  })
+                  .then(function() { render(); alert('Chain resume queued.'); })
                   .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
               });
             });
@@ -651,241 +256,37 @@
           buildsTableSel.refresh();
         }).catch(function() {
           const tbody = document.getElementById('builds-tbody');
-          if (tbody) tbody.innerHTML = '<tr><td colspan="10">Failed to load</td></tr>';
+          if (tbody) tbody.innerHTML = '<tr><td colspan="11">Failed to load</td></tr>';
         });
       }
-      (function initBuildsPagination() {
-        document.getElementById('builds-prev').addEventListener('click', function() {
-          if (buildsPage > 0) { buildsPage--; render(); }
-        });
-        document.getElementById('builds-next').addEventListener('click', function() {
-          var numPages = buildsTotal ? Math.ceil(buildsTotal / buildsPageSize) : 1;
-          if (buildsPage < numPages - 1) { buildsPage++; render(); }
-        });
-        document.getElementById('builds-page-size').addEventListener('change', function() {
-          buildsPageSize = parseInt(this.value, 10) || 25;
-          buildsPage = 0;
-          render();
-        });
-        var bff = document.getElementById('builds-filter');
-        if (bff && window.oreonPrefillUrlSearch) window.oreonPrefillUrlSearch('builds-filter');
-        if (bff && window.oreonDebounce) {
-          bff.addEventListener('input', window.oreonDebounce(function() {
-            buildsPage = 0;
-            render();
-          }, 300));
-        }
-      })();
-      updateLoggedInUI();
-      window.addEventListener('auth-change', updateLoggedInUI);
-      function getSelectedArchitecturesExisting() {
-        var arch = [];
-        if (document.getElementById('arch-x86_64-existing') && document.getElementById('arch-x86_64-existing').checked) arch.push('x86_64');
-        if (document.getElementById('arch-aarch64-existing') && document.getElementById('arch-aarch64-existing').checked) arch.push('aarch64');
-        return arch.length ? arch : ['x86_64', 'aarch64'];
-      }
-      function getSelectedArchitecturesNew() {
-        var arch = [];
-        if (document.getElementById('arch-x86_64-new') && document.getElementById('arch-x86_64-new').checked) arch.push('x86_64');
-        if (document.getElementById('arch-aarch64-new') && document.getElementById('arch-aarch64-new').checked) arch.push('aarch64');
-        return arch.length ? arch : ['x86_64', 'aarch64'];
-      }
-      function buildAcceptedMessage(data, fallback) {
-        if (data && data.status === 'accepted' && data.message) return data.message;
-        if (data && data.accepted && data.message) return data.message;
-        if (data && data.message) return data.message;
-        return fallback;
-      }
-      function followNewChain(data) {
-        var cid = data && data.chain_id;
-        if (!cid) return;
-        pollChainStatus(cid);
-        if (window.history && window.history.replaceState) {
-          window.history.replaceState({}, '', '/builds.html?chain_id=' + cid);
-        }
-      }
-      document.getElementById('btn-trigger-build').addEventListener('click', function() {
-        if (!selectedPackageId || !selectedReleaseId) { alert('Select a package and a release.'); return; }
-        var btn = this;
-        var architectures = getSelectedArchitecturesExisting();
-        oreonWithLoading(btn, function() {
-          return api.post('/builds/trigger', { package_id: selectedPackageId, release_id: selectedReleaseId, architectures: architectures })
-            .then(function(data) {
-              render();
-              if (data && data.status === 'accepted') {
-                alert(buildAcceptedMessage(data, 'Build trigger accepted.'));
-                return;
-              }
-              var jobs = Array.isArray(data) ? data : (data ? [data] : []);
-              if (jobs.length) alert('Builds triggered for ' + jobs.length + ' architecture(s).');
-              else alert('No new jobs queued. Every selected architecture that has a worker already has a successful build for this package and release.');
-            })
-            .catch(function(e) { alert('Failed: ' + e.message); });
-        });
+
+      document.getElementById('builds-prev').addEventListener('click', function() {
+        if (buildsPage > 0) { buildsPage--; render(); }
       });
-      document.getElementById('btn-create-and-build').addEventListener('click', function() {
-        if (!selectedReleaseIdNew) { alert('Select a release.'); return; }
-        var _btn = this;
-        var mockIdVal = (document.getElementById('new-package-mock-env') && document.getElementById('new-package-mock-env').value || '').trim();
-        var arches = getSelectedArchitecturesNew();
-        if (currentSourceType === 'url') {
-          var newPackage = {
-            name: '',
-            description: null,
-            preferred_mock_environment_id: mockIdVal ? parseInt(mockIdVal, 10) : null,
-            source_type: currentSourceType
-          };
-          var urlVal = (document.getElementById('source-url-input') && document.getElementById('source-url-input').value || '').trim();
-          if (urlVal) {
-            var urls = urlVal.split(/[,\s]+/).map(function(s) { return s.trim(); }).filter(Boolean);
-            if (urls.length === 1) newPackage.source_url = urls[0];
-            else if (urls.length > 1) { newPackage.source_url = urls[0]; newPackage.source_urls = urls; }
-          }
-          oreonWithLoading(_btn, function() {
-            return api.post('/builds/trigger', { new_package: newPackage, release_id: selectedReleaseIdNew, architectures: arches })
-              .then(function(data) {
-                render();
-                if (data && data.status === 'accepted') {
-                  alert(buildAcceptedMessage(data, 'Build trigger accepted.'));
-                  return;
-                }
-                var jobs = Array.isArray(data) ? data : (data ? [data] : []);
-                if (jobs.length) alert('Build triggered for ' + jobs.length + ' architecture(s).');
-                else alert('No new jobs queued. All selected arches already built for this package and release.');
-              })
-              .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
-          });
-        } else if (currentSourceType === 'upload') {
-          var files = document.getElementById('source-upload-files') && document.getElementById('source-upload-files').files;
-          if (!files || !files.length) { alert('Select at least one .src.rpm or .spec file.'); return; }
-          var formData = new FormData();
-          formData.append('release_id', selectedReleaseIdNew);
-          if (mockIdVal) formData.append('preferred_mock_environment_id', mockIdVal);
-          formData.append('architectures', arches.join(','));
-          for (var i = 0; i < files.length; i++) formData.append('files', files[i]);
-          oreonWithLoading(_btn, function() {
-            return fetch(api.base + '/builds/upload', {
-              method: 'POST',
-              headers: api.token ? { 'Authorization': 'Bearer ' + api.token } : {},
-              body: formData
-            }).then(function(r) {
-              if (r.status === 401) { api.setToken(null); window.dispatchEvent(new Event('auth-change')); throw new Error('Unauthorized'); }
-              if (!r.ok) {
-                return r.text().then(function(t) {
-                  var err = null;
-                  try { err = t ? JSON.parse(t) : {}; } catch (_) {}
-                  throw new Error((err && err.detail) || r.statusText);
-                });
-              }
-              return r.text().then(function(t) {
-                if (!t || !t.trim()) return null;
-                try { return JSON.parse(t); } catch (_) { return null; }
-              });
-            }).then(function() { render(); alert('Package created and build triggered.'); document.getElementById('source-upload-files').value = ''; })
-              .catch(function(e) { alert('Failed: ' + (e.message || e)); });
-          });
-          return;
-        } else if (currentSourceType === 'scm') {
-          var newPackage = {
-            name: '',
-            description: null,
-            preferred_mock_environment_id: mockIdVal ? parseInt(mockIdVal, 10) : null,
-            source_type: currentSourceType
-          };
-          var u = (document.getElementById('source-scm-url') && document.getElementById('source-scm-url').value || '').trim();
-          if (u) newPackage.source_url = u;
-          var b = (document.getElementById('source-scm-branch') && document.getElementById('source-scm-branch').value || '').trim();
-          if (b) newPackage.source_branch = b;
-          oreonWithLoading(_btn, function() {
-            return api.post('/builds/trigger', { new_package: newPackage, release_id: selectedReleaseIdNew, architectures: arches })
-              .then(function(data) {
-                render();
-                if (data && data.status === 'accepted') {
-                  alert(buildAcceptedMessage(data, 'Build trigger accepted.'));
-                  return;
-                }
-                var jobs = Array.isArray(data) ? data : (data ? [data] : []);
-                if (jobs.length) alert('Build triggered for ' + jobs.length + ' architecture(s).');
-                else alert('No new jobs queued. All selected arches already built for this package and release.');
-              })
-              .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
-          });
-        } else if (currentSourceType === 'distgit') {
-          var pkgsRaw = (document.getElementById('distgit-packages') && document.getElementById('distgit-packages').value) || '';
-          var pkgNames = pkgsRaw
-            .split(/[\s,]+/)
-            .map(function(s) { return s.trim(); })
-            .filter(function(s) { return !!s; });
-          if (!pkgNames.length) { alert('Enter at least one package name.'); return; }
-          var rel = releaseById(selectedReleaseIdNew);
-          var releasename = rel && rel.releasename ? rel.releasename.trim() : '';
-          if (!releasename) { alert('Selected release is missing a releasename.'); return; }
-        var batchBody = {
-          release_id: selectedReleaseIdNew,
-          architectures: arches,
-          skip_complete_arches: false,
-          packages: pkgNames.map(function(pkgName) {
-            return { name: pkgName, spec_path: releasename + '/' + pkgName + '/' + pkgName + '.spec' };
-          })
-        };
-        if (mockIdVal) batchBody.preferred_mock_environment_id = parseInt(mockIdVal, 10);
-        batchBody.distgit_branch = getDistgitBranch();
-        oreonWithLoading(_btn, function() {
-          return api.post('/builds/trigger-batch', batchBody)
-            .then(function(data) {
-              render();
-              var n = (data && data.package_count) ? data.package_count : pkgNames.length;
-              alert(buildAcceptedMessage(data, 'Queued ' + n + ' DistGit package(s) in the background.'));
-            })
-            .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
-        });
-          return;
-        } else if (currentSourceType === 'chainbuild') {
-          if (!selectedReleaseIdNew) { alert('Select a release.'); return; }
-          var chainRaw = (document.getElementById('chainbuild-spec') && document.getElementById('chainbuild-spec').value || '').trim();
-          if (!chainRaw) { alert('Enter a chain-build line (package names, spaces, and colons for groups).'); return; }
-          var chainBody = {
-            chain_spec: chainRaw,
-            release_id: selectedReleaseIdNew,
-            architectures: arches,
-            distgit_branch: getDistgitBranch(),
-            auto_resolve: !!(document.getElementById('chainbuild-auto-resolve') && document.getElementById('chainbuild-auto-resolve').checked)
-          };
-          var mockChain = (document.getElementById('new-package-mock-env') && document.getElementById('new-package-mock-env').value || '').trim();
-          if (mockChain) chainBody.preferred_mock_environment_id = parseInt(mockChain, 10);
-          oreonWithLoading(_btn, function() {
-            return api.post('/builds/chain-trigger', chainBody)
-              .then(function(data) {
-                render();
-                var cid = data && data.chain_id;
-                if (cid) followNewChain(data);
-                var tip = buildAcceptedMessage(data, 'Chain started. Jobs queue in the background.');
-                if (cid) showChainAlert('success', 'Chain ' + cid + ' started', '<p>' + escapeHtml(tip) + '</p>');
-                else alert(tip);
-              })
-              .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
-          });
-          return;
-        }
+      document.getElementById('builds-next').addEventListener('click', function() {
+        var numPages = buildsTotal ? Math.ceil(buildsTotal / buildsPageSize) : 1;
+        if (buildsPage < numPages - 1) { buildsPage++; render(); }
       });
-      document.getElementById('btn-chain-resume').addEventListener('click', function() {
-        if (!api.token) { alert('Log in to resume a chain.'); return; }
-        var raw = (document.getElementById('chain-resume-from-id') && document.getElementById('chain-resume-from-id').value || '').trim();
-        var fromId = parseInt(raw, 10);
-        if (!fromId || fromId < 1) { alert('Enter a valid previous chain id (positive integer).'); return; }
-        var btn = this;
-        oreonWithLoading(btn, function() {
-          return api.post('/builds/chain-resume', { from_chain_id: fromId })
-            .then(function(data) {
-              render();
-              followNewChain(data);
-              alert(buildAcceptedMessage(data, 'Resumed as chain ' + (data && data.chain_id) + ' from chain ' + fromId + '.'));
-            })
-            .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
-        });
+      document.getElementById('builds-page-size').addEventListener('change', function() {
+        buildsPageSize = parseInt(this.value, 10) || 25;
+        buildsPage = 0;
+        render();
       });
+      var bff = document.getElementById('builds-filter');
+      if (bff && window.oreonPrefillUrlSearch) window.oreonPrefillUrlSearch('builds-filter');
+      if (bff && window.oreonDebounce) {
+        bff.addEventListener('input', window.oreonDebounce(function() { buildsPage = 0; render(); }, 300));
+      }
+      function updateHint() {
+        var hint = document.getElementById('builds-hint');
+        if (!hint) return;
+        hint.innerHTML = api.token
+          ? 'All build jobs. Trigger new work from a <a href="/side-tags.html">side tag</a>.'
+          : 'All build jobs. Login to retry/cancel. Trigger from a <a href="/side-tags.html">side tag</a>.';
+      }
+      updateHint();
+      window.addEventListener('auth-change', function() { updateHint(); render(); });
       render();
-      startWatchChainFromUrl();
     })();
   </script>
 </body>
