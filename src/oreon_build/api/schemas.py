@@ -318,7 +318,7 @@ class ChainBuildTrigger(BaseModel):
         description="Architectures to build for (same as single trigger)",
     )
     preferred_mock_environment_id: Optional[int] = Field(
-        None, description="Mock env for new distgit packages (must belong to the release)"
+        None, description="Mock env for this chain/batch (must belong to the release)"
     )
     distgit_url: Optional[str] = Field(
         None,
@@ -327,6 +327,13 @@ class ChainBuildTrigger(BaseModel):
     )
     distgit_branch: Optional[str] = Field(None, max_length=128, description="Branch fragment in distgit URL")
     priority: int = 0
+    auto_resolve: bool = Field(
+        True,
+        description=(
+            "When true, treat chain_spec package names as roots and auto-resolve BuildRequires/Requires "
+            "closure, repo pruning, layer ordering, and bootstrap profiles. When false, use chain_spec stages literally."
+        ),
+    )
 
 
 class ChainResumeRequest(BaseModel):
@@ -440,6 +447,7 @@ class ChainStatusResponse(BaseModel):
     chain_spec: str
     error_message: Optional[str] = None
     job_count: int = 0
+    planning: bool = False
     releasename: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -590,6 +598,17 @@ class PromotionResponse(BaseModel):
     decided_at: Optional[datetime] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class BulkPromoteRequest(BaseModel):
+    promotion_ids: Optional[List[int]] = None
+    all_pending: bool = False
+
+
+class BulkPromoteAccepted(BaseModel):
+    status: str = "accepted"
+    message: str
+    promotion_count: int
 
 
 class RepositoryResponse(BaseModel):

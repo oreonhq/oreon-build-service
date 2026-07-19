@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import json
 import logging
 import os
 import re
@@ -11,8 +12,8 @@ import tarfile
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
-from functools import lru_cache
+from dataclasses import dataclass, field
+from functools import lru_cache, partial
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -25,6 +26,26 @@ except ImportError:
     Specfile = None  # type: ignore[assignment, misc]
 
 from oreon_build.config import get_settings
+from oreon_build.core.rpm_requires import (
+    add_capability_providers,
+    is_chain_plan_requirement,
+    is_distgit_source_name,
+    index_provider_map,
+    merge_provider_maps,
+    requirement_check_capabilities,
+    rpm_requirement_capabilities_from_value,
+    rpm_requirement_primary,
+    rpm_requirement_tokens_from_value,
+    sources_for_requirement,
+    _pkgconfig_glob_match,
+    _providers_from_maps,
+)
+from oreon_build.core.spec_bcond import (
+    active_build_brs,
+    default_build_defines,
+    default_distro_macros,
+    parse_spec_bconds,
+)
 from oreon_build.services.r2 import get_r2_client
 
 logger = logging.getLogger(__name__)
@@ -94,13 +115,29 @@ class _SpecParseResult:
     build_requires: list[str]
     provided_binary_names: set[str]
     build_requires_raw: list[str] = None  # type: ignore[assignment]
+    requires: list[str] = None  # type: ignore[assignment]
+    requires_raw: list[str] = None  # type: ignore[assignment]
     epoch: int = 0
     version: str = ""
     release: str = ""
+    exclusive_arches: set[str] | None = None
 
     def __post_init__(self) -> None:
         if self.build_requires_raw is None:
             self.build_requires_raw = list(self.build_requires)
+        if self.requires is None:
+            self.requires = []
+        if self.requires_raw is None:
+            self.requires_raw = list(self.requires)
+
+    def dependency_names(self) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for name in list(self.build_requires) + list(self.requires):
+            if name and name not in seen:
+                seen.add(name)
+                out.append(name)
+        return out
 
     def evr_canonical(self) -> str:
         ver = (self.version or "0").strip() or "0"
@@ -138,6 +175,35 @@ def _github_owner_repo_from_git_url(url: str) -> tuple[str, str] | None:
 _RE_RPM_MACRO = re.compile(r"%\{([^}]+)\}")
 _RE_GLOBAL_LINE = re.compile(r"^%\s*global\s+(\S+)\s+(.+)$", re.IGNORECASE)
 _RE_GLOBAL_IN_CONDITIONAL = re.compile(r"%global\s+(\S+)\s+([^}%]+)", re.IGNORECASE)
+_RE_PC_FILE = re.compile(r"([^/\s]+)\.pc\b")
+_RE_SO_FILE = re.compile(r"(lib[A-Za-z0-9_+.-]+)\.so(?:\.\*|(?:\.\d+)*)?")
+_RE_FILES_KEEP = re.compile(
+    r"^%(?:if\b|ifarch\b|ifnarch\b|else\b|endif\b|elif\b|license\b|doc\b|config\b|"
+    r"attr\b|defattr\b|ghost\b|verify\b|dir\b|exclude\b|readme\b|caps\b|missingok\b|files\b)",
+    re.IGNORECASE,
+)
+_RE_SPEC_SECTION = re.compile(
+    r"^%(?:package|description|prep|build|install|check|clean|changelog|"
+    r"pre\b|post\b|preun\b|postun\b|trigger)",
+    re.IGNORECASE,
+)
+
+
+def _files_section_continues(line: str, *, in_files: bool) -> bool | None:
+    """Return True/False to set in_files, or None to leave unchanged."""
+    low = (line or "").strip().lower()
+    if not low.startswith("%"):
+        return None
+    if low.startswith("%files"):
+        return True
+    if not in_files:
+        return None
+    if _RE_FILES_KEEP.match(low):
+        return True
+    if _RE_SPEC_SECTION.match(low):
+        return False
+    return None
+
 
 
 def _parse_spec_macro_table(spec_text: str) -> dict[str, str]:
@@ -176,6 +242,83 @@ def _expand_rpm_macros(value: str, macros: dict[str, str], *, max_rounds: int = 
     return out
 
 
+def _extract_br_tokens_from_tag_value(value: str) -> list[str]:
+    return rpm_requirement_capabilities_from_value(value)
+
+
+def dependency_capabilities(parsed: _SpecParseResult) -> list[str]:
+    caps: list[str] = []
+    seen: set[str] = set()
+
+    def add(cap: str) -> None:
+        c = (cap or "").strip()
+        if not c or c in seen or "%" in c:
+            return
+        seen.add(c)
+        caps.append(c)
+
+    for raw in list(parsed.build_requires_raw or []) + list(parsed.requires_raw or []):
+        for cap in rpm_requirement_tokens_from_value(raw):
+            add(cap)
+    for name in parsed.dependency_names():
+        add(name)
+    return caps
+
+
+def iter_plan_capabilities(
+    parsed: _SpecParseResult,
+    bcond: Any,
+    repo: Any,
+) -> list[str]:
+    defines = default_build_defines(bcond)
+    caps: list[str] = []
+    seen: set[str] = set()
+
+    def add(cap: str) -> None:
+        c = (cap or "").strip()
+        if not c or c in seen or "%" in c:
+            return
+        seen.add(c)
+        caps.append(c)
+
+    def add_requirement(cap: str) -> None:
+        c = (cap or "").strip()
+        if not c:
+            return
+        from oreon_build.services.repo_capability_index import is_rich_dependency
+
+        if is_rich_dependency(c):
+            if repo.satisfies_requirement(c):
+                return
+            missing_fn = getattr(repo, "rich_dependency_missing_leaves", None)
+            if callable(missing_fn):
+                for leaf in missing_fn(c):
+                    if is_chain_plan_requirement(leaf):
+                        add(leaf)
+                return
+            return
+        if is_chain_plan_requirement(c):
+            add(c)
+
+    seeds: list[str] = []
+    for br in active_build_brs(bcond, defines):
+        seeds.append(br)
+
+    for cap in seeds:
+        add_requirement(cap)
+        primary = rpm_requirement_primary(cap) or cap
+        walk_closure = repo.satisfies_requirement(cap)
+        if not walk_closure:
+            any_arch = getattr(repo, "has_capability_any_arch", None)
+            if callable(any_arch) and any_arch(primary):
+                walk_closure = True
+        if walk_closure:
+            for miss in repo.transitive_unsatisfied(cap):
+                if is_chain_plan_requirement(miss):
+                    add(miss)
+    return caps
+
+
 def _add_capability_tokens(target: set[str], raw: str, macros: dict[str, str]) -> None:
     expanded = _expand_rpm_macros(raw, macros).strip()
     if not expanded or "%" in expanded:
@@ -183,26 +326,6 @@ def _add_capability_tokens(target: set[str], raw: str, macros: dict[str, str]) -
     for tok in _extract_br_tokens_from_tag_value(expanded):
         if tok and "%" not in tok:
             target.add(tok)
-
-
-def _extract_br_tokens_from_tag_value(value: str) -> list[str]:
-    out: list[str] = []
-    for chunk in (value or "").replace("\n", ",").split(","):
-        token = chunk.strip()
-        if not token:
-            continue
-        if "=" in token:
-            token = token.split("=", 1)[0].strip()
-        if not token:
-            continue
-        m = _BR_NAME.match(token)
-        if not m:
-            continue
-        name = m.group(1)
-        if name.startswith("rpmlib(") or name.startswith("/") or name.startswith("config("):
-            continue
-        out.append(name)
-    return out
 
 
 def _extract_pkg_name_from_package_options(opts: str, source_name: str) -> str | None:
@@ -220,16 +343,36 @@ def _extract_pkg_name_from_package_options(opts: str, source_name: str) -> str |
     return f"{source_name}-{suffix}"
 
 
-def _parse_spec_text(spec_text: str, filename_hint: str = "inline.spec") -> _SpecParseResult:
+
+def _spec_parse_fn(releasename: str = "", target_arches: set[str] | None = None):
+    macros = default_distro_macros(releasename)
+    arches = frozenset(a.lower() for a in (target_arches or set()) if a)
+    return partial(_parse_spec_text, distro_macros=macros, target_arches=arches)
+
+def _parse_spec_text(
+    spec_text: str,
+    filename_hint: str = "inline.spec",
+    *,
+    distro_macros: dict[str, str] | None = None,
+    target_arches: set[str] | frozenset[str] | None = None,
+) -> _SpecParseResult:
     br_out: list[str] = []
     br_raw: list[str] = []
     br_seen: set[str] = set()
+    req_out: list[str] = []
+    req_raw: list[str] = []
+    req_seen: set[str] = set()
     provided: set[str] = set()
     source_name = Path(filename_hint).stem
     epoch = 0
     version = ""
     release = ""
-    macros = _parse_spec_macro_table(spec_text)
+    exclusive_arches: set[str] | None = None
+    macros = dict(distro_macros or {})
+    macros.update(_parse_spec_macro_table(spec_text))
+    arches = {a.lower() for a in (target_arches or set()) if a}
+    bcond = parse_spec_bconds(spec_text, distro_macros=distro_macros, target_arches=arches or None)
+    macros.update(bcond.macros)
     for line in (spec_text or "").splitlines():
         s = line.strip()
         if not s or s.startswith("#"):
@@ -239,6 +382,17 @@ def _parse_spec_text(spec_text: str, filename_hint: str = "inline.spec") -> _Spe
             val = _expand_rpm_macros(s.split(":", 1)[1].strip(), macros)
             if val and "%" not in val:
                 source_name = val
+                macros["name"] = val
+            continue
+        if us.startswith("EXCLUSIVEARCH:"):
+            val = _expand_rpm_macros(s.split(":", 1)[1].strip(), macros)
+            toks = {
+                t.lower()
+                for t in re.split(r"[\s,]+", val)
+                if t and "%" not in t and t.lower() not in {"noarch"}
+            }
+            if toks:
+                exclusive_arches = (exclusive_arches or set()) | toks
             continue
         if us.startswith("%PACKAGE "):
             opts = s.split(None, 1)[1].strip() if len(s.split(None, 1)) > 1 else ""
@@ -259,91 +413,65 @@ def _parse_spec_text(spec_text: str, filename_hint: str = "inline.spec") -> _Spe
             except ValueError:
                 epoch = 0
             continue
-        if us.startswith("BUILDREQUIRES:"):
-            val = s.split(":", 1)[1]
-            expanded = _expand_rpm_macros(val, macros)
-            for chunk in expanded.replace("\n", ",").split(","):
-                line = chunk.strip()
-                if not line:
-                    continue
-                br_raw.append(line)
-            for tok in _extract_br_tokens_from_tag_value(expanded):
-                if tok in br_seen:
-                    continue
-                br_seen.add(tok)
-                br_out.append(tok)
-            continue
         if us.startswith("PROVIDES:"):
             val = s.split(":", 1)[1]
             for tok in _extract_br_tokens_from_tag_value(_expand_rpm_macros(val, macros)):
                 if not tok or "%" in tok or tok.startswith("bundled("):
                     continue
                 provided.add(tok)
+            continue
+    defines = {k: str(v) for k, v in bcond.defaults.items()}
+    for tok in sorted(active_build_brs(bcond, defines)):
+        if "%" in tok:
+            continue
+        if tok not in br_seen:
+            br_seen.add(tok)
+            br_out.append(tok)
+            br_raw.append(tok)
+    for tok in sorted(bcond.unconditional_reqs):
+        if "%" in tok:
+            continue
+        if tok not in req_seen:
+            req_seen.add(tok)
+            req_out.append(tok)
+            req_raw.append(tok)
     provided.add(source_name)
-    deep_enabled = (os.environ.get("OREON_SPECFILE_DEEP_PARSE") or "").strip().lower() in ("1", "true", "yes", "on")
-    if not deep_enabled or Specfile is None:
-        return _SpecParseResult(
-            source_name=source_name,
-            build_requires=br_out,
-            provided_binary_names=provided,
-            build_requires_raw=br_raw,
-            epoch=epoch,
-            version=version,
-            release=release,
-        )
-
-    try:
-        spec = Specfile(content=spec_text, force_parse=True, sourcedir=tempfile.gettempdir())
-        with spec.tags() as tags:
-            for t in tags:
-                name = (getattr(t, "name", "") or "").strip()
-                if not name:
-                    continue
-                lname = name.lower()
-                if lname == "name" and not source_name:
-                    source_name = str(getattr(t, "value", "") or "").strip()
-                if lname == "provides":
-                    for tok in _extract_br_tokens_from_tag_value(str(getattr(t, "value", "") or "")):
-                        if not tok or "%" in tok or tok.startswith("bundled("):
-                            continue
-                        provided.add(tok)
-                    continue
-                if lname != "buildrequires":
-                    continue
-                for tok in _extract_br_tokens_from_tag_value(str(getattr(t, "value", "") or "")):
-                    if tok in br_seen:
-                        continue
-                    br_seen.add(tok)
-                    br_out.append(tok)
-        if not source_name:
-            source_name = Path(filename_hint).stem
-        provided.add(source_name)
-        with spec.sections() as sections:
-            for sec in sections:
-                if getattr(sec, "normalized_name", "") != "package":
-                    continue
-                pkg_name = _extract_pkg_name_from_package_options(str(getattr(sec, "options", "") or ""), source_name)
-                if pkg_name:
-                    provided.add(pkg_name)
-        return _SpecParseResult(
-            source_name=source_name,
-            build_requires=br_out,
-            provided_binary_names=provided,
-            build_requires_raw=br_raw,
-            epoch=epoch,
-            version=version,
-            release=release,
-        )
-    except Exception as exc:
-        logger.warning("specfile parse failed for %s: %s", filename_hint, exc)
+    for name in (source_name,):
+        perl_cap = _perl_provide_from_package_name(name)
+        if perl_cap:
+            provided.add(perl_cap)
+    in_files = False
+    for line in (spec_text or "").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        keep = _files_section_continues(s, in_files=in_files)
+        if keep is not None:
+            in_files = keep
+            continue
+        if not in_files:
+            continue
+        expanded = _expand_rpm_macros(s, macros)
+        if ".pc" in expanded:
+            m = _RE_PC_FILE.search(expanded)
+            if m and "%" not in m.group(1) and "*" not in m.group(1):
+                provided.add(f"pkgconfig({m.group(1)})")
+        if ".so" in expanded:
+            m = _RE_SO_FILE.search(expanded)
+            if m and "%" not in m.group(1):
+                provided.update(_so_file_provides(m.group(1)))
+    macros["name"] = source_name
     return _SpecParseResult(
         source_name=source_name,
         build_requires=br_out,
         provided_binary_names=provided,
         build_requires_raw=br_raw,
+        requires=req_out,
+        requires_raw=req_raw,
         epoch=epoch,
         version=version,
         release=release,
+        exclusive_arches=exclusive_arches,
     )
 
 
@@ -353,7 +481,7 @@ def _provider_map_from_specs(parsed_by_source: dict[str, _SpecParseResult]) -> d
         provider_map.setdefault(src, set()).add(src)
         for n in p.provided_binary_names:
             provider_map.setdefault(n, set()).add(src)
-    return provider_map
+    return index_provider_map(provider_map)
 
 
 def _kahn_layers(
@@ -367,7 +495,18 @@ def _kahn_layers(
         ready = sorted(n for n in remaining if in_deg.get(n, 0) == 0)
         if not ready:
             cycle = True
-            ready = [sorted(remaining)[0]]
+            # Prefer packages closest to buildable (lowest remaining indegree).
+            # Alphabetical picks consumers like "biber" before "perl-*" providers.
+            ready = [
+                min(
+                    remaining,
+                    key=lambda n: (
+                        in_deg.get(n, 0),
+                        -sum(1 for d in rdeps.get(n, set()) if d in remaining),
+                        n,
+                    ),
+                )
+            ]
         layers.append(ready)
         for n in ready:
             remaining.discard(n)
@@ -390,6 +529,468 @@ async def _download_distgit_tarball(
     if r.status_code != 200:
         return None, f"Tarball fetch failed HTTP {r.status_code}: {u}"
     return r.content, None
+
+
+_TARBALL_CACHE_TTL_SEC = 300.0
+_tarball_cache: dict[tuple[str, str, str, str], tuple[float, bytes]] = {}
+
+
+async def _resolve_branch_tree_sha(
+    *,
+    owner: str,
+    repo: str,
+    distgit_branch: str,
+    headers: dict[str, str],
+    client: httpx.AsyncClient | None = None,
+) -> str:
+    if client is not None:
+        sha = await _git_tree_sha(
+            client,
+            owner=owner,
+            repo=repo,
+            distgit_branch=distgit_branch,
+            headers=headers,
+        )
+    else:
+        timeout = httpx.Timeout(30.0, connect=10.0)
+        async with httpx.AsyncClient(
+            timeout=timeout, headers=headers, follow_redirects=True
+        ) as owned:
+            sha = await _git_tree_sha(
+                owned,
+                owner=owner,
+                repo=repo,
+                distgit_branch=distgit_branch,
+                headers=headers,
+            )
+    return (sha or "").strip() or "unknown"
+
+
+async def _get_distgit_tarball_cached(
+    *,
+    owner: str,
+    repo: str,
+    distgit_branch: str,
+    headers: dict[str, str],
+    tree_sha: str | None = None,
+) -> tuple[bytes | None, str | None]:
+    sha = (tree_sha or "").strip() or await _resolve_branch_tree_sha(
+        owner=owner,
+        repo=repo,
+        distgit_branch=distgit_branch,
+        headers=headers,
+    )
+    key = (owner, repo, distgit_branch, sha)
+    now = time.monotonic()
+    hit = _tarball_cache.get(key)
+    if hit and now - hit[0] < _TARBALL_CACHE_TTL_SEC:
+        return hit[1], None
+    tarball, err = await _download_distgit_tarball(
+        owner=owner,
+        repo=repo,
+        distgit_branch=distgit_branch,
+        headers=headers,
+    )
+    if tarball:
+        _tarball_cache[key] = (now, tarball)
+    return tarball, err
+
+
+def clear_distgit_tarball_cache() -> None:
+    _tarball_cache.clear()
+
+
+def _perl_provide_from_package_name(pkg: str) -> str | None:
+    """Fedora-style perl-Foo-Bar packages auto-Provide perl(Foo::Bar)."""
+    n = (pkg or "").strip()
+    if not n.startswith("perl-"):
+        return None
+    rest = n[5:]
+    if not rest or rest[0].isdigit():
+        return None
+    low = rest.lower()
+    if low in {"interpreter", "libs", "macros", "devel", "generators", "doc", "homedir"}:
+        return None
+    if low.endswith(("-tests", "-doc", "-debuginfo", "-debugsource")):
+        return None
+    return f"perl({rest.replace('-', '::')})"
+
+
+def _python_dist_provides_from_package_name(pkg: str) -> set[str]:
+    """python3-foo-bar / python-foo -> python3dist(foo-bar) (+ underscore form)."""
+    n = (pkg or "").strip()
+    out: set[str] = set()
+    for prefix in ("python3-", "python-"):
+        if not n.startswith(prefix) or len(n) <= len(prefix):
+            continue
+        rest = n[len(prefix) :]
+        if not rest or rest[0].isdigit():
+            continue
+        low = rest.lower()
+        if low in {"devel", "libs", "pip", "setuptools-wheel", "rpm-macros"}:
+            # still invent for setuptools itself; skip only pure tooling splits that never
+            # match python3dist(name) from py3_dist
+            pass
+        if low.endswith(("-debuginfo", "-debugsource")):
+            continue
+        out.add(f"python3dist({rest})")
+        dashed = rest.replace("_", "-")
+        unders = rest.replace("-", "_")
+        out.add(f"python3dist({dashed})")
+        out.add(f"python3dist({unders})")
+        break
+    return out
+
+
+@dataclass
+class DistgitProvidesIndex:
+    package_names: frozenset[str]
+    capability_providers: dict[str, frozenset[str]]
+    _indexed: dict[str, set[str]] | None = field(default=None, repr=False, compare=False)
+
+    def indexed_providers(self) -> dict[str, set[str]]:
+        if self._indexed is None:
+            raw = {k: set(v) for k, v in self.capability_providers.items()}
+            for pkg in self.package_names:
+                perl_cap = _perl_provide_from_package_name(pkg)
+                if perl_cap:
+                    raw.setdefault(perl_cap, set()).add(pkg)
+                for py_cap in _python_dist_provides_from_package_name(pkg):
+                    raw.setdefault(py_cap, set()).add(pkg)
+            self._indexed = index_provider_map(raw)
+        return self._indexed
+
+
+_PROVIDES_INDEX_CACHE: dict[tuple[str, str, str, str, str], tuple[float, DistgitProvidesIndex]] = {}
+_provides_index_tasks: dict[tuple[str, str, str, str, str], asyncio.Task[DistgitProvidesIndex | None]] = {}
+_PACKAGE_NAMES_CACHE: dict[tuple[str, str, str, str], tuple[float, frozenset[str]]] = {}
+_PACKAGE_NAMES_CACHE_TTL_SEC = 1800.0
+_PROVIDES_INDEX_DISK_VERSION = "v5"
+
+
+def _so_file_provides(libstem: str) -> set[str]:
+    stem = (libstem or "").strip()
+    if not stem:
+        return set()
+    if stem.endswith(".so"):
+        return {stem}
+    return {f"{stem}.so"}
+
+
+def _provides_match_capability(capability: str, provided: set[str]) -> bool:
+    cl = (capability or "").strip().lower()
+    if not cl:
+        return False
+    for p in provided:
+        if p.lower() == cl:
+            return True
+    if cl.startswith("pkgconfig(") and cl.endswith(")"):
+        for p in provided:
+            if _pkgconfig_glob_match(capability, p):
+                return True
+            # also allow exact reverse when provide itself is globless
+            pl = p.lower()
+            if pl.startswith("pkgconfig(") and pl.endswith(")") and pl == cl:
+                return True
+        return False
+    base = cl.split("(", 1)[0]
+    if ".so" not in base:
+        return False
+    for p in provided:
+        pl = p.lower().split("(", 1)[0]
+        if not pl or ".so" not in pl:
+            continue
+        if base == pl or base.startswith(pl + ".") or pl.startswith(base + "."):
+            return True
+    return False
+
+
+def _lightweight_provides_from_spec_text(pkg: str, spec_text: str) -> set[str]:
+    provided: set[str] = {pkg}
+    source_name = pkg
+    macros = dict(default_distro_macros(""))
+    macros.setdefault("_bindir", "/usr/bin")
+    macros.setdefault("_sbindir", "/usr/sbin")
+    macros.setdefault("_libexecdir", "/usr/libexec")
+    macros.setdefault("_libdir", "/usr/lib64")
+    macros.setdefault("_prefix", "/usr")
+    macros.update(_parse_spec_macro_table(spec_text))
+    macros["name"] = pkg
+    in_files = False
+    for line in (spec_text or "").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        us = s.upper()
+        low = s.lower()
+        if us.startswith("NAME:"):
+            source_name = _expand_rpm_macros((s.split(":", 1)[1] or "").strip(), macros) or pkg
+            if "%" not in source_name:
+                macros["name"] = source_name
+                provided.add(source_name)
+            in_files = False
+            continue
+        if us.startswith("PROVIDES:"):
+            val = _expand_rpm_macros(s.split(":", 1)[1], macros)
+            for tok in _extract_br_tokens_from_tag_value(val):
+                if tok and "%" not in tok and not tok.startswith("bundled("):
+                    provided.add(tok)
+            continue
+        if low.startswith("%package"):
+            in_files = False
+            opts = s.split(None, 1)[1].strip() if len(s.split(None, 1)) > 1 else ""
+            opts_exp = _expand_rpm_macros(opts, macros)
+            pkg_name = _extract_pkg_name_from_package_options(opts_exp, source_name)
+            if pkg_name and "%" not in pkg_name:
+                provided.add(pkg_name)
+            continue
+        keep = _files_section_continues(s, in_files=in_files)
+        if keep is not None:
+            in_files = keep
+            continue
+        if not in_files:
+            continue
+        expanded = _expand_rpm_macros(s, macros)
+        if ".pc" in expanded:
+            m = _RE_PC_FILE.search(expanded)
+            if m and "%" not in m.group(1) and "*" not in m.group(1):
+                provided.add(f"pkgconfig({m.group(1)})")
+        if ".so" in expanded:
+            m = _RE_SO_FILE.search(expanded)
+            if m and "%" not in m.group(1):
+                provided.update(_so_file_provides(m.group(1)))
+        # absolute file paths from %files (same solv surface mock uses via filelists)
+        if "%" not in expanded:
+            path = expanded.split()[0] if expanded.split() else ""
+            if path.startswith("/") and "*" not in path and "?" not in path:
+                provided.add(path)
+                base = path.rsplit("/", 1)[-1]
+                if base and "." not in base:
+                    provided.add(base)
+    provided.add(source_name)
+    for name in (pkg, source_name):
+        perl_cap = _perl_provide_from_package_name(name)
+        if perl_cap:
+            provided.add(perl_cap)
+        provided.update(_python_dist_provides_from_package_name(name))
+    return provided
+
+
+def _build_provides_index_from_tarball_sync(tarball: bytes, releasename: str) -> DistgitProvidesIndex:
+    """One sequential gzip pass. Dont seek extractfile per package (that re-decompresses forever)."""
+    provider_map: dict[str, set[str]] = {}
+    names: set[str] = set()
+    with tarfile.open(fileobj=io.BytesIO(tarball), mode="r|gz") as tf:
+        for m in tf:
+            if not m.isfile():
+                continue
+            parts = m.name.split("/")
+            if len(parts) < 4 or parts[1] != releasename:
+                continue
+            pkg, fn = parts[2], parts[3]
+            if fn != f"{pkg}.spec" or not is_distgit_source_name(pkg):
+                continue
+            f = tf.extractfile(m)
+            if f is None:
+                continue
+            text = f.read(262144).decode("utf-8", errors="replace")
+            names.add(pkg)
+            for cap in _lightweight_provides_from_spec_text(pkg, text):
+                provider_map.setdefault(cap, set()).add(pkg)
+    return DistgitProvidesIndex(
+        package_names=frozenset(names),
+        capability_providers={k: frozenset(v) for k, v in provider_map.items()},
+    )
+
+
+def _provides_index_disk_path(
+    owner: str, repo: str, distgit_branch: str, releasename: str, tree_sha: str
+) -> Path:
+    digest = hashlib.sha256(
+        f"{_PROVIDES_INDEX_DISK_VERSION}/{owner}/{repo}/{distgit_branch}/{releasename}/{tree_sha}".encode()
+    ).hexdigest()[:24]
+    root = Path(os.getenv("OREON_PROVIDES_INDEX_DIR") or (Path.home() / ".oreon" / "provides-index"))
+    return root / f"{digest}.json"
+
+
+def _load_provides_index_disk(path: Path) -> DistgitProvidesIndex | None:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    pkgs = raw.get("package_names") or []
+    caps = raw.get("capability_providers") or {}
+    if not isinstance(pkgs, list) or not isinstance(caps, dict):
+        return None
+    return DistgitProvidesIndex(
+        package_names=frozenset(str(p) for p in pkgs),
+        capability_providers={
+            str(k): frozenset(str(s) for s in (v or []))
+            for k, v in caps.items()
+            if isinstance(v, list)
+        },
+    )
+
+
+def _store_provides_index_disk(path: Path, index: DistgitProvidesIndex) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "package_names": sorted(index.package_names),
+        "capability_providers": {
+            k: sorted(v) for k, v in sorted(index.capability_providers.items())
+        },
+    }
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    tmp.replace(path)
+
+
+async def _git_tree_sha(
+    client: httpx.AsyncClient,
+    *,
+    owner: str,
+    repo: str,
+    distgit_branch: str,
+    headers: dict[str, str],
+) -> str | None:
+    try:
+        r = await client.get(
+            f"https://api.github.com/repos/{owner}/{repo}/commits/{distgit_branch}",
+            headers=headers,
+        )
+    except httpx.HTTPError:
+        return None
+    if r.status_code != 200:
+        return None
+    data = r.json() or {}
+    sha = ((data.get("commit") or {}).get("tree") or {}).get("sha") or data.get("sha")
+    return str(sha) if sha else None
+
+
+def _build_provides_index_from_specs_sync(
+    specs_by_pkg: dict[str, str],
+) -> DistgitProvidesIndex:
+    provider_map: dict[str, set[str]] = {}
+    for pkg, text in specs_by_pkg.items():
+        for cap in _lightweight_provides_from_spec_text(pkg, text):
+            provider_map.setdefault(cap, set()).add(pkg)
+    return DistgitProvidesIndex(
+        package_names=frozenset(specs_by_pkg),
+        capability_providers={k: frozenset(v) for k, v in provider_map.items()},
+    )
+
+
+async def get_distgit_provides_index_cached(
+    *,
+    owner: str,
+    repo: str,
+    distgit_branch: str,
+    releasename: str,
+    headers: dict[str, str],
+) -> DistgitProvidesIndex | None:
+    """
+    Capability -> distgit source from actual specs at the branch tree SHA.
+    Memory + disk keyed by tree SHA so imports on the branch invalidate cleanly.
+    """
+    timeout = httpx.Timeout(120.0, connect=15.0)
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        headers=headers,
+        follow_redirects=True,
+    ) as client:
+        tree_sha = await _resolve_branch_tree_sha(
+            owner=owner,
+            repo=repo,
+            distgit_branch=distgit_branch,
+            headers=headers,
+            client=client,
+        )
+
+    key = (owner, repo, distgit_branch, releasename, tree_sha)
+    now = time.monotonic()
+    hit = _PROVIDES_INDEX_CACHE.get(key)
+    if hit and now - hit[0] < _TARBALL_CACHE_TTL_SEC:
+        return hit[1]
+
+    inflight = _provides_index_tasks.get(key)
+    if inflight is not None:
+        return await inflight
+
+    async def _load() -> DistgitProvidesIndex | None:
+        t0 = time.monotonic()
+        disk = _provides_index_disk_path(owner, repo, distgit_branch, releasename, tree_sha)
+        if disk.is_file():
+            loaded = await asyncio.to_thread(_load_provides_index_disk, disk)
+            if loaded is not None:
+                _PROVIDES_INDEX_CACHE[key] = (time.monotonic(), loaded)
+                logger.info(
+                    "distgit provides index %s/%s: disk packages=%s caps=%s tree=%s in %.1fs",
+                    releasename,
+                    distgit_branch,
+                    len(loaded.package_names),
+                    len(loaded.capability_providers),
+                    tree_sha[:12],
+                    time.monotonic() - t0,
+                )
+                return loaded
+
+        logger.info(
+            "distgit provides index %s/%s: building from branch tarball (tree=%s)",
+            releasename,
+            distgit_branch,
+            tree_sha[:12] if tree_sha != "unknown" else tree_sha,
+        )
+        tarball, err = await _get_distgit_tarball_cached(
+            owner=owner,
+            repo=repo,
+            distgit_branch=distgit_branch,
+            headers=headers,
+            tree_sha=tree_sha,
+        )
+        if not tarball:
+            if err:
+                logger.warning("distgit provides index: %s", err)
+            return None
+        index = await asyncio.to_thread(
+            _build_provides_index_from_tarball_sync, tarball, releasename
+        )
+        _PROVIDES_INDEX_CACHE[key] = (time.monotonic(), index)
+        _clear_github_search_cache_for_branch(owner, repo, distgit_branch, releasename)
+        try:
+            await asyncio.to_thread(_store_provides_index_disk, disk, index)
+        except Exception as exc:
+            logger.warning("distgit provides index disk store failed: %s", exc)
+        logger.info(
+            "distgit provides index %s/%s: packages=%s capabilities=%s tree=%s in %.1fs",
+            releasename,
+            distgit_branch,
+            len(index.package_names),
+            len(index.capability_providers),
+            tree_sha[:12],
+            time.monotonic() - t0,
+        )
+        return index
+
+    task = asyncio.create_task(_load())
+    _provides_index_tasks[key] = task
+    try:
+        return await task
+    finally:
+        _provides_index_tasks.pop(key, None)
+
+
+def clear_distgit_provides_index_cache() -> None:
+    _PROVIDES_INDEX_CACHE.clear()
+    for task in _provides_index_tasks.values():
+        task.cancel()
+    _provides_index_tasks.clear()
+    _GITHUB_SEARCH_CACHE.clear()
+
+
+def distgit_providers_dict(index: DistgitProvidesIndex | None) -> dict[str, set[str]]:
+    if not index:
+        return {}
+    return index.indexed_providers()
 
 
 def _tarball_spec_member_index(
@@ -461,8 +1062,176 @@ def _chain_distgit_parse_wave_size() -> int:
     return max(8, min(n, 128))
 
 
+def _distgit_spec_raw_url(
+    owner: str,
+    repo: str,
+    distgit_branch: str,
+    releasename: str,
+    pkg: str,
+) -> str:
+    path = f"{releasename}/{pkg}/{pkg}.spec"
+    return f"https://raw.githubusercontent.com/{owner}/{repo}/{distgit_branch}/{path}"
+
+
+async def _fetch_distgit_specs_batch(
+    client: httpx.AsyncClient,
+    *,
+    owner: str,
+    repo: str,
+    distgit_branch: str,
+    releasename: str,
+    packages: list[str],
+) -> dict[str, str]:
+    if not packages:
+        return {}
+
+    async def one(pkg: str) -> tuple[str, str | None]:
+        url = _distgit_spec_raw_url(owner, repo, distgit_branch, releasename, pkg)
+        try:
+            r = await client.get(url)
+        except httpx.HTTPError:
+            return pkg, None
+        if r.status_code != 200:
+            return pkg, None
+        return pkg, r.text
+
+    results = await asyncio.gather(*(one(pkg) for pkg in packages))
+    return {pkg: text for pkg, text in results if text}
+
+
+async def expand_chain_spec_closure_sparse(
+    roots: list[str],
+    *,
+    releasename: str,
+    owner: str,
+    repo: str,
+    distgit_branch: str,
+    headers: dict[str, str],
+    repo_index: Any | None = None,
+    target_arches: set[str] | None = None,
+) -> tuple[dict[str, str], dict[str, _SpecParseResult], list[str]]:
+    err: list[str] = []
+    specs: dict[str, str] = {}
+    parsed_by_source: dict[str, _SpecParseResult] = {}
+    provider_map: dict[str, set[str]] = index_provider_map({})
+    known: set[str] = set()
+    needed: set[str] = set()
+    queue: deque[str] = deque()
+
+    for r in roots:
+        rn = (r or "").strip()
+        if not rn:
+            continue
+        needed.add(rn)
+        queue.append(rn)
+
+    max_parse = _chain_distgit_max_parse()
+    wave_size = _chain_distgit_parse_wave_size()
+    pool = _distgit_spec_parse_executor()
+    arches = {a.lower() for a in (target_arches or set()) if a} or None
+    parse_fn = _spec_parse_fn(releasename, target_arches=arches)
+    t0 = time.monotonic()
+    fetched = 0
+
+    timeout = httpx.Timeout(30.0, connect=10.0)
+    limits = httpx.Limits(max_connections=64, max_keepalive_connections=32)
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        headers=headers,
+        follow_redirects=True,
+        limits=limits,
+    ) as client:
+        while queue and len(needed) <= max_parse:
+            wave: list[str] = []
+            while queue and len(wave) < wave_size:
+                pkg = queue.popleft()
+                if pkg in parsed_by_source:
+                    continue
+                wave.append(pkg)
+            if not wave:
+                break
+
+            batch_specs = await _fetch_distgit_specs_batch(
+                client,
+                owner=owner,
+                repo=repo,
+                distgit_branch=distgit_branch,
+                releasename=releasename,
+                packages=wave,
+            )
+            fetched += len(batch_specs)
+            for pkg in wave:
+                if pkg not in batch_specs:
+                    if pkg in roots:
+                        err.append(f"chain root {pkg!r} not found under {releasename}/ in distgit")
+                    continue
+                known.add(pkg)
+
+            futures = {
+                pool.submit(parse_fn, batch_specs[pkg], f"{pkg}.spec"): pkg
+                for pkg in batch_specs
+            }
+            for fut in as_completed(futures):
+                pkg = futures[fut]
+                try:
+                    parsed = fut.result()
+                except Exception as exc:
+                    err.append(f"{pkg}: parse failed ({type(exc).__name__}: {exc})")
+                    parsed = _SpecParseResult(
+                        source_name=pkg,
+                        build_requires=[],
+                        provided_binary_names={pkg},
+                        build_requires_raw=[],
+                    )
+                specs[pkg] = batch_specs[pkg]
+                parsed_by_source[pkg] = parsed
+                for cap, srcs in _provider_map_from_specs({pkg: parsed}).items():
+                    if cap == "__lower__":
+                        continue
+                    add_capability_providers(provider_map, cap, srcs)
+                for dep in dependency_capabilities(parsed):
+                    if repo_index is not None and repo_index.satisfies_requirement(dep):
+                        continue
+                    for cap in requirement_check_capabilities(dep):
+                        for prov in _providers_from_maps(cap, [provider_map]):
+                            if prov in parsed_by_source or prov == pkg:
+                                continue
+                            if not is_distgit_source_name(prov):
+                                continue
+                            if prov not in needed:
+                                needed.add(prov)
+                                queue.append(prov)
+                        if repo_index is not None:
+                            for src in repo_index.distgit_sources_for_capability(cap):
+                                if src in parsed_by_source or src == pkg:
+                                    continue
+                                if not is_distgit_source_name(src):
+                                    continue
+                                if src not in needed:
+                                    needed.add(src)
+                                    queue.append(src)
+
+    if len(needed) > max_parse:
+        err.append(
+            f"Chain distgit closure exceeded OREON_CHAIN_DISTGIT_MAX_PARSE ({max_parse}); narrow the chain spec."
+        )
+
+    logger.info(
+        "sparse distgit closure %s/%s: roots=%s fetched=%s parsed=%s in %.1fs",
+        releasename,
+        distgit_branch,
+        len([r for r in roots if (r or "").strip()]),
+        fetched,
+        len(parsed_by_source),
+        time.monotonic() - t0,
+    )
+    return specs, parsed_by_source, err
+
+
 async def _parse_specs_parallel_async(
     specs_by_pkg: dict[str, str],
+    *,
+    releasename: str = "",
 ) -> tuple[dict[str, _SpecParseResult], list[str]]:
     err: list[str] = []
     parsed_by_source: dict[str, _SpecParseResult] = {}
@@ -470,9 +1239,10 @@ async def _parse_specs_parallel_async(
         return parsed_by_source, err
     loop = asyncio.get_running_loop()
     pool = _distgit_spec_parse_executor()
+    parse_fn = _spec_parse_fn(releasename)
     items = list(specs_by_pkg.items())
     tasks = [
-        loop.run_in_executor(pool, _parse_spec_text, spec_text, f"{pkg}.spec")
+        loop.run_in_executor(pool, parse_fn, spec_text, f"{pkg}.spec")
         for pkg, spec_text in items
     ]
     parse_results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -505,8 +1275,8 @@ def _distgit_order_from_parsed(
     provider_map = _provider_map_from_specs(parsed_by_source)
 
     for cons, parsed in parsed_by_source.items():
-        for br in parsed.build_requires:
-            providers = provider_map.get(br) or set()
+        for dep in parsed.dependency_names():
+            providers = provider_map.get(dep) or set()
             for prov in sorted(providers):
                 if prov not in names_set or prov == cons:
                     continue
@@ -516,7 +1286,7 @@ def _distgit_order_from_parsed(
                     {
                         "from": cons,
                         "to": prov,
-                        "requirement": br,
+                        "requirement": dep,
                         "satisfied": False,
                         "type": "distgit_br",
                     }
@@ -526,7 +1296,11 @@ def _distgit_order_from_parsed(
     if cyc:
         err.append("Warning: a cycle exists in distgit BuildRequires; some parallel layers may be conservative.")
 
-    capability_providers = {cap: sorted(srcs) for cap, srcs in sorted(provider_map.items())}
+    capability_providers = {
+        cap: sorted(srcs)
+        for cap, srcs in sorted(provider_map.items())
+        if cap != "__lower__" and isinstance(srcs, set)
+    }
     spec_evrs = {src: parsed.evr_canonical() for src, parsed in parsed_by_source.items()}
     build_requires_raw = {src: list(parsed.build_requires_raw) for src, parsed in parsed_by_source.items()}
 
@@ -559,7 +1333,7 @@ def _expand_chain_spec_closure(
         names_set, members = _tarball_spec_member_index(tarball, releasename)
     specs: dict[str, str] = {}
     parsed_by_source: dict[str, _SpecParseResult] = {}
-    provider_map: dict[str, set[str]] = {}
+    provider_map: dict[str, set[str]] = index_provider_map({})
     needed: set[str] = set()
     queue: deque[str] = deque()
 
@@ -576,6 +1350,7 @@ def _expand_chain_spec_closure(
     max_parse = _chain_distgit_max_parse()
     wave_size = _chain_distgit_parse_wave_size()
     pool = _distgit_spec_parse_executor()
+    parse_fn = _spec_parse_fn(releasename)
 
     while queue and len(needed) <= max_parse:
         wave: list[str] = []
@@ -595,7 +1370,7 @@ def _expand_chain_spec_closure(
                 err.append(f"spec missing in tarball for {pkg}")
 
         futures = {
-            pool.submit(_parse_spec_text, batch_specs[pkg], f"{pkg}.spec"): pkg
+            pool.submit(parse_fn, batch_specs[pkg], f"{pkg}.spec"): pkg
             for pkg in batch_specs
         }
         for fut in as_completed(futures):
@@ -613,11 +1388,13 @@ def _expand_chain_spec_closure(
             specs[pkg] = batch_specs[pkg]
             parsed_by_source[pkg] = parsed
             for cap, srcs in _provider_map_from_specs({pkg: parsed}).items():
-                provider_map.setdefault(cap, set()).update(srcs)
-            for br in parsed.build_requires:
-                provs = set(provider_map.get(br) or set())
-                if br in names_set:
-                    provs.add(br)
+                if cap == "__lower__":
+                    continue
+                add_capability_providers(provider_map, cap, srcs)
+            for dep in dependency_capabilities(parsed):
+                provs = set(_providers_from_maps(dep, [provider_map]))
+                if dep in names_set:
+                    provs.add(dep)
                 for prov in provs:
                     if prov not in names_set or prov == pkg:
                         continue
@@ -629,6 +1406,1137 @@ def _expand_chain_spec_closure(
         err.append(
             f"Chain distgit closure exceeded OREON_CHAIN_DISTGIT_MAX_PARSE ({max_parse}); narrow the chain spec."
         )
+    return specs, parsed_by_source, err
+
+
+async def expand_chain_spec_closure_tarball(
+    roots: list[str],
+    *,
+    releasename: str,
+    owner: str,
+    repo: str,
+    distgit_branch: str,
+    headers: dict[str, str],
+) -> tuple[dict[str, str], dict[str, _SpecParseResult], list[str]]:
+    err: list[str] = []
+    t0 = time.monotonic()
+    tarball, terr = await _get_distgit_tarball_cached(
+        owner=owner,
+        repo=repo,
+        distgit_branch=distgit_branch,
+        headers=headers,
+    )
+    if terr:
+        err.append(terr)
+    if not tarball:
+        return {}, {}, err or ["distgit tarball fetch returned no data"]
+
+    all_names, members = await asyncio.to_thread(_tarball_spec_member_index, tarball, releasename)
+    specs, parsed_by_source, cerr = await asyncio.to_thread(
+        _expand_chain_spec_closure,
+        roots,
+        all_names,
+        tarball,
+        releasename,
+        members=members,
+    )
+    err.extend(cerr)
+    logger.info(
+        "tarball distgit closure %s/%s: roots=%s parsed=%s in %.1fs",
+        releasename,
+        distgit_branch,
+        len([r for r in roots if (r or "").strip()]),
+        len(parsed_by_source),
+        time.monotonic() - t0,
+    )
+    return specs, parsed_by_source, err
+
+
+def _chain_repo_transitive_max_waves() -> int:
+    raw = (os.getenv("OREON_CHAIN_REPO_TRANSITIVE_MAX_WAVES") or "12").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 12
+    return max(1, min(n, 64))
+
+
+def _repo_caps_to_walk(repo: Any, br: str) -> list[str]:
+    checks = requirement_check_capabilities(br)
+    if not checks:
+        raw = (br or "").strip()
+        return [raw] if raw else []
+    satisfied = [c for c in checks if repo.has_capability(c)]
+    return satisfied if satisfied else checks
+
+
+def _repo_transitive_miss_sources(
+    repo: Any,
+    cap: str,
+    *,
+    distgit_providers: dict[str, set[str]] | None = None,
+) -> tuple[set[str], set[str]]:
+    missing_caps: set[str] = set()
+    provider_sources: set[str] = set()
+    maps = [distgit_providers] if distgit_providers else []
+    for walk_cap in _repo_caps_to_walk(repo, cap):
+        path_miss = getattr(repo, "missing_caps_on_provider_path", None)
+        if callable(path_miss):
+            misses = set(path_miss(walk_cap) or ())
+        else:
+            misses = set(repo.transitive_unsatisfied(walk_cap))
+        if not misses and not repo.satisfies_requirement(walk_cap):
+            misses = set(repo.transitive_unsatisfied(walk_cap)) or {walk_cap}
+        for miss in misses:
+            missing_caps.add(miss)
+            provider_sources.update(repo.distgit_sources_for_capability(miss))
+            provider_sources.update(_providers_from_maps(miss, maps))
+    return missing_caps, {s for s in provider_sources if s and is_distgit_source_name(s)}
+
+
+def _collect_repo_transitive_candidates(
+    parsed_by_source: dict[str, Any],
+    repo: Any,
+    *,
+    scope_packages: set[str] | None = None,
+    distgit_providers: dict[str, set[str]] | None = None,
+    solver: Any | None = None,
+) -> set[str]:
+    candidates: set[str] = set()
+    if scope_packages is not None:
+        pkg_iter = (
+            (pkg, parsed_by_source[pkg])
+            for pkg in scope_packages
+            if pkg in parsed_by_source
+        )
+    else:
+        pkg_iter = parsed_by_source.items()
+
+    scope_map = _provider_map_from_specs(parsed_by_source)
+    provider_maps = [scope_map, distgit_providers or {}]
+    missing_caps: set[str] = set()
+    br_fp_cache: dict[tuple[str, ...], Any] = {}
+
+    if solver is not None:
+        for _pkg, parsed in pkg_iter:
+            leaf_ok: list[str] = []
+            for cap in dependency_capabilities(parsed):
+                if "%" in cap:
+                    continue
+                if repo.satisfies_requirement(cap):
+                    leaf_ok.append(cap)
+                else:
+                    missing_caps.add(cap)
+            if not leaf_ok:
+                continue
+            key = tuple(sorted(set(leaf_ok)))
+            result = br_fp_cache.get(key)
+            if result is None:
+                result = solver.resolve(key)
+                br_fp_cache[key] = result
+            if not result.ok:
+                missing_caps.update(result.missing_provides or key)
+    else:
+        seen_brs: set[str] = set()
+        for _pkg, parsed in pkg_iter:
+            for cap in dependency_capabilities(parsed):
+                if "%" in cap or cap in seen_brs:
+                    continue
+                seen_brs.add(cap)
+                # leaf holes only. pathwalk fans the whole distro into candidates.
+                if not repo.satisfies_requirement(cap):
+                    missing_caps.add(cap)
+
+    for miss in missing_caps:
+        candidates.update(
+            sources_for_requirement(
+                miss,
+                repo,
+                provider_maps=provider_maps,
+            )
+        )
+        for src in _providers_from_maps(miss, provider_maps):
+            if src and is_distgit_source_name(src):
+                candidates.add(src)
+
+    return {c for c in candidates if c and is_distgit_source_name(c)}
+
+
+_GITHUB_SEARCH_CACHE: dict[tuple[str, ...], tuple[float, frozenset[str]]] = {}
+_GITHUB_SEARCH_CACHE_TTL_SEC = 600.0
+
+
+def _clear_github_search_cache_for_branch(
+    owner: str, repo: str, distgit_branch: str, releasename: str
+) -> None:
+    branch = (distgit_branch or "main").strip() or "main"
+    drop = [
+        k
+        for k in _GITHUB_SEARCH_CACHE
+        if len(k) >= 4
+        and k[0] == owner
+        and k[1] == repo
+        and k[2] == releasename
+        and k[3] == branch
+    ]
+    for k in drop:
+        _GITHUB_SEARCH_CACHE.pop(k, None)
+
+
+def _source_name_from_distgit_spec_path(path: str, releasename: str) -> str | None:
+    parts = (path or "").strip().split("/")
+    if len(parts) < 3 or parts[0] != releasename:
+        return None
+    pkg, fn = parts[1], parts[2]
+    if fn != f"{pkg}.spec":
+        return None
+    if not is_distgit_source_name(pkg):
+        return None
+    return pkg
+
+
+def _so_search_tokens(capability: str) -> list[str]:
+    """Literal soname fragments only. No inventing package names."""
+    cap = (capability or "").strip()
+    if not cap:
+        return []
+    base = cap.split("(", 1)[0].strip()
+    if ".so" not in base:
+        return []
+    out: list[str] = [base]
+    # libIL.so.1 -> also search libIL.so which is what %files usually writes
+    m = re.match(r"^(lib[A-Za-z0-9_+.-]+\.so)(?:\.\d+)*$", base)
+    if m and m.group(1) != base:
+        out.append(m.group(1))
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for t in out:
+        tl = t.lower()
+        if tl in seen:
+            continue
+        seen.add(tl)
+        uniq.append(t)
+    return uniq
+
+
+async def _get_distgit_package_names_cached(
+    client: httpx.AsyncClient,
+    *,
+    owner: str,
+    repo: str,
+    releasename: str,
+    distgit_branch: str,
+    headers: dict[str, str],
+) -> frozenset[str]:
+    branch = (distgit_branch or "main").strip() or "main"
+    key = (owner, repo, branch, releasename)
+    now = time.monotonic()
+    hit = _PACKAGE_NAMES_CACHE.get(key)
+    if hit and now - hit[0] < _PACKAGE_NAMES_CACHE_TTL_SEC:
+        return hit[1]
+    try:
+        r = await client.get(
+            f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}",
+            headers=headers,
+            params={"recursive": "1"},
+        )
+    except httpx.HTTPError:
+        return frozenset()
+    if r.status_code != 200:
+        return frozenset()
+    names: set[str] = set()
+    prefix = f"{releasename}/"
+    for item in r.json().get("tree") or []:
+        p = item.get("path") or ""
+        if not p.startswith(prefix) or not p.endswith(".spec"):
+            continue
+        parts = p.split("/")
+        if len(parts) != 3:
+            continue
+        pkg, fn = parts[1], parts[2]
+        if fn == f"{pkg}.spec" and is_distgit_source_name(pkg):
+            names.add(pkg)
+    frozen = frozenset(names)
+    _PACKAGE_NAMES_CACHE[key] = (now, frozen)
+    return frozen
+
+
+def _warm_provides_index_lookup(capability: str) -> set[str]:
+    cap = (capability or "").strip()
+    if not cap:
+        return set()
+    out: set[str] = set()
+    now = time.monotonic()
+    for _key, (ts, index) in list(_PROVIDES_INDEX_CACHE.items()):
+        if now - ts >= _TARBALL_CACHE_TTL_SEC:
+            continue
+        out.update(_providers_from_maps(cap, [distgit_providers_dict(index)]))
+    return {s for s in out if s and is_distgit_source_name(s)}
+
+
+async def _verify_spec_provides_capability(
+    client: httpx.AsyncClient,
+    *,
+    owner: str,
+    repo: str,
+    releasename: str,
+    distgit_branch: str,
+    headers: dict[str, str],
+    source: str,
+    capability: str,
+) -> bool:
+    branch = (distgit_branch or "main").strip() or "main"
+    url = (
+        f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/"
+        f"{releasename}/{source}/{source}.spec"
+    )
+    try:
+        r = await client.get(url, headers=headers)
+    except httpx.HTTPError:
+        return False
+    if r.status_code != 200:
+        return False
+    provided = _lightweight_provides_from_spec_text(source, r.text)
+    return _provides_match_capability(capability, provided)
+
+
+def _search_queries_for_capability(owner: str, repo: str, releasename: str, capability: str) -> list[str]:
+    cap = (capability or "").strip()
+    if not cap:
+        return []
+    queries = [f'repo:{owner}/{repo} path:{releasename}/ filename:.spec "Provides: {cap}"']
+    if cap.startswith("pkgconfig(") and cap.endswith(")"):
+        inner = cap[len("pkgconfig(") : -1].strip()
+        if inner and "*" not in inner:
+            queries.append(
+                f'repo:{owner}/{repo} path:{releasename}/ filename:.spec "{inner}.pc"'
+            )
+    for tok in _so_search_tokens(cap):
+        if ".so" in tok:
+            queries.append(f'repo:{owner}/{repo} path:{releasename}/ filename:.spec "{tok}"')
+    if is_distgit_source_name(cap):
+        queries.append(
+            f'repo:{owner}/{repo} path:{releasename}/ filename:.spec "%package -n {cap}"'
+        )
+        queries.append(
+            f'repo:{owner}/{repo} path:{releasename}/ filename:{cap}.spec'
+        )
+    # de-dupe
+    seen: set[str] = set()
+    out: list[str] = []
+    for q in queries:
+        if q in seen:
+            continue
+        seen.add(q)
+        out.append(q)
+    return out
+
+
+async def _github_search_distgit_providers(
+    client: httpx.AsyncClient,
+    *,
+    owner: str,
+    repo: str,
+    releasename: str,
+    capability: str,
+    headers: dict[str, str],
+    distgit_branch: str = "main",
+    allow_network: bool = False,
+) -> set[str]:
+    """
+    Resolve capability -> distgit source.
+    When the Provides index for this branch is warm, that index is authoritative.
+    Network search is only for cold-index fallback.
+    """
+    cap = (capability or "").strip()
+    if not cap:
+        return set()
+    branch = (distgit_branch or "main").strip() or "main"
+    cache_key = (owner, repo, releasename, branch, cap.lower())
+    now = time.monotonic()
+    hit = _GITHUB_SEARCH_CACHE.get(cache_key)
+    if hit and now - hit[0] < _GITHUB_SEARCH_CACHE_TTL_SEC:
+        return set(hit[1])
+
+    sources: set[str] = set()
+    sources.update(_warm_provides_index_lookup(cap))
+    index_warm = _provides_index_is_warm(owner, repo, branch, releasename)
+
+    # Index for this tree SHA is the source of truth. No code-search spam on misses.
+    if sources or (index_warm and not allow_network):
+        _GITHUB_SEARCH_CACHE[cache_key] = (now, frozenset(sources))
+        return sources
+
+    for q in _search_queries_for_capability(owner, repo, releasename, cap)[:5]:
+        try:
+            r = await client.get(
+                "https://api.github.com/search/code",
+                params={"q": q, "per_page": 15},
+                headers=headers,
+            )
+        except httpx.HTTPError:
+            continue
+        if r.status_code != 200:
+            continue
+        for item in r.json().get("items") or []:
+            src = _source_name_from_distgit_spec_path(item.get("path") or "", releasename)
+            if not src:
+                continue
+            if await _verify_spec_provides_capability(
+                client,
+                owner=owner,
+                repo=repo,
+                releasename=releasename,
+                distgit_branch=branch,
+                headers=headers,
+                source=src,
+                capability=cap,
+            ):
+                sources.add(src)
+        if sources:
+            break
+
+    if not sources and is_distgit_source_name(cap):
+        try:
+            r = await client.get(
+                f"https://api.github.com/repos/{owner}/{repo}/contents/{releasename}/{cap}/{cap}.spec",
+                headers=headers,
+                params={"ref": branch},
+            )
+        except httpx.HTTPError:
+            r = None
+        if r is not None and r.status_code == 200:
+            if await _verify_spec_provides_capability(
+                client,
+                owner=owner,
+                repo=repo,
+                releasename=releasename,
+                distgit_branch=branch,
+                headers=headers,
+                source=cap,
+                capability=cap,
+            ):
+                sources.add(cap)
+
+    _GITHUB_SEARCH_CACHE[cache_key] = (now, frozenset(sources))
+    return sources
+
+
+def _provides_index_is_warm(
+    owner: str, repo: str, distgit_branch: str, releasename: str
+) -> bool:
+    now = time.monotonic()
+    for key, (ts, _index) in _PROVIDES_INDEX_CACHE.items():
+        if len(key) < 4:
+            continue
+        o, r, b, rel = key[0], key[1], key[2], key[3]
+        if o == owner and r == repo and b == distgit_branch and rel == releasename:
+            if now - ts < _TARBALL_CACHE_TTL_SEC:
+                return True
+    return False
+
+
+
+
+def _missing_runtime_caps_for_scope(
+    parsed_by_source: dict[str, Any],
+    repo: Any,
+    *,
+    scope_packages: set[str] | None = None,
+) -> set[str]:
+    out: set[str] = set()
+    if scope_packages is not None:
+        pkg_iter = (
+            (pkg, parsed_by_source[pkg])
+            for pkg in scope_packages
+            if pkg in parsed_by_source
+        )
+    else:
+        pkg_iter = parsed_by_source.items()
+    seen: set[str] = set()
+    for _pkg, parsed in pkg_iter:
+        for cap in dependency_capabilities(parsed):
+            if cap in seen:
+                continue
+            seen.add(cap)
+            for walk_cap in _repo_caps_to_walk(repo, cap):
+                out.update(repo.missing_runtime_caps_for_requirement(walk_cap))
+    return out
+
+
+async def _resolve_missing_runtime_via_github(
+    parsed_by_source: dict[str, _SpecParseResult],
+    repo: Any,
+    providers: dict[str, set[str]],
+    *,
+    owner: str,
+    repo_name: str,
+    releasename: str,
+    headers: dict[str, str],
+    scope_packages: set[str] | None,
+    client: httpx.AsyncClient,
+    distgit_branch: str = "main",
+) -> int:
+    caps = _missing_runtime_caps_for_scope(
+        parsed_by_source,
+        repo,
+        scope_packages=scope_packages,
+    )
+    resolved = 0
+    for cap in sorted(caps)[:24]:
+        if _providers_from_maps(cap, [providers]):
+            continue
+        if repo.distgit_sources_for_capability(cap):
+            continue
+        sources = await _github_search_distgit_providers(
+            client,
+            owner=owner,
+            repo=repo_name,
+            releasename=releasename,
+            capability=cap,
+            headers=headers,
+            distgit_branch=distgit_branch,
+        )
+        if not sources:
+            continue
+        add_capability_providers(providers, cap, sources)
+        resolved += 1
+    return resolved
+
+
+def _unresolved_capabilities(
+    specs_by_pkg: dict[str, str],
+    parsed_by_source: dict[str, _SpecParseResult],
+    repo: Any,
+    *,
+    distgit_providers: dict[str, set[str]] | None = None,
+    scope_packages: set[str] | None = None,
+    distro_macros: dict[str, str] | None = None,
+    target_arches: set[str] | None = None,
+) -> set[str]:
+    out: set[str] = set()
+    chain_providers = _provider_map_from_specs(parsed_by_source)
+    pkg_iter = (
+        sorted(scope_packages)
+        if scope_packages is not None
+        else sorted(parsed_by_source.keys())
+    )
+    for pkg in pkg_iter:
+        if pkg not in parsed_by_source:
+            continue
+        spec_text = specs_by_pkg.get(pkg) or ""
+        if not spec_text:
+            continue
+        bcond = parse_spec_bconds(
+            spec_text, distro_macros=distro_macros, target_arches=target_arches
+        )
+        defines = default_build_defines(bcond)
+        for cap in iter_plan_capabilities(parsed_by_source[pkg], bcond, repo):
+            if "%" in cap or repo.satisfies_requirement(cap):
+                continue
+            if _distgit_fetch_candidates_for_br(
+                cap,
+                repo,
+                distgit_providers=distgit_providers,
+                chain_providers=chain_providers,
+            ):
+                continue
+            primary = rpm_requirement_primary(cap)
+            if primary:
+                out.add(primary)
+    return out
+
+
+async def _resolve_capabilities_via_github(
+    specs_by_pkg: dict[str, str],
+    parsed_by_source: dict[str, _SpecParseResult],
+    repo: Any,
+    providers: dict[str, set[str]],
+    *,
+    owner: str,
+    repo_name: str,
+    releasename: str,
+    headers: dict[str, str],
+    scope_packages: set[str] | None,
+    client: httpx.AsyncClient,
+    distgit_branch: str = "main",
+    target_arches: set[str] | None = None,
+) -> int:
+    caps = _unresolved_capabilities(
+        specs_by_pkg,
+        parsed_by_source,
+        repo,
+        distgit_providers=providers,
+        scope_packages=scope_packages,
+        distro_macros=default_distro_macros(releasename),
+        target_arches=target_arches,
+    )
+    resolved = 0
+    for cap in sorted(caps)[:48]:
+        if _providers_from_maps(cap, [providers]):
+            continue
+        sources = await _github_search_distgit_providers(
+            client,
+            owner=owner,
+            repo=repo_name,
+            releasename=releasename,
+            capability=cap,
+            headers=headers,
+            distgit_branch=distgit_branch,
+        )
+        if not sources:
+            continue
+        add_capability_providers(providers, cap, sources)
+        resolved += 1
+    return resolved
+
+
+def _distgit_fetch_candidates_for_br(
+    br: str,
+    repo: Any,
+    *,
+    distgit_providers: dict[str, set[str]] | None = None,
+    chain_providers: dict[str, set[str]] | None = None,
+) -> set[str]:
+    maps: list[dict[str, set[str]]] = []
+    if chain_providers:
+        maps.append(chain_providers)
+    if distgit_providers:
+        maps.append(distgit_providers)
+    return sources_for_requirement(br, repo, provider_maps=maps)
+
+
+def _distgit_source_needers(
+    specs_by_pkg: dict[str, str],
+    parsed_by_source: dict[str, _SpecParseResult],
+    repo: Any,
+    *,
+    distgit_providers: dict[str, set[str]] | None = None,
+    scope_packages: set[str] | None = None,
+    distro_macros: dict[str, str] | None = None,
+    target_arches: set[str] | None = None,
+) -> dict[str, set[str]]:
+    needers: dict[str, set[str]] = {}
+    chain_providers = _provider_map_from_specs(parsed_by_source)
+    pkg_iter = (
+        sorted(scope_packages)
+        if scope_packages is not None
+        else sorted(parsed_by_source.keys())
+    )
+    for pkg in pkg_iter:
+        if pkg not in parsed_by_source:
+            continue
+        spec_text = specs_by_pkg.get(pkg) or ""
+        if not spec_text:
+            continue
+        bcond = parse_spec_bconds(
+            spec_text, distro_macros=distro_macros, target_arches=target_arches
+        )
+        for cap in iter_plan_capabilities(parsed_by_source[pkg], bcond, repo):
+            if "%" in cap:
+                continue
+            for src in _distgit_fetch_candidates_for_br(
+                cap,
+                repo,
+                distgit_providers=distgit_providers,
+                chain_providers=chain_providers,
+            ):
+                needers.setdefault(src, set()).add(pkg)
+    return needers
+
+
+def _collect_unsatisfied_build_dep_sources(
+    specs_by_pkg: dict[str, str],
+    parsed_by_source: dict[str, _SpecParseResult],
+    repo: Any,
+    *,
+    distgit_providers: dict[str, set[str]] | None = None,
+    scope_packages: set[str] | None = None,
+    distro_macros: dict[str, str] | None = None,
+    target_arches: set[str] | None = None,
+    solver: Any | None = None,
+) -> set[str]:
+    out: set[str] = set()
+    chain_providers = _provider_map_from_specs(parsed_by_source)
+    pkg_iter = (
+        sorted(scope_packages)
+        if scope_packages is not None
+        else sorted(parsed_by_source.keys())
+    )
+    misses: set[str] = set()
+    br_fp_cache: dict[tuple[str, ...], Any] = {}
+
+    if solver is not None:
+        for pkg in pkg_iter:
+            if pkg not in parsed_by_source:
+                continue
+            spec_text = specs_by_pkg.get(pkg) or ""
+            if not spec_text:
+                continue
+            bcond = parse_spec_bconds(
+                spec_text, distro_macros=distro_macros, target_arches=target_arches
+            )
+            leaf_ok: list[str] = []
+            for cap in iter_plan_capabilities(parsed_by_source[pkg], bcond, repo):
+                if "%" in cap:
+                    continue
+                if repo.satisfies_requirement(cap):
+                    leaf_ok.append(cap)
+                else:
+                    misses.add(cap)
+            if not leaf_ok:
+                continue
+            key = tuple(sorted(set(leaf_ok)))
+            result = br_fp_cache.get(key)
+            if result is None:
+                result = solver.resolve(key)
+                br_fp_cache[key] = result
+            if not result.ok:
+                misses.update(result.missing_provides or key)
+    else:
+        for pkg in pkg_iter:
+            if pkg not in parsed_by_source:
+                continue
+            spec_text = specs_by_pkg.get(pkg) or ""
+            if not spec_text:
+                continue
+            bcond = parse_spec_bconds(
+                spec_text, distro_macros=distro_macros, target_arches=target_arches
+            )
+            for cap in iter_plan_capabilities(parsed_by_source[pkg], bcond, repo):
+                if "%" in cap:
+                    continue
+                # leaf holes only. pathwalk of every installable BR fans out into
+                # the whole distro (perl/texlive/ghc...). dnf force covers that.
+                if not repo.satisfies_requirement(cap):
+                    misses.add(cap)
+
+    for miss in misses:
+        out.update(
+            _distgit_fetch_candidates_for_br(
+                miss,
+                repo,
+                distgit_providers=distgit_providers,
+                chain_providers=chain_providers,
+            )
+        )
+    return out
+
+
+def _has_unresolved_distgit_build_deps(
+    specs_by_pkg: dict[str, str],
+    parsed_by_source: dict[str, _SpecParseResult],
+    repo: Any,
+    *,
+    distgit_providers: dict[str, set[str]] | None = None,
+    scope_packages: set[str] | None = None,
+    distro_macros: dict[str, str] | None = None,
+    target_arches: set[str] | None = None,
+) -> bool:
+    return bool(
+        _unresolved_capabilities(
+            specs_by_pkg,
+            parsed_by_source,
+            repo,
+            distgit_providers=distgit_providers,
+            scope_packages=scope_packages,
+            distro_macros=distro_macros,
+            target_arches=target_arches,
+        )
+    )
+
+
+async def expand_unsatisfied_build_dep_sources(
+    specs: dict[str, str],
+    parsed_by_source: dict[str, _SpecParseResult],
+    repo: Any,
+    *,
+    releasename: str,
+    owner: str,
+    repo_name: str,
+    distgit_branch: str,
+    headers: dict[str, str],
+    distgit_providers: dict[str, set[str]] | None = None,
+    scope_packages: set[str] | None = None,
+    target_arches: set[str] | None = None,
+    solver: Any | None = None,
+) -> tuple[dict[str, str], dict[str, _SpecParseResult], list[str], set[str]]:
+    err: list[str] = []
+    missing_distgit: set[str] = set()
+    if not parsed_by_source:
+        return specs, parsed_by_source, err, missing_distgit
+
+    providers = distgit_providers if distgit_providers is not None else {}
+    arches = {a.lower() for a in (target_arches or set()) if a} or None
+    active_scope = set(scope_packages) if scope_packages is not None else None
+
+    max_parse = _chain_distgit_max_parse()
+    wave_size = _chain_distgit_parse_wave_size()
+    pool = _distgit_spec_parse_executor()
+    parse_fn = _spec_parse_fn(releasename, target_arches=arches)
+    distro_macros = default_distro_macros(releasename)
+    t0 = time.monotonic()
+    fetched_total = 0
+    attempted_fetch: set[str] = set()
+    timeout = httpx.Timeout(30.0, connect=10.0)
+    limits = httpx.Limits(max_connections=64, max_keepalive_connections=32)
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        headers=headers,
+        follow_redirects=True,
+        limits=limits,
+    ) as client:
+        for wave_num in range(1, 17):
+            if _has_unresolved_distgit_build_deps(
+                specs,
+                parsed_by_source,
+                repo,
+                distgit_providers=providers,
+                scope_packages=active_scope,
+                distro_macros=distro_macros,
+                target_arches=arches,
+            ):
+                n = await _resolve_capabilities_via_github(
+                    specs,
+                    parsed_by_source,
+                    repo,
+                    providers,
+                    owner=owner,
+                    repo_name=repo_name,
+                    releasename=releasename,
+                    headers=headers,
+                    scope_packages=active_scope,
+                    client=client,
+                    distgit_branch=distgit_branch,
+                    target_arches=arches,
+                )
+                if n:
+                    logger.info(
+                        "github provides lookup %s/%s: resolved=%s cached_caps=%s",
+                        releasename,
+                        distgit_branch,
+                        n,
+                        len(providers),
+                    )
+
+            candidates = await asyncio.to_thread(
+                _collect_unsatisfied_build_dep_sources,
+                specs,
+                parsed_by_source,
+                repo,
+                distgit_providers=providers,
+                scope_packages=active_scope,
+                distro_macros=distro_macros,
+                target_arches=arches,
+                solver=solver,
+            )
+            if active_scope is not None:
+                candidates |= {
+                    p
+                    for p in active_scope
+                    if p and is_distgit_source_name(p) and p not in parsed_by_source
+                }
+            needers = await asyncio.to_thread(
+                _distgit_source_needers,
+                specs,
+                parsed_by_source,
+                repo,
+                distgit_providers=providers,
+                scope_packages=active_scope,
+                distro_macros=distro_macros,
+                target_arches=arches,
+            )
+            to_fetch = sorted(
+                c for c in candidates if c not in parsed_by_source and c not in attempted_fetch
+            )
+            if not to_fetch or len(parsed_by_source) >= max_parse:
+                break
+            logger.info(
+                "builddep expand wave %s %s/%s: candidates=%s to_fetch=%s scope=%s parsed=%s",
+                wave_num,
+                releasename,
+                distgit_branch,
+                len(candidates),
+                len(to_fetch),
+                len(active_scope or ()),
+                len(parsed_by_source),
+            )
+            batch_specs = await _fetch_distgit_specs_batch(
+                client,
+                owner=owner,
+                repo=repo_name,
+                distgit_branch=distgit_branch,
+                releasename=releasename,
+                packages=to_fetch[:wave_size],
+            )
+            for pkg in to_fetch[:wave_size]:
+                if pkg not in batch_specs:
+                    attempted_fetch.add(pkg)
+                    missing_distgit.add(pkg)
+                    by = sorted(needers.get(pkg, []))
+                    who = ", ".join(by[:6]) if by else "unsatisfied build dep"
+                    err.append(
+                        f"{pkg}: not in distgit at {releasename}/{pkg}/ (needed by {who})"
+                    )
+            if not batch_specs:
+                break
+            fetched_total += len(batch_specs)
+            futures = {
+                pool.submit(parse_fn, batch_specs[pkg], f"{pkg}.spec"): pkg
+                for pkg in batch_specs
+            }
+            for fut in as_completed(futures):
+                pkg = futures[fut]
+                try:
+                    parsed = fut.result()
+                except Exception as exc:
+                    err.append(f"{pkg}: parse failed ({type(exc).__name__}: {exc})")
+                    parsed = _SpecParseResult(
+                        source_name=pkg,
+                        build_requires=[],
+                        provided_binary_names={pkg},
+                        build_requires_raw=[],
+                    )
+                specs[pkg] = batch_specs[pkg]
+                parsed_by_source[pkg] = parsed
+            # do NOT grow active_scope to every fetched provider. that walks their
+            # BRs and sucks in the whole distro. forced packages reenter via scope.
+
+    logger.info(
+        "unsatisfied builddep distgit %s/%s: fetched=%s parsed=%s in %.1fs",
+        releasename,
+        distgit_branch,
+        fetched_total,
+        len(parsed_by_source),
+        time.monotonic() - t0,
+    )
+    return specs, parsed_by_source, err, missing_distgit
+
+
+async def fetch_repo_transitive_extras_for_roots(
+    specs: dict[str, str],
+    parsed_by_source: dict[str, _SpecParseResult],
+    repo: Any,
+    roots: list[str],
+    *,
+    releasename: str,
+    owner: str,
+    repo_name: str,
+    distgit_branch: str,
+    headers: dict[str, str],
+    distgit_providers: dict[str, set[str]] | None = None,
+    target_arches: set[str] | None = None,
+    solver: Any | None = None,
+) -> tuple[dict[str, str], dict[str, _SpecParseResult], list[str]]:
+    err: list[str] = []
+    root_set = {(r or "").strip() for r in roots if (r or "").strip()}
+    if not root_set or not parsed_by_source:
+        return specs, parsed_by_source, err
+
+    arches = {a.lower() for a in (target_arches or set()) if a} or None
+    parse_fn = _spec_parse_fn(releasename, target_arches=arches)
+    t0 = time.monotonic()
+    timeout = httpx.Timeout(30.0, connect=10.0)
+    limits = httpx.Limits(max_connections=64, max_keepalive_connections=32)
+    fetched_total = 0
+    providers = distgit_providers if distgit_providers is not None else {}
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        headers=headers,
+        follow_redirects=True,
+        limits=limits,
+    ) as client:
+        for _ in range(3):
+            n = await _resolve_missing_runtime_via_github(
+                parsed_by_source,
+                repo,
+                providers,
+                owner=owner,
+                repo_name=repo_name,
+                releasename=releasename,
+                headers=headers,
+                scope_packages=root_set,
+                client=client,
+                distgit_branch=distgit_branch,
+            )
+            if n:
+                logger.info(
+                    "runtime provides lookup %s/%s: resolved=%s cached_caps=%s",
+                    releasename,
+                    distgit_branch,
+                    n,
+                    len(providers),
+                )
+            candidates = await asyncio.to_thread(
+                _collect_repo_transitive_candidates,
+                parsed_by_source,
+                repo,
+                scope_packages=root_set,
+                distgit_providers=providers,
+                solver=solver,
+            )
+            to_fetch = sorted(c for c in candidates if c not in parsed_by_source)
+            if not to_fetch:
+                break
+            batch_specs = await _fetch_distgit_specs_batch(
+                client,
+                owner=owner,
+                repo=repo_name,
+                distgit_branch=distgit_branch,
+                releasename=releasename,
+                packages=to_fetch[:16],
+            )
+            if not batch_specs:
+                break
+            fetched_total += len(batch_specs)
+            for pkg, text in batch_specs.items():
+                try:
+                    parsed = await asyncio.to_thread(parse_fn, text, f"{pkg}.spec")
+                except Exception as exc:
+                    err.append(f"{pkg}: parse failed ({type(exc).__name__}: {exc})")
+                    parsed = _SpecParseResult(
+                        source_name=pkg,
+                        build_requires=[],
+                        provided_binary_names={pkg},
+                        build_requires_raw=[],
+                    )
+                specs[pkg] = text
+                parsed_by_source[pkg] = parsed
+                for cap in list(parsed.provided_binary_names) + [pkg]:
+                    add_capability_providers(providers, cap, {pkg})
+
+    logger.info(
+        "repo transitive extras %s/%s: fetched=%s in %.1fs",
+        releasename,
+        distgit_branch,
+        fetched_total,
+        time.monotonic() - t0,
+    )
+    return specs, parsed_by_source, err
+
+
+async def expand_closure_for_repo_transitive_deps(
+    specs: dict[str, str],
+    parsed_by_source: dict[str, _SpecParseResult],
+    repo: Any,
+    *,
+    releasename: str,
+    owner: str,
+    repo_name: str,
+    distgit_branch: str,
+    headers: dict[str, str],
+    scope_packages: set[str] | None = None,
+) -> tuple[dict[str, str], dict[str, _SpecParseResult], list[str]]:
+    err: list[str] = []
+    if not parsed_by_source:
+        return specs, parsed_by_source, err
+
+    max_parse = _chain_distgit_max_parse()
+    wave_size = _chain_distgit_parse_wave_size()
+    pool = _distgit_spec_parse_executor()
+    parse_fn = _spec_parse_fn(releasename)
+    t0 = time.monotonic()
+    fetched_extra = 0
+    logger.info(
+        "repo transitive distgit closure %s/%s: start parsed=%s",
+        releasename,
+        distgit_branch,
+        len(parsed_by_source),
+    )
+
+    timeout = httpx.Timeout(30.0, connect=10.0)
+    limits = httpx.Limits(max_connections=64, max_keepalive_connections=32)
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        headers=headers,
+        follow_redirects=True,
+        limits=limits,
+    ) as client:
+        max_waves = _chain_repo_transitive_max_waves()
+        wave_num = 0
+        to_fetch: list[str] = []
+        attempted_fetch: set[str] = set()
+        while len(parsed_by_source) <= max_parse and wave_num < max_waves:
+            wave_num += 1
+            candidates = await asyncio.to_thread(
+                _collect_repo_transitive_candidates,
+                parsed_by_source,
+                repo,
+                scope_packages=scope_packages,
+            )
+            to_fetch = sorted(
+                c for c in candidates if c not in parsed_by_source and c not in attempted_fetch
+            )
+            logger.info(
+                "repo transitive wave %s/%s %s/%s: candidates=%s to_fetch=%s parsed=%s",
+                wave_num,
+                max_waves,
+                releasename,
+                distgit_branch,
+                len(candidates),
+                len(to_fetch),
+                len(parsed_by_source),
+            )
+            if not to_fetch:
+                break
+
+            wave_added = False
+            for off in range(0, len(to_fetch), wave_size):
+                wave = to_fetch[off : off + wave_size]
+                batch_specs = await _fetch_distgit_specs_batch(
+                    client,
+                    owner=owner,
+                    repo=repo_name,
+                    distgit_branch=distgit_branch,
+                    releasename=releasename,
+                    packages=wave,
+                )
+                for pkg in wave:
+                    if pkg not in batch_specs:
+                        attempted_fetch.add(pkg)
+                if not batch_specs:
+                    continue
+                wave_added = True
+                fetched_extra += len(batch_specs)
+                futures = {
+                    pool.submit(parse_fn, batch_specs[pkg], f"{pkg}.spec"): pkg
+                    for pkg in batch_specs
+                }
+                for fut in as_completed(futures):
+                    pkg = futures[fut]
+                    try:
+                        parsed = fut.result()
+                    except Exception as exc:
+                        err.append(f"{pkg}: parse failed ({type(exc).__name__}: {exc})")
+                        parsed = _SpecParseResult(
+                            source_name=pkg,
+                            build_requires=[],
+                            provided_binary_names={pkg},
+                            build_requires_raw=[],
+                        )
+                    specs[pkg] = batch_specs[pkg]
+                    parsed_by_source[pkg] = parsed
+            if not wave_added:
+                break
+
+    if wave_num >= max_waves and to_fetch:
+        err.append(
+            f"Repo transitive distgit closure hit OREON_CHAIN_REPO_TRANSITIVE_MAX_WAVES ({max_waves}); some runtime deps may be missing."
+        )
+
+    if len(parsed_by_source) > max_parse:
+        err.append(
+            f"Chain distgit closure exceeded OREON_CHAIN_DISTGIT_MAX_PARSE ({max_parse}); narrow the chain spec."
+        )
+
+    logger.info(
+        "repo transitive distgit closure %s/%s: parsed=%s extra_fetched=%s in %.1fs",
+        releasename,
+        distgit_branch,
+        len(parsed_by_source),
+        fetched_extra,
+        time.monotonic() - t0,
+    )
     return specs, parsed_by_source, err
 
 
@@ -706,7 +2614,7 @@ async def compute_distgit_build_order_for_chain(
         len(found),
         time.monotonic() - t_index,
     )
-    parsed_by_source, perr = await _parse_specs_parallel_async(specs_by_pkg)
+    parsed_by_source, perr = await _parse_specs_parallel_async(specs_by_pkg, releasename=releasename)
     err.extend(perr)
     return _distgit_order_from_parsed(
         releasename=releasename,
@@ -802,7 +2710,7 @@ async def compute_distgit_build_order(
     if not specs_by_pkg and not err:
         err.append(f"No packages with specs found under {releasename}/ on branch {distgit_branch}")
 
-    parsed_by_source, perr = await _parse_specs_parallel_async(specs_by_pkg)
+    parsed_by_source, perr = await _parse_specs_parallel_async(specs_by_pkg, releasename=releasename)
     err.extend(perr)
     return _distgit_order_from_parsed(
         releasename=releasename,
@@ -912,8 +2820,9 @@ async def compute_spec_tree_dependency_plan(
 
     loop = asyncio.get_running_loop()
     pool = _distgit_spec_parse_executor()
+    parse_fn = _spec_parse_fn(releasename)
     tasks = [
-        loop.run_in_executor(pool, _parse_spec_text, spec_text, f"{pkg}.spec")
+        loop.run_in_executor(pool, parse_fn, spec_text, f"{pkg}.spec")
         for pkg, spec_text in specs_by_pkg.items()
     ]
     parse_results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -932,8 +2841,8 @@ async def compute_spec_tree_dependency_plan(
     deps_all: dict[str, set[str]] = {n: set() for n in names_set}
     rdeps_all: dict[str, set[str]] = {n: set() for n in names_set}
     for cons, parsed in parsed_by_source.items():
-        for br in parsed.build_requires:
-            providers = provider_map.get(br) or set()
+        for dep in parsed.dependency_names():
+            providers = provider_map.get(dep) or set()
             valid_providers = [p for p in providers if p in names_set and p != cons]
             if not valid_providers:
                 if br not in names_set:

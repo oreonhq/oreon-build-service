@@ -363,24 +363,73 @@ async def trigger_chain_build_endpoint(
     db: DbSession,
     user: CurrentUser,
 ):
+    from oreon_build.core.repo_branch import release_distgit_branch
     from oreon_build.services.build_chain import trigger_chain_build as run_chain_build
-    from oreon_build.services.build_trigger_bg import run_chain_trigger_enqueue, spawn
-
-    chain, _, _ = await run_chain_build(
-        db,
-        request,
-        user,
-        chain_spec=data.chain_spec,
-        release_id=data.release_id,
-        architectures=data.architectures,
-        preferred_mock_environment_id=data.preferred_mock_environment_id,
-        distgit_url=data.distgit_url,
-        distgit_branch=data.distgit_branch,
-        priority=data.priority,
-        defer_enqueue=True,
+    from oreon_build.services.build_planner import chain_spec_root_packages
+    from oreon_build.services.build_trigger_bg import (
+        run_auto_chain_plan_and_enqueue,
+        run_chain_trigger_enqueue,
+        spawn,
     )
-    await db.commit()
-    spawn(run_chain_trigger_enqueue(chain.id))
+
+    rel_result = await db.execute(select(Release).where(Release.id == data.release_id))
+    release = rel_result.scalar_one_or_none()
+    if not release:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Release not found")
+
+    distgit_url = (data.distgit_url or "https://github.com/oreonhq/rpm-specfiles.git").strip()
+    distgit_branch = (data.distgit_branch or release_distgit_branch(release)).strip()
+    architectures = list(data.architectures or ["x86_64", "aarch64"])
+    chain_spec = (data.chain_spec or "").strip()
+    release_id = int(data.release_id)
+    priority = int(data.priority or 0)
+    pref_mock = data.preferred_mock_environment_id
+
+    if data.auto_resolve:
+        roots = chain_spec_root_packages(chain_spec)
+        if not roots:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No package names in chain spec")
+        placeholder_spec = " ".join(roots)
+        chain, _, _ = await run_chain_build(
+            db,
+            request,
+            user,
+            chain_spec=placeholder_spec,
+            release_id=release_id,
+            architectures=architectures,
+            preferred_mock_environment_id=pref_mock,
+            distgit_url=distgit_url,
+            distgit_branch=distgit_branch,
+            priority=priority,
+            defer_enqueue=True,
+            plan_pending_roots=roots,
+        )
+        await db.commit()
+        spawn(run_auto_chain_plan_and_enqueue(chain.id))
+        msg = (
+            f"Chain {chain.id} accepted. Dependency planning runs in the background, "
+            "then jobs queue automatically."
+        )
+    else:
+        if not chain_spec:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="chain_spec is empty")
+        chain, _, _ = await run_chain_build(
+            db,
+            request,
+            user,
+            chain_spec=chain_spec,
+            release_id=release_id,
+            architectures=architectures,
+            preferred_mock_environment_id=pref_mock,
+            distgit_url=distgit_url,
+            distgit_branch=distgit_branch,
+            priority=priority,
+            defer_enqueue=True,
+        )
+        await db.commit()
+        spawn(run_chain_trigger_enqueue(chain.id))
+        msg = "Chain accepted. Stage jobs are being queued in the background."
+
     stages_raw = chain.stages_json if isinstance(chain.stages_json, list) else []
     stages: list[list[str]] = [[str(n) for n in grp] for grp in stages_raw if isinstance(grp, list)]
     return ChainBuildTriggerResponse(
@@ -390,7 +439,7 @@ async def trigger_chain_build_endpoint(
         chain_spec=chain.chain_spec,
         jobs=[],
         accepted=True,
-        message="Chain accepted. Stage jobs are being queued in the background.",
+        message=msg,
     )
 
 
@@ -401,9 +450,9 @@ async def ci_chain_trigger_endpoint(
     db: DbSession,
     user: CurrentUser,
 ):
+    from oreon_build.core.repo_branch import release_distgit_branch
     from oreon_build.services.build_chain import trigger_chain_build as run_chain_build
-    from oreon_build.services.build_trigger_bg import run_chain_trigger_enqueue, spawn
-    from oreon_build.services.distgit_order import compute_distgit_build_order_for_chain
+    from oreon_build.services.build_trigger_bg import run_auto_chain_plan_and_enqueue, spawn
 
     rel_result = await db.execute(select(Release).where(Release.id == data.release_id))
     release = rel_result.scalar_one_or_none()
@@ -411,41 +460,32 @@ async def ci_chain_trigger_endpoint(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Release not found")
 
     distgit_url = data.distgit_url or "https://github.com/oreonhq/rpm-specfiles.git"
+    distgit_branch = (data.distgit_branch or release_distgit_branch(release)).strip()
+    architectures = list(data.architectures or ["x86_64", "aarch64"])
+    root_packages = list(data.packages)
+    release_id = int(data.release_id)
+    priority = int(data.priority or 0)
 
-    order = await compute_distgit_build_order_for_chain(
-        releasename=release.releasename,
-        distgit_url=distgit_url,
-        distgit_branch=data.distgit_branch,
-        root_packages=data.packages,
-    )
-    if order.errors:
-        logger.warning("CI chain dependency resolution errors: %s", order.errors)
-    if not order.layers:
-        chain_spec = " ".join(data.packages)
-    else:
-        chain_spec = " : ".join(" ".join(layer) for layer in order.layers if layer)
+    if not root_packages:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No packages provided")
 
-    if not chain_spec.strip():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Dependency resolution produced empty chain spec.",
-        )
-
+    placeholder_spec = " ".join(root_packages)
     chain, _, _ = await run_chain_build(
         db,
         request,
         user,
-        chain_spec=chain_spec,
-        release_id=data.release_id,
-        architectures=data.architectures,
+        chain_spec=placeholder_spec,
+        release_id=release_id,
+        architectures=architectures,
         preferred_mock_environment_id=None,
         distgit_url=distgit_url,
-        distgit_branch=data.distgit_branch,
-        priority=data.priority,
+        distgit_branch=distgit_branch,
+        priority=priority,
         defer_enqueue=True,
+        plan_pending_roots=root_packages,
     )
     await db.commit()
-    spawn(run_chain_trigger_enqueue(chain.id))
+    spawn(run_auto_chain_plan_and_enqueue(chain.id))
 
     stages_raw = chain.stages_json if isinstance(chain.stages_json, list) else []
     stages: list[list[str]] = [[str(n) for n in grp] for grp in stages_raw if isinstance(grp, list)]
@@ -455,7 +495,10 @@ async def ci_chain_trigger_endpoint(
         stages=stages,
         chain_spec=chain.chain_spec,
         accepted=True,
-        message="CI chain accepted. Dependencies resolved and stage jobs are being queued.",
+        message=(
+            f"CI chain {chain.id} accepted. Dependency planning runs in the background, "
+            "then jobs queue automatically."
+        ),
     )
 
 
@@ -507,6 +550,7 @@ async def _chain_to_status_response(db: DbSession, chain: BuildChain) -> ChainSt
     stages: list[list[str]] = [[str(n) for n in grp] for grp in stages_raw if isinstance(grp, list)]
     rel = await db.get(Release, chain.release_id)
     job_n = await db.scalar(select(func.count()).select_from(BuildJob).where(BuildJob.chain_id == chain.id))
+    opt = chain.chain_options if isinstance(chain.chain_options, dict) else {}
     return ChainStatusResponse(
         chain_id=chain.id,
         status=chain.status.value,
@@ -515,6 +559,7 @@ async def _chain_to_status_response(db: DbSession, chain: BuildChain) -> ChainSt
         chain_spec=chain.chain_spec,
         error_message=chain.error_message,
         job_count=int(job_n or 0),
+        planning=bool(opt.get("plan_pending")),
         releasename=(rel.releasename if rel else None),
         created_at=chain.created_at,
         updated_at=chain.updated_at,

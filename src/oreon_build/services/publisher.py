@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from pathlib import Path
 from typing import List
@@ -452,15 +453,18 @@ def _sync_rpms_dir_from_r2(
                     need_fetch = False
                     etag_cache[fname] = etag
                     cache_dirty = True
-            else:
-                need_fetch = False
+            # no strong etag: never trust size alone. R2 can replace bytes at same size.
 
         if not need_fetch:
             continue
         data = client.get_object(key)
         if not data:
             raise RuntimeError(f"missing or empty RPM object at {key!r}, aborting repodata update")
-        dest.write_bytes(data)
+        _write_staged_rpm(dest, data)
+        if dest.stat().st_size != len(data):
+            raise RuntimeError(
+                f"local RPM write size mismatch for {dest}: got {dest.stat().st_size} expected {len(data)}"
+            )
         fetched += 1
         if etag and _r2_etag_strong_content_md5(etag):
             etag_cache[fname] = etag
@@ -472,7 +476,48 @@ def _sync_rpms_dir_from_r2(
     if fetched:
         logger.info("Fetched %d new/changed RPMs from R2 under %s", fetched, rpms_prefix)
 
-    return len(wanted)
+    return len(wanted), fetched
+
+
+def _repair_corrupt_local_rpms(
+    client: R2Client,
+    rpms_prefix: str,
+    rpms_dir: Path,
+) -> int:
+    if not rpms_dir.is_dir():
+        return 0
+    repaired = 0
+    removed = 0
+    for path in list(rpms_dir.glob("*.rpm")):
+        try:
+            sz = path.stat().st_size
+        except OSError:
+            continue
+        bad = sz <= 0
+        if not bad:
+            continue
+        key = f"{rpms_prefix}{path.name}"
+        data = client.get_object(key)
+        if data:
+            _write_staged_rpm(path, data)
+            if path.stat().st_size == len(data) and path.stat().st_size > 0:
+                repaired += 1
+                logger.warning("Re-fetched corrupt local RPM from R2: %s (%s bytes)", path.name, len(data))
+                continue
+        try:
+            path.unlink()
+            removed += 1
+            logger.warning("Removed unreadable local RPM %s (size=%s)", path.name, sz)
+        except OSError as e:
+            logger.warning("Could not remove corrupt local RPM %s: %s", path, e)
+    if repaired or removed:
+        logger.info(
+            "Local RPM repair under %s repaired=%s removed=%s",
+            rpms_dir,
+            repaired,
+            removed,
+        )
+    return repaired + removed
 
 def _list_repodata_keys(client: R2Client, r2_prefix: str) -> list[str]:
     repodata_prefix = f"{r2_prefix}/repodata/"
@@ -521,6 +566,116 @@ def _clear_createrepo_cache(container: Path) -> None:
             shutil.rmtree(d)
         except OSError as e:
             logger.warning("Could not clear createrepo cache %s: %s", d, e)
+
+def _sync_repodata_from_r2(client: R2Client, r2_prefix: str, repodata_dir: Path) -> int:
+    repodata_dir.mkdir(parents=True, exist_ok=True)
+    keys = _list_repodata_keys(client, r2_prefix)
+    written = 0
+    for key in keys:
+        fname = key.rsplit("/", 1)[-1]
+        if not fname:
+            continue
+        data = client.get_object(key)
+        if not data:
+            continue
+        (repodata_dir / fname).write_bytes(data)
+        written += 1
+    return written
+
+
+def _drop_local_rpms_not_in_wanted(
+    rpms_dir: Path,
+    wanted: set[str],
+    *,
+    container: Path | None = None,
+) -> list[str]:
+    """Remove local stage RPMs that are gone from R2.
+
+    Prune deletes R2 objects but warm-stage publishes used to skip a full
+    mirror sync, so createrepo --update kept advertising the dead NEVRAs.
+    """
+    if not rpms_dir.is_dir():
+        return []
+    dropped: list[str] = []
+    for path in list(rpms_dir.glob("*.rpm")):
+        if path.name in wanted:
+            continue
+        try:
+            path.unlink()
+            dropped.append(path.name)
+        except OSError as e:
+            logger.warning("Could not remove stale local RPM %s: %s", path, e)
+    if dropped:
+        _invalidate_etag_cache_entries(container, set(dropped))
+        logger.info(
+            "Dropped %s local RPMs absent from R2 under %s (sample=%s)",
+            len(dropped),
+            rpms_dir,
+            dropped[:8],
+        )
+    return dropped
+
+
+def _invalidate_etag_cache_entries(container: Path | None, filenames: set[str]) -> None:
+    if not container or not filenames:
+        return
+    cache = _load_etag_cache(container)
+    dirty = False
+    for fname in filenames:
+        if fname in cache:
+            cache.pop(fname, None)
+            dirty = True
+    if dirty:
+        _save_etag_cache(container, cache)
+
+
+def _refresh_staged_rpms_from_r2(
+    client: R2Client,
+    rpms_prefix: str,
+    rpms_dir: Path,
+    staged: list[str],
+    *,
+    container: Path | None = None,
+) -> None:
+    rpms_dir.mkdir(parents=True, exist_ok=True)
+    for fname in staged:
+        data = client.get_object(f"{rpms_prefix}{fname}")
+        if not data:
+            raise RuntimeError(f"staged RPM missing on R2: {rpms_prefix}{fname}")
+        _write_staged_rpm(rpms_dir / fname, data)
+    _invalidate_etag_cache_entries(container, set(staged))
+
+
+def _ensure_local_repodata_baseline(
+    client: R2Client,
+    r2_prefix: str,
+    repo_root: Path,
+    *,
+    min_packages: int,
+) -> None:
+    if _repodata_looks_valid(repo_root, min_packages=min_packages):
+        return
+    logger.warning(
+        "Local repodata missing or truncated at %s, pulling repodata baseline from R2",
+        r2_prefix,
+    )
+    _sync_repodata_from_r2(client, r2_prefix, repo_root / "repodata")
+    if not _repodata_looks_valid(repo_root, min_packages=min_packages):
+        raise RuntimeError(
+            f"Cannot run incremental repodata update for {r2_prefix}: "
+            "no valid repodata on local stage or R2. Run an explicit full regen."
+        )
+
+
+def _write_staged_rpm(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    path.write_bytes(data)
+    os.utime(path, None)
+
 
 def _run_createrepo(
     repo_dir: Path,
@@ -577,19 +732,41 @@ def _run_createrepo(
         if comps_file is not None and comps_file.exists():
             cmd += ["--groupfile", str(comps_file)]
         try:
-            subprocess.run(
+            proc = subprocess.run(
                 cmd,
-                check=True,
+                check=False,
                 stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
                 timeout=timeout_s,
             )
         except subprocess.TimeoutExpired as e:
             raise RuntimeError(
                 f"createrepo_c timed out after {timeout_s}s for repo_root={repo_dir} workers={workers}"
             ) from e
+        stderr = (proc.stderr or "").strip()
+        stdout = (proc.stdout or "").strip()
+        if stderr:
+            for line in stderr.splitlines()[-40:]:
+                logger.warning("createrepo_c: %s", line)
+        if stdout:
+            for line in stdout.splitlines()[-20:]:
+                logger.info("createrepo_c: %s", line)
         repomd = repo_dir / "repodata" / "repomd.xml"
+        if proc.returncode != 0:
+            if proc.returncode == 2 and repomd.exists() and repomd.stat().st_size > 0:
+                logger.warning(
+                    "createrepo_c exited %s with invalid-package warnings but wrote %s; continuing",
+                    proc.returncode,
+                    repomd,
+                )
+            else:
+                detail = stderr or stdout or f"exit {proc.returncode}"
+                raise RuntimeError(
+                    f"createrepo_c failed repo_root={repo_dir} workers={workers}: {detail}"
+                )
         if not repomd.exists():
-            raise RuntimeError(f"createrepo_c reported success but {repomd} is missing")
+            raise RuntimeError(f"createrepo_c finished but {repomd} is missing")
         logger.info("createrepo_c finished repo_root=%s workers=%s update=%s", repo_dir, workers, use_update)
 
     _cleanup_tmp_repodata()
@@ -622,11 +799,68 @@ def _upload_repodata_dir_ordered(client: R2Client, r2_prefix: str, repodata_dir:
         r2_key = f"{r2_prefix}/repodata/{name}"
         client.put_object(r2_key, f.read_bytes())
 
+def _count_primary_packages(repodata_dir: Path) -> int:
+    if not repodata_dir.is_dir():
+        return 0
+    primary_file: Path | None = None
+    for f in repodata_dir.iterdir():
+        if f.is_file() and "primary" in f.name and f.stat().st_size > 256:
+            primary_file = f
+            break
+    if primary_file is None:
+        return 0
+    raw = primary_file.read_bytes()
+    try:
+        if primary_file.name.endswith(".zst"):
+            with tempfile.TemporaryDirectory() as td:
+                zst = Path(td) / primary_file.name
+                zst.write_bytes(raw)
+                out = Path(td) / "primary.xml"
+                subprocess.run(
+                    ["zstd", "-d", "-f", str(zst), "-o", str(out)],
+                    check=True,
+                    capture_output=True,
+                )
+                proot = ET.parse(out).getroot()
+        elif primary_file.name.endswith(".gz"):
+            import gzip
+
+            proot = ET.fromstring(gzip.decompress(raw))
+        else:
+            proot = ET.fromstring(raw)
+    except Exception as exc:
+        logger.warning("Could not read primary metadata %s: %s", primary_file, exc)
+        return 0
+    return len(proot.findall("{http://linux.duke.edu/metadata/common}package"))
+
+
+def _validate_repodata_sane(repo_root: Path, *, min_packages: int) -> None:
+    repodata_dir = repo_root / "repodata"
+    repomd = repodata_dir / "repomd.xml"
+    if not repomd.is_file():
+        raise RuntimeError(f"createrepo produced no repomd.xml under {repodata_dir}")
+    pkgs = _count_primary_packages(repodata_dir)
+    floor = max(1, int(min_packages * 0.9))
+    if pkgs < floor:
+        raise RuntimeError(
+            f"repodata sanity check failed: primary has {pkgs} packages, expected at least {floor} "
+            f"(rpm_count={min_packages}). Refusing to upload truncated metadata."
+        )
+
+
+def _repodata_looks_valid(repo_root: Path, *, min_packages: int = 100) -> bool:
+    repodata = repo_root / "repodata"
+    if not (repodata / "repomd.xml").is_file():
+        return False
+    return _count_primary_packages(repodata) >= max(1, int(min_packages * 0.9))
+
+
 def update_repodata_at_prefix(
     r2_prefix: str,
     r2_client: R2Client | None = None,
     *,
     force_full: bool = False,
+    staged_binaries: list[str] | None = None,
 ) -> bool:
     client = r2_client or get_r2_client()
     rpms_prefix = f"{r2_prefix}/RPMS/"
@@ -647,14 +881,91 @@ def update_repodata_at_prefix(
     rpms_dir = repo_root / "RPMS"
     try:
         with _repo_stage_lock(container):
-            _progress(f"{r2_prefix} syncing RPMs to local stage (may take a while)")
-            n = _sync_rpms_dir_from_r2(client, rpms_prefix, rpms_dir, container=container)
-            _progress(f"{r2_prefix} synced {n} RPMs, running createrepo_c")
-            _run_createrepo(repo_root, container=container, force_full=force_full)
+            staged = [b for b in (staged_binaries or []) if b and b.endswith(".rpm")]
+            has_local_rpms = any(rpms_dir.glob("*.rpm")) if rpms_dir.is_dir() else False
+            local_rpm_count = sum(1 for _ in rpms_dir.glob("*.rpm")) if has_local_rpms else 0
+            local_mirror_ready = has_local_rpms and local_rpm_count >= max(
+                100, int(len(rpm_keys) * 0.9)
+            )
+            rpm_count = local_rpm_count or len(rpm_keys)
+
+            if staged:
+                wanted = {k.split("/")[-1] for k in rpm_keys}
+                if not local_mirror_ready:
+                    _progress(f"{r2_prefix} syncing RPM mirror for staged publish")
+                    rpm_count, _synced = _sync_rpms_dir_from_r2(
+                        client, rpms_prefix, rpms_dir, container=container
+                    )
+                else:
+                    # prune deletes R2 only. drop dead locals or --update keeps ghosts.
+                    _drop_local_rpms_not_in_wanted(
+                        rpms_dir, wanted, container=container
+                    )
+                    rpm_count = sum(1 for _ in rpms_dir.glob("*.rpm")) if rpms_dir.is_dir() else 0
+                try:
+                    _ensure_local_repodata_baseline(
+                        client, r2_prefix, repo_root, min_packages=len(rpm_keys)
+                    )
+                    staged_force_full = False
+                except RuntimeError as e:
+                    logger.warning(
+                        "%s; falling back to full createrepo for %s",
+                        e,
+                        r2_prefix,
+                    )
+                    staged_force_full = True
+                if staged_force_full:
+                    logger.info(
+                        "Full createrepo for %s after mirror sync local_rpms=%s (skipping per-RPM staged refresh of %s files)",
+                        r2_prefix,
+                        rpm_count,
+                        len(staged),
+                    )
+                else:
+                    _refresh_staged_rpms_from_r2(
+                        client, rpms_prefix, rpms_dir, staged, container=container
+                    )
+                    logger.info(
+                        "Staged repodata update %s staged=%s local_rpms=%s",
+                        r2_prefix,
+                        len(staged),
+                        rpm_count,
+                    )
+                _repair_corrupt_local_rpms(client, rpms_prefix, rpms_dir)
+                if container is not None:
+                    _clear_createrepo_cache(container)
+                _run_createrepo(repo_root, container=container, force_full=staged_force_full)
+            elif local_mirror_ready and force_full:
+                logger.info(
+                    "Local-only full repodata regen %s rpms=%s (skipping R2 RPM sync)",
+                    r2_prefix,
+                    rpm_count,
+                )
+                _repair_corrupt_local_rpms(client, rpms_prefix, rpms_dir)
+                if container is not None:
+                    _clear_createrepo_cache(container)
+                _run_createrepo(repo_root, container=container, force_full=True)
+            else:
+                _progress(f"{r2_prefix} syncing RPMs to local stage (may take a while)")
+                rpm_count, fetched = _sync_rpms_dir_from_r2(
+                    client, rpms_prefix, rpms_dir, container=container
+                )
+                _progress(f"{r2_prefix} synced {rpm_count} RPMs ({fetched} fetched), running createrepo_c")
+                if fetched == 0 and not force_full:
+                    repodata_local = _repodata_looks_valid(repo_root, min_packages=len(rpm_keys))
+                    if repodata_local:
+                        logger.info("No RPM changes at %s, skipping createrepo_c", r2_prefix)
+                        return True
+                _repair_corrupt_local_rpms(client, rpms_prefix, rpms_dir)
+                if container is not None:
+                    _clear_createrepo_cache(container)
+                _run_createrepo(repo_root, container=container, force_full=force_full)
+
             _progress(f"{r2_prefix} createrepo_c done, uploading repodata to R2")
             repodata_dir = repo_root / "repodata"
             if repodata_dir.exists():
-                new_filenames = {f.name for f in repodata_dir.iterdir()}
+                _validate_repodata_sane(repo_root, min_packages=rpm_count)
+                new_filenames = {f.name for f in repodata_dir.iterdir() if f.is_file()}
 
                 repomd = repodata_dir / "repomd.xml"
                 if repomd.exists():
@@ -663,7 +974,12 @@ def update_repodata_at_prefix(
                 _upload_repodata_dir_ordered(client, r2_prefix, repodata_dir)
 
                 _cleanup_old_repodata(client, r2_prefix, new_filenames)
-                logger.info("Updated repodata at R2 prefix %s (%s RPMs in metadata)", r2_prefix, n)
+                logger.info(
+                    "Updated repodata at R2 prefix %s (%s RPMs, primary=%s packages)",
+                    r2_prefix,
+                    rpm_count,
+                    _count_primary_packages(repodata_dir),
+                )
                 return True
             logger.error("createrepo_c produced no repodata under %s", repo_root)
             return False

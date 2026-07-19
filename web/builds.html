@@ -107,14 +107,17 @@
               </div>
             </div>
             <div id="source-chainbuild-panel" class="source-panel" style="display:none;">
-              <label>Chain build (manual stages)</label>
+            <label>Chain build</label>
               <p style="color:var(--text-muted); font-size:0.85rem; margin-bottom:0.5rem;">
-                You list every package and stage yourself. Uses distgit spec paths like the DistGit tab.
-                Colon <code>:</code> = parallel in one stage. Next stage starts after the previous stage is published.
-                No colon = one package per stage in order.
-                If a job in the current stage fails or is cancelled, the rest of that stage is cancelled. Fix specs and Resume with the chain id.
+                List package names (spaces). With auto-resolve on, the service walks BuildRequires and Requires,
+                skips what is already in the Oreon repo, orders layers, and can run bootstrap then full passes.
+                Turn off auto-resolve to set stages yourself with colons.
               </p>
-              <textarea id="chainbuild-spec" class="form-control" rows="4" placeholder="Example (parallel then next):&#10;kactivities kdelibs : kde-workspace&#10;&#10;Sequential only:&#10;bash grep coreutils"></textarea>
+              <label class="inline-check-label" style="display:flex; align-items:center; gap:0.5rem; font-weight:400; margin-bottom:0.5rem; cursor:pointer; color:var(--text);">
+                <input type="checkbox" id="chainbuild-auto-resolve" checked style="width:auto; min-width:0; max-width:none; margin:0; flex:0 0 auto;">
+                <span>Auto-resolve dependencies (BuildRequires + Requires)</span>
+              </label>
+              <textarea id="chainbuild-spec" class="form-control" rows="4" placeholder="Example roots:&#10;firefox&#10;&#10;Manual stages (auto-resolve off):&#10;kactivities kdelibs : kde-workspace"></textarea>
               <div style="margin-top:0.75rem; padding-top:0.75rem; border-top:1px solid var(--border-color,#e5e5e5);">
                 <span style="font-size:0.9rem; font-weight:500;">Resume from a previous chain</span>
                 <p style="color:var(--text-muted); font-size:0.82rem; margin:0.3rem 0 0.45rem 0;">Starts a new chain with the same spec and picks up from the first stage that did not fully finish. Slots that already built and published in the old chain are not re-queued.</p>
@@ -256,6 +259,11 @@
         if (st === 'success') {
           showChainAlert('success', 'Chain ' + data.chain_id + ' finished', '<p>All stages completed.</p>');
           stopChainPoll();
+          return;
+        }
+        if (data.planning) {
+          showChainAlert('info', 'Chain ' + data.chain_id + ': planning dependencies',
+            '<p>Fetching distgit specs and resolving build order. Jobs queue when this finishes.</p>');
           return;
         }
         showChainAlert('info', 'Chain ' + data.chain_id + ': ' + st,
@@ -840,7 +848,8 @@
             chain_spec: chainRaw,
             release_id: selectedReleaseIdNew,
             architectures: arches,
-            distgit_branch: getDistgitBranch()
+            distgit_branch: getDistgitBranch(),
+            auto_resolve: !!(document.getElementById('chainbuild-auto-resolve') && document.getElementById('chainbuild-auto-resolve').checked)
           };
           var mockChain = (document.getElementById('new-package-mock-env') && document.getElementById('new-package-mock-env').value || '').trim();
           if (mockChain) chainBody.preferred_mock_environment_id = parseInt(mockChain, 10);

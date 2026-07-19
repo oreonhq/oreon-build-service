@@ -137,6 +137,24 @@ async def lifespan(app: FastAPI):
         else:
             logger.exception("Skipping role/admin startup bootstrap due to startup DB error")
 
+    try:
+        from oreon_build.services.build_chain import list_interrupted_chain_planning
+        from oreon_build.services.build_trigger_bg import run_auto_chain_plan_and_enqueue, spawn
+
+        async with async_session_maker() as db:
+            try:
+                resume_ids = await list_interrupted_chain_planning(db)
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+        if resume_ids:
+            logger.info("Resuming interrupted chain planning chain_ids=%s", resume_ids)
+            for cid in resume_ids:
+                spawn(run_auto_chain_plan_and_enqueue(cid))
+    except Exception:
+        logger.exception("Failed resuming interrupted chain planning on startup")
+
     sweep_task: asyncio.Task[None] | None = None
     publish_task: asyncio.Task[None] | None = None
 
@@ -153,18 +171,30 @@ async def lifespan(app: FastAPI):
             try:
                 s = get_settings()
                 interval = max(60, s.stale_build_sweep_interval_seconds)
+                chain_terminal_jobs: list[tuple[int, str]] = []
                 async with async_session_maker() as db:
                     try:
-                        await reconcile_queue_inconsistencies(db)
+                        _, _, _, cj1 = await reconcile_queue_inconsistencies(db)
+                        chain_terminal_jobs.extend(cj1)
                         await reclaim_publish_tasks_stuck_running(db, s)
                         if s.build_stale_running_minutes > 0 or s.build_stale_worker_heartbeat_minutes > 0:
-                            await sweep_stale_running_builds(db, s)
+                            _, cj2 = await sweep_stale_running_builds(db, s)
+                            chain_terminal_jobs.extend(cj2)
                         if s.build_stale_pending_minutes > 0:
-                            await sweep_stale_pending_builds(db, s)
+                            _, cj3 = await sweep_stale_pending_builds(db, s)
+                            chain_terminal_jobs.extend(cj3)
                         await db.commit()
                     except Exception:
                         await db.rollback()
                         raise
+                for job_id, reason in chain_terminal_jobs:
+                    try:
+                        from oreon_build.services.build_chain import (
+                            notify_chain_job_terminal_after_result,
+                        )
+                        await notify_chain_job_terminal_after_result(job_id, "failed", reason)
+                    except Exception:
+                        logger.exception("chain notify after stale sweep job_id=%s", job_id)
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 break

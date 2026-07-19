@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -36,8 +37,10 @@ from oreon_build.services.ci_callback import notify_chain_terminal
 from oreon_build.services.build_target_util import (
     get_or_create_build_target,
     latest_package_version_id,
+    resolve_mock_environment_id,
     resolve_package_by_name,
 )
+from oreon_build.services.build_pass import apply_plan_to_job_options, package_plan_from_chain
 
 if TYPE_CHECKING:
     from oreon_build.models import Account
@@ -45,6 +48,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_ARCH = ["x86_64", "aarch64"]
+
+
+async def _chain_package_mock_id(
+    *,
+    package_mock_environment_id: int | None,
+    trigger_mock_environment_id: int | None,
+) -> tuple[int | None, bool]:
+    """Return (package_mock_id, ignore_package_mock).
+
+    Chain "use default release" stores trigger mock as None. That must mean
+    release.default_mock_environment_id, not the package's sticky preferred mock
+    (kernel often keeps fedora-44 bootstrap from an old import pass).
+    """
+    pkg_mock = package_mock_environment_id
+    if trigger_mock_environment_id is not None:
+        return pkg_mock, False
+    # explicit chain mock not set → release default wins over package preferred
+    return pkg_mock, True
 
 
 def _job_build_terminal_ok(status: BuildStatus) -> bool:
@@ -360,7 +381,13 @@ async def fail_chain(
     notify_chain_terminal(chain.id, terminal.value, chain.error_message)
 
 
-async def on_build_job_failed_for_chain(db: Any, job: BuildJob, reason: str) -> None:
+async def on_build_job_failed_for_chain(
+    db: Any,
+    job: BuildJob,
+    reason: str,
+    *,
+    package_name: str | None = None,
+) -> None:
     if job.chain_id is None:
         return
     cres = await db.execute(select(BuildChain).where(BuildChain.id == job.chain_id).with_for_update())
@@ -369,7 +396,31 @@ async def on_build_job_failed_for_chain(db: Any, job: BuildJob, reason: str) -> 
         return
     if job.chain_stage_index is not None and job.chain_stage_index != chain.active_stage_index:
         return
-    await fail_chain(db, chain, reason, terminal=BuildChainStatus.FAILED)
+    pkg = package_name
+    if not pkg and job.package is not None:
+        pkg = job.package.name
+    await fail_chain(db, chain, _summarize_chain_job_failure(pkg, reason), terminal=BuildChainStatus.FAILED)
+
+
+def _summarize_chain_job_failure(package_name: str | None, reason: str) -> str:
+    pkg = (package_name or "build").strip()
+    text = (reason or "").strip()
+    if len(text) > 7000:
+        text = text[-7000:]
+    headline = ""
+    for line in reversed(text.splitlines()):
+        s = line.strip()
+        if not s:
+            continue
+        if re.search(
+            r"(?i)(error:|failed|fatal|no matching package|not all dependencies|recipe failed|BUILD FAILED)",
+            s,
+        ):
+            headline = s[:800]
+            break
+    if headline:
+        return f"{pkg} failed: {headline}\n\n{text}"
+    return f"{pkg} failed:\n\n{text}"
 
 
 async def on_user_cancelled_chain_job(db: Any, job: BuildJob) -> None:
@@ -500,6 +551,8 @@ async def _enqueue_chain_stage_jobs(
     publish_branch = r2_publish_branch(release)
     releasename = (release.releasename or "").strip()
     skip_slots_set = skip_package_arch_slots or set()
+    chain_opt = _options_dict(chain)
+    pkg_plans = chain_opt.get("package_plans") if isinstance(chain_opt.get("package_plans"), dict) else {}
 
     for pkg_name in pkgs:
         existing_pkg = await resolve_package_by_name(
@@ -524,7 +577,16 @@ async def _enqueue_chain_stage_jobs(
                     distgit_url=distgit_url,
                     distgit_branch=distgit_branch,
                 )
-            pref_mock = preferred_mock_environment_id or existing_pkg.preferred_mock_environment_id
+            pkg_mock_id, ignore_pkg_mock = await _chain_package_mock_id(
+                package_mock_environment_id=existing_pkg.preferred_mock_environment_id,
+                trigger_mock_environment_id=preferred_mock_environment_id,
+            )
+            pref_mock = resolve_mock_environment_id(
+                trigger_mock_environment_id=preferred_mock_environment_id,
+                package_mock_environment_id=pkg_mock_id,
+                release_default_mock_environment_id=release.default_mock_environment_id,
+                ignore_package_mock=ignore_pkg_mock,
+            )
         else:
             npd = distgit_new_package_dict(
                 pkg_name,
@@ -551,7 +613,16 @@ async def _enqueue_chain_stage_jobs(
             if npd.get("source_url"):
                 db.add(Source(package_version_id=pv.id, kind="distgit", url=npd["source_url"]))
             await db.flush()
-            pref_mock = npd["preferred_mock_environment_id"]
+            pkg_mock_id, ignore_pkg_mock = await _chain_package_mock_id(
+                package_mock_environment_id=npd["preferred_mock_environment_id"],
+                trigger_mock_environment_id=preferred_mock_environment_id,
+            )
+            pref_mock = resolve_mock_environment_id(
+                trigger_mock_environment_id=preferred_mock_environment_id,
+                package_mock_environment_id=pkg_mock_id,
+                release_default_mock_environment_id=release.default_mock_environment_id,
+                ignore_package_mock=ignore_pkg_mock,
+            )
             if triggered_by_id is not None:
                 await log_audit(
                     db,
@@ -568,6 +639,13 @@ async def _enqueue_chain_stage_jobs(
             canon = normalize_machine_arch(arch)
             if not workers_by_arch.get(canon, False):
                 continue
+            plan = package_plan_from_chain(chain_opt, pkg_name) or pkg_plans.get(pkg_name, {})
+            ex_raw = plan.get("exclusive_arches") if isinstance(plan, dict) else None
+            if isinstance(ex_raw, (list, tuple, set)) and ex_raw:
+                allowed = {normalize_machine_arch(str(a)) for a in ex_raw if str(a).strip()}
+                if allowed and canon not in allowed:
+                    skip_slots += 1
+                    continue
             target = await get_or_create_build_target(db, chain.release_id, canon, pref_mock)
             if (package_id, canon) in skip_slots_set:
                 skip_slots += 1
@@ -585,6 +663,7 @@ async def _enqueue_chain_stage_jobs(
                 chain_id=chain.id,
                 chain_stage_index=stage_index,
             )
+            apply_plan_to_job_options(job, plan if isinstance(plan, dict) else {})
             db.add(job)
             await db.flush()
             jobs_created.append(job)
@@ -605,7 +684,7 @@ async def _enqueue_chain_stage_jobs(
     chain.stage_publish_done = 0
 
     if expected_jobs == 0:
-        if skip_slots > 0 and advance_if_stage_satisfied_by_skips:
+        if skip_slots > 0:
             await _advance_chain_after_stage_complete(db, chain)
         else:
             await fail_chain(
@@ -631,6 +710,8 @@ async def trigger_chain_build(
     distgit_branch: str | None,
     priority: int,
     defer_enqueue: bool = False,
+    package_plans: dict[str, Any] | None = None,
+    plan_pending_roots: list[str] | None = None,
 ) -> tuple[BuildChain, list[BuildJob], bool]:
     stages = parse_chain_build_spec(chain_spec)
     rr = await db.execute(select(Release).where(Release.id == release_id))
@@ -682,6 +763,11 @@ async def trigger_chain_build(
         "preferred_mock_environment_id": preferred_mock_environment_id,
         "priority": priority,
     }
+    if package_plans:
+        chain_options["package_plans"] = package_plans
+    if plan_pending_roots is not None:
+        chain_options["plan_pending"] = True
+        chain_options["plan_roots"] = [str(r) for r in plan_pending_roots if r]
     chain = BuildChain(
         release_id=release_id,
         triggered_by_id=user.id,
@@ -729,6 +815,45 @@ async def trigger_chain_build(
     return chain, jobs, defer_enqueue
 
 
+def apply_automatic_plan_to_chain(
+    chain: BuildChain,
+    *,
+    chain_spec: str,
+    package_plans: dict[str, Any],
+) -> None:
+    spec = (chain_spec or "").strip()
+    chain.chain_spec = spec
+    chain.stages_json = parse_chain_build_spec(spec)
+    flag_modified(chain, "stages_json")
+    opt = _options_dict(chain)
+    opt["package_plans"] = package_plans
+    opt.pop("plan_pending", None)
+    opt.pop("plan_roots", None)
+    _set_chain_options(chain, opt)
+
+
+async def list_interrupted_chain_planning(db: Any) -> list[int]:
+    """Chains still waiting on dependency planning after a crash/restart."""
+    result = await db.execute(
+        select(BuildChain).where(
+            BuildChain.status.in_(
+                (BuildChainStatus.PENDING, BuildChainStatus.RUNNING),
+            )
+        )
+    )
+    out: list[int] = []
+    for chain in result.scalars():
+        opt = _options_dict(chain)
+        if opt.get("plan_pending") and opt.get("plan_roots"):
+            out.append(int(chain.id))
+    return out
+
+
+async def cancel_interrupted_chain_planning(db: Any) -> list[int]:
+    # legacy name: resume planning instead of cancelling
+    return await list_interrupted_chain_planning(db)
+
+
 async def enqueue_chain_jobs_after_create(db: Any, chain_id: int) -> None:
     chain_r = await db.execute(select(BuildChain).where(BuildChain.id == chain_id).with_for_update())
     chain = chain_r.scalar_one_or_none()
@@ -736,6 +861,9 @@ async def enqueue_chain_jobs_after_create(db: Any, chain_id: int) -> None:
         logger.error("chain enqueue: chain_id=%s not found", chain_id)
         return
     opt = _options_dict(chain)
+    if opt.get("plan_pending"):
+        logger.info("chain_id=%s still planning, skipping enqueue", chain_id)
+        return
     arches = [str(x) for x in opt.get("architectures") or DEFAULT_ARCH]
     pm = opt.get("preferred_mock_environment_id")
     if pm is None or pm == "":
@@ -771,6 +899,68 @@ async def enqueue_chain_jobs_after_create(db: Any, chain_id: int) -> None:
 
 async def on_repo_publish_success_for_chain(attempt_id: int) -> None:
     from oreon_build.db.session import async_session_maker
+    from oreon_build.services.build_pass import schedule_next_pass_after_publish
+
+    async with async_session_maker() as db:
+        att_r = await db.execute(select(BuildAttempt).where(BuildAttempt.id == attempt_id))
+        att = att_r.scalar_one_or_none()
+        if not att:
+            return
+        job_r = await db.execute(select(BuildJob).where(BuildJob.id == att.build_job_id))
+        job = job_r.scalar_one_or_none()
+        if not job:
+            return
+        if schedule_next_pass_after_publish(job):
+            from oreon_build.services.repo_capability_index import clear_repo_capability_cache
+
+            clear_repo_capability_cache()
+            await db.commit()
+            return
+        if job.chain_id is None:
+            return
+
+        chain_r = await db.execute(select(BuildChain).where(BuildChain.id == job.chain_id).with_for_update())
+        chain = chain_r.scalar_one_or_none()
+        if not chain or chain.status not in (BuildChainStatus.PENDING, BuildChainStatus.RUNNING):
+            return
+        if job.chain_stage_index is None or job.chain_stage_index != chain.active_stage_index:
+            return
+
+        if chain.status == BuildChainStatus.PENDING:
+            chain.status = BuildChainStatus.RUNNING
+
+        rec = BuildChainPublishReceipt(build_chain_id=chain.id, build_attempt_id=attempt_id)
+        db.add(rec)
+        try:
+            await db.flush()
+        except Exception:
+            await db.rollback()
+            return
+
+        await _maybe_advance_after_stage_slot(db, chain)
+
+        await db.commit()
+
+
+async def _maybe_advance_after_stage_slot(db: Any, chain: BuildChain) -> None:
+    chain.stage_publish_done += 1
+    if chain.stage_publish_done < chain.stage_expected_jobs:
+        return
+    settle = _chain_stage_settle_sec()
+    if settle > 0:
+        chain.stage_advance_after = datetime.now(timezone.utc) + timedelta(seconds=settle)
+        logger.info(
+            "chain_id=%s stage=%s all stage slots done; advancing in %ss",
+            chain.id,
+            chain.active_stage_index,
+            settle,
+        )
+    else:
+        await _advance_chain_after_stage_complete(db, chain)
+
+
+async def on_build_job_skipped_for_chain(attempt_id: int) -> None:
+    from oreon_build.db.session import async_session_maker
 
     async with async_session_maker() as db:
         att_r = await db.execute(select(BuildAttempt).where(BuildAttempt.id == attempt_id))
@@ -800,21 +990,7 @@ async def on_repo_publish_success_for_chain(attempt_id: int) -> None:
             await db.rollback()
             return
 
-        chain.stage_publish_done += 1
-
-        if chain.stage_publish_done >= chain.stage_expected_jobs:
-            settle = _chain_stage_settle_sec()
-            if settle > 0:
-                chain.stage_advance_after = datetime.now(timezone.utc) + timedelta(seconds=settle)
-                logger.info(
-                    "chain_id=%s stage=%s all publishes done; advancing in %ss",
-                    chain.id,
-                    chain.active_stage_index,
-                    settle,
-                )
-            else:
-                await _advance_chain_after_stage_complete(db, chain)
-
+        await _maybe_advance_after_stage_slot(db, chain)
         await db.commit()
 
 
@@ -1111,11 +1287,24 @@ async def notify_chain_job_terminal_after_result(
     if st not in ("failed", "cancelled"):
         return
     from oreon_build.db.session import async_session_maker
+    from sqlalchemy.orm import selectinload
 
     reason = (error_message or "").strip() or f"Build {st}"
     async with async_session_maker() as db:
-        job = await db.get(BuildJob, build_job_id)
+        job = await db.get(
+            BuildJob,
+            build_job_id,
+            options=[selectinload(BuildJob.package)],
+        )
         if job is None or job.chain_id is None:
             return
-        await on_build_job_failed_for_chain(db, job, reason)
+        pkg_name = job.package.name if job.package else None
+        await on_build_job_failed_for_chain(db, job, reason, package_name=pkg_name)
         await db.commit()
+
+
+async def notify_chain_job_skipped_after_result(attempt_id: int) -> None:
+    try:
+        await on_build_job_skipped_for_chain(attempt_id)
+    except Exception:
+        logger.exception("chain notify after skipped job attempt_id=%s", attempt_id)
