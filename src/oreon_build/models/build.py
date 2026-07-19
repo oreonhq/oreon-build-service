@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from .package import Package, PackageVersion
     from .release import Release
     from .rpmbuild_plan import RpmbuildPlan
+    from .side_tag import SideTag
 
 
 class BuildStatus(str, enum.Enum):
@@ -69,7 +70,10 @@ class BuildJob(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    branch: Mapped[str] = mapped_column(String(32), default="dev", nullable=False)
+    branch: Mapped[str] = mapped_column(String(128), default="dev", nullable=False)
+    side_tag_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("side_tags.id"), nullable=True, index=True
+    )
     chain_id: Mapped[Optional[int]] = mapped_column(ForeignKey("build_chains.id"), nullable=True, index=True)
     chain_stage_index: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     rpmbuild_plan_id: Mapped[Optional[int]] = mapped_column(
@@ -91,6 +95,7 @@ class BuildJob(Base):
         "BuildAttempt", back_populates="build_job", order_by="BuildAttempt.started_at.desc()"
     )
     build_chain: Mapped[Optional["BuildChain"]] = relationship("BuildChain", back_populates="jobs")
+    side_tag: Mapped[Optional["SideTag"]] = relationship("SideTag", back_populates="jobs")
     rpmbuild_plan: Mapped[Optional["RpmbuildPlan"]] = relationship("RpmbuildPlan", back_populates="jobs")
 
     @property

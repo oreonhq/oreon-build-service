@@ -18,6 +18,7 @@ from .cve import TrackedRpm, CveMatch, CveMatchRelease
 from .publish_task import PublishTask
 from .rpm_complete_lock import RpmCompleteLock
 from .security_advisory import SecurityAdvisory, SecurityAdvisoryRelease
+from .side_tag import SideTag, SideTagCreatedFrom, SideTagMember
 
 __all__ = [
     "Account",
@@ -57,4 +58,7 @@ __all__ = [
     "CveMatchRelease",
     "SecurityAdvisory",
     "SecurityAdvisoryRelease",
+    "SideTag",
+    "SideTagCreatedFrom",
+    "SideTagMember",
 ]

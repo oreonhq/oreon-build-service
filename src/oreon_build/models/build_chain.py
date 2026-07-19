@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from .account import Account
     from .build import BuildJob
     from .release import Release
+    from .side_tag import SideTag
 
 
 class BuildChainStatus(str, enum.Enum):
@@ -45,6 +46,9 @@ class BuildChain(Base):
     stage_publish_done: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     stage_advance_after: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    side_tag_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("side_tags.id"), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -52,6 +56,7 @@ class BuildChain(Base):
 
     release: Mapped["Release"] = relationship("Release")
     triggered_by: Mapped[Optional["Account"]] = relationship("Account")
+    side_tag: Mapped[Optional["SideTag"]] = relationship("SideTag", back_populates="chains")
     jobs: Mapped[List["BuildJob"]] = relationship("BuildJob", back_populates="build_chain")
 
 
