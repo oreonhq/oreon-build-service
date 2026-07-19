@@ -8,7 +8,9 @@
   <style>
     .promo-testing { background: #d4edda; color: #155724; }
     .promo-stable { background: #cce5ff; color: #004085; }
-    .promo-keep { background: #e2e3e5; color: #383d41; }
+    .warn { color: #856404; background: #fff3cd; padding: 0.75rem 1rem; border-radius: 4px; margin: 0.75rem 0; }
+    #promo-status { margin-top: 1rem; display: none; }
+    #promo-status .line { margin: 0.35rem 0; }
   </style>
 </head>
 <body>
@@ -19,179 +21,151 @@
   <main class="main">
     <section class="card">
       <h2>Promotions</h2>
-      <p id="promo-hint">Completed builds appear here as promotion candidates. Login to promote to Testing or Stable.</p>
-      <div id="promo-quick-actions" style="display:none; margin-bottom:1rem; display:flex; gap:0.5rem; flex-wrap:wrap;">
-        <button type="button" class="btn promo-testing" id="btn-promote-all-testing">Promote all to Testing</button>
-        <button type="button" class="btn promo-stable" id="btn-promote-all-stable">Promote all to Stable</button>
-      </div>
-      <div class="form-group" style="margin-bottom:1rem; display:flex; gap:1rem; flex-wrap:wrap;">
-        <label style="display:flex; align-items:center;">Filter</label>
-        <input type="text" id="promo-text-filter" placeholder="Filter by package, ID" style="padding:0.4rem; width:12rem;">
-        <select id="promo-status-filter">
-          <option value="">All</option>
-          <option value="pending" selected>Pending only</option>
-          <option value="promoted_testing">Promoted to Testing</option>
-          <option value="promoted_stable">Promoted to Stable</option>
-          <option value="missing_artifacts">Missing artifacts</option>
-        </select>
-      </div>
-      <div class="list-toolbar">
-        <div class="bulk-selection-bar" id="promo-bulk-bar">
-          <span class="bulk-selection-count"></span>
-          <span class="bulk-selection-buttons"></span>
+      <p id="promo-hint">Whole-branch R2 promote between primary channels. Source tree is emptied after copy. Side tags promote from their detail page.</p>
+      <div class="warn">This copies every RPM under the source branch (all arches + src) into the destination, then removes those objects from the source. Confirm carefully. The job runs in the background so you do not wait on this page.</div>
+      <div id="promo-form" style="display:none;">
+        <div class="form-group">
+          <label>Release</label>
+          <select id="release-id" class="form-control" style="max-width:20rem;"></select>
         </div>
-        <div class="select-all-wrap"><label for="promo-select-all">Select all</label></div>
-        <div class="pagination">
-          <button type="button" class="btn" id="promo-prev" disabled>Prev</button>
-          <span class="page-info" id="promo-page-info">Page 1 of 1</span>
-          <button type="button" class="btn" id="promo-next" disabled>Next</button>
-          <select class="page-size" id="promo-page-size"><option value="25" selected>25</option><option value="50">50</option><option value="100">100</option></select>
+        <div class="form-group" style="display:flex; flex-wrap:wrap; gap:0.75rem; align-items:flex-end;">
+          <div>
+            <label>From</label>
+            <select id="from-branch" class="form-control">
+              <option value="dev">dev</option>
+              <option value="testing">testing</option>
+              <option value="stable">stable</option>
+            </select>
+          </div>
+          <div>
+            <label>To</label>
+            <select id="to-branch" class="form-control">
+              <option value="testing" selected>testing</option>
+              <option value="stable">stable</option>
+              <option value="dev">dev</option>
+            </select>
+          </div>
+          <button type="button" class="btn primary" id="btn-promote">Promote whole branch</button>
         </div>
+        <div style="margin-top:1rem; display:flex; gap:0.5rem; flex-wrap:wrap;">
+          <button type="button" class="btn promo-testing" id="btn-dev-testing">dev → testing</button>
+          <button type="button" class="btn promo-stable" id="btn-testing-stable">testing → stable</button>
+        </div>
+        <div id="promo-status"></div>
       </div>
-      <table class="table-list">
-        <thead>
-          <tr><th class="col-checkbox"><input type="checkbox" id="promo-select-all" title="Select all on this page"></th><th>ID</th><th>Package</th><th>Release ID</th><th>Build Job</th><th>Status</th><th>Created</th><th>Actions</th></tr>
-        </thead>
-        <tbody id="promo-tbody"></tbody>
-      </table>
+      <p style="margin-top:1.25rem;">For side-tag promotions open <a href="/side-tags.html">Side Tags</a>.</p>
     </section>
   </main>
-  <script src="/static/app.js?v=13"></script>
+  <script src="/static/app.js?v=15"></script>
   <script>
     (function() {
       const api = window.oreonApi;
-      var promoPage = 0, promoPageSize = 25, promoTotal = 0;
+      var pollTimer = null;
 
-      function promoteAll(pathSuffix, label) {
-        if (!confirm('Promote ALL pending promotions to ' + label + '?\n\nThis will affect every pending item, not just this page.')) return;
-        if (!confirm('Are you absolutely sure? This will promote everything pending to ' + label + ' and cannot be undone.')) return;
-        var btn = document.getElementById(pathSuffix === 'to-testing' ? 'btn-promote-all-testing' : 'btn-promote-all-stable');
-        oreonWithLoading(btn, function() {
-          return api.post('/promotions/bulk/' + pathSuffix, { all_pending: true }).then(function(data) {
-            alert((data && data.message) ? data.message : ('Queued ' + ((data && data.promotion_count) || 0) + ' promotions'));
-            load();
-          }).catch(function(e) { alert('Failed: ' + (window.oreonErrorMessage ? window.oreonErrorMessage(e) : e.message)); });
-        });
+      function escapeHtml(s) {
+        var d = document.createElement('div');
+        d.textContent = s == null ? '' : String(s);
+        return d.innerHTML;
       }
-
-      function updateQuickActions() {
-        var el = document.getElementById('promo-quick-actions');
-        if (!el) return;
-        el.style.display = api.token ? 'flex' : 'none';
+      function setStatusHtml(html) {
+        var el = document.getElementById('promo-status');
+        el.style.display = 'block';
+        el.innerHTML = html;
       }
-      var promoTableSel = window.oreonBindTableSelection(document.getElementById('promo-tbody'), {
-        rowCheckboxSelector: '.promo-row-cb',
-        selectAll: document.getElementById('promo-select-all'),
-        bulkBar: document.getElementById('promo-bulk-bar'),
-        onSelectionChange: function(ids, btns) {
-          var tbody = document.getElementById('promo-tbody');
-          var clear = document.createElement('button');
-          clear.type = 'button';
-          clear.className = 'btn';
-          clear.textContent = 'Clear selection';
-          clear.addEventListener('click', function() {
-            tbody.querySelectorAll('.promo-row-cb').forEach(function(cb) { cb.checked = false; });
-            promoTableSel.refresh();
-          });
-          btns.appendChild(clear);
-          if (!api.token) return;
-          function runPromote(btn, pathSuffix) {
-            var pendingIds = [];
-            ids.forEach(function(id) {
-              var tr = tbody.querySelector('tr[data-id="' + id + '"]');
-              var st = tr ? (tr.getAttribute('data-status') || '') : '';
-              if (st === 'pending') pendingIds.push(Number(id));
-            });
-            if (!pendingIds.length) {
-              alert('No pending promotions in selection');
-              return;
-            }
-            oreonWithLoading(btn, function() {
-              return api.post('/promotions/bulk/' + pathSuffix, { promotion_ids: pendingIds }).then(function(data) {
-                alert((data && data.message) ? data.message : ('Queued ' + pendingIds.length + ' promotions'));
-                load();
-              }).catch(function(e) { alert('Failed: ' + (window.oreonErrorMessage ? window.oreonErrorMessage(e) : e.message)); });
-            });
-          }
-          var b1 = document.createElement('button');
-          b1.type = 'button';
-          b1.className = 'btn promo-testing';
-          b1.textContent = 'Promote selected to Testing';
-          b1.addEventListener('click', function() { runPromote(b1, 'to-testing'); });
-          btns.appendChild(b1);
-          var b2 = document.createElement('button');
-          b2.type = 'button';
-          b2.className = 'btn promo-stable';
-          b2.textContent = 'Promote selected to Stable';
-          b2.addEventListener('click', function() { runPromote(b2, 'to-stable'); });
-          btns.appendChild(b2);
+      function stopPoll() {
+        if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+      }
+      function updateAuth() {
+        var form = document.getElementById('promo-form');
+        var hint = document.getElementById('promo-hint');
+        if (api.token) {
+          form.style.display = 'block';
+          if (hint) hint.textContent = 'Whole-branch R2 promote. Queued in the background; source emptied when the job finishes.';
+        } else {
+          form.style.display = 'none';
+          if (hint) hint.textContent = 'Login to run whole-branch promotions.';
         }
-      });
-      function load() {
-        var statusFilter = document.getElementById('promo-status-filter').value;
-        var path = '/promotions?limit=' + promoPageSize + '&offset=' + (promoPage * promoPageSize);
-        if (statusFilter) path += '&status_filter=' + encodeURIComponent(statusFilter);
-        var tf = document.getElementById('promo-text-filter');
-        var pq = (tf && tf.value) ? String(tf.value).trim() : '';
-        if (pq) path += '&search=' + encodeURIComponent(pq);
-        api.get(path).then(function(data) {
-          var tbody = document.getElementById('promo-tbody');
-          if (!tbody) return;
-          var list = (data && data.items) ? data.items : [];
-          promoTotal = (data && typeof data.total === 'number') ? data.total : 0;
-          var canAct = !!api.token;
-          function esc(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; }
-          tbody.innerHTML = list.map(function(p) {
-            var status = p.status || 'pending';
-            var statusClass = status === 'promoted_testing' ? 'promo-testing' : status === 'promoted_stable' ? 'promo-stable' : status === 'kept_dev' ? 'promo-keep' : '';
-            var actions = '';
-            if (status === 'pending' && canAct) {
-              actions = '<button type="button" class="btn promo-testing" data-id="' + p.id + '" data-action="to-testing">Promote to Testing</button> ' +
-                '<button type="button" class="btn promo-stable" data-id="' + p.id + '" data-action="to-stable">Promote to Stable</button>';
-            } else {
-              actions = p.to_channel ? (p.from_channel + ' → ' + p.to_channel) : '-';
-            }
-            return '<tr data-id="' + p.id + '" data-status="' + esc(status) + '"><td class="col-checkbox"><input type="checkbox" class="promo-row-cb" data-id="' + p.id + '"></td><td>' + p.id + '</td><td>' + esc(p.package_name || '') + ' <span style="color:var(--text-muted)">(' + (p.package_id || '') + ')</span></td><td>' + p.release_id + '</td><td>' +
-              (p.build_job_id ? '<a href="/build.html?job_id=' + p.build_job_id + '">' + p.build_job_id + '</a>' : '-') + '</td><td><span class="' + statusClass + '">' + esc(status) + '</span></td><td>' + (p.created_at ? new Date(p.created_at).toLocaleString() : '') + '</td><td>' + actions + '</td></tr>';
-          }).join('') || '<tr><td colspan="8">No promotions</td></tr>';
-          tbody.querySelectorAll('[data-action]').forEach(function(btn) {
-            btn.addEventListener('click', function() {
-              var id = btn.dataset.id;
-              var action = btn.dataset.action;
-              var postPath = '/promotions/' + id + '/' + (action === 'to-testing' ? 'to-testing' : 'to-stable');
-              oreonWithLoading(btn, function() {
-                return api.post(postPath).then(function() { load(); }).catch(function(e) { alert('Failed: ' + e.message); });
-              });
-            });
+      }
+      function loadReleases() {
+        return api.get('/releases?limit=500').then(function(r) {
+          var items = (r && r.items) ? r.items : [];
+          var sel = document.getElementById('release-id');
+          sel.innerHTML = items.map(function(x) {
+            return '<option value="' + x.id + '">' + escapeHtml(x.releasename || ('#' + x.id)) + '</option>';
+          }).join('') || '<option value="">No releases</option>';
+        }).catch(function() {});
+      }
+      function renderJob(job, kickoff) {
+        var st = (job && job.status) || 'unknown';
+        var lines = [];
+        if (kickoff) {
+          lines.push('<div class="line"><strong>Queued</strong> ' + escapeHtml(kickoff.from_branch) + ' → ' + escapeHtml(kickoff.to_branch) + ' (' + escapeHtml(kickoff.releasename || '') + ')</div>');
+          lines.push('<div class="line" style="color:var(--text-muted)">job ' + escapeHtml(kickoff.job_id) + ' — you can leave this page</div>');
+        }
+        lines.push('<div class="line">Status: <span class="badge ' + (st === 'ok' ? 'success' : (st === 'failed' ? 'failed' : 'running')) + '">' + escapeHtml(st) + '</span></div>');
+        if (job && job.message) lines.push('<div class="line">' + escapeHtml(job.message) + '</div>');
+        if (job && job.error) lines.push('<div class="line" style="color:#a00">' + escapeHtml(job.error) + '</div>');
+        if (job && job.r2) lines.push('<div class="line">R2: copied=' + escapeHtml(String(job.r2.copied != null ? job.r2.copied : '?')) + '</div>');
+        setStatusHtml(lines.join(''));
+      }
+      function pollJob(jobId, kickoff) {
+        stopPoll();
+        function tick() {
+          api.get('/promotions/jobs/' + encodeURIComponent(jobId)).then(function(job) {
+            renderJob(job, kickoff);
+            var st = (job && job.status) || '';
+            if (st === 'ok' || st === 'failed') stopPoll();
+          }).catch(function(e) {
+            setStatusHtml('<div class="line">Poll failed: ' + escapeHtml(e.message || e) + '</div>');
           });
-          var numPages = promoTotal ? Math.ceil(promoTotal / promoPageSize) : 1;
-          document.getElementById('promo-page-info').textContent = 'Page ' + (promoPage + 1) + ' of ' + numPages;
-          document.getElementById('promo-prev').disabled = promoPage <= 0;
-          document.getElementById('promo-next').disabled = promoPage >= numPages - 1;
-          promoTableSel.refresh();
-        }).catch(function() {
-          var tbody = document.getElementById('promo-tbody');
-          if (tbody) tbody.innerHTML = '<tr><td colspan="8">Failed to load</td></tr>';
+        }
+        tick();
+        pollTimer = setInterval(tick, 3000);
+      }
+      function runPromote(fromB, toB) {
+        var rid = parseInt(document.getElementById('release-id').value, 10);
+        if (!rid) { alert('Pick a release'); return Promise.reject(new Error('no release')); }
+        if (fromB === toB) { alert('from and to must differ'); return Promise.reject(new Error('same')); }
+        if (!confirm('Promote ALL of ' + fromB + ' → ' + toB + ' for this release?\n\nSource branch will be emptied when the job finishes.')) {
+          return Promise.reject(new Error('cancelled'));
+        }
+        if (!confirm('Final confirm: queue whole-tree promote ' + fromB + ' → ' + toB + '.')) {
+          return Promise.reject(new Error('cancelled'));
+        }
+        return api.post('/promotions/branch', {
+          release_id: rid,
+          from_branch: fromB,
+          to_branch: toB
+        }).then(function(data) {
+          var kickoff = {
+            job_id: data.job_id,
+            from_branch: data.from_branch || fromB,
+            to_branch: data.to_branch || toB,
+            releasename: data.releasename || ''
+          };
+          renderJob({ status: 'queued' }, kickoff);
+          if (data.job_id) pollJob(data.job_id, kickoff);
+          return data;
         });
       }
-      (function initPromoPagination() {
-        document.getElementById('promo-prev').addEventListener('click', function() { if (promoPage > 0) { promoPage--; load(); } });
-        document.getElementById('promo-next').addEventListener('click', function() { var n = promoTotal ? Math.ceil(promoTotal / promoPageSize) : 1; if (promoPage < n - 1) { promoPage++; load(); } });
-        document.getElementById('promo-page-size').addEventListener('change', function() { promoPageSize = parseInt(this.value, 10) || 25; promoPage = 0; load(); });
-      })();
-      document.getElementById('promo-status-filter').addEventListener('change', function() { promoPage = 0; load(); });
-      var ptf = document.getElementById('promo-text-filter');
-      if (ptf && window.oreonDebounce) {
-        ptf.addEventListener('input', window.oreonDebounce(function() {
-          promoPage = 0;
-          load();
-        }, 300));
+      function wire(btn, fn) {
+        btn.onclick = function() {
+          oreonWithLoading(btn, function() {
+            return fn().catch(function(e) {
+              if (e && e.message === 'cancelled') return;
+              alert('Failed: ' + (window.oreonErrorMessage ? window.oreonErrorMessage(e) : e.message));
+            });
+          });
+        };
       }
-      document.getElementById('btn-promote-all-testing').addEventListener('click', function() { promoteAll('to-testing', 'Testing'); });
-      document.getElementById('btn-promote-all-stable').addEventListener('click', function() { promoteAll('to-stable', 'Stable'); });
-      window.addEventListener('auth-change', updateQuickActions);
-      updateQuickActions();
-      load();
+      wire(document.getElementById('btn-promote'), function() {
+        return runPromote(document.getElementById('from-branch').value, document.getElementById('to-branch').value);
+      });
+      wire(document.getElementById('btn-dev-testing'), function() { return runPromote('dev', 'testing'); });
+      wire(document.getElementById('btn-testing-stable'), function() { return runPromote('testing', 'stable'); });
+      updateAuth();
+      window.addEventListener('auth-change', updateAuth);
+      loadReleases();
     })();
   </script>
 </body>
