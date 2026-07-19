@@ -27,6 +27,24 @@ def find_architecture_excluded_line(msg: str | None) -> str | None:
     return msg[start:end].strip()
 
 
+def prepare_build_error_message(
+    msg: str | None,
+    *,
+    limit: int = 2000,
+    fallback: str = "build failed",
+) -> str:
+    text = msg if isinstance(msg, str) else ""
+    hit = find_architecture_excluded_line(text)
+    if hit:
+        return hit[:limit]
+    body = text.strip()
+    if not body:
+        return fallback
+    if len(body) <= limit:
+        return body
+    return body[-limit:]
+
+
 def normalize_terminal_build_status(status: str | None, error_message: str | None) -> str:
     st = (status or "").strip().lower()
     if st == "failed" and is_architecture_excluded_error(error_message):
