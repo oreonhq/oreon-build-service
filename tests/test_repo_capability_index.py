@@ -260,6 +260,29 @@ def test_ingest_primary_xml_populates_names() -> None:
     assert "macros-pkg" in idx.source_names
 
 
+def test_multi_arch_satisfies_source_any_arch_for_exclusive() -> None:
+    x86 = RepoCapabilityIndex(
+        binary_names={"sgx-enclave-prebuilt-common"},
+        provides={"sgx-enclave-prebuilt-common"},
+        capability_providers={"sgx-enclave-prebuilt-common": {"sgx-enclave-prebuilt-common"}},
+        binary_source={"sgx-enclave-prebuilt-common": "linux-sgx-enclaves-prebuilt"},
+        source_names={"linux-sgx-enclaves-prebuilt", "kernel"},
+    )
+    aarch = RepoCapabilityIndex(
+        binary_names={"kernel"},
+        provides={"kernel"},
+        capability_providers={"kernel": {"kernel"}},
+        binary_source={"kernel": "kernel"},
+        source_names={"kernel"},
+    )
+    merged = _merge_arch_indexes([x86, aarch])
+    assert merged.satisfies_requirement("sgx-enclave-prebuilt-common") is False
+    assert merged.satisfies_source("linux-sgx-enclaves-prebuilt") is True
+    assert merged.satisfies_source("kernel") is True
+    assert "linux-sgx-enclaves-prebuilt" in merged.source_names_any
+    assert "linux-sgx-enclaves-prebuilt" not in merged.source_names
+
+
 def test_multi_arch_merge_requires_capability_on_every_arch() -> None:
     x86 = RepoCapabilityIndex(
         binary_names={"common", "x86-only"},

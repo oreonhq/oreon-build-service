@@ -79,6 +79,52 @@ def test_staged_update_on_warm_mirror_runs_full_update_not_includepkg(tmp_path: 
     assert createrepo.call_args.kwargs.get("force_full") is False
 
 
+def test_warm_staged_publish_drops_local_rpms_pruned_from_r2(tmp_path: Path) -> None:
+    prefix = "oreon-11-rp1/dev/x86_64"
+    container = tmp_path / "stage"
+    repo_root = container / "repo"
+    rpms_dir = repo_root / "RPMS"
+    rpms_dir.mkdir(parents=True)
+    keys = [{"key": f"{prefix}/RPMS/pkg-{i}.x86_64.rpm"} for i in range(120)]
+    keys.append({"key": f"{prefix}/RPMS/keep-2-1.x86_64.rpm"})
+    for i in range(120):
+        (rpms_dir / f"pkg-{i}.x86_64.rpm").write_bytes(b"old")
+    (rpms_dir / "keep-2-1.x86_64.rpm").write_bytes(b"keep")
+    # ghost nevra still on local stage after R2 prune
+    (rpms_dir / "ghost-1-1.x86_64.rpm").write_bytes(b"ghost")
+    repodata = repo_root / "repodata"
+    repodata.mkdir()
+    (repodata / "repomd.xml").write_text("<?xml version='1.0'?><repomd/>")
+    (repodata / "deadbeef-primary.xml.zst").write_bytes(b"x" * 4096)
+
+    client = MagicMock()
+    client.list_objects.return_value = keys
+    client.get_object.return_value = b"keep"
+
+    with (
+        patch("oreon_build.services.publisher._repo_temp_dir_parent", return_value=str(tmp_path)),
+        patch("oreon_build.services.publisher._stage_container_for_prefix", return_value=container),
+        patch("oreon_build.services.publisher._count_primary_packages", return_value=120),
+        patch("oreon_build.services.publisher._sync_rpms_dir_from_r2") as sync,
+        patch("oreon_build.services.publisher._run_createrepo") as createrepo,
+        patch("oreon_build.services.publisher._validate_repodata_sane"),
+        patch("oreon_build.services.publisher._upload_repodata_dir_ordered"),
+        patch("oreon_build.services.publisher._cleanup_old_repodata"),
+        patch("oreon_build.services.publisher.sign_repomd"),
+    ):
+        ok = update_repodata_at_prefix(
+            prefix,
+            r2_client=client,
+            staged_binaries=["keep-2-1.x86_64.rpm"],
+        )
+
+    assert ok is True
+    sync.assert_not_called()
+    createrepo.assert_called_once()
+    assert not (rpms_dir / "ghost-1-1.x86_64.rpm").exists()
+    assert (rpms_dir / "keep-2-1.x86_64.rpm").exists()
+
+
 def test_staged_identical_version_rebuild_always_runs_createrepo(tmp_path: Path) -> None:
     prefix = "oreon-11-rp1/dev/x86_64"
     container = tmp_path / "stage"
