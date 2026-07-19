@@ -118,21 +118,19 @@ def logs(attempt_id):
 @click.option("--release-id", type=int, required=True)
 @click.option("--from-channel", required=True)
 @click.option("--to-channel", required=True)
-@click.option("--package-name", default=None)
-@click.option("--build-job-id", type=int, default=None)
 @click.pass_context
-def promote(ctx, release_id, from_channel, to_channel, package_name, build_job_id):
+def promote(ctx, release_id, from_channel, to_channel):
     token = get_token()
     if not token:
         click.echo("OREON_TOKEN required", err=True)
         sys.exit(1)
-    data = {"release_id": release_id, "from_channel": from_channel, "to_channel": to_channel}
-    if package_name:
-        data["package_name"] = package_name
-    if build_job_id is not None:
-        data["build_job_id"] = build_job_id
-    out = api_request("POST", "/promotions/promote", json=data, token=token)
-    click.echo("Promotion created: id=%s" % out.get("id"))
+    data = {
+        "release_id": release_id,
+        "from_branch": from_channel,
+        "to_branch": to_channel,
+    }
+    out = api_request("POST", "/promotions/branch", json=data, token=token)
+    click.echo("Branch promote ok: %s" % (out.get("status") or out))
 
 @cli.command("publish")
 @click.option("--release-id", type=int, required=True)

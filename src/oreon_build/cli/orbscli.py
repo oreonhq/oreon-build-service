@@ -955,34 +955,49 @@ def logs_view(attempt_id: int, out: str | None, tail: int | None) -> None:
 @click.argument("from_channel")
 @click.argument("to_channel")
 @click.option("--release-id", type=int, required=True)
-@click.option("--package-name", default=None)
-@click.option("--build-job-id", type=int, default=None)
 @click.pass_context
 def cmd_promote(
     ctx: click.Context,
     from_channel: str,
     to_channel: str,
     release_id: int,
-    package_name: str | None,
-    build_job_id: int | None,
 ) -> None:
     token = require_auth(get_token())
     require_maintainer(token)
     body: dict[str, Any] = {
         "release_id": release_id,
-        "from_channel": from_channel,
-        "to_channel": to_channel,
+        "from_branch": from_channel,
+        "to_branch": to_channel,
     }
-    if package_name:
-        body["package_name"] = package_name
-    if build_job_id is not None:
-        body["build_job_id"] = build_job_id
-    out = http_json("POST", get_api_url(), "/api/promotions/promote", token=token, json_body=body)
+    out = http_json("POST", get_api_url(), "/api/promotions/branch", token=token, json_body=body)
     click.echo(json.dumps(out, indent=2))
 
 @cli.group("promotions")
 def grp_promotions() -> None:
     pass
+
+@grp_promotions.command("branch")
+@click.option("--release-id", type=int, required=True)
+@click.option("--from-branch", required=True)
+@click.option("--to-branch", required=True)
+@click.pass_context
+def promotions_branch(
+    ctx: click.Context, release_id: int, from_branch: str, to_branch: str
+) -> None:
+    token = require_auth(get_token())
+    require_maintainer(token)
+    out = http_json(
+        "POST",
+        get_api_url(),
+        "/api/promotions/branch",
+        token=token,
+        json_body={
+            "release_id": release_id,
+            "from_branch": from_branch,
+            "to_branch": to_branch,
+        },
+    )
+    click.echo(json.dumps(out, indent=2))
 
 @grp_promotions.command("list")
 @click.option("--release-id", type=int, default=None)
@@ -990,15 +1005,10 @@ def grp_promotions() -> None:
 @click.option("--limit", type=int, default=50)
 @click.pass_context
 def promotions_list(ctx: click.Context, release_id: int | None, status: str | None, limit: int) -> None:
-    token = get_token()
-    params: dict[str, Any] = {"limit": limit, "offset": 0}
-    if release_id is not None:
-        params["release_id"] = release_id
-    if status:
-        params["status_filter"] = status
-    out = http_json("GET", get_api_url(), "/api/promotions", token=token, params=params)
-    for p in out.get("items", []):
-        click.echo("%s\t%s\t%s\t%s" % (p.get("id"), p.get("package_name"), p.get("status"), p.get("from_channel")))
+    click.echo(
+        "Promotion DB queue is gone. Use: orbs promote FROM TO --release-id ID "
+        "(whole-tree R2 copy, empties source)."
+    )
 
 @cli.group("mockenv")
 def grp_mockenv() -> None:
