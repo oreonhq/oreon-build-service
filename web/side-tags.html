@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Side Tags - Oreon Build Service</title>
+  <link rel="stylesheet" href="/static/style.css?v=4">
+  <style>
+    .badge.busy { background: rgba(13,110,253,0.18); color: #0d6efd; }
+    .badge.idle { background: rgba(25,135,84,0.18); color: #198754; }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <a href="/" class="header-logo-link"><img src="/static/obslogo.png" alt="Oreon Build Service" class="header-logo" /></a>
+    <nav></nav>
+  </header>
+  <main class="main">
+    <section class="card">
+      <h2>Side Tags</h2>
+      <p id="hint">Open side tags for builds. Create one, then trigger packages from its detail page.</p>
+      <div id="create-box" class="card" style="display:none; margin-bottom:1rem;">
+        <h3 style="margin-top:0;">Create side tag</h3>
+        <div style="display:flex; flex-wrap:wrap; gap:0.5rem; align-items:flex-end;">
+          <div class="form-group" style="margin:0;">
+            <label>Release</label>
+            <select id="create-release" class="form-control" style="min-width:12rem;"></select>
+          </div>
+          <div class="form-group" style="margin:0;">
+            <label>Name</label>
+            <input type="text" id="create-name" class="form-control" placeholder="my-feature" maxlength="128" style="min-width:12rem;">
+          </div>
+          <button type="button" class="btn primary" id="btn-create">Create</button>
+        </div>
+        <p style="color:var(--text-muted); font-size:0.85rem; margin:0.5rem 0 0 0;">Names cannot be dev, testing, stable, builds, logs, src, or repodata.</p>
+      </div>
+      <div class="form-group" style="margin-bottom:1rem;">
+        <select id="release-filter" class="form-control" style="width:auto; min-width:12rem;">
+          <option value="">All releases</option>
+        </select>
+      </div>
+      <table class="table-list">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Release</th>
+            <th>Owner</th>
+            <th>Status</th>
+            <th>Last activity</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="tags-tbody"></tbody>
+      </table>
+    </section>
+  </main>
+  <script src="/static/app.js?v=15"></script>
+  <script>
+    (function() {
+      const api = window.oreonApi;
+      function escapeHtml(s) {
+        var d = document.createElement('div');
+        d.textContent = s == null ? '' : String(s);
+        return d.innerHTML;
+      }
+      function fillReleases(sel, withAll) {
+        return api.get('/releases?limit=500').then(function(r) {
+          var items = (r && r.items) ? r.items : [];
+          var html = withAll ? '<option value="">All releases</option>' : '';
+          html += items.map(function(x) {
+            return '<option value="' + x.id + '">' + escapeHtml(x.releasename || ('#' + x.id)) + '</option>';
+          }).join('');
+          sel.innerHTML = html || '<option value="">No releases</option>';
+        }).catch(function() { sel.innerHTML = '<option value="">Failed</option>'; });
+      }
+      function updateAuth() {
+        var box = document.getElementById('create-box');
+        var hint = document.getElementById('hint');
+        if (api.token) {
+          if (box) box.style.display = 'block';
+          if (hint) hint.textContent = 'Create a side tag, then open it to trigger builds, invite maintainers, promote, or scrap.';
+        } else {
+          if (box) box.style.display = 'none';
+          if (hint) hint.textContent = 'Open side tags for builds. Login to create or manage tags.';
+        }
+      }
+      function load() {
+        var rid = (document.getElementById('release-filter').value || '').trim();
+        var url = '/side-tags?limit=200';
+        if (rid) url += '&release_id=' + encodeURIComponent(rid);
+        api.get(url).then(function(data) {
+          var items = (data && data.items) ? data.items : [];
+          var tbody = document.getElementById('tags-tbody');
+          tbody.innerHTML = items.map(function(t) {
+            var st = (t.status || 'idle');
+            var chip = st === 'busy' ? 'badge busy' : 'badge idle';
+            var acts = '<a class="btn" href="/side-tag.html?id=' + t.id + '">Open</a>';
+            if (api.token && t.can_access) {
+              acts += ' <button type="button" class="btn scrap-tag" data-id="' + t.id + '" data-name="' + escapeHtml(t.name) + '">Scrap</button>';
+            }
+            return '<tr>' +
+              '<td><a href="/side-tag.html?id=' + t.id + '">' + escapeHtml(t.name) + '</a></td>' +
+              '<td>' + escapeHtml(t.releasename || ('#' + t.release_id)) + '</td>' +
+              '<td>' + escapeHtml(t.owner_username || '—') + '</td>' +
+              '<td><span class="' + chip + '">' + escapeHtml(st) + '</span></td>' +
+              '<td>' + (t.last_activity_at || '').toString().slice(0, 19) + '</td>' +
+              '<td>' + acts + '</td>' +
+              '</tr>';
+          }).join('') || '<tr><td colspan="6">No side tags</td></tr>';
+          tbody.querySelectorAll('.scrap-tag').forEach(function(btn) {
+            btn.onclick = function() {
+              var name = btn.getAttribute('data-name') || '';
+              if (!confirm('Scrap side tag ' + name + '?')) return;
+              if (!confirm('Really scrap ' + name + '?')) return;
+              oreonWithLoading(btn, function() {
+                return api.post('/side-tags/' + btn.dataset.id + '/scrap', {})
+                  .then(load)
+                  .catch(function(e) { alert(e.message); });
+              });
+            };
+          });
+        }).catch(function() {
+          document.getElementById('tags-tbody').innerHTML = '<tr><td colspan="6">Failed to load</td></tr>';
+        });
+      }
+      document.getElementById('btn-create').onclick = function() {
+        var rid = parseInt(document.getElementById('create-release').value, 10);
+        var name = (document.getElementById('create-name').value || '').trim();
+        if (!rid || !name) { alert('Pick a release and enter a name'); return; }
+        var btn = this;
+        oreonWithLoading(btn, function() {
+          return api.post('/side-tags', { release_id: rid, name: name })
+            .then(function(t) {
+              window.location.href = '/side-tag.html?id=' + t.id;
+            })
+            .catch(function(e) { alert(e.message); });
+        });
+      };
+      document.getElementById('release-filter').onchange = load;
+      updateAuth();
+      window.addEventListener('auth-change', function() { updateAuth(); load(); });
+      Promise.all([
+        fillReleases(document.getElementById('create-release'), false),
+        fillReleases(document.getElementById('release-filter'), true),
+      ]).then(load);
+    })();
+  </script>
+</body>
+</html>
