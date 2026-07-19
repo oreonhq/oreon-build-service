@@ -27,6 +27,8 @@ def test_openapi(client):
     assert "paths" in data
     assert "/api/builds/rpmbuild-plan" in data["paths"]
     assert "/api/builds/rpmbuild-plans" in data["paths"]
+    assert "/api/side-tags" in data["paths"]
+    assert "/api/promotions/branch" in data["paths"]
 
 
 @needs_db
