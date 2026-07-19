@@ -990,10 +990,17 @@ def _resolve_mock_config_file(name: str) -> str | None:
         return os.path.realpath(c)
     return None
 
+def _mock_addrepo_section_id(url: str, idx: int) -> str:
+    raw = re.sub(r"[^A-Za-z0-9._-]+", "_", (url or "").strip().rstrip("/"))
+    raw = raw.strip("_")[:80] or "repo"
+    return f"oreon_addrepo_{idx}_{raw}"
+
+
 def _write_oreon_mock_mixed_repos_wrapper_cfg(
     include_path: str,
     parent: Path,
     attempt_id: int,
+    addrepo_baseurls: list[str] | None = None,
 ) -> Path:
     parent.mkdir(parents=True, exist_ok=True)
     out = parent / f"oreon-mock-mixed-repos-{attempt_id}.cfg"
@@ -1015,6 +1022,33 @@ def _write_oreon_mock_mixed_repos_wrapper_cfg(
         '    config_opts["dnf.conf"] = _oreon_dcf.replace(_oreon_pat, "\\nbest=0\\n", 1)',
         "",
     ]
+    urls = [str(u).strip() for u in (addrepo_baseurls or []) if str(u).strip()]
+    if urls:
+        lines += [
+            '_oreon_dcf = config_opts.get("dnf.conf") or ""',
+            'if not isinstance(_oreon_dcf, str):',
+            '    _oreon_dcf = ""',
+            '_oreon_extra = ""',
+        ]
+        for i, url in enumerate(urls):
+            rid = _mock_addrepo_section_id(url, i)
+            base = url if url.endswith("/") else (url + "/")
+            lines += [
+                f'_oreon_extra += """',
+                f'[{rid}]',
+                f'name=Oreon addrepo {i}',
+                f'baseurl={base}',
+                'enabled=1',
+                'gpgcheck=0',
+                'repo_gpgcheck=0',
+                'skip_if_unavailable=True',
+                '',
+                '"""',
+            ]
+        lines += [
+            'config_opts["dnf.conf"] = (_oreon_dcf.rstrip() + "\\n" + _oreon_extra).strip() + "\\n"',
+            "",
+        ]
     out.write_text("\n".join(lines), encoding="utf-8")
     return out
 
@@ -1036,7 +1070,9 @@ def _mock_config_for_mixed_addrepos(
         )
         return base_cfg
     wid = int(attempt_id) if attempt_id is not None else 0
-    wpath = _write_oreon_mock_mixed_repos_wrapper_cfg(inc, result_parent, wid)
+    wpath = _write_oreon_mock_mixed_repos_wrapper_cfg(
+        inc, result_parent, wid, addrepo_baseurls=addrepo_baseurls
+    )
     logger.info("mock -r %s (mixed addrepo, include %s)", wpath, inc)
     return str(wpath)
 
@@ -1115,8 +1151,10 @@ def _mock_cmd_base(
         cmd += ["--uniqueext", mock_unique_ext]
     if attempt_id is not None and not _mock_shared_host_cache_enabled():
         cmd += ["--config-opts", f"cache_topdir={_mock_cache_topdir_for_attempt(attempt_id)}"]
-    for url in addrepo_baseurls:
-        cmd += ["--addrepo", url]
+    # addrepos go into the wrapper cfg with gpgcheck=0 (CLI --addrepo has no key)
+    if addrepo_baseurls and _truthy_env("OREON_WORKER_MOCK_USE_CLI_ADDREPO"):
+        for url in addrepo_baseurls:
+            cmd += ["--addrepo", url]
     cmd += _mock_rpmbuild_smp_define_args()
     cmd += _mock_rpmbuild_define_args(rpmbuild_defines)
     if rpm_dist:
