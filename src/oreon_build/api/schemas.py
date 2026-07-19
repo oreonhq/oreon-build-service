@@ -278,6 +278,7 @@ class BuildTrigger(BaseModel):
     package_id: Optional[int] = Field(None, description="Existing package ID (omit if using new_package)")
     new_package: Optional[NewPackageForBuild] = Field(None, description="Create this package and build it")
     release_id: int = Field(..., description="Release to build for")
+    side_tag_id: int = Field(..., description="Side tag to publish into (required)")
     architectures: List[str] = Field(
         default=["x86_64", "aarch64"],
         description="Architectures to build for; job per arch; no worker for arch = that job fails",
@@ -313,6 +314,7 @@ class ChainBuildTrigger(BaseModel):
         ),
     )
     release_id: int = Field(..., description="Release to build for")
+    side_tag_id: int = Field(..., description="Side tag to publish into (required)")
     architectures: List[str] = Field(
         default=["x86_64", "aarch64"],
         description="Architectures to build for (same as single trigger)",
@@ -352,7 +354,7 @@ class CIChainTrigger(BaseModel):
         ...,
         min_length=1,
         max_length=128,
-        description="Git branch to build from (the PR head branch).",
+        description="Git branch to build from (the PR head branch). Also names the auto side tag.",
     )
     release_id: int = Field(..., description="Release to build for")
     architectures: List[str] = Field(
@@ -365,6 +367,9 @@ class CIChainTrigger(BaseModel):
         description="Git URL for distgit spec repo (default oreonhq/rpm-specfiles)",
     )
     priority: int = 0
+    side_tag_id: Optional[int] = Field(
+        None, description="Optional existing side tag; otherwise created from distgit_branch"
+    )
 
 
 class CIChainTriggerResponse(BaseModel):
@@ -393,6 +398,9 @@ class BuildJobResponse(BaseModel):
     created_at: datetime
     completed_at: Optional[datetime] = None
     chain_id: Optional[int] = None
+    side_tag_id: Optional[int] = None
+    side_tag_name: Optional[str] = None
+    branch: Optional[str] = None
     chain_stage_index: Optional[int] = None
     rpmbuild_plan_id: Optional[int] = None
     rpmbuild_layer_index: Optional[int] = None
@@ -427,6 +435,7 @@ class DistgitBatchPackageItem(BaseModel):
 
 class DistgitBatchTrigger(BaseModel):
     release_id: int = Field(..., ge=1)
+    side_tag_id: int = Field(..., description="Side tag to publish into (required)")
     packages: List[DistgitBatchPackageItem] = Field(..., min_length=1)
     architectures: List[str] = Field(default_factory=lambda: ["x86_64", "aarch64"])
     preferred_mock_environment_id: Optional[int] = None
@@ -437,6 +446,61 @@ class DistgitBatchTrigger(BaseModel):
         default=False,
         description="If true, skip arches that already have a successful build for this package and release.",
     )
+
+
+class SideTagCreate(BaseModel):
+    release_id: int = Field(..., ge=1)
+    name: str = Field(..., min_length=1, max_length=128)
+
+
+class SideTagInvite(BaseModel):
+    username: str = Field(..., min_length=1, max_length=64)
+
+
+class SideTagPromoteRequest(BaseModel):
+    to_branch: str = Field(..., description="dev, testing, or stable")
+
+
+class BranchPromoteRequest(BaseModel):
+    release_id: int = Field(..., ge=1)
+    from_branch: str = Field(..., min_length=1, max_length=128)
+    to_branch: str = Field(..., min_length=1, max_length=128)
+
+
+class SideTagMemberResponse(BaseModel):
+    account_id: int
+    username: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SideTagResponse(BaseModel):
+    id: int
+    release_id: int
+    releasename: Optional[str] = None
+    name: str
+    owner_account_id: Optional[int] = None
+    owner_username: Optional[str] = None
+    created_from: str
+    status: str = "idle"
+    created_at: datetime
+    last_activity_at: datetime
+    members: List[SideTagMemberResponse] = Field(default_factory=list)
+    can_access: bool = False
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SideTagPackageRow(BaseModel):
+    package_id: int
+    package_name: str
+    side_tag_id: int
+    side_tag_name: str
+    release_id: int
+    releasename: Optional[str] = None
+    latest_job_status: Optional[str] = None
+    latest_job_id: Optional[int] = None
+    updated_at: Optional[datetime] = None
 
 
 class ChainStatusResponse(BaseModel):

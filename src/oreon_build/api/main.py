@@ -58,6 +58,7 @@ from .routers import (
     audit,
     search as search_router,
     github_webhook,
+    side_tags,
 )
 from .worker_api import router as worker_router
 
@@ -455,6 +456,35 @@ async def lifespan(app: FastAPI):
 
     burst_vm_task = asyncio.create_task(_burst_vm_watcher_loop(), name="burst-vm-watcher")
 
+    async def _side_tag_inactivity_loop() -> None:
+        from oreon_build.db.session import async_session_maker
+        from oreon_build.services.side_tags import scrap_inactive_side_tags
+
+        while True:
+            try:
+                await asyncio.sleep(3600)
+                async with async_session_maker() as db:
+                    try:
+                        scrapped = await scrap_inactive_side_tags(db)
+                        await db.commit()
+                        if scrapped:
+                            logger.info("auto-scrapped %d inactive side tags", len(scrapped))
+                    except Exception:
+                        await db.rollback()
+                        raise
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("side tag inactivity scrap failed")
+                try:
+                    await asyncio.sleep(600)
+                except asyncio.CancelledError:
+                    break
+
+    side_tag_idle_task = asyncio.create_task(
+        _side_tag_inactivity_loop(), name="side-tag-inactivity"
+    )
+
     yield
 
     for t, label in [
@@ -465,6 +495,7 @@ async def lifespan(app: FastAPI):
         (mass_rebuild_task, "mass-rebuild"),
         (rpmbuild_settle_task, "rpmbuild-settle"),
         (burst_vm_task, "burst-vm-watcher"),
+        (side_tag_idle_task, "side-tag-inactivity"),
     ]:
         if t is not None:
             t.cancel()
@@ -497,6 +528,7 @@ def create_app() -> FastAPI:
     app.include_router(workers.router, prefix="/api")
     app.include_router(mock_envs.router, prefix="/api")
     app.include_router(promotions.router, prefix="/api")
+    app.include_router(side_tags.router, prefix="/api")
     app.include_router(repos.router, prefix="/api")
     app.include_router(schedules.router, prefix="/api")
     app.include_router(logs.router, prefix="/api")
@@ -545,6 +577,12 @@ def create_app() -> FastAPI:
         @app.get("/promotions.html")
         def _promotions():
             return _html(web_dir / "promotions.html")
+        @app.get("/side-tags.html")
+        def _side_tags():
+            return _html(web_dir / "side-tags.html")
+        @app.get("/side-tag.html")
+        def _side_tag():
+            return _html(web_dir / "side-tag.html")
         @app.get("/search.html")
         def _search():
             return _html(web_dir / "search.html")

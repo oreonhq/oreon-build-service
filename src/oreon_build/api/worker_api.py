@@ -25,7 +25,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from oreon_build.api.deps import DbSession
 from oreon_build.config import get_settings
 from oreon_build.core.machine_arch import sql_arch_match_values
-from oreon_build.core.repo_branch import r2_publish_branch
+from oreon_build.core.repo_branch import job_publish_branch, r2_publish_branch
 from oreon_build.core.build_result import (
     find_architecture_excluded_line,
     normalize_terminal_build_status,
@@ -458,7 +458,7 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
             mock_config = me.config_name
 
     build_arch = (target.architecture if target else None) or (worker.architecture or "").strip() or "x86_64"
-    branch = r2_publish_branch(release)
+    branch = job_publish_branch(job.branch, release)
     if mock_config:
         base = mock_config.strip()
         for suffix in ("-x86_64", "-aarch64"):
@@ -472,6 +472,21 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
         mock_additional_repos = [
             str(u).strip() for u in (selected_mock_env.additional_repo_urls or []) if str(u).strip()
         ]
+    # mock cfg already has primary channels (with gpg keys). only add the side
+    # tag itself when it already has repomd so later builds can builddep on it.
+    # never re-add primary branches via --addrepo (no gpgkey -> GPG check FAILED).
+    if releasename and branch and job.side_tag_id:
+        from oreon_build.core.repo_branch import PRIMARY_REPO_BRANCHES
+        from oreon_build.services.repo_solver import mock_addrepo_urls_for_available_branches
+
+        if branch not in PRIMARY_REPO_BRANCHES:
+            seen = set(mock_additional_repos)
+            for url in mock_addrepo_urls_for_available_branches(
+                str(releasename), [branch], build_arch
+            ):
+                if url not in seen:
+                    seen.add(url)
+                    mock_additional_repos.append(url)
 
     return {
         "job": {
@@ -660,7 +675,7 @@ async def _resolve_worker_rpm_upload_context(
         t = t_result.scalar_one_or_none()
         if t and t.architecture:
             arch = t.architecture
-    branch = r2_publish_branch(release)
+    branch = job_publish_branch(job.branch, release)
 
     if fname.endswith(".src.rpm"):
         r2_key = src_r2_key(release.releasename, branch, fname)
@@ -1681,33 +1696,19 @@ async def report_result(
                 await db.flush()
                 await sync_worker_state_after_attempt_finished(db, worker)
                 await db.commit()
-                promo_count = await db.scalar(
-                    select(func.count(Promotion.id)).where(Promotion.build_job_id == job.id)
-                )
-                if (promo_count or 0) == 0:
-                    pkg_result = await db.execute(select(Package).where(Package.id == job.package_id))
-                    pkg = pkg_result.scalar_one_or_none()
-                    db.add(
-                        Promotion(
-                            release_id=job.release_id,
-                            from_channel="dev",
-                            to_channel=None,
-                            status="pending",
-                            package_id=job.package_id,
-                            package_name=pkg.name if pkg else None,
-                            build_job_id=job.id,
-                        )
-                    )
-                    await db.flush()
                 rel_result = await db.execute(select(Release).where(Release.id == job.release_id))
                 release = rel_result.scalar_one_or_none()
                 target_result = await db.execute(select(BuildTarget).where(BuildTarget.id == job.target_id))
                 target = target_result.scalar_one_or_none()
                 arch = target.architecture if target else None
-                branch = r2_publish_branch(release)
-                job.branch = branch
+                branch = job_publish_branch(job.branch, release)
                 if release and arch:
                     await _enqueue_repo_publish_task()
+                if job.side_tag_id:
+                    from oreon_build.services.side_tags import bump_side_tag_activity
+
+                    await bump_side_tag_activity(db, job.side_tag_id)
+                    await db.commit()
 
                 await log_audit(
                     db,
@@ -1785,15 +1786,12 @@ async def report_result(
 
     if terminal_st == "success":
         try:
-            pkg_result = await db.execute(select(Package).where(Package.id == job.package_id))
-            pkg = pkg_result.scalar_one_or_none()
             rel_result = await db.execute(select(Release).where(Release.id == job.release_id))
             release = rel_result.scalar_one()
             target_result = await db.execute(select(BuildTarget).where(BuildTarget.id == job.target_id))
             target = target_result.scalar_one_or_none()
             arch = target.architecture if target else None
-            branch = r2_publish_branch(release)
-            job.branch = branch
+            branch = job_publish_branch(job.branch, release)
             if release and arch:
                 await _enqueue_repo_publish_task()
                 if job.package_version_id:
@@ -1816,25 +1814,10 @@ async def report_result(
                                     r2.put_object(dest_key, data)
                         except Exception:
                             pass
-            promo_count = await db.scalar(
-                select(func.count(Promotion.id)).where(
-                    Promotion.build_job_id == job.id,
-                    Promotion.status == "pending",
-                    Promotion.to_channel.is_(None),
-                )
-            )
-            if (promo_count or 0) == 0:
-                promo = Promotion(
-                    release_id=job.release_id,
-                    from_channel="dev",
-                    to_channel=None,
-                    status="pending",
-                    package_id=job.package_id,
-                    package_name=pkg.name if pkg else None,
-                    build_job_id=job.id,
-                )
-                db.add(promo)
-                await db.flush()
+            if job.side_tag_id:
+                from oreon_build.services.side_tags import bump_side_tag_activity
+
+                await bump_side_tag_activity(db, job.side_tag_id)
             await db.commit()
         except Exception:
             logger.exception(
