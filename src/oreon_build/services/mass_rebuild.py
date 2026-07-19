@@ -7,7 +7,6 @@ from sqlalchemy import select
 
 from oreon_build.config import get_settings
 from oreon_build.core.machine_arch import normalize_machine_arch
-from oreon_build.core.repo_branch import r2_publish_branch
 from oreon_build.core.audit import log_audit
 from oreon_build.models import (
     BuildJob,
@@ -154,6 +153,18 @@ async def run_mass_rebuild_pass(db: Any) -> dict[str, Any]:
                 if n in by_name and n not in layer_idx_by_name:
                     layer_idx_by_name[n] = idx
 
+        from oreon_build.models import SideTagCreatedFrom
+        from oreon_build.services.side_tags import bump_side_tag_activity, ensure_side_tag
+
+        side_tag = await ensure_side_tag(
+            db,
+            release_id=release.id,
+            name="mass-rebuild",
+            owner_account_id=None,
+            created_from=SideTagCreatedFrom.MANUAL,
+        )
+        await bump_side_tag_activity(db, side_tag.id)
+
         for name in flat:
             if total_queued >= max_n:
                 break
@@ -192,7 +203,8 @@ async def run_mass_rebuild_pass(db: Any) -> dict[str, Any]:
                     status=BuildStatus.PENDING,
                     priority=pr,
                     triggered_by_id=None,
-                    branch=r2_publish_branch(release),
+                    branch=side_tag.name,
+                    side_tag_id=side_tag.id,
                     rpmbuild_layer_index=layer_idx_by_name.get(name),
                 )
                 db.add(job)

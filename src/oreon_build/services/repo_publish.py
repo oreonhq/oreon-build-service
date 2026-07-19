@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select, update
 
 from oreon_build.config import get_settings
-from oreon_build.core.repo_branch import r2_publish_branch
+from oreon_build.core.repo_branch import job_publish_branch
 from oreon_build.db.session import async_session_maker
 from oreon_build.models import Artifact, BuildAttempt, BuildJob, BuildTarget, PublishTask, Release
 from oreon_build.services.publisher import prefix_publish_lock, update_repodata_at_prefix
@@ -70,7 +70,6 @@ def process_repo_publish_sync(
     with prefix_publish_lock(prefix):
         r2 = get_r2_client()
         from oreon_build.services.publisher import (
-            _clear_createrepo_cache,
             _ensure_stage_sidecar,
             _persistent_repo_root,
             _stage_container_for_prefix,
@@ -139,7 +138,7 @@ def process_repo_publish_sync(
                     pass
 
         if staged_binaries:
-            _clear_createrepo_cache(container)
+            # keep createrepo --update cache; wiping it makes every publish walk ~all RPMs
             update_repodata_at_prefix(prefix, staged_binaries=staged_binaries)
         else:
             logger.info("repo publish %s: no binary RPMs staged, skipping repodata update", prefix)
@@ -209,7 +208,7 @@ async def _load_publish_batch(task: PublishTask) -> _PrefixPublishBatch | None:
         if not target or not target.architecture:
             raise RuntimeError(f"build target arch missing for job {job.id}")
 
-        branch = r2_publish_branch(release)
+        branch = job_publish_branch(job.branch, release)
         arch = target.architecture
         prefix = repo_r2_prefix(release.releasename, branch, arch)
 

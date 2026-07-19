@@ -183,6 +183,102 @@ def copy_filenames_parallel(
     return copied
 
 
+def list_release_arches(architectures_csv: str | None) -> list[str]:
+    raw = (architectures_csv or "x86_64,aarch64").strip()
+    out: list[str] = []
+    for part in raw.replace(";", ",").split(","):
+        a = part.strip()
+        if a and a not in out:
+            out.append(a)
+    return out or ["x86_64", "aarch64"]
+
+
+def whole_tree_promote_branch(
+    *,
+    releasename: str,
+    from_branch: str,
+    to_branch: str,
+    arches: list[str] | None = None,
+    empty_source: bool = True,
+    delete_source_prefix: bool = False,
+    r2: R2Client | None = None,
+) -> dict[str, int]:
+    """Copy entire branch tree to dest, prune superseded on dest, empty/delete source."""
+    client = r2 or get_r2_client()
+    rel = (releasename or "").strip()
+    src_b = (from_branch or "").strip()
+    dest_b = (to_branch or "").strip()
+    if not rel or not src_b or not dest_b:
+        raise ValueError("releasename/from_branch/to_branch required")
+    if src_b == dest_b:
+        raise ValueError("from_branch and to_branch must differ")
+    arch_list = list(arches or ["x86_64", "aarch64"])
+    copied_total = 0
+    for arch in arch_list:
+        src_bin, src_src = list_branch_basenames(client, rel, src_b, arch)
+        filenames = sorted(src_bin | src_src)
+        if not filenames:
+            continue
+        _dest_keys, copied = copy_branch_to_branch(
+            rel, src_b, dest_b, arch, filenames, r2=client
+        )
+        copied_total += len(copied)
+        run_batched_promotion_r2_maintenance(
+            releasename=rel,
+            from_branch=src_b,
+            dest_channel=dest_b,
+            arch=arch,
+            artifact_filenames=filenames,
+            copied_filenames=copied if empty_source else [],
+            newly_copied_filenames=copied,
+        )
+        if not empty_source and copied:
+            # still refresh dest; leave source objects
+            update_repodata_at_prefix(repo_r2_prefix(rel, dest_b, arch), r2_client=client, force_full=True)
+
+    # any leftover keys under source prefix (repodata etc)
+    if delete_source_prefix:
+        prefix = f"{rel}/{src_b}/"
+        keys = list(client.iter_keys_with_prefix(prefix))
+        for i in range(0, len(keys), 900):
+            chunk = keys[i : i + 900]
+            try:
+                client.delete_objects(chunk)
+            except Exception:
+                for k in chunk:
+                    try:
+                        client.delete_object(k)
+                    except Exception:
+                        pass
+        return {"copied": copied_total, "source_keys_deleted": len(keys)}
+
+    if empty_source:
+        # wipe leftover repodata under source after RPM remove
+        for arch in arch_list:
+            prefix = f"{repo_r2_prefix(rel, src_b, arch)}/repodata/"
+            keys = list(client.iter_keys_with_prefix(prefix))
+            if keys:
+                try:
+                    client.delete_objects(keys)
+                except Exception:
+                    pass
+            update_repodata_at_prefix(repo_r2_prefix(rel, src_b, arch), r2_client=client, force_full=True)
+        src_prefix = f"{rel}/{src_b}/src/"
+        # src RPMs already removed by maintenance; clear empty leftovers
+        leftovers = [
+            k
+            for k in client.iter_keys_with_prefix(f"{rel}/{src_b}/")
+            if "/repodata/" in k or k.endswith("/")
+        ]
+        if leftovers:
+            try:
+                client.delete_objects(leftovers)
+            except Exception:
+                pass
+
+    return {"copied": copied_total, "source_keys_deleted": 0}
+
+
 def copy_branch_to_branch(
     releasename: str,
     from_branch: str,
@@ -403,19 +499,22 @@ def run_batched_promotion_r2_maintenance(
         for fn in (newly_copied_filenames or [])
         if fn.endswith(".rpm") and not fn.endswith(".src.rpm")
     ]
-    if staged_binaries and len(staged_binaries) <= 500:
+    # Prefer staged/--update createrepo for the copied set. A "full" regen walks
+    # every RPM already on the dest mirror (can be tens of thousands) and is way
+    # slower than updating metadata for the packages just promoted.
+    if staged_binaries:
+        logger.info(
+            "promotion dest repodata staged update prefix=%s staged=%s",
+            dest_prefix,
+            len(staged_binaries),
+        )
         update_repodata_at_prefix(
             dest_prefix,
             r2_client=r2,
             staged_binaries=staged_binaries,
         )
     else:
-        logger.info(
-            "promotion dest repodata full regen prefix=%s staged=%s",
-            dest_prefix,
-            len(staged_binaries),
-        )
-        update_repodata_at_prefix(dest_prefix, r2_client=r2, force_full=True)
+        update_repodata_at_prefix(dest_prefix, r2_client=r2)
 
     if copied_filenames:
         _remove_promoted_objects_from_branch(

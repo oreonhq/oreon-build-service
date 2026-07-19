@@ -15,7 +15,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
 from oreon_build.core.chain_build_spec import parse_chain_build_spec
 from oreon_build.core.machine_arch import normalize_machine_arch
-from oreon_build.core.repo_branch import r2_publish_branch, release_distgit_branch
+from oreon_build.core.repo_branch import release_distgit_branch
 from oreon_build.models import (
     BuildAttempt,
     BuildChain,
@@ -548,7 +548,25 @@ async def _enqueue_chain_stage_jobs(
     jobs_created: list[BuildJob] = []
     expected_jobs = 0
     skip_slots = 0
-    publish_branch = r2_publish_branch(release)
+    from oreon_build.services.side_tags import bump_side_tag_activity, get_side_tag
+
+    side_tag_id = chain.side_tag_id
+    if side_tag_id is None:
+        opt_st = _options_dict(chain).get("side_tag_id")
+        if opt_st is not None:
+            try:
+                side_tag_id = int(opt_st)
+            except (TypeError, ValueError):
+                side_tag_id = None
+    if side_tag_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Chain has no side_tag_id; builds only publish into side tags",
+        )
+    side_tag = await get_side_tag(db, int(side_tag_id), with_members=False)
+    if side_tag is None or int(side_tag.release_id) != int(chain.release_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Side tag not found")
+    publish_branch = side_tag.name
     releasename = (release.releasename or "").strip()
     skip_slots_set = skip_package_arch_slots or set()
     chain_opt = _options_dict(chain)
@@ -660,6 +678,7 @@ async def _enqueue_chain_stage_jobs(
                 priority=priority,
                 triggered_by_id=triggered_by_id,
                 branch=publish_branch,
+                side_tag_id=side_tag.id,
                 chain_id=chain.id,
                 chain_stage_index=stage_index,
             )
@@ -682,6 +701,8 @@ async def _enqueue_chain_stage_jobs(
     chain.stage_expected_jobs = expected_jobs
     chain.stage_skip_slots = skip_slots
     chain.stage_publish_done = 0
+    if jobs_created:
+        await bump_side_tag_activity(db, side_tag.id)
 
     if expected_jobs == 0:
         if skip_slots > 0:
@@ -704,6 +725,7 @@ async def trigger_chain_build(
     *,
     chain_spec: str,
     release_id: int,
+    side_tag_id: int,
     architectures: list[str] | None,
     preferred_mock_environment_id: int | None,
     distgit_url: str | None,
@@ -713,11 +735,20 @@ async def trigger_chain_build(
     package_plans: dict[str, Any] | None = None,
     plan_pending_roots: list[str] | None = None,
 ) -> tuple[BuildChain, list[BuildJob], bool]:
+    from oreon_build.services.side_tags import bump_side_tag_activity, resolve_required_side_tag
+
     stages = parse_chain_build_spec(chain_spec)
     rr = await db.execute(select(Release).where(Release.id == release_id))
     release = rr.scalar_one_or_none()
     if not release:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Release not found")
+    side_tag = await resolve_required_side_tag(
+        db,
+        release_id=release_id,
+        side_tag_id=side_tag_id,
+        user=user,
+        require_access=True,
+    )
 
     if preferred_mock_environment_id:
         me_r = await db.execute(
@@ -762,6 +793,8 @@ async def trigger_chain_build(
         "distgit_branch": dg_branch,
         "preferred_mock_environment_id": preferred_mock_environment_id,
         "priority": priority,
+        "side_tag_id": side_tag.id,
+        "repo_branch": side_tag.name,
     }
     if package_plans:
         chain_options["package_plans"] = package_plans
@@ -776,9 +809,11 @@ async def trigger_chain_build(
         chain_options=chain_options,
         stages_json=stages,
         active_stage_index=0,
+        side_tag_id=side_tag.id,
     )
     db.add(chain)
     await db.flush()
+    await bump_side_tag_activity(db, side_tag.id)
 
     await log_audit(
         db,
@@ -1167,6 +1202,28 @@ async def resume_chain_from_previous(
     priority = int(opt.get("priority") or 0)
     resume_start = resume_stage
 
+    side_tag_id = old.side_tag_id
+    if side_tag_id is None:
+        raw_st = opt.get("side_tag_id")
+        if raw_st is not None and raw_st != "":
+            try:
+                side_tag_id = int(raw_st)
+            except (TypeError, ValueError):
+                side_tag_id = None
+    if side_tag_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Source chain has no side_tag_id; resume needs an open side tag",
+        )
+    from oreon_build.services.side_tags import bump_side_tag_activity, resolve_required_side_tag
+
+    side_tag = await resolve_required_side_tag(
+        db,
+        release_id=old.release_id,
+        side_tag_id=int(side_tag_id),
+        user=user,
+        require_access=True,
+    )
     chain_options: dict[str, Any] = {
         "architectures": arches,
         "distgit_url": dg_url,
@@ -1175,6 +1232,8 @@ async def resume_chain_from_previous(
         "priority": priority,
         "resumed_from_chain_id": from_chain_id,
         "resume_start_stage_index": resume_start,
+        "side_tag_id": side_tag.id,
+        "repo_branch": side_tag.name,
     }
     chain = BuildChain(
         release_id=old.release_id,
@@ -1184,9 +1243,11 @@ async def resume_chain_from_previous(
         chain_options=chain_options,
         stages_json=stages,
         active_stage_index=resume_stage,
+        side_tag_id=side_tag.id,
     )
     db.add(chain)
     await db.flush()
+    await bump_side_tag_activity(db, side_tag.id)
 
     await log_audit(
         db,

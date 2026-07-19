@@ -100,7 +100,7 @@ async def run_auto_chain_plan_and_enqueue(chain_id: int) -> None:
     from sqlalchemy import select
 
     from oreon_build.config import get_settings
-    from oreon_build.core.repo_branch import r2_publish_branch, release_distgit_branch
+    from oreon_build.core.repo_branch import release_distgit_branch
     from oreon_build.models import BuildChain, Release
     from oreon_build.services.build_chain import (
         apply_automatic_plan_to_chain,
@@ -145,7 +145,21 @@ async def run_auto_chain_plan_and_enqueue(chain_id: int) -> None:
         )
 
         releasename = (release.releasename or "").strip()
-        publish_branch = r2_publish_branch(release)
+        # plan against side tag (plus primary channels as extras)
+        publish_branch = str(opt.get("repo_branch") or "").strip()
+        if not publish_branch and chain.side_tag_id:
+            from oreon_build.services.side_tags import get_side_tag
+
+            st = await get_side_tag(db, int(chain.side_tag_id), with_members=False)
+            if st:
+                publish_branch = st.name
+        if not publish_branch:
+            logger.error("chain %s missing side tag branch; cannot plan", chain.id)
+            await _fail_chain_planning(
+                chain.id,
+                "Chain has no side tag / repo_branch for planning",
+            )
+            return
         mock_urls: list[str] = []
         mock_envs = list(
             (
@@ -165,7 +179,12 @@ async def run_auto_chain_plan_and_enqueue(chain_id: int) -> None:
         for env in mock_envs:
             mock_urls.extend(str(u).strip() for u in (env.additional_repo_urls or []) if str(u).strip())
             mock_urls.extend(str(u).strip() for u in (env.lookaside_repo_urls or []) if str(u).strip())
-        extra_branches = default_capability_extra_branches(publish_branch)
+        from oreon_build.core.repo_branch import PRIMARY_REPO_BRANCHES
+
+        extra_branches = [b for b in PRIMARY_REPO_BRANCHES if b != publish_branch]
+        for ch in default_capability_extra_branches("dev"):
+            if ch != publish_branch and ch not in extra_branches:
+                extra_branches.append(ch)
         for ch in repo_channels_from_mock_urls(releasename, mock_urls):
             if ch != publish_branch and ch not in extra_branches:
                 extra_branches.append(ch)
@@ -298,6 +317,7 @@ async def run_distgit_batch(payload: dict[str, Any], user_id: int, ip: str | Non
             trigger = BuildTrigger(
                 new_package=np,
                 release_id=data.release_id,
+                side_tag_id=int(data.side_tag_id),
                 architectures=data.architectures,
                 priority=data.priority,
                 skip_complete_arches=data.skip_complete_arches,

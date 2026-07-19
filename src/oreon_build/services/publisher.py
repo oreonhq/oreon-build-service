@@ -638,11 +638,35 @@ def _refresh_staged_rpms_from_r2(
     container: Path | None = None,
 ) -> None:
     rpms_dir.mkdir(parents=True, exist_ok=True)
+    fetched = 0
+    skipped = 0
     for fname in staged:
-        data = client.get_object(f"{rpms_prefix}{fname}")
+        key = f"{rpms_prefix}{fname}"
+        local = rpms_dir / fname
+        remote_len = None
+        try:
+            remote_len = client.head_object_content_length(key)
+        except Exception:
+            remote_len = None
+        if (
+            local.is_file()
+            and remote_len is not None
+            and local.stat().st_size == int(remote_len)
+        ):
+            skipped += 1
+            continue
+        data = client.get_object(key)
         if not data:
-            raise RuntimeError(f"staged RPM missing on R2: {rpms_prefix}{fname}")
-        _write_staged_rpm(rpms_dir / fname, data)
+            raise RuntimeError(f"staged RPM missing on R2: {key}")
+        _write_staged_rpm(local, data)
+        fetched += 1
+    if skipped:
+        logger.info(
+            "staged RPM refresh skipped %s already-local file(s), fetched %s under %s",
+            skipped,
+            fetched,
+            rpms_prefix,
+        )
     _invalidate_etag_cache_entries(container, set(staged))
 
 
@@ -932,7 +956,8 @@ def update_repodata_at_prefix(
                         rpm_count,
                     )
                 _repair_corrupt_local_rpms(client, rpms_prefix, rpms_dir)
-                if container is not None:
+                # only wipe cache on full regen; --update needs it for speed
+                if staged_force_full and container is not None:
                     _clear_createrepo_cache(container)
                 _run_createrepo(repo_root, container=container, force_full=staged_force_full)
             elif local_mirror_ready and force_full:
@@ -957,7 +982,7 @@ def update_repodata_at_prefix(
                         logger.info("No RPM changes at %s, skipping createrepo_c", r2_prefix)
                         return True
                 _repair_corrupt_local_rpms(client, rpms_prefix, rpms_dir)
-                if container is not None:
+                if force_full and container is not None:
                     _clear_createrepo_cache(container)
                 _run_createrepo(repo_root, container=container, force_full=force_full)
 

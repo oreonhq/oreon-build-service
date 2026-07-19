@@ -10,7 +10,6 @@ from sqlalchemy.orm import selectinload
 from oreon_build.api.schemas import BuildTrigger
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
 from oreon_build.core.machine_arch import normalize_machine_arch
-from oreon_build.core.repo_branch import r2_publish_branch
 from oreon_build.models import BuildJob, BuildStatus, MockEnvironment, Package, PackageVersion, Release, Source, Worker
 from oreon_build.services.build_target_util import (
     get_or_create_build_target,
@@ -19,6 +18,7 @@ from oreon_build.services.build_target_util import (
     resolve_mock_environment_id,
     resolve_package_by_name,
 )
+from oreon_build.services.side_tags import bump_side_tag_activity, resolve_required_side_tag
 
 if TYPE_CHECKING:
     from oreon_build.models import Account
@@ -162,7 +162,14 @@ async def execute_build_trigger(
     release_for_job = rr.scalar_one_or_none()
     if not release_for_job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Release not found")
-    publish_branch = r2_publish_branch(release_for_job)
+    side_tag = await resolve_required_side_tag(
+        db,
+        release_id=data.release_id,
+        side_tag_id=getattr(data, "side_tag_id", None),
+        user=user,
+        require_access=True,
+    )
+    publish_branch = side_tag.name
 
     preferred_mock_environment_id = resolve_mock_environment_id(
         trigger_mock_environment_id=trigger_mock_environment_id,
@@ -219,10 +226,13 @@ async def execute_build_trigger(
             priority=data.priority,
             triggered_by_id=account_id,
             branch=publish_branch,
+            side_tag_id=side_tag.id,
         )
         db.add(job)
         await db.flush()
         jobs_created.append(job)
+    if jobs_created:
+        await bump_side_tag_activity(db, side_tag.id)
 
     if not jobs_created:
         req_norm = sorted({normalize_machine_arch(a) for a in architectures if (a or "").strip()})

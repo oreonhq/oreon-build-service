@@ -12,7 +12,6 @@ from sqlalchemy.orm import selectinload
 from oreon_build.services.build_target_util import get_or_create_build_target
 from oreon_build.config import get_settings
 from oreon_build.core.audit import log_audit
-from oreon_build.core.repo_branch import r2_publish_branch
 from oreon_build.models import BuildJob, BuildStatus, Package, PackageVersion, Release, Source
 from oreon_build.services.github import get_github_client
 
@@ -402,7 +401,28 @@ async def apply_github_push(
             if not rel_obj:
                 skipped.append({"package_id": pkg.id, "release_id": release_id, "reason": "release_not_found"})
                 continue
-            publish_branch = r2_publish_branch(rel_obj)
+            from oreon_build.models import SideTagCreatedFrom
+            from oreon_build.services.side_tags import bump_side_tag_activity, ensure_side_tag
+
+            try:
+                side_tag = await ensure_side_tag(
+                    db,
+                    release_id=release_id,
+                    name=push_branch,
+                    owner_account_id=None,
+                    created_from=SideTagCreatedFrom.GITHUB_PUSH,
+                )
+            except Exception as e:
+                skipped.append(
+                    {
+                        "package_id": pkg.id,
+                        "release_id": release_id,
+                        "reason": "side_tag_create_failed",
+                        "error": str(e),
+                    }
+                )
+                continue
+            publish_branch = side_tag.name
             target = await get_or_create_build_target(db, release_id, arch, pkg.preferred_mock_environment_id)
             job = BuildJob(
                 package_id=pkg.id,
@@ -413,9 +433,11 @@ async def apply_github_push(
                 priority=0,
                 triggered_by_id=None,
                 branch=publish_branch,
+                side_tag_id=side_tag.id,
             )
             db.add(job)
             await db.flush()
+            await bump_side_tag_activity(db, side_tag.id)
             triggered.append(job.id)
             await log_audit(
                 db,

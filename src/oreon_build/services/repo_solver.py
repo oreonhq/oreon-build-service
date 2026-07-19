@@ -121,6 +121,46 @@ def _branch_baseurl(releasename: str, branch: str, arch: str) -> str:
     return f"{_public_repo_base()}{releasename}/{branch}/{arch}"
 
 
+def branch_baseurl(releasename: str, branch: str, arch: str) -> str:
+    return _branch_baseurl(releasename, branch, arch)
+
+
+def branch_repomd_r2_key(releasename: str, branch: str, arch: str) -> str:
+    return f"{releasename}/{branch}/{arch}/repodata/repomd.xml"
+
+
+def mock_addrepo_urls_for_available_branches(
+    releasename: str,
+    branches: Iterable[str],
+    arch: str,
+    *,
+    r2_client: Any = None,
+) -> list[str]:
+    """Public repo URLs for branches that already have repomd in R2.
+
+    Skip empty branches. mock --addrepo 404s and kills bootstrap otherwise.
+    """
+    from oreon_build.services.r2 import get_r2_client
+
+    r2 = r2_client or get_r2_client()
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in branches:
+        b = (raw or "").strip()
+        if not b or b in seen:
+            continue
+        seen.add(b)
+        key = branch_repomd_r2_key(releasename, b, arch)
+        try:
+            if not r2.object_exists(key):
+                continue
+        except Exception:
+            logger.warning("repomd probe failed for %s, skipping addrepo", key, exc_info=True)
+            continue
+        out.append(branch_baseurl(releasename, b, arch).rstrip("/") + "/")
+    return out
+
+
 def _safe_rpm_name(name: str) -> str:
     out = re.sub(r"[^A-Za-z0-9._+-]+", "-", (name or "").strip())
     return (out or "pkg")[:80]

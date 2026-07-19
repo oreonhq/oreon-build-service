@@ -11,7 +11,6 @@ from sqlalchemy import select
 
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
 from oreon_build.core.machine_arch import normalize_machine_arch
-from oreon_build.core.repo_branch import r2_publish_branch
 from oreon_build.models import (
     BuildJob,
     BuildStatus,
@@ -121,7 +120,26 @@ async def enqueue_plan_layer_jobs(
     release = await db.get(Release, plan.release_id)
     if release is None:
         return []
-    publish_branch = r2_publish_branch(release)
+    from oreon_build.models import SideTagCreatedFrom
+    from oreon_build.services.side_tags import (
+        bump_side_tag_activity,
+        ensure_side_tag,
+        is_primary_repo_branch,
+        sanitize_side_tag_name,
+    )
+
+    tag_name = sanitize_side_tag_name(plan.repo_branch or "")
+    if not tag_name or is_primary_repo_branch(tag_name):
+        tag_name = "rpmbuild-plan"
+    side_tag = await ensure_side_tag(
+        db,
+        release_id=release.id,
+        name=tag_name,
+        owner_account_id=triggered_by_id,
+        created_from=SideTagCreatedFrom.MANUAL,
+    )
+    publish_branch = side_tag.name
+    await bump_side_tag_activity(db, side_tag.id)
     jobs: list[BuildJob] = []
     layer_pkgs = [str(x) for x in layers[layer_index] if str(x).strip()]
     plan_not_before = _plan_skip_jobs_not_before(plan)
@@ -171,6 +189,7 @@ async def enqueue_plan_layer_jobs(
                 priority=priority,
                 triggered_by_id=triggered_by_id,
                 branch=publish_branch,
+                side_tag_id=side_tag.id,
                 rpmbuild_plan_id=plan.id,
                 rpmbuild_layer_index=layer_index,
                 rpmbuild_wave_index=0,
@@ -234,10 +253,29 @@ async def create_rpmbuild_plan(
         )
 
     start_layer = min(layer_map[x] for x in clean_seed)
+    from oreon_build.models import SideTagCreatedFrom
+    from oreon_build.services.side_tags import (
+        bump_side_tag_activity,
+        ensure_side_tag,
+        is_primary_repo_branch,
+        sanitize_side_tag_name,
+    )
+
+    tag_name = sanitize_side_tag_name(repo_branch or "")
+    if not tag_name or is_primary_repo_branch(tag_name):
+        tag_name = "rpmbuild-plan"
+    side_tag = await ensure_side_tag(
+        db,
+        release_id=release.id,
+        name=tag_name,
+        owner_account_id=triggered_by_id,
+        created_from=SideTagCreatedFrom.MANUAL,
+    )
+    await bump_side_tag_activity(db, side_tag.id)
     plan = RpmbuildPlan(
         release_id=release.id,
         releasename=releasename,
-        repo_branch=(repo_branch or "dev").strip() or "dev",
+        repo_branch=side_tag.name,
         distgit_url=durl,
         distgit_branch=dbranch,
         seed_mode="minimal_seed",
@@ -287,7 +325,8 @@ async def create_rpmbuild_plan(
                 status=BuildStatus.PENDING,
                 priority=priority,
                 triggered_by_id=triggered_by_id,
-                branch=r2_publish_branch(release),
+                branch=side_tag.name,
+                side_tag_id=side_tag.id,
                 rpmbuild_plan_id=plan.id,
                 rpmbuild_layer_index=start_layer,
                 rpmbuild_wave_index=0,
