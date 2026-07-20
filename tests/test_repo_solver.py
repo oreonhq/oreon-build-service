@@ -457,8 +457,8 @@ def test_force_slot_builds_bootstrap_not_block() -> None:
 
     repo = RepoCapabilityIndex(
         source_names={"perl-CPAN-Meta-Requirements"},
-        binary_names={"perl-CPAN-Meta-Requirements"},
-        provides={"perl-CPAN-Meta-Requirements"},
+        binary_names={"perl-CPAN-Meta-Requirements", "make"},
+        provides={"perl-CPAN-Meta-Requirements", "make"},
     )
     repo.finalize_lookups()
     spec = """

@@ -269,8 +269,9 @@ def iter_plan_capabilities(
     parsed: _SpecParseResult,
     bcond: Any,
     repo: Any,
+    defines: dict[str, str] | None = None,
 ) -> list[str]:
-    defines = default_build_defines(bcond)
+    use_defines = defines if defines is not None else default_build_defines(bcond)
     caps: list[str] = []
     seen: set[str] = set()
 
@@ -301,7 +302,7 @@ def iter_plan_capabilities(
             add(c)
 
     seeds: list[str] = []
-    for br in active_build_brs(bcond, defines):
+    for br in active_build_brs(bcond, use_defines):
         seeds.append(br)
 
     for cap in seeds:

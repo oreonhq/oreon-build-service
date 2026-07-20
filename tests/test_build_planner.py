@@ -253,6 +253,42 @@ def test_planner_skips_repo_source_with_maven_brs() -> None:
     assert slot.action == "skip"
 
 
+def test_published_forced_root_still_blocks_on_runtime_br_hole() -> None:
+    """sbctl-style: published root in force_set must not skip go-rpm-macros->golist holes."""
+    from oreon_build.services.build_planner import _plan_slots_for_package
+
+    repo = RepoCapabilityIndex(
+        source_names={"sbctl", "go-rpm-macros"},
+        binary_names={"sbctl", "go-rpm-macros", "golang"},
+        provides={
+            "sbctl",
+            "go-rpm-macros",
+            "golang",
+            "compiler(go-compiler)",
+        },
+        capability_providers={
+            "compiler(go-compiler)": {"go-rpm-macros"},
+            "go-rpm-macros": {"go-rpm-macros"},
+            "golang": {"golang"},
+            "sbctl": {"sbctl"},
+        },
+        binary_requires={
+            "go-rpm-macros": {"golist", "golang", "go-filesystem"},
+            "golang": {"golang-bin"},
+        },
+        binary_source={"go-rpm-macros": "go-rpm-macros", "golang": "golang", "sbctl": "sbctl"},
+    )
+    repo.finalize_lookups()
+    spec = (
+        "Name: sbctl\nVersion: 0.18\nRelease: 2\n"
+        "BuildRequires: golang\nBuildRequires: compiler(go-compiler)\n"
+        "Provides: sbctl\n"
+    )
+    slot = _plan_slots_for_package("sbctl", spec, repo, force_build=True)
+    assert slot.action == "block"
+    assert "golist" in slot.reason
+
+
 def test_chain_spec_root_packages_dedupes() -> None:
     from oreon_build.services.build_planner import chain_spec_root_packages
 

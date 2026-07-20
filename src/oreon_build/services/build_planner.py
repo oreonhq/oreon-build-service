@@ -87,11 +87,12 @@ def _uncovered_plan_capabilities(
     chain: set[str],
     provider_maps: list[dict[str, set[str]]] | None = None,
     solver: MultiArchRepoSolver | None = None,
+    defines: dict[str, str] | None = None,
 ) -> list[str]:
     pmap = provider_maps or []
     caps = [
         cap
-        for cap in iter_plan_capabilities(parsed, bcond, repo)
+        for cap in iter_plan_capabilities(parsed, bcond, repo, defines=defines)
         if is_chain_plan_requirement(cap)
     ]
     if not caps:
@@ -203,8 +204,19 @@ def _plan_slots_for_package(
             reason="repo satisfies source",
         )
 
-    # published packages forced for uninstallable provides always rebuild.
-    # unpublished roots stay in force_set but must still pass BR coverage.
+    # roots are always force_set, including packages already in the repo. still
+    # must pass BR coverage / dnf, or mock dies on holes like go-rpm-macros->golist.
+    if name in (solver_failed_pkgs or ()):
+        return PlannedPackage(
+            name=name,
+            action="block",
+            build_profile="full",
+            rpmbuild_defines={},
+            reason="dnf cannot install hard buildrequires under current repos/overlay",
+        )
+
+    build_defines: dict[str, str] | None = None
+    force_profile = "full"
     if force_build and repo.satisfies_source(name):
         profile, toggled = solve_bootstrap_defines(bcond, repo)
         defines = dict(toggled) if toggled else {}
@@ -215,8 +227,6 @@ def _plan_slots_for_package(
             profile = "bootstrap"
         if defines or profile == "bootstrap":
             profile = "bootstrap"
-            # specs often do `%if %{with X} || (0%{?oreon} >= N)` so with_=0 alone
-            # still enables the block under Oreon mock macros. kill oreon for this pass.
             if any(
                 k.startswith("with_") and str(v).strip() == "0" for k, v in defines.items()
             ) and (distro_macros or {}).get("oreon"):
@@ -224,25 +234,17 @@ def _plan_slots_for_package(
         else:
             profile = "full"
             defines = {}
-        return PlannedPackage(
-            name=name,
-            action="build",
-            build_profile=profile,
-            rpmbuild_defines=defines,
-            reason="forced rebuild for uninstallable provider",
-        )
-
-    if name in (solver_failed_pkgs or ()):
-        return PlannedPackage(
-            name=name,
-            action="block",
-            build_profile="full",
-            rpmbuild_defines={},
-            reason="dnf cannot install hard buildrequires under current repos/overlay",
-        )
+        force_profile = profile
+        build_defines = defines
 
     uncovered = _uncovered_plan_capabilities(
-        parsed, bcond, repo, chain | {name}, [pmap], solver=solver
+        parsed,
+        bcond,
+        repo,
+        chain | {name},
+        [pmap],
+        solver=solver,
+        defines=build_defines,
     )
     if uncovered:
         return PlannedPackage(
@@ -251,6 +253,15 @@ def _plan_slots_for_package(
             build_profile="full",
             rpmbuild_defines={},
             reason=f"missing hard buildrequires: {' | '.join(uncovered)}",
+        )
+
+    if force_build and repo.satisfies_source(name):
+        return PlannedPackage(
+            name=name,
+            action="build",
+            build_profile=force_profile,
+            rpmbuild_defines=dict(build_defines or {}),
+            reason="forced rebuild for uninstallable provider",
         )
 
     if force_build:
