@@ -475,7 +475,7 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
     # mock cfg already has primary channels (with gpg keys). only add the side
     # tag itself when it already has repomd so later builds can builddep on it.
     # never re-add primary branches via --addrepo (no gpgkey -> GPG check FAILED).
-    if releasename and branch and job.side_tag_id:
+    if releasename and branch:
         from oreon_build.core.repo_branch import PRIMARY_REPO_BRANCHES
         from oreon_build.services.repo_solver import mock_addrepo_urls_for_available_branches
 

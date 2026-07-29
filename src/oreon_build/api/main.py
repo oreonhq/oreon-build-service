@@ -156,6 +156,13 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Failed resuming interrupted chain planning on startup")
 
+    try:
+        from oreon_build.services.distgit_warmup import spawn_distgit_warmup
+
+        spawn_distgit_warmup()
+    except Exception:
+        logger.exception("Failed starting distgit provides warmup")
+
     sweep_task: asyncio.Task[None] | None = None
     publish_task: asyncio.Task[None] | None = None
 
