@@ -11,7 +11,7 @@ def _noop_distgit_provides_index():
         return None
 
     def _no_live_solver(*_a, **_k):
-        raise RuntimeError("live dnf solver disabled in unit tests")
+        raise RuntimeError("live libsolv solver disabled in unit tests")
 
     with (
         patch(
@@ -19,11 +19,11 @@ def _noop_distgit_provides_index():
             side_effect=inner,
         ),
         patch(
-            "oreon_build.services.build_planner.get_distgit_provides_index_cached",
+            "oreon_build.services.dep_plan.planner.get_distgit_provides_index_cached",
             side_effect=inner,
         ),
         patch(
-            "oreon_build.services.build_planner.get_repo_solver",
+            "oreon_build.services.dep_plan.planner.get_repo_solver",
             side_effect=_no_live_solver,
         ),
     ):

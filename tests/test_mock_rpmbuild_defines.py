@@ -18,3 +18,4 @@ def test_with_one_uses_rpm_with_macro() -> None:
     args = _mock_rpmbuild_define_args({"with_check": "1"})
     flat = " ".join(args)
     assert "_with_check --with-check" in flat
+    assert "with_check 1" not in flat

@@ -53,6 +53,72 @@ def test_perl_package_name_maps_to_virtual_provide() -> None:
     assert "perl-Any-URI-Escape" in distgit_providers_dict(idx).get("perl(Any::URI::Escape)", set())
 
 
+def test_rust_package_name_maps_to_crate_provide() -> None:
+    from oreon_build.services.distgit_order import (
+        _crate_provides_from_package_name,
+        _rust_crate_name_from_package,
+        distgit_providers_dict,
+    )
+
+    assert _crate_provides_from_package_name("rust-clap") == {"crate(clap)"}
+    assert _crate_provides_from_package_name("rust-serde_json") == {"crate(serde_json)"}
+    assert _crate_provides_from_package_name("rust-askalono") == {"crate(askalono)"}
+    assert _crate_provides_from_package_name("rust-packaging") == set()
+    assert _crate_provides_from_package_name("rust-clap+default-devel") == set()
+
+    assert _rust_crate_name_from_package("rust-itertools0.13", "0.13.0") == "itertools"
+    assert _rust_crate_name_from_package("rust-nom7", "7.1.3") == "nom"
+    assert _rust_crate_name_from_package("rust-rstest0.11", "0.11.0") == "rstest"
+    assert _rust_crate_name_from_package("rust-rand_pcg0.2", "0.2.1") == "rand_pcg"
+    assert _rust_crate_name_from_package("rust-sha1", "0.10.1") == "sha1"
+    assert _crate_provides_from_package_name("rust-itertools0.13", version="0.13.0") == {
+        "crate(itertools)"
+    }
+    assert _crate_provides_from_package_name("rust-nom7", version="7.1.3") == {"crate(nom)"}
+    # no Version: still strip 0.x compat dirs
+    assert _crate_provides_from_package_name("rust-itertools0.13") == {"crate(itertools)"}
+
+    idx = DistgitProvidesIndex(
+        package_names=frozenset(
+            {"rust-clap", "rust-serde_json", "rust-rayon", "rust-ignore", "rust-askalono"}
+        ),
+        capability_providers={},
+    )
+    mapped = distgit_providers_dict(idx)
+    assert mapped.get("crate(clap)") == {"rust-clap"}
+    assert mapped.get("crate(serde_json)") == {"rust-serde_json"}
+    assert mapped.get("crate(askalono)") == {"rust-askalono"}
+
+
+def test_lightweight_rust_compat_pkg_uses_global_crate() -> None:
+    spec = """
+%global crate itertools
+Name: rust-itertools0.13
+Version: 0.13.0
+Release: 1
+%package devel
+%description
+x
+%files
+"""
+    provided = _lightweight_provides_from_spec_text("rust-itertools0.13", spec)
+    assert "crate(itertools)" in provided
+    assert "crate(itertools0.13)" not in provided
+
+    nom = """
+%global crate nom
+Name: rust-nom7
+Version: 7.1.3
+Release: 1
+%description
+x
+%files
+"""
+    provided2 = _lightweight_provides_from_spec_text("rust-nom7", nom)
+    assert "crate(nom)" in provided2
+    assert "crate(nom7)" not in provided2
+
+
 def test_lightweight_soname_from_files() -> None:
     spec = """
 Name: DevIL

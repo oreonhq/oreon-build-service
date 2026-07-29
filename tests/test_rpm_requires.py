@@ -32,6 +32,23 @@ def test_requirement_check_aliases_path_and_py_dist() -> None:
     assert "python3dist(setuptools)" in py_caps
     assert "python3-setuptools" in py_caps
     assert "python-setuptools" in py_caps
+    crate_caps = requirement_check_capabilities("crate(clap/default)")
+    assert "crate(clap)" in crate_caps
+    assert "rust-clap" in crate_caps
+
+
+def test_rich_crate_br_expands_to_rust_providers() -> None:
+    rich = "(crate(quickcheck) >= 1.0.0 with crate(quickcheck) < 2.0.0~)"
+    caps = requirement_check_capabilities(rich)
+    assert "crate(quickcheck)" in caps
+    assert "rust-quickcheck" in caps
+    feat = (
+        "(crate(unicode-segmentation/default) >= 1.2.1 with "
+        "crate(unicode-segmentation/default) < 2.0.0~)"
+    )
+    fcaps = requirement_check_capabilities(feat)
+    assert "crate(unicode-segmentation)" in fcaps
+    assert "rust-unicode-segmentation" in fcaps
 
 
 def test_sources_resolve_path_via_basename_provide() -> None:
@@ -175,63 +192,6 @@ def test_sources_for_unmet_cap_keeps_already_built_mapped_provider() -> None:
     assert "perl-CPAN-Meta-Requirements" in got
     # sourcerpm remap to meta "perl" must not poison the rebuild target
     assert "perl" not in got
-
-
-def test_force_rebuild_when_published_provider_is_uninstallable() -> None:
-    from oreon_build.services.build_planner import _provider_rebuild_force_sources
-    from oreon_build.services.distgit_order import _parse_spec_text
-    from oreon_build.services.repo_capability_index import RepoCapabilityIndex
-
-    repo = RepoCapabilityIndex(
-        binary_names={"perl-Module-Build", "perl-CPAN-Meta", "perl-CPAN-Meta-Requirements"},
-        provides={
-            "perl(Module::Build)",
-            "perl-Module-Build",
-            "perl(CPAN::Meta)",
-            "perl(CPAN::Meta::Merge)",
-            "perl(CPAN::Meta::Requirements)",
-            "perl-CPAN-Meta-Requirements",
-        },
-        capability_providers={
-            "perl(Module::Build)": {"perl-Module-Build"},
-            "perl(CPAN::Meta)": {"perl-CPAN-Meta"},
-            "perl(CPAN::Meta::Merge)": {"perl-CPAN-Meta"},
-            "perl(CPAN::Meta::Requirements)": {"perl-CPAN-Meta-Requirements"},
-        },
-        binary_requires={
-            "perl-Module-Build": {"perl(CPAN::Meta)", "perl(CPAN::Meta::Merge)"},
-            "perl-CPAN-Meta": {"perl(CPAN::Meta::Requirements)"},
-            "perl-CPAN-Meta-Requirements": {"perl(CPAN::Meta::Requirements::Range)"},
-        },
-        binary_source={
-            "perl-Module-Build": "perl-Module-Build",
-            "perl-CPAN-Meta": "perl",
-            "perl-CPAN-Meta-Requirements": "perl",
-        },
-        source_names={"perl-Module-Build", "perl", "perl-CPAN-Meta-Requirements"},
-    )
-    repo.finalize_lookups()
-    assert repo.satisfies_requirement("perl(Module::Build)")
-    assert "perl(CPAN::Meta::Requirements::Range)" in repo.missing_caps_on_provider_path(
-        "perl(Module::Build)"
-    )
-
-    spec = (
-        "Name: app\nVersion: 1\nRelease: 1\n"
-        "BuildRequires: perl(Module::Build)\n"
-        "Provides: app\n"
-    )
-    parsed = {"app": _parse_spec_text(spec, "app.spec")}
-    distgit = {"perl(CPAN::Meta::Requirements::Range)": {"perl-CPAN-Meta-Requirements"}}
-    force, _ok, _bad, _fetch = _provider_rebuild_force_sources(
-        {"app"},
-        parsed,
-        {"app": spec},
-        repo,
-        distgit,
-    )
-    assert "perl-CPAN-Meta-Requirements" in force
-    assert "perl" not in force
 
 
 def test_indexed_provider_lookup_is_case_insensitive_and_fast() -> None:

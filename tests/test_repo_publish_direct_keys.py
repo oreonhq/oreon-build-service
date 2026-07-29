@@ -30,7 +30,6 @@ def test_publish_stages_rpms_already_at_repo_path() -> None:
         patch("oreon_build.services.publisher._stage_container_for_prefix", return_value=MagicMock()),
         patch("oreon_build.services.publisher._ensure_stage_sidecar"),
         patch("oreon_build.services.publisher._persistent_repo_root") as repo_root,
-        patch("oreon_build.services.publisher._clear_createrepo_cache") as clear_cache,
         patch("oreon_build.api.worker_api._prune_superseded_repo_objects"),
         patch("oreon_build.services.repo_publish.update_repodata_at_prefix") as update_meta,
     ):
@@ -47,7 +46,6 @@ def test_publish_stages_rpms_already_at_repo_path() -> None:
 
     client.put_object.assert_not_called()
     rpms_dir.mkdir.assert_called()
-    clear_cache.assert_called_once()
     update_meta.assert_called_once()
     assert update_meta.call_args.kwargs["staged_binaries"] == [
         "graphviz-14.1.4-3.or11.x86_64.rpm"

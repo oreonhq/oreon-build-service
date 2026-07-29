@@ -163,10 +163,71 @@ def test_staged_identical_version_rebuild_always_runs_createrepo(tmp_path: Path)
 
     assert ok is True
     sync.assert_not_called()
-    clear_cache.assert_called_once()
+    clear_cache.assert_not_called()
     createrepo.assert_called_once()
     assert createrepo.call_args.kwargs.get("force_full") is False
     client.get_object.assert_called()
+    assert (rpms_dir / "pkg-0.x86_64.rpm").read_bytes() == b"rebuilt-bytes"
+
+
+def test_staged_refresh_overwrites_same_size_stale_local(tmp_path: Path) -> None:
+    """Same NEVRA promote can replace R2 bytes at identical size. never size-skip."""
+    from oreon_build.services.publisher import _refresh_staged_rpms_from_r2
+
+    rpms_dir = tmp_path / "RPMS"
+    rpms_dir.mkdir()
+    stale = b"A" * 64
+    fresh = b"B" * 64
+    (rpms_dir / "oreon-release-11-4.or11.noarch.rpm").write_bytes(stale)
+    client = MagicMock()
+    client.get_object.return_value = fresh
+    _refresh_staged_rpms_from_r2(
+        client,
+        "oreon-11-rp1/testing/x86_64/RPMS/",
+        rpms_dir,
+        ["oreon-release-11-4.or11.noarch.rpm"],
+        container=tmp_path,
+    )
+    assert (rpms_dir / "oreon-release-11-4.or11.noarch.rpm").read_bytes() == fresh
+    client.get_object.assert_called_once()
+
+
+def test_force_full_warm_mirror_still_syncs_from_r2(tmp_path: Path) -> None:
+    prefix = "oreon-11-rp1/testing/x86_64"
+    container = tmp_path / "stage"
+    repo_root = container / "repo"
+    rpms_dir = repo_root / "RPMS"
+    rpms_dir.mkdir(parents=True)
+    keys = [{"key": f"{prefix}/RPMS/pkg-{i}.x86_64.rpm", "size": 3} for i in range(120)]
+    for i in range(120):
+        (rpms_dir / f"pkg-{i}.x86_64.rpm").write_bytes(b"old")
+    repodata = repo_root / "repodata"
+    repodata.mkdir()
+    (repodata / "repomd.xml").write_text("<?xml version='1.0'?><repomd/>")
+    (repodata / "deadbeef-primary.xml.zst").write_bytes(b"x" * 4096)
+
+    client = MagicMock()
+    client.list_objects.return_value = keys
+
+    with (
+        patch("oreon_build.services.publisher._repo_temp_dir_parent", return_value=str(tmp_path)),
+        patch("oreon_build.services.publisher._stage_container_for_prefix", return_value=container),
+        patch("oreon_build.services.publisher._count_primary_packages", return_value=120),
+        patch("oreon_build.services.publisher._sync_rpms_dir_from_r2", return_value=(120, 1)) as sync,
+        patch("oreon_build.services.publisher._clear_createrepo_cache") as clear_cache,
+        patch("oreon_build.services.publisher._run_createrepo") as createrepo,
+        patch("oreon_build.services.publisher._validate_repodata_sane"),
+        patch("oreon_build.services.publisher._upload_repodata_dir_ordered"),
+        patch("oreon_build.services.publisher._cleanup_old_repodata"),
+        patch("oreon_build.services.publisher.sign_repomd"),
+    ):
+        ok = update_repodata_at_prefix(prefix, r2_client=client, force_full=True)
+
+    assert ok is True
+    sync.assert_called_once()
+    clear_cache.assert_called_once()
+    createrepo.assert_called_once()
+    assert createrepo.call_args.kwargs.get("force_full") is True
 
 
 def test_staged_publish_with_truncated_local_repodata_pulls_r2_baseline_not_full_regen(

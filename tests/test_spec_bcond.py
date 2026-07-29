@@ -4,6 +4,7 @@ from oreon_build.core.spec_bcond import (
     default_build_defines,
     default_distro_macros,
     parse_spec_bconds,
+    rpm_bcond_define_args,
     solve_bootstrap_defines,
 )
 
@@ -20,6 +21,54 @@ BuildRequires: make
     assert info.defaults.get("with_check") == 0
     assert "gcc" not in info.unconditional_brs
     assert "make" in info.unconditional_brs
+
+
+def test_parse_modern_bcond_default_on() -> None:
+    spec = """
+%bcond check 1
+%bcond manpages 1
+%bcond scancode %{defined fedora}
+%if %{with check}
+BuildRequires: askalono-cli
+BuildRequires: trivy
+%endif
+%if %{with manpages}
+BuildRequires: scdoc
+%endif
+%if %{with scancode}
+BuildRequires: scancode-toolkit
+%endif
+BuildRequires: python3-devel
+"""
+    info = parse_spec_bconds(spec, distro_macros=default_distro_macros("oreon-11-rp1"))
+    assert info.defaults.get("with_check") == 1
+    assert info.defaults.get("with_manpages") == 1
+    assert info.defaults.get("with_scancode") == 0
+    brs = active_build_brs(info, default_build_defines(info))
+    assert "askalono-cli" in brs
+    assert "trivy" in brs
+    assert "scdoc" in brs
+    assert "python3-devel" in brs
+    assert "scancode-toolkit" not in brs
+
+    fedora = parse_spec_bconds(spec, distro_macros=default_distro_macros("fedora-44"))
+    assert fedora.defaults.get("with_scancode") == 1
+    fbrs = active_build_brs(fedora, default_build_defines(fedora))
+    assert "scancode-toolkit" in fbrs
+
+
+def test_parse_modern_bcond_expr_default() -> None:
+    spec = """
+%bcond scancode 1
+%bcond scancode_tests %[ %{with scancode} && 1 ]
+%if %{with scancode_tests}
+BuildRequires: pytest
+%endif
+"""
+    info = parse_spec_bconds(spec)
+    assert info.defaults.get("with_scancode") == 1
+    assert info.defaults.get("with_scancode_tests") == 1
+    assert "pytest" in active_build_brs(info, default_build_defines(info))
 
 
 def test_parse_bcond_without_defaults_on() -> None:
@@ -237,3 +286,71 @@ BuildRequires: make
     profile, _ = solve_bootstrap_defines(info, {"make"})
     assert profile == "full"
     assert "DevIL-devel" not in active_build_brs(info, {k: str(v) for k, v in info.defaults.items()})
+
+
+def test_rpm_bcond_define_args_uses_with_without_macros() -> None:
+    flat = " ".join(
+        rpm_bcond_define_args(
+            {
+                "with_perl_Test_Simple_enables_optional_test": "0",
+                "oreon": "0",
+                "with_check": "1",
+            }
+        )
+    )
+    assert (
+        "_without_perl_Test_Simple_enables_optional_test --without-perl_Test_Simple_enables_optional_test"
+        in flat
+    )
+    assert "_with_check --with-check" in flat
+    assert "oreon 0" in flat
+    assert "with_check 0" not in flat
+    assert "with_check 1" not in flat
+    assert "with_perl_Test_Simple_enables_optional_test 0" not in flat
+
+
+def test_rpmspec_with_check_zero_does_not_enable_check_brs() -> None:
+    """Regression: --define 'with_check 0' wrongly enabled %{with check}."""
+    from oreon_build.services.dynamic_brs import rpmspec_query_buildrequires
+
+    spec = """
+%bcond check 0
+Name: demo
+Version: 1
+Release: 1
+Summary: x
+License: MIT
+BuildRequires: foo
+%if %{with check}
+BuildRequires: bar-check
+%endif
+%description
+x
+%prep
+%build
+%install
+%files
+"""
+    brs = rpmspec_query_buildrequires(spec, defines={"with_check": "0"})
+    assert "foo" in brs
+    assert "bar-check" not in brs
+
+
+def test_simple_qmark_macro_gate_hal() -> None:
+    spec = """
+%define hal 1
+%define udisks2 1
+BuildRequires: qt-devel
+%if 0%{?hal:1}
+BuildRequires: hal-devel
+%endif
+%if 0%{?udisks2:1}
+BuildRequires: udisks2-devel
+%endif
+"""
+    info = parse_spec_bconds(spec)
+    assert "hal-devel" not in info.unconditional_brs
+    assert "hal-devel" in info.conditional_brs.get("hal", set())
+    assert "hal-devel" in active_build_brs(info, {})
+    assert "hal-devel" not in active_build_brs(info, {"hal": "0"})
+    assert "udisks2-devel" in active_build_brs(info, {})

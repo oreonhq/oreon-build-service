@@ -453,11 +453,7 @@ def test_satisfies_requirement_is_case_sensitive_like_dnf() -> None:
     assert repo.has_capability_ci("PackageKit-Qt6-devel") is True
 
 
-def test_uncovered_flags_case_mismatch_when_repo_has_similar_binary() -> None:
-    from oreon_build.core.spec_bcond import parse_spec_bconds
-    from oreon_build.services.build_planner import _uncovered_plan_capabilities
-    from oreon_build.services.distgit_order import _parse_spec_text
-
+def test_case_insensitive_capability_present() -> None:
     repo = RepoCapabilityIndex(
         binary_names={"packagekit-qt6-devel"},
         provides={"packagekit-qt6-devel"},
@@ -466,17 +462,8 @@ def test_uncovered_flags_case_mismatch_when_repo_has_similar_binary() -> None:
         source_names={"packagekit-qt"},
     )
     repo.finalize_lookups()
-    spec = (
-        "Name: plasma-desktop\nVersion: 1\nRelease: 1\n"
-        "BuildRequires: PackageKit-Qt6-devel\n"
-        "Provides: plasma-desktop\n"
-    )
-    parsed = _parse_spec_text(spec, "plasma-desktop.spec")
-    bcond = parse_spec_bconds(spec)
-    bad = _uncovered_plan_capabilities(parsed, bcond, repo, {"plasma-desktop"}, [{}])
-    assert len(bad) == 1
-    assert "PackageKit-Qt6-devel" in bad[0]
-    assert "case-different" in bad[0]
+    assert repo.has_capability_ci("PackageKit-Qt6-devel") is True
+    assert repo.satisfies_requirement("packagekit-qt6-devel") is True
 
 
 def test_repo_channels_from_mock_urls() -> None:
