@@ -4,9 +4,12 @@
 %global _debuginfo_subpackages 0
 %global debug_package %{nil}
 
+%global __requires_exclude_from ^%{_prefix}/lib/oreon-build-worker/.*$
+%global __provides_exclude_from ^%{_prefix}/lib/oreon-build-worker/.*$
+
 Name:           oreon-build-worker
 Version:        1.0.0
-Release:        63%{?dist}
+Release:        64%{?dist}
 Summary:        Oreon Build Service worker daemon
 License:        GPLv3
 URL:            https://github.com/oreon/oreon-build-service
@@ -24,6 +27,9 @@ BuildRequires:  libffi-devel
 BuildRequires:  libpq-devel
 BuildRequires:  krb5-devel
 BuildRequires:  openldap-devel
+BuildRequires:  libxml2-devel
+BuildRequires:  libxslt-devel
+BuildRequires:  xz-devel
 
 Requires:       python3 >= 3.11
 Requires:       mock
@@ -50,8 +56,8 @@ mkdir -p %{buildroot}%{_bindir}
 mkdir -p %{buildroot}%{_sysconfdir}/oreon-build-worker
 mkdir -p %{buildroot}%{_unitdir}
 
-python3 -m pip install --no-compile --ignore-installed --prefer-binary \
-  --only-binary bcrypt \
+python3 -m pip install --no-compile --ignore-installed \
+  --only-binary bcrypt,lxml \
   --no-binary cryptography,cffi,psycopg2-binary \
   --target %{buildroot}%{_prefix}/lib/oreon-build-worker .
 
@@ -89,8 +95,6 @@ getent group oreon-build >/dev/null 2>&1 || groupadd -r oreon-build
 getent passwd oreon-build >/dev/null 2>&1 || useradd -r -g oreon-build -s /sbin/nologin -d /var/lib/oreon-build-worker oreon-build
 
 %post
-# After install: drop pip-vendored pydantic trees so the system python3-pydantic package is used.
-# (%post runs as root; same effect as the sudo rm commands below.)
 rm -rf %{_prefix}/lib/oreon-build-worker/pydantic
 rm -rf %{_prefix}/lib/oreon-build-worker/pydantic-*
 rm -rf %{_prefix}/lib/oreon-build-worker/pydantic_core
