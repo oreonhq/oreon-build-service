@@ -13,6 +13,9 @@ class _ReqCheck(Protocol):
 
 _RE_BCOND_WITH = re.compile(r"^%\s*bcond_with\s+(\S+)", re.IGNORECASE)
 _RE_BCOND_WITHOUT = re.compile(r"^%\s*bcond_without\s+(\S+)", re.IGNORECASE)
+# rpm 4.17.1+: %bcond name default   (must be matched after bcond_with/without)
+_RE_BCOND = re.compile(r"^%\s*bcond\s+(\S+)\s+(.+)$", re.IGNORECASE)
+_RE_EXPR_BRACKET = re.compile(r"^%\[\s*(.+?)\s*\]$", re.DOTALL)
 _RE_GLOBAL = re.compile(r"^%\s*global\s+(\S+)\s+(.+)$", re.IGNORECASE)
 _RE_DEFINE = re.compile(r"^%\s*define\s+(\S+)\s+(.+)$", re.IGNORECASE)
 _RE_IF = re.compile(r"^%\s*if\b(.*)$", re.IGNORECASE)
@@ -143,12 +146,9 @@ def _expand_br_macros(value: str, macros: dict[str, str], *, max_rounds: int = 1
 
 
 def default_distro_macros(releasename: str = "") -> dict[str, str]:
+    # only set the active distro id. sentinel fedora=0 made %{defined fedora}
+    # true on oreon and wrongly enabled fedora-only bconds like scancode.
     out = {
-        "oreon": "0",
-        "rhel": "0",
-        "fedora": "0",
-        "el": "0",
-        "centos": "0",
         "python3_pkgversion": "3",
         "python3_version": "3",
     }
@@ -156,12 +156,14 @@ def default_distro_macros(releasename: str = "") -> dict[str, str]:
     m = re.search(r"oreon[_-]?(\d+)", rel)
     if m:
         out["oreon"] = m.group(1)
+        return out
     m = re.search(r"(?:^|[_\-])(?:el|rhel)(\d+)", rel)
     if m:
         out["rhel"] = m.group(1)
         out["el"] = m.group(1)
+        return out
     m = re.search(r"(?:^|[_\-])f(?:edora)?[_-]?(\d+)", rel)
-    if m and "oreon" not in rel:
+    if m:
         out["fedora"] = m.group(1)
     return out
 
@@ -313,7 +315,42 @@ def _gating_bconds_from_expr(expr: str) -> set[str]:
             out.add(f"with_{with_name}")
         if without_name:
             out.add(f"with_{without_name}")
+    # only simple feature toggles like %if 0%{?hal:1} — not complex !0%{?bootstrap} && ...
+    simple = (expr or "").strip()
+    m = re.fullmatch(
+        r"0?\s*%\{\?([A-Za-z0-9_]+)(?::1)?\}\s*",
+        simple,
+        re.IGNORECASE,
+    )
+    if m:
+        name = (m.group(1) or "").strip()
+        low = name.lower()
+        if name and not low.startswith(("with_", "without_")) and low not in {
+            "with",
+            "without",
+            "defined",
+            "undefined",
+            "expand",
+        }:
+            out.add(name)
     return out
+
+
+def _eval_bcond_default(raw: str, macros: dict[str, str], bconds: dict[str, int]) -> int:
+    """Evaluate %bcond name <default> to 0/1 (rpm numeric / %{defined} / %[expr])."""
+    text = (raw or "").strip()
+    if not text:
+        return 0
+    m = _RE_EXPR_BRACKET.match(text)
+    if m:
+        text = (m.group(1) or "").strip()
+    if _eval_condition(text, macros, bconds):
+        return 1
+    expanded = _expand_macro_value(text, macros, bconds)
+    try:
+        return 1 if int(str(expanded).strip() or "0") != 0 else 0
+    except ValueError:
+        return 0
 
 
 def parse_spec_bconds(
@@ -361,6 +398,15 @@ def parse_spec_bconds(
                 bconds[key] = 1
                 info.defaults[key] = 1
                 macros[key] = "1"
+            continue
+        m_b = _RE_BCOND.match(s)
+        if m_b:
+            if active():
+                key = f"with_{m_b.group(1)}"
+                iv = _eval_bcond_default(m_b.group(2), macros, bconds)
+                bconds[key] = iv
+                info.defaults[key] = iv
+                macros[key] = str(iv)
             continue
 
         m_g = _RE_GLOBAL.match(s) or _RE_DEFINE.match(s)
@@ -440,10 +486,14 @@ def parse_spec_bconds(
 
 def active_brs(info: SpecBcondInfo, defines: dict[str, str]) -> set[str]:
     out = set(info.unconditional_brs) | set(info.unconditional_reqs)
-    merged = {**{k: str(v) for k, v in info.defaults.items()}, **defines}
+    merged = {
+        **dict(info.macros or {}),
+        **{k: str(v) for k, v in info.defaults.items()},
+        **defines,
+    }
     for bc, brs in info.conditional_brs.items():
-        key = bc if bc.startswith("with_") else f"with_{bc}"
-        val = merged.get(key, str(info.defaults.get(key, 0)))
+        key = bc if bc.startswith("with_") else bc
+        val = merged.get(key, "0")
         try:
             on = int(str(val).strip() or "0") != 0
         except ValueError:
@@ -455,10 +505,14 @@ def active_brs(info: SpecBcondInfo, defines: dict[str, str]) -> set[str]:
 
 def active_build_brs(info: SpecBcondInfo, defines: dict[str, str]) -> set[str]:
     out = set(info.unconditional_brs)
-    merged = {**{k: str(v) for k, v in info.defaults.items()}, **defines}
+    merged = {
+        **dict(info.macros or {}),
+        **{k: str(v) for k, v in info.defaults.items()},
+        **defines,
+    }
     for bc, brs in info.conditional_brs.items():
-        key = bc if bc.startswith("with_") else f"with_{bc}"
-        val = merged.get(key, str(info.defaults.get(key, 0)))
+        key = bc if bc.startswith("with_") else bc
+        val = merged.get(key, "0")
         try:
             on = int(str(val).strip() or "0") != 0
         except ValueError:
@@ -487,6 +541,40 @@ def unsatisfied_brs(
 
 def default_build_defines(info: SpecBcondInfo) -> dict[str, str]:
     return {k: str(v) for k, v in info.defaults.items()}
+
+
+_FALSEY = frozenset({"0", "no", "false", "off"})
+_TRUTHY = frozenset({"1", "yes", "true", "on"})
+
+
+def rpm_bcond_define_args(defines: dict[str, str] | None) -> list[str]:
+    """Translate planner with_*=0/1 into rpm --with/--without defines.
+
+    `--define 'with_check 0'` still *defines* with_check, so %{with check} becomes
+    true and cargo_generate_buildrequires adds --with-check (dev-deps). Use
+    `_without_check` / `_with_check` instead, matching mock CLI.
+    """
+    out: list[str] = []
+    if not isinstance(defines, dict):
+        return out
+    for key in sorted(defines.keys()):
+        k = str(key).strip()
+        if not k:
+            continue
+        v = str(defines.get(key) or "").strip()
+        if k.startswith("with_"):
+            feature = k[5:]
+            if not feature:
+                continue
+            low = v.lower()
+            if low in _FALSEY:
+                out += ["--define", f"_without_{feature} --without-{feature}"]
+                continue
+            if low in _TRUTHY:
+                out += ["--define", f"_with_{feature} --with-{feature}"]
+                continue
+        out += ["--define", f"{k} {v}"]
+    return out
 
 
 def solve_bootstrap_defines(

@@ -8,6 +8,7 @@ _RE_VERSIONED = re.compile(r"\s[<>=]")
 _RE_VERSIONED_REQ = re.compile(
     r"^(?P<name>.+?)\s*(?P<op><=|>=|==|!=|<|>|=)\s*(?P<ver>\S+)\s*$"
 )
+_RE_VERSION_ONLY_TOKEN = re.compile(r"^[\d]+([.-][\d]+)*$")
 _RE_RPM_ARCH_QUAL = re.compile(
     r"^(.+)\((?:x86-64|aarch-64|aarch64|i686|noarch|ppc64le|s390x)\)$",
     re.IGNORECASE,
@@ -44,14 +45,32 @@ def is_low_level_runtime_requirement(cap: str) -> bool:
     return False
 
 
+def is_spurious_solver_miss(cap: str) -> bool:
+    """junk caps from bad macro split / version-only solver jobs."""
+    c = (cap or "").strip()
+    if not c:
+        return True
+    if _RE_VERSION_ONLY_TOKEN.match(c):
+        return True
+    if len(c) == 1 and c in "<>=!":
+        return True
+    if c in {">", "<", ">=", "<=", "==", "!="}:
+        return True
+    return False
+
+
 def is_chain_plan_requirement(cap: str) -> bool:
     c = (cap or "").strip()
     if not c or "%" in c:
         return False
     if c.startswith("(") and c.endswith(")"):
         return False
+    if is_spurious_solver_miss(c):
+        return False
     name, _op, _ver = parse_versioned_requirement(c)
     check = name or c
+    if is_spurious_solver_miss(check):
+        return False
     if is_low_level_runtime_requirement(check):
         return False
     if is_arch_qualified_rpm_dependency(check):
@@ -332,7 +351,14 @@ def parse_versioned_requirement(requirement: str) -> tuple[str | None, str | Non
     name = (m.group("name") or "").strip()
     op = (m.group("op") or "").strip()
     ver = (m.group("ver") or "").strip()
-    if not name or "%" in name or not ver or "%" in ver:
+    if (
+        not name
+        or "%" in name
+        or not ver
+        or "%" in ver
+        or is_spurious_solver_miss(name)
+        or name in {">", "<", "=", "!"}
+    ):
         primary = rpm_requirement_primary(raw)
         return primary, None, None
     if op == "==":
@@ -521,17 +547,16 @@ def requirement_check_capabilities(requirement: str) -> list[str]:
         seen.add(c)
         caps.append(c)
 
-    for cap in rpm_requirement_capabilities(requirement):
+    def add_leaf(cap: str) -> None:
         add(cap)
         arch_base = rpm_arch_qualified_base(cap)
         if arch_base:
             add(arch_base)
         if cap.startswith("mvn(") and cap.endswith(")"):
             add(cap[4:-1].strip())
-            continue
+            return
         if ":" in cap and not cap.startswith(("/", "pkgconfig(", "mvn(")):
             add(f"mvn({cap})")
-        # /usr/bin/npm also resolves via Provide: npm / package name npm
         if cap.startswith("/") and not cap.endswith("/"):
             base = cap.rsplit("/", 1)[-1].strip()
             if base and base not in {".", ".."} and "%" not in base:
@@ -540,9 +565,26 @@ def requirement_check_capabilities(requirement: str) -> list[str]:
         if m:
             inner = (m.group(2) or "").strip()
             if inner and "%" not in inner:
-                # convention: python3dist(foo_bar) <-> python3-foo-bar / python-foo-bar
                 dashed = inner.replace("_", "-")
                 unders = inner.replace("-", "_")
                 for name in (f"python3-{dashed}", f"python-{dashed}", f"python3-{unders}", f"python-{unders}"):
                     add(name)
+        # crate(foo/default) also resolves via rust-foo Provide crate(foo)
+        cm = re.match(r"^crate\(([^)/]+)(?:/[^)]+)?\)$", cap)
+        if cm:
+            crate = (cm.group(1) or "").strip()
+            if crate and "%" not in crate:
+                add(f"crate({crate})")
+                add(f"rust-{crate}")
+
+    raw = (requirement or "").strip()
+    if raw.startswith("(") and raw.endswith(")"):
+        from oreon_build.services.repo_capability_index import _rich_dep_actionable_leaves
+
+        for leaf in _rich_dep_actionable_leaves(raw):
+            add_leaf(leaf)
+        return caps
+
+    for cap in rpm_requirement_capabilities(requirement):
+        add_leaf(cap)
     return caps
