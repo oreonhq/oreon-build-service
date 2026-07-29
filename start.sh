@@ -21,6 +21,12 @@ if [ ! -d .venv ]; then
   exit 1
 fi
 
+export PATH="${HOME}/.cargo/bin:${HOME}/.local/bin:${PATH}"
+if ! command -v cargo2rpm &>/dev/null || ! command -v cargo &>/dev/null; then
+  echo "WARNING: cargo2rpm/cargo missing. cargo %generate_buildrequires will fail closed."
+  echo "  Install via ./scripts/deploy.sh or: sudo dnf install cargo-rpm-macros cargo2rpm cargo"
+fi
+
 if [ -f .oreon-repodata-refresh.pid ] && kill -0 "$(cat .oreon-repodata-refresh.pid)" 2>/dev/null; then
   _oreon_old_rep="$(cat .oreon-repodata-refresh.pid 2>/dev/null || true)"
   echo "Stale repodata refresh pid file (PID $_oreon_old_rep not running). Removing."
