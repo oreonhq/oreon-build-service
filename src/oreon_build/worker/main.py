@@ -1001,6 +1001,8 @@ def _write_oreon_mock_mixed_repos_wrapper_cfg(
     parent: Path,
     attempt_id: int,
     addrepo_baseurls: list[str] | None = None,
+    *,
+    prefer_arch: str | None = None,
 ) -> Path:
     parent.mkdir(parents=True, exist_ok=True)
     out = parent / f"oreon-mock-mixed-repos-{attempt_id}.cfg"
@@ -1023,6 +1025,7 @@ def _write_oreon_mock_mixed_repos_wrapper_cfg(
         "",
     ]
     urls = [str(u).strip() for u in (addrepo_baseurls or []) if str(u).strip()]
+    arch_pref = (prefer_arch or "").strip()
     if urls:
         lines += [
             '_oreon_dcf = config_opts.get("dnf.conf") or ""',
@@ -1033,6 +1036,10 @@ def _write_oreon_mock_mixed_repos_wrapper_cfg(
         for i, url in enumerate(urls):
             rid = _mock_addrepo_section_id(url, i)
             base = url if url.endswith("/") else (url + "/")
+            # sibling-arch side-tag trees are for noarch visibility; prefer native arch
+            cost = 500
+            if arch_pref and f"/{arch_pref}/" not in base:
+                cost = 2000
             lines += [
                 f'_oreon_extra += """',
                 f'[{rid}]',
@@ -1042,6 +1049,7 @@ def _write_oreon_mock_mixed_repos_wrapper_cfg(
                 'gpgcheck=0',
                 'repo_gpgcheck=0',
                 'skip_if_unavailable=True',
+                f'cost={cost}',
                 '',
                 '"""',
             ]
@@ -1057,6 +1065,8 @@ def _mock_config_for_mixed_addrepos(
     addrepo_baseurls: list[str] | None,
     result_parent: Path,
     attempt_id: int | None,
+    *,
+    prefer_arch: str | None = None,
 ) -> str:
     if not addrepo_baseurls or _truthy_env("OREON_WORKER_MOCK_SKIP_MIXED_REPOS_OPTS"):
         return base_cfg
@@ -1071,7 +1081,11 @@ def _mock_config_for_mixed_addrepos(
         return base_cfg
     wid = int(attempt_id) if attempt_id is not None else 0
     wpath = _write_oreon_mock_mixed_repos_wrapper_cfg(
-        inc, result_parent, wid, addrepo_baseurls=addrepo_baseurls
+        inc,
+        result_parent,
+        wid,
+        addrepo_baseurls=addrepo_baseurls,
+        prefer_arch=prefer_arch,
     )
     logger.info("mock -r %s (mixed addrepo, include %s)", wpath, inc)
     return str(wpath)
@@ -1694,12 +1708,14 @@ def _mock_build_srpm_from_spec(
     attempt_id: int | None = None,
     live_out: MockLiveOutput | None = None,
     rpmbuild_defines: dict | None = None,
+    prefer_arch: str | None = None,
 ) -> tuple[bool, Path | None, str, bool]:
     eff_mock_config = _mock_config_for_mixed_addrepos(
         mock_config,
         addrepo_baseurls or [],
         result_dir.parent,
         attempt_id,
+        prefer_arch=prefer_arch,
     )
     cmd = _mock_cmd_base(
         eff_mock_config,
@@ -1743,12 +1759,14 @@ def _mock_rebuild_srpm(
     attempt_id: int | None = None,
     live_out: MockLiveOutput | None = None,
     rpmbuild_defines: dict | None = None,
+    prefer_arch: str | None = None,
 ) -> tuple[bool, str, bool]:
     eff_mock_config = _mock_config_for_mixed_addrepos(
         mock_config,
         addrepo_baseurls or [],
         result_dir.parent,
         attempt_id,
+        prefer_arch=prefer_arch,
     )
     cmd = _mock_cmd_base(
         eff_mock_config,
@@ -2126,6 +2144,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
         mock_addrepos = _mock_addrepo_baseurls(job)
         if mock_addrepos:
             logger.info("mock --addrepo for attempt %s: %s", attempt_id, mock_addrepos)
+        build_arch = str(job.get("architecture") or "").strip() or None
 
         rpm_dist = _rpm_dist_macro_value(job.get("releasename"))
         if rpm_dist:
@@ -2166,6 +2185,10 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
             tmp = Path(tmpdir)
             build_log_parts: list[str] = []
             log_max_lines = int(os.environ.get("OREON_WORKER_LOG_MAX_LINES", "40000"))
+            if mock_addrepos:
+                build_log_parts.append(
+                    "## mock additional repos\n" + "\n".join(mock_addrepos)
+                )
 
             def _live_log_prefix() -> str:
                 return "\n\n".join(p for p in build_log_parts if p).strip()
@@ -2297,6 +2320,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                         attempt_id=attempt_id,
                         live_out=srpm_live,
                         rpmbuild_defines=rpmbuild_defines,
+                        prefer_arch=build_arch,
                     )
                 finally:
                     live_srpm_stop.set()
@@ -2383,6 +2407,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                     attempt_id=attempt_id,
                     live_out=rebuild_live,
                     rpmbuild_defines=rpmbuild_defines,
+                    prefer_arch=build_arch,
                 )
             finally:
                 live_rebuild_stop.set()
