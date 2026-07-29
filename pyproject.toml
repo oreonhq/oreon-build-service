@@ -30,6 +30,8 @@ dependencies = [
     "jinja2>=3.1.0",
     "itsdangerous>=2.1.0",
     "zstandard>=0.22.0",
+    "solv>=0.7.39",
+    "networkx>=3.0",
 ]
 
 [project.optional-dependencies]
@@ -42,6 +44,7 @@ oreon-api = "oreon_build.api.main:run_server"
 oreon-worker = "oreon_build.worker.main:main"
 oreon-scheduler = "oreon_build.scheduler.main:main"
 oreon-publisher = "oreon_build.publisher.main:main"
+oreon-cargo2rpm = "oreon_build.tools.cargo2rpm_filter:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
