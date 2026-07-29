@@ -1,0 +1,425 @@
+"""Evaluate BuildRequires the way rpm/mock do, including %generate_buildrequires."""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+logger = logging.getLogger(__name__)
+
+_RE_GENERATE = re.compile(r"^\s*%generate_buildrequires\b", re.IGNORECASE | re.MULTILINE)
+_RE_SOURCE = re.compile(r"^Source\d*\s*:\s*(\S+)", re.IGNORECASE | re.MULTILINE)
+_RE_PATCH = re.compile(r"^Patch\d*\s*:\s*(\S+)", re.IGNORECASE | re.MULTILINE)
+_RE_RPMLIB = re.compile(r"^rpmlib\(", re.IGNORECASE)
+_RE_CARGO_SPEC = re.compile(
+    r"^\s*%\s*(?:cargo_prep|cargo_build|cargo_install|cargo_test|cargo_generate_buildrequires)\b"
+    r"|^\s*%\s*global\s+crate\b"
+    r"|%\{crates_source\}"
+    r"|^\s*%\s*cargo_generate_buildrequires\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+_CACHE: dict[str, tuple[float, list[str], bool]] = {}
+_CACHE_TTL = 1800.0
+
+
+@dataclass
+class DynBrResult:
+    buildrequires: list[str]
+    complete: bool
+    error: str = ""
+
+
+def spec_has_generate_buildrequires(spec_text: str) -> bool:
+    return bool(_RE_GENERATE.search(spec_text or ""))
+
+
+def spec_uses_cargo_generate_buildrequires(spec_text: str) -> bool:
+    """Rust/cargo specs need buildreqs.nosrc crate() deps. static rpmspec BRs lie."""
+    return bool(_RE_CARGO_SPEC.search(spec_text or ""))
+
+
+def _rpmbuild_env() -> dict[str, str]:
+    env = dict(os.environ)
+    home = Path.home()
+    extras = [str(home / ".cargo" / "bin"), str(home / ".local" / "bin")]
+    path = env.get("PATH") or ""
+    for p in reversed(extras):
+        if p and p not in path.split(os.pathsep):
+            path = p + os.pathsep + path
+    env["PATH"] = path
+    return env
+
+
+def _define_args(defines: dict[str, str] | None) -> list[str]:
+    from oreon_build.core.spec_bcond import rpm_bcond_define_args
+
+    return rpm_bcond_define_args(defines)
+
+
+def _run(cmd: list[str], *, timeout: int = 120) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+        env=_rpmbuild_env(),
+    )
+
+
+def rpmspec_query_buildrequires(
+    spec_text: str,
+    *,
+    defines: dict[str, str] | None = None,
+) -> list[str]:
+    """Static/macro-expanded BRs via rpmspec (no %generate_buildrequires pass)."""
+    with tempfile.TemporaryDirectory(prefix="oreon-rpmspec-") as td:
+        spec_path = Path(td) / "pkg.spec"
+        spec_path.write_text(spec_text or "", encoding="utf-8")
+        cmd = ["rpmspec", "-q", "--buildrequires", str(spec_path)]
+        cmd.extend(_define_args(defines))
+        proc = _run(cmd, timeout=60)
+        if proc.returncode != 0:
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        for line in (proc.stdout or "").splitlines():
+            br = (line or "").strip()
+            if not br or _RE_RPMLIB.match(br) or br in seen:
+                continue
+            seen.add(br)
+            out.append(br)
+        return out
+
+
+def _parse_source_entries(spec_text: str, defines: dict[str, str] | None) -> list[tuple[str, str]]:
+    """Return (basename, url_or_empty) for each SourceN after macro expand."""
+    return _parse_tag_file_entries(spec_text, defines, _RE_SOURCE)
+
+
+def _parse_patch_entries(spec_text: str, defines: dict[str, str] | None) -> list[tuple[str, str]]:
+    """Return (basename, url_or_empty) for each PatchN after macro expand."""
+    return _parse_tag_file_entries(spec_text, defines, _RE_PATCH)
+
+
+def _parse_tag_file_entries(
+    spec_text: str,
+    defines: dict[str, str] | None,
+    tag_re: re.Pattern[str],
+) -> list[tuple[str, str]]:
+    with tempfile.TemporaryDirectory(prefix="oreon-rpmspec-src-") as td:
+        spec_path = Path(td) / "pkg.spec"
+        spec_path.write_text(spec_text or "", encoding="utf-8")
+        cmd = ["rpmspec", "-P", str(spec_path)]
+        cmd.extend(_define_args(defines))
+        proc = _run(cmd, timeout=60)
+        blob = proc.stdout or ""
+        out: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for m in tag_re.finditer(blob):
+            raw = (m.group(1) or "").strip()
+            if not raw:
+                continue
+            url = ""
+            name = raw
+            if raw.startswith(("http://", "https://", "ftp://")):
+                url = raw
+                if "#/" in raw:
+                    name = raw.rsplit("#/", 1)[-1]
+                else:
+                    name = raw.rstrip("/").rsplit("/", 1)[-1] or "Source"
+            name = name.split("?", 1)[0].strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            out.append((name, url))
+        return out
+
+
+def _parse_source_urls(spec_text: str, defines: dict[str, str] | None) -> list[str]:
+    return [url for _name, url in _parse_source_entries(spec_text, defines) if url]
+
+
+def local_source_basenames(spec_text: str, defines: dict[str, str] | None = None) -> list[str]:
+    """Local SourceN + PatchN files that live beside the spec in distgit."""
+    names: list[str] = []
+    seen: set[str] = set()
+    for name, url in (
+        *_parse_source_entries(spec_text, defines),
+        *_parse_patch_entries(spec_text, defines),
+    ):
+        if url or not name or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names
+
+
+def _parse_source0_url(spec_text: str, defines: dict[str, str] | None) -> str | None:
+    urls = _parse_source_urls(spec_text, defines)
+    return urls[0] if urls else None
+
+
+def _crates_io_static_url(url: str) -> str | None:
+    """Rewrite crates.io API download URLs to static.crates.io (avoids API 429)."""
+    raw = (url or "").strip()
+    if not raw:
+        return None
+    # https://crates.io/api/v1/crates/<name>/<ver>/download#/<name>-<ver>.crate
+    m = re.match(
+        r"^https?://crates\.io/api/v1/crates/([^/]+)/([^/]+)/download(?:#/.*)?$",
+        raw,
+        re.IGNORECASE,
+    )
+    if not m:
+        return None
+    name, ver = m.group(1), m.group(2)
+    return f"https://static.crates.io/crates/{name}/{name}-{ver}.crate"
+
+def _http_download(url: str, dest: Path, *, timeout: int = 180) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    urls = [url]
+    alt = _crates_io_static_url(url)
+    if alt and alt not in urls:
+        # prefer static CDN first for crates.io
+        urls = [alt, url]
+    last_err: Exception | None = None
+    for u in urls:
+        try:
+            req = urllib.request.Request(
+                u, headers={"User-Agent": "oreon-build-service/dynamic-brs"}
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp, open(tmp, "wb") as out:
+                shutil.copyfileobj(resp, out)
+            tmp.replace(dest)
+            return
+        except Exception as exc:
+            last_err = exc
+            continue
+    if last_err:
+        raise last_err
+    raise RuntimeError(f"download failed for {url}")
+
+
+def _cache_key(spec_text: str, defines: dict[str, str] | None, local_sources: Iterable[str]) -> str:
+    h = hashlib.sha256()
+    h.update((spec_text or "").encode("utf-8", errors="replace"))
+    for k in sorted((defines or {}).keys()):
+        h.update(f"{k}={(defines or {})[k]}\n".encode())
+    for p in sorted(local_sources):
+        h.update(p.encode())
+        try:
+            h.update(Path(p).read_bytes()[:65536])
+        except Exception:
+            pass
+    return h.hexdigest()
+
+
+def _requires_from_nosrc_rpm(path: Path) -> list[str]:
+    """Read Requires from a buildreqs.nosrc.rpm via python-rpm header API."""
+    try:
+        import rpm
+    except ImportError:
+        return _requires_from_nosrc_rpm_cli(path)
+
+    ts = rpm.TransactionSet()
+    try:
+        ts.setVSFlags(rpm._RPMVSF_NOSIGNATURES)
+    except Exception:
+        pass
+    fdno = -1
+    try:
+        fdno = os.open(str(path), os.O_RDONLY)
+        hdr = ts.hdrFromFdno(fdno)
+    except Exception:
+        logger.warning("python-rpm failed reading %s, falling back to rpm -qp", path, exc_info=True)
+        return _requires_from_nosrc_rpm_cli(path)
+    finally:
+        if fdno >= 0:
+            try:
+                os.close(fdno)
+            except Exception:
+                pass
+
+    out: list[str] = []
+    seen: set[str] = set()
+    try:
+        for dep in rpm.ds(hdr, "requires"):
+            raw = (dep.DNEVR() or "").strip()
+            if raw.startswith("R "):
+                raw = raw[2:].strip()
+            br = raw.strip()
+            if not br or _RE_RPMLIB.match(br) or br in seen:
+                continue
+            seen.add(br)
+            out.append(br)
+    except Exception:
+        logger.warning("rpm.ds requires failed for %s", path, exc_info=True)
+        return _requires_from_nosrc_rpm_cli(path)
+    return out
+
+
+def _requires_from_nosrc_rpm_cli(path: Path) -> list[str]:
+    q = _run(["rpm", "-qp", "--requires", str(path)], timeout=30)
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in (q.stdout or "").splitlines():
+        br = (line or "").strip()
+        if not br or _RE_RPMLIB.match(br) or br in seen:
+            continue
+        seen.add(br)
+        out.append(br)
+    return out
+
+
+def evaluate_generate_buildrequires(
+    spec_text: str,
+    *,
+    defines: dict[str, str] | None = None,
+    local_source_paths: list[Path] | None = None,
+    allow_source_download: bool = True,
+    target_arches: set[str] | None = None,
+) -> DynBrResult:
+    """Run rpmbuild -br and read Requires from the buildreqs nosrc rpm.
+
+    Same DynamicBuildRequires path mock uses before builddep.
+    complete=False when %generate_buildrequires could not be evaluated.
+    For cargo specs, crate() caps that only apply to foreign target cfgs
+    (windows/hermit/redox/...) are dropped for the planned Linux arches.
+    """
+    import time
+
+    from oreon_build.services.cargo_target_brs import (
+        filter_foreign_target_crate_brs,
+        find_cargo_tomls,
+    )
+
+    if not spec_has_generate_buildrequires(spec_text):
+        brs = rpmspec_query_buildrequires(spec_text, defines=defines)
+        return DynBrResult(buildrequires=brs, complete=True)
+
+    locals_ = [str(p) for p in (local_source_paths or []) if p and Path(p).is_file()]
+    arch_key = ",".join(sorted((target_arches or set()) or {"x86_64"}))
+    key = _cache_key(spec_text, {**(defines or {}), "__arches__": arch_key}, locals_)
+    now = time.monotonic()
+    hit = _CACHE.get(key)
+    if hit and now - hit[0] < _CACHE_TTL:
+        return DynBrResult(buildrequires=list(hit[1]), complete=bool(hit[2]))
+
+    with tempfile.TemporaryDirectory(prefix="oreon-rpmbr-") as td:
+        top = Path(td)
+        for sub in ("BUILD", "RPMS", "SOURCES", "SPECS", "SRPMS"):
+            (top / sub).mkdir(parents=True, exist_ok=True)
+        spec_path = top / "SPECS" / "pkg.spec"
+        spec_path.write_text(spec_text or "", encoding="utf-8")
+        for src in locals_:
+            shutil.copy2(src, top / "SOURCES" / Path(src).name)
+
+        source_fail = False
+        if allow_source_download:
+            for name, url in _parse_source_entries(spec_text, defines):
+                if not url:
+                    continue
+                dest = top / "SOURCES" / name
+                if dest.exists():
+                    continue
+                try:
+                    _http_download(url, dest)
+                except Exception:
+                    source_fail = True
+                    logger.warning("source download failed for dyn BRs: %s", url, exc_info=True)
+
+        cmd = [
+            "rpmbuild",
+            "-br",
+            "--nodeps",
+            "--define",
+            f"_topdir {top}",
+            "--define",
+            "_build_id_links none",
+            "--define",
+            "source_date_epoch_from_changelog 0",
+        ]
+        cmd.extend(_define_args(defines))
+        cmd.append(str(spec_path))
+        proc = _run(cmd, timeout=300)
+        brs: list[str] = []
+        nosrc = sorted((top / "SRPMS").glob("*.buildreqs.nosrc.rpm"))
+        if nosrc:
+            brs = _requires_from_nosrc_rpm(nosrc[-1])
+
+        if brs:
+            if spec_uses_cargo_generate_buildrequires(spec_text):
+                brs = filter_foreign_target_crate_brs(
+                    brs,
+                    cargo_tomls=find_cargo_tomls(top / "BUILD"),
+                    arches=target_arches,
+                )
+            # pyproject/%generate_buildrequires often exits non-zero after writing
+            # the nosrc Requires (deps not in the empty buildroot). that output is
+            # still the real DynamicBuildRequires list mock would use.
+            _CACHE[key] = (now, list(brs), True)
+            return DynBrResult(buildrequires=brs, complete=True)
+
+        static = rpmspec_query_buildrequires(spec_text, defines=defines)
+        err = (proc.stderr or proc.stdout or "")[-400:].strip()
+        if source_fail and not err:
+            err = "source download failed"
+        if not err:
+            err = "rpmbuild -br produced no buildreqs nosrc"
+        cargo = spec_uses_cargo_generate_buildrequires(spec_text)
+        if cargo:
+            # cargo second pass is rich crate() caps. static BRs alone are a lie.
+            logger.info(
+                "cargo rpmbuild -br produced no nosrc (complete=False): %s",
+                err[:200],
+            )
+            _CACHE[key] = (now, list(static), False)
+            return DynBrResult(
+                buildrequires=static,
+                complete=False,
+                error=err or "cargo buildreqs nosrc missing",
+            )
+        # golang/py generate often needs tools from static BRs (go-vendor-tools,
+        # hatchling, ...) that mock installs in builddep pass 1 inside the chroot.
+        # on the planner host those tools may be missing, so -br writes no nosrc.
+        # static BRs schedule those tools (pass-1). complete=False so planner can
+        # re-run -br once tools are installable under the plan overlay.
+        if static:
+            logger.info(
+                "rpmbuild -br produced no nosrc, static pass-1 BRs (%s): %s",
+                len(static),
+                err[:200],
+            )
+            _CACHE[key] = (now, list(static), False)
+            return DynBrResult(buildrequires=static, complete=False, error=err)
+        logger.info("rpmbuild -br incomplete for dyn BRs: %s", err[:200])
+        _CACHE[key] = (now, [], False)
+        return DynBrResult(buildrequires=[], complete=False, error=err)
+
+
+def merge_buildrequires(*groups: Iterable[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for br in group:
+            b = (br or "").strip()
+            if not b or b in seen or "%" in b:
+                continue
+            seen.add(b)
+            out.append(b)
+    return out
+
+
+def clear_dynamic_br_cache() -> None:
+    _CACHE.clear()

@@ -32,6 +32,22 @@ def spawn(coro) -> None:
     task.add_done_callback(_log_task_result)
 
 
+def uncovered_plan_roots(
+    root_packages: list[str],
+    *,
+    package_plans: dict[str, Any] | None,
+    skipped: list[str] | None,
+) -> list[str]:
+    """Roots that are neither scheduled to build nor skipped as already satisfied."""
+    covered = set(package_plans or {}) | {s for s in (skipped or []) if s}
+    out: list[str] = []
+    for r in root_packages or []:
+        name = (r or "").strip()
+        if name and name not in covered:
+            out.append(name)
+    return out
+
+
 async def _fail_chain_planning(
     chain_id: int,
     message: str,
@@ -223,11 +239,7 @@ async def run_auto_chain_plan_and_enqueue(chain_id: int) -> None:
 
     if t_errs:
         logger.warning("chain_id=%s distgit fetch errors: %s", chain_id, t_errs)
-    if not plan.chain_spec.strip() and not plan.package_plans:
-        msg = plan.errors[0] if plan.errors else "Could not plan chain dependencies"
-        await _fail_chain_planning(chain_id, msg, plan_errors=plan.errors)
-        return
-
+    # leaf imports beat empty-plan errors[0] (was toasting intermediate holes)
     if plan.blocking_errors:
         pkgs = ", ".join(plan.blocking_errors[:40])
         if len(plan.blocking_errors) > 40:
@@ -236,6 +248,46 @@ async def run_auto_chain_plan_and_enqueue(chain_id: int) -> None:
             "Dependency planning blocked, please import the following into rpm-specfiles:\n"
             + pkgs
         )
+        logger.info(
+            "chain_id=%s plan failed imports=%s errors=%s",
+            chain_id,
+            plan.blocking_errors[:20],
+            (plan.errors or [])[:10],
+        )
+        await _fail_chain_planning(chain_id, msg, plan_errors=plan.errors)
+        return
+
+    # cascade can leave orphan dep builds while pruning the requested root
+    # (996 built rust-clap_builder/serde_json and marked success without sbctl).
+    uncovered_roots = uncovered_plan_roots(
+        plan_params["root_packages"],
+        package_plans=plan.package_plans,
+        skipped=plan.skipped,
+    )
+    if uncovered_roots:
+        if plan.errors:
+            detail = "\n".join(plan.errors[:30])
+        else:
+            detail = "requested package(s) not scheduled: " + ", ".join(uncovered_roots)
+        logger.info(
+            "chain_id=%s plan failed uncovered roots=%s detail=%s",
+            chain_id,
+            uncovered_roots,
+            detail[:500],
+        )
+        await _fail_chain_planning(
+            chain_id,
+            "Dependency planning blocked:\n" + detail,
+            plan_errors=plan.errors,
+        )
+        return
+
+    if not plan.chain_spec.strip() and not plan.package_plans:
+        if plan.errors:
+            msg = "Dependency planning blocked:\n" + "\n".join(plan.errors[:20])
+        else:
+            msg = "Could not plan chain dependencies"
+        logger.info("chain_id=%s plan failed empty plan msg=%s", chain_id, msg[:500])
         await _fail_chain_planning(chain_id, msg, plan_errors=plan.errors)
         return
 

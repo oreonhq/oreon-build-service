@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import bz2
 import gzip
+import hashlib
 import io
 import logging
 import lzma
+import os
 import re
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 from oreon_build.core.rpm_requires import (
     evr_satisfies,
@@ -24,7 +28,7 @@ from oreon_build.services.r2 import get_r2_client
 
 logger = logging.getLogger(__name__)
 
-_CACHE_TTL_SEC = 300.0
+_CACHE_TTL_SEC = 1800.0
 _cache: dict[tuple[str, str, str], tuple[float, RepoCapabilityIndex]] = {}
 
 _RE_REPO_CHANNEL = re.compile(
@@ -700,6 +704,54 @@ def _ingest_filelists_xml(index: RepoCapabilityIndex, filelists_xml: bytes) -> N
         elem.clear()
 
 
+def _cap_cache_root() -> Path:
+    raw = (os.environ.get("OREON_CAP_CACHE_DIR") or "").strip()
+    if raw:
+        return Path(raw)
+    return Path.home() / ".oreon" / "cap-cache"
+
+
+def _meta_blob_path(releasename: str, branch: str, arch: str, kind: str, digest: str) -> Path:
+    return _cap_cache_root() / releasename / branch / arch / f"{digest}.{kind}.bin"
+
+
+def _read_blob(path: Path) -> bytes | None:
+    try:
+        if path.is_file() and path.stat().st_size > 32:
+            return path.read_bytes()
+    except Exception:
+        logger.debug("cap blob read failed %s", path, exc_info=True)
+    return None
+
+
+def _write_blob(path: Path, data: bytes) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_bytes(data)
+        tmp.replace(path)
+    except Exception:
+        logger.debug("cap blob write failed %s", path, exc_info=True)
+
+
+def _fetch_repodata_blob(
+    r2: Any,
+    key: str | None,
+    *,
+    cache_path: Path,
+) -> bytes | None:
+    if not key:
+        return None
+    cached = _read_blob(cache_path)
+    if cached is not None:
+        return cached
+    raw = r2.get_object(key)
+    if not raw:
+        return None
+    _write_blob(cache_path, raw)
+    return raw
+
+
 def _load_arch_metadata(releasename: str, branch: str, arch: str) -> RepoCapabilityIndex:
     partial = RepoCapabilityIndex()
     r2 = get_r2_client()
@@ -708,17 +760,24 @@ def _load_arch_metadata(releasename: str, branch: str, arch: str) -> RepoCapabil
     if not repomd:
         return partial
 
+    digest = hashlib.sha256(repomd).hexdigest()[:24]
     primary_key = _resolve_repodata_key(repo_prefix, repomd, "primary")
-    if primary_key:
-        primary_raw = r2.get_object(primary_key)
-        if primary_raw:
-            _ingest_primary_xml(partial, _decompress_if_needed(primary_raw, primary_key))
+    primary_raw = _fetch_repodata_blob(
+        r2,
+        primary_key,
+        cache_path=_meta_blob_path(releasename, branch, arch, "primary", digest),
+    )
+    if primary_raw and primary_key:
+        _ingest_primary_xml(partial, _decompress_if_needed(primary_raw, primary_key))
 
     filelists_key = _resolve_repodata_key(repo_prefix, repomd, "filelists")
-    if filelists_key:
-        filelists_raw = r2.get_object(filelists_key)
-        if filelists_raw:
-            _ingest_filelists_xml(partial, _decompress_if_needed(filelists_raw, filelists_key))
+    filelists_raw = _fetch_repodata_blob(
+        r2,
+        filelists_key,
+        cache_path=_meta_blob_path(releasename, branch, arch, "filelists", digest),
+    )
+    if filelists_raw and filelists_key:
+        _ingest_filelists_xml(partial, _decompress_if_needed(filelists_raw, filelists_key))
 
     return partial
 
@@ -850,6 +909,9 @@ def load_repo_capability_index(
     branch_key = "+".join(branches)
     cache_key = (rel, branch_key, arch_key)
     now = time.monotonic()
+    for k, (ts, _idx) in list(_cache.items()):
+        if now - ts >= _CACHE_TTL_SEC:
+            _cache.pop(k, None)
     hit = _cache.get(cache_key)
     if hit and now - hit[0] < _CACHE_TTL_SEC:
         return hit[1]

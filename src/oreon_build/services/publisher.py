@@ -637,36 +637,27 @@ def _refresh_staged_rpms_from_r2(
     *,
     container: Path | None = None,
 ) -> None:
+    """Pull staged RPM basenames from R2 onto the local createrepo stage.
+
+    Always re-fetch. Side-tag promote / identical-NEVRA rebuilds overwrite the same
+    key on R2 (often same Content-Length after resign). Size-skip left createrepo
+    hashing stale locals while clients downloaded the new R2 bytes → checksum mismatch.
+    """
     rpms_dir.mkdir(parents=True, exist_ok=True)
     fetched = 0
-    skipped = 0
     for fname in staged:
         key = f"{rpms_prefix}{fname}"
         local = rpms_dir / fname
-        remote_len = None
-        try:
-            remote_len = client.head_object_content_length(key)
-        except Exception:
-            remote_len = None
-        if (
-            local.is_file()
-            and remote_len is not None
-            and local.stat().st_size == int(remote_len)
-        ):
-            skipped += 1
-            continue
         data = client.get_object(key)
         if not data:
             raise RuntimeError(f"staged RPM missing on R2: {key}")
         _write_staged_rpm(local, data)
         fetched += 1
-    if skipped:
-        logger.info(
-            "staged RPM refresh skipped %s already-local file(s), fetched %s under %s",
-            skipped,
-            fetched,
-            rpms_prefix,
-        )
+    logger.info(
+        "staged RPM refresh fetched %s file(s) under %s",
+        fetched,
+        rpms_prefix,
+    )
     _invalidate_etag_cache_entries(container, set(staged))
 
 
@@ -960,11 +951,19 @@ def update_repodata_at_prefix(
                 if staged_force_full and container is not None:
                     _clear_createrepo_cache(container)
                 _run_createrepo(repo_root, container=container, force_full=staged_force_full)
-            elif local_mirror_ready and force_full:
+            elif force_full:
+                # warm local mirrors can still be stale vs R2 after same-NEVRA
+                # overwrites. etag sync is cheap when unchanged; skipping sync made
+                # "full regen" re-hash bad locals and re-publish broken checksums.
+                _progress(f"{r2_prefix} syncing RPMs to local stage for full regen")
+                rpm_count, fetched = _sync_rpms_dir_from_r2(
+                    client, rpms_prefix, rpms_dir, container=container
+                )
                 logger.info(
-                    "Local-only full repodata regen %s rpms=%s (skipping R2 RPM sync)",
+                    "Full repodata regen %s rpms=%s fetched=%s",
                     r2_prefix,
                     rpm_count,
+                    fetched,
                 )
                 _repair_corrupt_local_rpms(client, rpms_prefix, rpms_dir)
                 if container is not None:
@@ -976,15 +975,13 @@ def update_repodata_at_prefix(
                     client, rpms_prefix, rpms_dir, container=container
                 )
                 _progress(f"{r2_prefix} synced {rpm_count} RPMs ({fetched} fetched), running createrepo_c")
-                if fetched == 0 and not force_full:
+                if fetched == 0:
                     repodata_local = _repodata_looks_valid(repo_root, min_packages=len(rpm_keys))
                     if repodata_local:
                         logger.info("No RPM changes at %s, skipping createrepo_c", r2_prefix)
                         return True
                 _repair_corrupt_local_rpms(client, rpms_prefix, rpms_dir)
-                if force_full and container is not None:
-                    _clear_createrepo_cache(container)
-                _run_createrepo(repo_root, container=container, force_full=force_full)
+                _run_createrepo(repo_root, container=container, force_full=False)
 
             _progress(f"{r2_prefix} createrepo_c done, uploading repodata to R2")
             repodata_dir = repo_root / "repodata"

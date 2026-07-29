@@ -7,9 +7,11 @@ import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 import tarfile
 import time
+import urllib.request
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -121,6 +123,11 @@ class _SpecParseResult:
     version: str = ""
     release: str = ""
     exclusive_arches: set[str] | None = None
+    has_generate_buildrequires: bool = False
+    # authoritative when set (rpmspec / rpmbuild -br). else use bcond parse.
+    rpm_build_requires: list[str] | None = None
+    # False when %generate_buildrequires eval failed. None = not attempted.
+    dyn_br_complete: bool | None = None
 
     def __post_init__(self) -> None:
         if self.build_requires_raw is None:
@@ -462,6 +469,8 @@ def _parse_spec_text(
             if m and "%" not in m.group(1):
                 provided.update(_so_file_provides(m.group(1)))
     macros["name"] = source_name
+    from oreon_build.services.dynamic_brs import spec_has_generate_buildrequires
+
     return _SpecParseResult(
         source_name=source_name,
         build_requires=br_out,
@@ -473,6 +482,7 @@ def _parse_spec_text(
         version=version,
         release=release,
         exclusive_arches=exclusive_arches,
+        has_generate_buildrequires=spec_has_generate_buildrequires(spec_text),
     )
 
 
@@ -488,32 +498,47 @@ def _provider_map_from_specs(parsed_by_source: dict[str, _SpecParseResult]) -> d
 def _kahn_layers(
     names: set[str], deps: dict[str, set[str]], rdeps: dict[str, set[str]]
 ) -> tuple[list[list[str]], bool]:
-    remaining = set(names)
-    in_deg = {n: len(deps.get(n, set())) for n in names}
-    layers: list[list[str]] = []
+    """Layer sources with networkx topological_generations (provider before consumer).
+
+    deps[cons] = providers that must build first. On cycles, break like before
+    (lowest remaining indegree, prefer high fan-out providers over consumers).
+    """
+    import networkx as nx
+
+    if not names:
+        return [], False
+
+    G = nx.DiGraph()
+    G.add_nodes_from(names)
+    for cons, provs in deps.items():
+        if cons not in names:
+            continue
+        for p in provs:
+            if p in names and p != cons:
+                G.add_edge(p, cons)
+
     cycle = False
+    layers: list[list[str]] = []
+    remaining = set(names)
     while remaining:
-        ready = sorted(n for n in remaining if in_deg.get(n, 0) == 0)
-        if not ready:
+        sub = G.subgraph(remaining)
+        try:
+            for gen in nx.topological_generations(sub):
+                layers.append(sorted(gen))
+            return layers, cycle
+        except nx.NetworkXUnfeasible:
             cycle = True
-            # Prefer packages closest to buildable (lowest remaining indegree).
-            # Alphabetical picks consumers like "biber" before "perl-*" providers.
-            ready = [
-                min(
-                    remaining,
-                    key=lambda n: (
-                        in_deg.get(n, 0),
-                        -sum(1 for d in rdeps.get(n, set()) if d in remaining),
-                        n,
-                    ),
-                )
-            ]
-        layers.append(ready)
-        for n in ready:
-            remaining.discard(n)
-            for d in rdeps.get(n, set()):
-                if d in remaining:
-                    in_deg[d] = max(0, in_deg.get(d, 0) - 1)
+            in_deg = {n: int(sub.in_degree(n)) for n in remaining}
+            pick = min(
+                remaining,
+                key=lambda n: (
+                    in_deg.get(n, 0),
+                    -sum(1 for d in rdeps.get(n, set()) if d in remaining),
+                    n,
+                ),
+            )
+            layers.append([pick])
+            remaining.discard(pick)
     return layers, cycle
 
 
@@ -533,7 +558,42 @@ async def _download_distgit_tarball(
 
 
 _TARBALL_CACHE_TTL_SEC = 300.0
+_PROVIDES_INDEX_MEM_TTL_SEC = 1800.0
 _tarball_cache: dict[tuple[str, str, str, str], tuple[float, bytes]] = {}
+
+
+def _prune_tarball_cache(now: float | None = None) -> None:
+    ts_now = time.monotonic() if now is None else now
+    for k, (ts, _blob) in list(_tarball_cache.items()):
+        if ts_now - ts >= _TARBALL_CACHE_TTL_SEC:
+            _tarball_cache.pop(k, None)
+
+
+def _prune_provides_index_cache(now: float | None = None) -> None:
+    """Drop expired indexes and keep only the newest tree SHA per branch/release."""
+    ts_now = time.monotonic() if now is None else now
+    for k, (ts, _idx) in list(_PROVIDES_INDEX_CACHE.items()):
+        if ts_now - ts >= _PROVIDES_INDEX_MEM_TTL_SEC:
+            _PROVIDES_INDEX_CACHE.pop(k, None)
+    newest: dict[tuple[str, str, str, str], tuple[float, tuple]] = {}
+    for k, (ts, _idx) in list(_PROVIDES_INDEX_CACHE.items()):
+        base = (k[0], k[1], k[2], k[3])
+        prev = newest.get(base)
+        if prev is None or ts >= prev[0]:
+            newest[base] = (ts, k)
+    keep = {v[1] for v in newest.values()}
+    for k in list(_PROVIDES_INDEX_CACHE):
+        if k not in keep:
+            _PROVIDES_INDEX_CACHE.pop(k, None)
+
+
+def prune_distgit_memory_caches() -> None:
+    _prune_tarball_cache()
+    _prune_provides_index_cache()
+    now = time.monotonic()
+    for k, (ts, _names) in list(_PACKAGE_NAMES_CACHE.items()):
+        if now - ts >= _PACKAGE_NAMES_CACHE_TTL_SEC:
+            _PACKAGE_NAMES_CACHE.pop(k, None)
 
 
 async def _resolve_branch_tree_sha(
@@ -583,6 +643,7 @@ async def _get_distgit_tarball_cached(
     )
     key = (owner, repo, distgit_branch, sha)
     now = time.monotonic()
+    _prune_tarball_cache(now)
     hit = _tarball_cache.get(key)
     if hit and now - hit[0] < _TARBALL_CACHE_TTL_SEC:
         return hit[1], None
@@ -593,6 +654,10 @@ async def _get_distgit_tarball_cached(
         headers=headers,
     )
     if tarball:
+        # only keep the latest tarball for this branch
+        for k in list(_tarball_cache):
+            if k[:3] == (owner, repo, distgit_branch) and k != key:
+                _tarball_cache.pop(k, None)
         _tarball_cache[key] = (now, tarball)
     return tarball, err
 
@@ -639,8 +704,73 @@ def _python_dist_provides_from_package_name(pkg: str) -> set[str]:
         unders = rest.replace("-", "_")
         out.add(f"python3dist({dashed})")
         out.add(f"python3dist({unders})")
+        out.add(f"python3dist({rest.lower()})")
+        out.add(f"python3dist({dashed.lower()})")
+        out.add(f"python3dist({unders.lower()})")
         break
     return out
+
+
+def _rust_crate_name_from_package(pkg: str, version: str | None = None) -> str | None:
+    """Map rust2rpm source dir to crate name.
+
+    rust-itertools0.13 + Version 0.13.0 → itertools
+    rust-nom7 + Version 7.1.3 → nom
+    rust-sha1 + Version 0.10.1 → sha1 (digit crate name, no false strip)
+    rust-serde_json → serde_json
+    """
+    n = (pkg or "").strip()
+    if not n.startswith("rust-") or len(n) <= 5:
+        return None
+    rest = n[5:]
+    if not rest or rest[0].isdigit() or "+" in rest:
+        return None
+    low = rest.lower()
+    if low in {
+        "packaging",
+        "srpm-macros",
+        "rpm-macros",
+        "toolset",
+        "std-static",
+        "debugger",
+        "doc",
+        "analyzer",
+    }:
+        return None
+    if low.endswith(("-debuginfo", "-debugsource", "-tests")):
+        return None
+    ver = (version or "").strip()
+    if ver:
+        parts = [p for p in ver.split(".") if p != ""]
+        candidates: list[str] = []
+        # rust2rpm compat dirs append 0.minor (and sometimes major.minor.patch-ish)
+        if len(parts) >= 2 and parts[0] == "0":
+            candidates.append(f"{parts[0]}.{parts[1]}")
+        if parts:
+            candidates.append(parts[0])
+        for c in candidates:
+            if not c or not rest.endswith(c):
+                continue
+            if len(rest) <= len(c):
+                continue
+            base = rest[: -len(c)]
+            if base and re.search(r"[A-Za-z_]", base):
+                return base
+    # no Version: still strip obvious 0.x compat suffixes (never part of a real crate name)
+    m = re.match(r"^(?P<crate>.+?)(?P<ver>0\.\d+(?:\.\d+)*)$", rest)
+    if m and re.search(r"[A-Za-z_]", m.group("crate") or ""):
+        return m.group("crate")
+    return rest
+
+
+def _crate_provides_from_package_name(
+    pkg: str, *, version: str | None = None
+) -> set[str]:
+    """rust-foo_bar / rust-foo0.13 (rust2rpm) → crate(foo_bar) / crate(foo)."""
+    crate = _rust_crate_name_from_package(pkg, version=version)
+    if not crate:
+        return set()
+    return {f"crate({crate})"}
 
 
 @dataclass
@@ -658,6 +788,8 @@ class DistgitProvidesIndex:
                     raw.setdefault(perl_cap, set()).add(pkg)
                 for py_cap in _python_dist_provides_from_package_name(pkg):
                     raw.setdefault(py_cap, set()).add(pkg)
+                for crate_cap in _crate_provides_from_package_name(pkg):
+                    raw.setdefault(crate_cap, set()).add(pkg)
             self._indexed = index_provider_map(raw)
         return self._indexed
 
@@ -666,7 +798,7 @@ _PROVIDES_INDEX_CACHE: dict[tuple[str, str, str, str, str], tuple[float, Distgit
 _provides_index_tasks: dict[tuple[str, str, str, str, str], asyncio.Task[DistgitProvidesIndex | None]] = {}
 _PACKAGE_NAMES_CACHE: dict[tuple[str, str, str, str], tuple[float, frozenset[str]]] = {}
 _PACKAGE_NAMES_CACHE_TTL_SEC = 1800.0
-_PROVIDES_INDEX_DISK_VERSION = "v5"
+_PROVIDES_INDEX_DISK_VERSION = "v8"
 
 
 def _so_file_provides(libstem: str) -> set[str]:
@@ -717,6 +849,7 @@ def _lightweight_provides_from_spec_text(pkg: str, spec_text: str) -> set[str]:
     macros.setdefault("_prefix", "/usr")
     macros.update(_parse_spec_macro_table(spec_text))
     macros["name"] = pkg
+    rpm_version = (macros.get("version") or "").strip()
     in_files = False
     for line in (spec_text or "").splitlines():
         s = line.strip()
@@ -730,6 +863,12 @@ def _lightweight_provides_from_spec_text(pkg: str, spec_text: str) -> set[str]:
                 macros["name"] = source_name
                 provided.add(source_name)
             in_files = False
+            continue
+        if us.startswith("VERSION:"):
+            ver = _expand_rpm_macros((s.split(":", 1)[1] or "").strip(), macros)
+            if ver and "%" not in ver:
+                rpm_version = ver
+                macros["version"] = ver
             continue
         if us.startswith("PROVIDES:"):
             val = _expand_rpm_macros(s.split(":", 1)[1], macros)
@@ -769,6 +908,19 @@ def _lightweight_provides_from_spec_text(pkg: str, spec_text: str) -> set[str]:
                 if base and "." not in base:
                     provided.add(base)
     provided.add(source_name)
+    crate_macro = (macros.get("crate") or "").strip()
+    if crate_macro and "%" not in crate_macro:
+        provided.add(f"crate({crate_macro})")
+    else:
+        provided.update(
+            _crate_provides_from_package_name(pkg, version=rpm_version or None)
+        )
+        if source_name != pkg:
+            provided.update(
+                _crate_provides_from_package_name(
+                    source_name, version=rpm_version or None
+                )
+            )
     for name in (pkg, source_name):
         perl_cap = _perl_provide_from_package_name(name)
         if perl_cap:
@@ -794,7 +946,8 @@ def _build_provides_index_from_tarball_sync(tarball: bytes, releasename: str) ->
             f = tf.extractfile(m)
             if f is None:
                 continue
-            text = f.read(262144).decode("utf-8", errors="replace")
+            # full spec: texlive-collection-* is multi-MB with thousands of %package -n
+            text = f.read().decode("utf-8", errors="replace")
             names.add(pkg)
             for cap in _lightweight_provides_from_spec_text(pkg, text):
                 provider_map.setdefault(cap, set()).add(pkg)
@@ -909,8 +1062,9 @@ async def get_distgit_provides_index_cached(
 
     key = (owner, repo, distgit_branch, releasename, tree_sha)
     now = time.monotonic()
+    _prune_provides_index_cache(now)
     hit = _PROVIDES_INDEX_CACHE.get(key)
-    if hit and now - hit[0] < _TARBALL_CACHE_TTL_SEC:
+    if hit and now - hit[0] < _PROVIDES_INDEX_MEM_TTL_SEC:
         return hit[1]
 
     inflight = _provides_index_tasks.get(key)
@@ -1055,11 +1209,11 @@ def _chain_distgit_max_parse() -> int:
 
 
 def _chain_distgit_parse_wave_size() -> int:
-    raw = (os.getenv("OREON_CHAIN_DISTGIT_PARSE_WAVE") or "48").strip()
+    raw = (os.getenv("OREON_CHAIN_DISTGIT_PARSE_WAVE") or "96").strip()
     try:
         n = int(raw)
     except ValueError:
-        n = 48
+        n = 96
     return max(8, min(n, 128))
 
 
@@ -1100,6 +1254,187 @@ async def _fetch_distgit_specs_batch(
     return {pkg: text for pkg, text in results if text}
 
 
+
+def _enrich_one_spec_brs(
+    pkg: str,
+    spec_text: str,
+    parsed: _SpecParseResult,
+    *,
+    distro_macros: dict[str, str] | None,
+    run_generate: bool,
+    local_source_paths: list[Path] | None = None,
+) -> _SpecParseResult:
+    """Merge rpmspec / rpmbuild -br BRs into the parse result."""
+    from oreon_build.core.spec_bcond import default_build_defines, parse_spec_bconds
+    from oreon_build.services.dynamic_brs import (
+        evaluate_generate_buildrequires,
+        merge_buildrequires,
+        rpmspec_query_buildrequires,
+        spec_has_generate_buildrequires,
+    )
+
+    bcond = parse_spec_bconds(spec_text, distro_macros=distro_macros)
+    defines = default_build_defines(bcond)
+    has_gen = parsed.has_generate_buildrequires or spec_has_generate_buildrequires(spec_text)
+    try:
+        if run_generate and has_gen:
+            dyn = evaluate_generate_buildrequires(
+                spec_text,
+                defines=defines,
+                local_source_paths=local_source_paths,
+            )
+            rpm_brs = list(dyn.buildrequires)
+            parsed.dyn_br_complete = bool(dyn.complete)
+        else:
+            rpm_brs = rpmspec_query_buildrequires(spec_text, defines=defines)
+            if has_gen and not run_generate:
+                parsed.dyn_br_complete = None
+            else:
+                parsed.dyn_br_complete = True
+    except Exception:
+        logger.warning("rpm BR enrich failed for %s", pkg, exc_info=True)
+        if run_generate and has_gen:
+            parsed.dyn_br_complete = False
+        return parsed
+    if not rpm_brs and not (run_generate and has_gen and parsed.dyn_br_complete is False):
+        return parsed
+    merged = merge_buildrequires(parsed.build_requires, rpm_brs)
+    parsed.build_requires = merged
+    parsed.build_requires_raw = merge_buildrequires(parsed.build_requires_raw or [], rpm_brs)
+    parsed.rpm_build_requires = list(rpm_brs)
+    parsed.has_generate_buildrequires = has_gen
+    return parsed
+
+
+def _download_distgit_local_sources(
+    *,
+    pkg: str,
+    spec_text: str,
+    releasename: str,
+    owner: str,
+    repo: str,
+    distgit_branch: str,
+    headers: dict[str, str],
+    distro_macros: dict[str, str] | None,
+    dest_dir: Path,
+) -> list[Path]:
+    """Pull non-URL SourceN / PatchN files from the package dir in distgit."""
+    from oreon_build.core.spec_bcond import default_build_defines, parse_spec_bconds
+    from oreon_build.services.dynamic_brs import local_source_basenames
+
+    bcond = parse_spec_bconds(spec_text, distro_macros=distro_macros)
+    defines = default_build_defines(bcond)
+    names = local_source_basenames(spec_text, defines)
+    if not names:
+        return []
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    out: list[Path] = []
+    base = (
+        f"https://raw.githubusercontent.com/{owner}/{repo}/"
+        f"{distgit_branch}/{releasename}/{pkg}"
+    )
+    for name in names:
+        dest = dest_dir / name
+        if dest.is_file() and dest.stat().st_size > 0:
+            out.append(dest)
+            continue
+        url = f"{base}/{name}"
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "oreon-build-service/dynamic-brs",
+                    **{k: v for k, v in (headers or {}).items() if k.lower() != "user-agent"},
+                },
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp, open(dest, "wb") as fh:
+                shutil.copyfileobj(resp, fh)
+            if dest.is_file() and dest.stat().st_size > 0:
+                out.append(dest)
+            else:
+                logger.warning("empty distgit source %s for %s", name, pkg)
+        except Exception:
+            logger.warning("distgit source fetch failed %s/%s", pkg, name, exc_info=True)
+    return out
+
+
+async def enrich_specs_buildrequires_with_rpm(
+    specs_by_pkg: dict[str, str],
+    parsed_by_source: dict[str, _SpecParseResult],
+    *,
+    releasename: str,
+    scope_packages: set[str] | None = None,
+    generate_packages: set[str] | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
+    distgit_branch: str | None = None,
+    headers: dict[str, str] | None = None,
+) -> None:
+    """In-place: set rpm_build_requires via rpmspec / rpmbuild -br for scoped pkgs.
+
+    rpmspec for everyone. rpmbuild -br (+ Source download + distgit locals) for generate pkgs.
+    """
+    from oreon_build.core.spec_bcond import default_distro_macros
+
+    macros = default_distro_macros(releasename)
+    want = set(scope_packages) if scope_packages is not None else set(parsed_by_source)
+    gen = set(generate_packages or ())
+    jobs = [
+        (pkg, specs_by_pkg.get(pkg) or "", parsed_by_source[pkg], pkg in gen)
+        for pkg in sorted(want)
+        if pkg in parsed_by_source and (specs_by_pkg.get(pkg) or "")
+    ]
+    if not jobs:
+        return
+
+    local_by_pkg: dict[str, list[Path]] = {}
+    tmp_root = None
+    if gen and owner and repo and distgit_branch:
+        tmp_root = tempfile.TemporaryDirectory(prefix="oreon-dynsrc-")
+        for pkg, text, _parsed, run_gen in jobs:
+            if not run_gen:
+                continue
+            dest = Path(tmp_root.name) / pkg
+            paths = await asyncio.to_thread(
+                _download_distgit_local_sources,
+                pkg=pkg,
+                spec_text=text,
+                releasename=releasename,
+                owner=owner,
+                repo=repo,
+                distgit_branch=distgit_branch,
+                headers=headers or {},
+                distro_macros=macros,
+                dest_dir=dest,
+            )
+            if paths:
+                local_by_pkg[pkg] = paths
+
+    pool = _distgit_spec_parse_executor()
+    futs = {
+        pool.submit(
+            _enrich_one_spec_brs,
+            pkg,
+            text,
+            parsed,
+            distro_macros=macros,
+            run_generate=run_gen,
+            local_source_paths=local_by_pkg.get(pkg),
+        ): pkg
+        for pkg, text, parsed, run_gen in jobs
+    }
+    try:
+        for fut in as_completed(futs):
+            pkg = futs[fut]
+            try:
+                parsed_by_source[pkg] = fut.result()
+            except Exception:
+                logger.warning("BR enrich worker failed for %s", pkg, exc_info=True)
+    finally:
+        if tmp_root is not None:
+            tmp_root.cleanup()
+
+
 async def expand_chain_spec_closure_sparse(
     roots: list[str],
     *,
@@ -1110,11 +1445,14 @@ async def expand_chain_spec_closure_sparse(
     headers: dict[str, str],
     repo_index: Any | None = None,
     target_arches: set[str] | None = None,
+    distgit_providers: dict[str, set[str]] | None = None,
 ) -> tuple[dict[str, str], dict[str, _SpecParseResult], list[str]]:
     err: list[str] = []
     specs: dict[str, str] = {}
     parsed_by_source: dict[str, _SpecParseResult] = {}
     provider_map: dict[str, set[str]] = index_provider_map({})
+    if distgit_providers:
+        provider_map = merge_provider_maps(provider_map, distgit_providers)
     known: set[str] = set()
     needed: set[str] = set()
     queue: deque[str] = deque()
@@ -1669,7 +2007,7 @@ def _warm_provides_index_lookup(capability: str) -> set[str]:
     out: set[str] = set()
     now = time.monotonic()
     for _key, (ts, index) in list(_PROVIDES_INDEX_CACHE.items()):
-        if now - ts >= _TARBALL_CACHE_TTL_SEC:
+        if now - ts >= _PROVIDES_INDEX_MEM_TTL_SEC:
             continue
         out.update(_providers_from_maps(cap, [distgit_providers_dict(index)]))
     return {s for s in out if s and is_distgit_source_name(s)}
@@ -1832,7 +2170,7 @@ def _provides_index_is_warm(
             continue
         o, r, b, rel = key[0], key[1], key[2], key[3]
         if o == owner and r == repo and b == distgit_branch and rel == releasename:
-            if now - ts < _TARBALL_CACHE_TTL_SEC:
+            if now - ts < _PROVIDES_INDEX_MEM_TTL_SEC:
                 return True
     return False
 
@@ -2385,14 +2723,21 @@ async def fetch_repo_transitive_extras_for_roots(
                 repo=repo_name,
                 distgit_branch=distgit_branch,
                 releasename=releasename,
-                packages=to_fetch[:16],
+                packages=to_fetch[: _chain_distgit_parse_wave_size()],
             )
             if not batch_specs:
                 break
             fetched_total += len(batch_specs)
-            for pkg, text in batch_specs.items():
+            pool = _distgit_spec_parse_executor()
+            futures = {
+                pool.submit(parse_fn, text, f"{pkg}.spec"): pkg
+                for pkg, text in batch_specs.items()
+            }
+            for fut in as_completed(futures):
+                pkg = futures[fut]
+                text = batch_specs[pkg]
                 try:
-                    parsed = await asyncio.to_thread(parse_fn, text, f"{pkg}.spec")
+                    parsed = fut.result()
                 except Exception as exc:
                     err.append(f"{pkg}: parse failed ({type(exc).__name__}: {exc})")
                     parsed = _SpecParseResult(
