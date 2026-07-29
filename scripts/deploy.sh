@@ -82,6 +82,28 @@ source .venv/bin/activate
 pip install -e . -q
 pip install psycopg2-binary -q 2>/dev/null || true
 
+OREON_TESTING_REPO="${OREON_TESTING_REPO:-https://repo-us.oreonhq.com/oreon-11-rp1/testing/x86_64/}"
+if command -v dnf &>/dev/null; then
+  echo "Installing cargo DynamicBuildRequires tools from Oreon testing..."
+  if ! sudo dnf install -y \
+      --repofrompath=oreon-testing,"$OREON_TESTING_REPO" \
+      --repo=oreon-testing \
+      cargo-rpm-macros cargo2rpm cargo 2>/dev/null; then
+    echo "WARNING: could not install cargo-rpm-macros/cargo2rpm/cargo."
+    echo "  On the API/planner host run:"
+    echo "  sudo dnf install -y --repofrompath=oreon-testing,${OREON_TESTING_REPO} --repo=oreon-testing cargo-rpm-macros cargo2rpm cargo"
+    echo "  Without those, cargo %generate_buildrequires stays incomplete and chains fail closed."
+  fi
+fi
+if ! command -v cargo2rpm &>/dev/null || ! command -v cargo &>/dev/null; then
+  echo "WARNING: cargo2rpm and/or cargo missing on PATH (needed for cargo DynamicBuildRequires)."
+fi
+
+if ! rpm -q go-vendor-tools &>/dev/null; then
+  echo "NOTE: go-vendor-tools not installed. golang generate falls back to static BRs."
+  echo "  Optional: sudo dnf install -y --repofrompath=oreon-testing,${OREON_TESTING_REPO} --repo=oreon-testing go-vendor-tools"
+fi
+
 export DATABASE_URL
 alembic upgrade head
 echo "Migrations applied."
