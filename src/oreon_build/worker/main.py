@@ -1027,10 +1027,26 @@ def _write_oreon_mock_mixed_repos_wrapper_cfg(
     urls = [str(u).strip() for u in (addrepo_baseurls or []) if str(u).strip()]
     arch_pref = (prefer_arch or "").strip()
     if urls:
+        # config_opts['macros'] only hits rpmbuild .rpmmacros, not dnf install.
+        # files/ is copied into bootstrap+target before groupinstall. rpm loads
+        # /etc/rpm/macros.* and /usr/lib/rpm/macros.d/macros.* (not etc/rpm/macros.d).
         lines += [
+            '_oreon_files = dict(config_opts.get("files") or {})',
+            '_oreon_files["etc/rpm/macros.oreon-sidetag-pkgverify"] = "%_pkgverify_level none\\n"',
+            '_oreon_files["usr/lib/rpm/macros.d/macros.oreon-sidetag-pkgverify"] = "%_pkgverify_level none\\n"',
+            'config_opts["files"] = _oreon_files',
+            '_oreon_d4 = " ".join(str(x) for x in (config_opts.get("dnf4_common_opts") or []))',
+            'if "--nogpgcheck" not in _oreon_d4.lower():',
+            '    config_opts["dnf4_common_opts"] = list(config_opts.get("dnf4_common_opts") or []) + ["--nogpgcheck"]',
+            '_oreon_d5 = " ".join(str(x) for x in (config_opts.get("dnf5_common_opts") or []))',
+            'if "--nogpgcheck" not in _oreon_d5.lower():',
+            '    config_opts["dnf5_common_opts"] = list(config_opts.get("dnf5_common_opts") or []) + ["--nogpgcheck"]',
             '_oreon_dcf = config_opts.get("dnf.conf") or ""',
             'if not isinstance(_oreon_dcf, str):',
             '    _oreon_dcf = ""',
+            'import re as _oreon_re',
+            '_oreon_gm = _oreon_re.search(r"(?m)^gpgkey\\s*=\\s*(\\S+)", _oreon_dcf)',
+            '_oreon_gpgkey = (_oreon_gm.group(1).strip() if _oreon_gm else "")',
             '_oreon_extra = ""',
         ]
         for i, url in enumerate(urls):
@@ -1046,25 +1062,21 @@ def _write_oreon_mock_mixed_repos_wrapper_cfg(
                 f'name=Oreon addrepo {i}',
                 f'baseurl={base}',
                 'enabled=1',
-                'gpgcheck=0',
+                '"""',
+                'if _oreon_gpgkey:',
+                '    _oreon_extra += "gpgcheck=1\\n"',
+                '    _oreon_extra += "gpgkey=%s\\n" % (_oreon_gpgkey,)',
+                'else:',
+                '    _oreon_extra += "gpgcheck=0\\n"',
+                f'_oreon_extra += """',
                 'repo_gpgcheck=0',
                 'skip_if_unavailable=True',
                 f'cost={cost}',
                 '',
                 '"""',
             ]
-        # gpgcheck=0 gets ignored under rpm crypto policy without these
         lines += [
             'config_opts["dnf.conf"] = (_oreon_dcf.rstrip() + "\\n" + _oreon_extra).strip() + "\\n"',
-            '_oreon_macros = dict(config_opts.get("macros") or {})',
-            '_oreon_macros["%_pkgverify_level"] = "none"',
-            'config_opts["macros"] = _oreon_macros',
-            '_oreon_d4 = " ".join(str(x) for x in (config_opts.get("dnf4_common_opts") or []))',
-            'if "--nogpgcheck" not in _oreon_d4.lower():',
-            '    config_opts["dnf4_common_opts"] = list(config_opts.get("dnf4_common_opts") or []) + ["--nogpgcheck"]',
-            '_oreon_d5 = " ".join(str(x) for x in (config_opts.get("dnf5_common_opts") or []))',
-            'if "--nogpgcheck" not in _oreon_d5.lower():',
-            '    config_opts["dnf5_common_opts"] = list(config_opts.get("dnf5_common_opts") or []) + ["--nogpgcheck"]',
             "",
         ]
     out.write_text("\n".join(lines), encoding="utf-8")
@@ -1175,7 +1187,7 @@ def _mock_cmd_base(
         cmd += ["--uniqueext", mock_unique_ext]
     if attempt_id is not None and not _mock_shared_host_cache_enabled():
         cmd += ["--config-opts", f"cache_topdir={_mock_cache_topdir_for_attempt(attempt_id)}"]
-    # addrepos go into the wrapper cfg with gpgcheck=0 (CLI --addrepo has no key)
+    # addrepos go into the wrapper cfg (gpgkey + pkgverify macros). CLI --addrepo is opt-in only.
     if addrepo_baseurls and _truthy_env("OREON_WORKER_MOCK_USE_CLI_ADDREPO"):
         for url in addrepo_baseurls:
             cmd += ["--addrepo", url]
