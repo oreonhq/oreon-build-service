@@ -1053,8 +1053,18 @@ def _write_oreon_mock_mixed_repos_wrapper_cfg(
                 '',
                 '"""',
             ]
+        # gpgcheck=0 gets ignored under rpm crypto policy without these
         lines += [
             'config_opts["dnf.conf"] = (_oreon_dcf.rstrip() + "\\n" + _oreon_extra).strip() + "\\n"',
+            '_oreon_macros = dict(config_opts.get("macros") or {})',
+            '_oreon_macros["%_pkgverify_level"] = "none"',
+            'config_opts["macros"] = _oreon_macros',
+            '_oreon_d4 = " ".join(str(x) for x in (config_opts.get("dnf4_common_opts") or []))',
+            'if "--nogpgcheck" not in _oreon_d4.lower():',
+            '    config_opts["dnf4_common_opts"] = list(config_opts.get("dnf4_common_opts") or []) + ["--nogpgcheck"]',
+            '_oreon_d5 = " ".join(str(x) for x in (config_opts.get("dnf5_common_opts") or []))',
+            'if "--nogpgcheck" not in _oreon_d5.lower():',
+            '    config_opts["dnf5_common_opts"] = list(config_opts.get("dnf5_common_opts") or []) + ["--nogpgcheck"]',
             "",
         ]
     out.write_text("\n".join(lines), encoding="utf-8")
