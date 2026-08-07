@@ -29,6 +29,16 @@ _kill_tree() {
   kill "-$sig" "$pid" 2>/dev/null || true
 }
 
+_kill_pgrp() {
+  local pid="$1"
+  local sig="$2"
+  local pgid
+  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+  [ -z "$pgid" ] && return 1
+  kill "-$sig" "-$pgid" 2>/dev/null
+  return 0
+}
+
 _stop_pid_file() {
   local name="$1"
   local file="$2"
@@ -45,12 +55,15 @@ _stop_pid_file() {
     return 0
   fi
   echo "Stopping $name (PID $pid)..."
+  _kill_pgrp "$pid" TERM
   _kill_tree "$pid" TERM
   if ! _wait_gone "$pid"; then
     echo "  $name still running, sending SIGKILL"
+    _kill_pgrp "$pid" KILL
     _kill_tree "$pid" KILL
     _wait_gone "$pid" || true
   fi
+  _kill_pgrp "$pid" KILL
   if kill -0 "$pid" 2>/dev/null; then
     echo "  WARNING: could not stop $name (PID $pid)"
   else
@@ -89,12 +102,15 @@ _kill_oreon_on_port() {
     case "$args" in
       *"$needle"*)
         echo "Stopping port $port listener (PID $pid)..."
+        _kill_pgrp "$pid" TERM
         _kill_tree "$pid" TERM
         if ! _wait_gone "$pid"; then
           echo "  still running, sending SIGKILL"
+          _kill_pgrp "$pid" KILL
           _kill_tree "$pid" KILL
           _wait_gone "$pid" || true
         fi
+        _kill_pgrp "$pid" KILL
         ;;
       *)
         echo "Port $port in use by unrelated PID $pid (not killed): $args"
@@ -114,6 +130,7 @@ _kill_oreon_on_port 8001 "oreon_build.watchdog.main:app"
 for pid in $(pgrep -f 'uvicorn oreon_build\.(api|watchdog)\.main:app' 2>/dev/null || true); do
   if kill -0 "$pid" 2>/dev/null; then
     echo "Stopping leftover uvicorn (PID $pid)..."
+    _kill_pgrp "$pid" KILL
     _kill_tree "$pid" KILL
   fi
 done
