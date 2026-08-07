@@ -433,10 +433,10 @@ def _start_live_build_log_snapshot_thread(
     mock_output_getter: Callable[[], str] | None = None,
     mock_config: str | None = None,
     mock_unique_ext: str | None = None,
-) -> None:
+) -> threading.Thread | None:
     interval = _live_log_interval_sec()
     if interval <= 0:
-        return
+        return None
 
     def runner() -> None:
         first = True
@@ -481,7 +481,20 @@ def _start_live_build_log_snapshot_thread(
             except Exception:
                 logger.debug("Live build log snapshot failed (attempt %s)", attempt_id, exc_info=True)
 
-    threading.Thread(target=runner, daemon=True, name=f"oreon-live-log-{attempt_id}").start()
+    t = threading.Thread(target=runner, daemon=True, name=f"oreon-live-log-{attempt_id}")
+    t.start()
+    return t
+
+
+def _stop_live_build_log_snapshot_thread(
+    stop_flag: threading.Event,
+    thread: threading.Thread | None,
+    *,
+    timeout_sec: float = 30.0,
+) -> None:
+    stop_flag.set()
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=max(1.0, float(timeout_sec)))
 
 def _upload_accumulated_build_log(
     session: httpx.Client,
@@ -659,22 +672,21 @@ def _post_worker_build_result(
     json_body: dict,
 ) -> httpx.Response:
     from oreon_build.core.build_result import (
-        find_architecture_excluded_line,
         normalize_terminal_build_status,
+        prepare_build_error_message,
     )
 
+    json_body = dict(json_body)
     err = json_body.get("error_message")
-    hit = find_architecture_excluded_line(err if isinstance(err, str) else None)
-    if hit:
-        json_body = dict(json_body)
-        json_body["error_message"] = hit[:2000]
+    if isinstance(err, str) and err.strip():
+        raw = err if len(err) <= 256_000 else err[-256_000:]
+        json_body["error_message"] = prepare_build_error_message(raw)
         err = json_body["error_message"]
     st = normalize_terminal_build_status(
         str(json_body.get("status") or ""),
         err if isinstance(err, str) else None,
     )
     if st != str(json_body.get("status") or "").lower():
-        json_body = dict(json_body)
         json_body["status"] = st
 
     def _do() -> httpx.Response:
@@ -720,7 +732,7 @@ def _try_post_orphan_failure(
                 oc,
                 controller_url,
                 attempt_id,
-                {"status": "failed", "log_r2_key": log_key or None, "error_message": msg[:2000]},
+                {"status": "failed", "log_r2_key": log_key or None, "error_message": msg},
             )
         except Exception:
             logger.exception("Orphan failure: could not POST result for attempt %s", attempt_id)
@@ -2231,7 +2243,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                         session,
                         controller_url,
                         attempt_id,
-                        {"status": "failed", "log_r2_key": log_key, "error_message": msg[:2000]},
+                        {"status": "failed", "log_r2_key": log_key, "error_message": msg},
                     )
                     return
                 if not srpm_bytes:
@@ -2269,7 +2281,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                         session,
                         controller_url,
                         attempt_id,
-                        {"status": "failed", "log_r2_key": log_key, "error_message": msg[:2000]},
+                        {"status": "failed", "log_r2_key": log_key, "error_message": msg},
                     )
                     return
                 lfs_rc, lfs_out = _maybe_git_lfs_pull(git_dir)
@@ -2284,7 +2296,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                         session,
                         controller_url,
                         attempt_id,
-                        {"status": "failed", "log_r2_key": log_key, "error_message": msg[:2000]},
+                        {"status": "failed", "log_r2_key": log_key, "error_message": msg},
                     )
                     return
 
@@ -2301,7 +2313,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                         session,
                         controller_url,
                         attempt_id,
-                        {"status": "failed", "log_r2_key": log_key, "error_message": msg[:2000]},
+                        {"status": "failed", "log_r2_key": log_key, "error_message": msg},
                     )
                     return
 
@@ -2318,7 +2330,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                 def _srpm_mock_tail() -> str:
                     return srpm_live.tail()
 
-                _start_live_build_log_snapshot_thread(
+                live_srpm_thread = _start_live_build_log_snapshot_thread(
                     session,
                     controller_url,
                     attempt_id,
@@ -2345,7 +2357,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                         prefer_arch=build_arch,
                     )
                 finally:
-                    live_srpm_stop.set()
+                    _stop_live_build_log_snapshot_thread(live_srpm_stop, live_srpm_thread)
                 _make_mock_resultdir_world_readable(srpm_result_dir)
                 build_log_parts.extend(
                     _mock_stage_log_sections(
@@ -2379,7 +2391,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                         session,
                         controller_url,
                         attempt_id,
-                        {"status": "failed", "log_r2_key": log_key, "error_message": msg[:2000]},
+                        {"status": "failed", "log_r2_key": log_key, "error_message": msg},
                     )
                     return
 
@@ -2406,7 +2418,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
             def _rebuild_mock_tail() -> str:
                 return rebuild_live.tail()
 
-            _start_live_build_log_snapshot_thread(
+            live_rebuild_thread = _start_live_build_log_snapshot_thread(
                 session,
                 controller_url,
                 attempt_id,
@@ -2432,7 +2444,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                     prefer_arch=build_arch,
                 )
             finally:
-                live_rebuild_stop.set()
+                _stop_live_build_log_snapshot_thread(live_rebuild_stop, live_rebuild_thread)
             _make_mock_resultdir_world_readable(result_dir)
             build_log_parts.extend(
                 _mock_stage_log_sections(
@@ -2471,7 +2483,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                     {
                         "status": "failed",
                         "log_r2_key": log_key,
-                        "error_message": (full_log[:2000] if full_log else "mock --rebuild failed"),
+                        "error_message": (full_log if full_log else "mock --rebuild failed"),
                         "artifacts": [],
                     },
                 )
@@ -2510,7 +2522,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                         {
                             "status": "failed",
                             "log_r2_key": log_key,
-                            "error_message": fail_log[:2000],
+                            "error_message": fail_log,
                             "artifacts": [],
                         },
                     )
@@ -2548,7 +2560,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                                     {
                                         "status": "failed",
                                         "log_r2_key": log_key,
-                                        "error_message": fail_log[:2000],
+                                        "error_message": fail_log,
                                         "artifacts": artifacts_payload,
                                     },
                                 )
@@ -2567,7 +2579,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                             {
                                 "status": "failed",
                                 "log_r2_key": log_key,
-                                "error_message": fail_log[:2000],
+                                "error_message": fail_log,
                                 "artifacts": artifacts_payload,
                             },
                         )
@@ -2589,7 +2601,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                             {
                                 "status": "failed",
                                 "log_r2_key": log_key,
-                                "error_message": fail_log[:2000],
+                                "error_message": fail_log,
                                 "artifacts": artifacts_payload,
                             },
                         )
@@ -2611,7 +2623,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                                 {
                                     "status": "failed",
                                     "log_r2_key": log_key,
-                                    "error_message": fail_log[:2000],
+                                    "error_message": fail_log,
                                     "artifacts": artifacts_payload,
                                 },
                             )
@@ -2631,7 +2643,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                             {
                                 "status": "failed",
                                 "log_r2_key": log_key,
-                                "error_message": fail_log[:2000],
+                                "error_message": fail_log,
                                 "artifacts": artifacts_payload,
                             },
                         )
@@ -2650,7 +2662,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                             {
                                 "status": "failed",
                                 "log_r2_key": log_key,
-                                "error_message": fail_log[:2000],
+                                "error_message": fail_log,
                                 "artifacts": artifacts_payload,
                             },
                         )
@@ -2677,7 +2689,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                     {
                         "status": "success" if ok else "failed",
                         "log_r2_key": log_key,
-                        "error_message": None if ok else full_log[:2000],
+                        "error_message": None if ok else full_log,
                         "artifacts": artifacts_payload,
                     },
                 )
