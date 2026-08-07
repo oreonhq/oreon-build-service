@@ -12,7 +12,7 @@ from oreon_build.db.base import Base
 if TYPE_CHECKING:
     from .account import Account
     from .build import BuildJob
-    from .build_chain import BuildChain
+    from .layer_plan import LayerPlan
     from .release import Release
 
 
@@ -53,7 +53,7 @@ class SideTag(Base):
         "SideTagMember", back_populates="side_tag", cascade="all, delete-orphan"
     )
     jobs: Mapped[List["BuildJob"]] = relationship("BuildJob", back_populates="side_tag")
-    chains: Mapped[List["BuildChain"]] = relationship("BuildChain", back_populates="side_tag")
+    layer_plans: Mapped[List["LayerPlan"]] = relationship("LayerPlan", back_populates="side_tag")
 
 
 class SideTagMember(Base):

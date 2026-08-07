@@ -10,7 +10,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from oreon_build.db.base import Base
 
 if TYPE_CHECKING:
-    from .build_chain import BuildChain
+    from .layer_plan import LayerPlan
     from .package import Package, PackageVersion
     from .release import Release
     from .rpmbuild_plan import RpmbuildPlan
@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 class BuildStatus(str, enum.Enum):
     PENDING = "pending"
     QUEUED = "queued"
+    BLOCKED = "blocked"
     RUNNING = "running"
     SUCCESS = "success"
     FAILED = "failed"
@@ -74,8 +75,9 @@ class BuildJob(Base):
     side_tag_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("side_tags.id"), nullable=True, index=True
     )
-    chain_id: Mapped[Optional[int]] = mapped_column(ForeignKey("build_chains.id"), nullable=True, index=True)
-    chain_stage_index: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    layer_plan_id: Mapped[Optional[int]] = mapped_column(ForeignKey("layer_plans.id"), nullable=True, index=True)
+    layer_index: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    blocked_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     rpmbuild_plan_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("rpmbuild_plans.id"), nullable=True, index=True
     )
@@ -94,7 +96,7 @@ class BuildJob(Base):
     attempts: Mapped[List["BuildAttempt"]] = relationship(
         "BuildAttempt", back_populates="build_job", order_by="BuildAttempt.started_at.desc()"
     )
-    build_chain: Mapped[Optional["BuildChain"]] = relationship("BuildChain", back_populates="jobs")
+    layer_plan: Mapped[Optional["LayerPlan"]] = relationship("LayerPlan", back_populates="jobs")
     side_tag: Mapped[Optional["SideTag"]] = relationship("SideTag", back_populates="jobs")
     rpmbuild_plan: Mapped[Optional["RpmbuildPlan"]] = relationship("RpmbuildPlan", back_populates="jobs")
 
