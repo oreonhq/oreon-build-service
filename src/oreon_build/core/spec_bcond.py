@@ -32,8 +32,14 @@ _RE_WITHOUT_US = re.compile(r"%\{?\??without_([A-Za-z0-9_]+)\}?", re.IGNORECASE)
 _RE_DEFINED = re.compile(r"%\{defined\s+([A-Za-z0-9_]+)\}", re.IGNORECASE)
 _RE_PY_DIST = re.compile(r"%\{(py\d*_?dist|python3_dist)\s+([^}]+)\}", re.IGNORECASE)
 # rpm %{?name} / %{?name:body} / %{!?name:body}  (do before bare %{name})
+# body may nest %{...}; matched by _expand_conditional_macros brace scan
+_RE_COND_MACRO_HEAD = re.compile(
+    r"%\{(?P<bang>!?)\?(?P<name>[A-Za-z0-9_]+)",
+    re.IGNORECASE,
+)
+# kept for tests / simple no-nest bodies
 _RE_COND_MACRO = re.compile(
-    r"%\{(?P<bang>!?)\?(?P<name>[A-Za-z0-9_]+)(?::(?P<body>[^}]*))?\}",
+    r"%\{(?P<bang>!?)\?(?P<name>[A-Za-z0-9_]+)(?::(?P<body>(?:[^{}]|%\{[^}]*\})*))?\}",
     re.IGNORECASE,
 )
 _RE_MACRO = re.compile(r"%\{?\??([A-Za-z0-9_]+)\}?")
@@ -95,27 +101,58 @@ def _macro_is_defined(name: str, macros: dict[str, str], bconds: dict[str, int])
 def _expand_conditional_macros(
     text: str, macros: dict[str, str], bconds: dict[str, int], *, max_rounds: int = 16
 ) -> str:
-    """rpm %{?name} / %{?name:body} / %{!?name:body}"""
+    """rpm %{?name} / %{?name:body} / %{!?name:body}
+
+    Body may nest macros like %{?up_prever:~%{up_prever}}.
+    """
+
+    def _one_pass(src: str) -> str:
+        m = _RE_COND_MACRO_HEAD.search(src)
+        if not m:
+            return src
+        start = m.start()
+        name = (m.group("name") or "").strip()
+        bang = bool(m.group("bang"))
+        pos = m.end()
+        body: str | None = None
+        if pos < len(src) and src[pos] == "}":
+            end = pos + 1
+        elif pos < len(src) and src[pos] == ":":
+            depth = 1
+            j = pos + 1
+            body_start = j
+            while j < len(src) and depth:
+                ch = src[j]
+                if ch == "{" and j > 0 and src[j - 1] == "%":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            if depth != 0:
+                return src
+            body = src[body_start:j]
+            end = j + 1
+        else:
+            return src
+        defined = _macro_is_defined(name, macros, bconds)
+        take = (not defined) if bang else defined
+        if not take:
+            repl = ""
+        elif body is not None:
+            repl = body
+        elif name in macros:
+            repl = str(macros[name])
+        elif name in bconds:
+            repl = str(bconds[name])
+        else:
+            repl = ""
+        return src[:start] + repl + src[end:]
 
     out = text or ""
     for _ in range(max_rounds):
-        def repl(m: re.Match[str]) -> str:
-            name = (m.group("name") or "").strip()
-            body = m.group("body")
-            bang = bool(m.group("bang"))
-            defined = _macro_is_defined(name, macros, bconds)
-            take = (not defined) if bang else defined
-            if not take:
-                return ""
-            if body is not None:
-                return body
-            if name in macros:
-                return str(macros[name])
-            if name in bconds:
-                return str(bconds[name])
-            return ""
-
-        new = _RE_COND_MACRO.sub(repl, out)
+        new = _one_pass(out)
         if new == out:
             break
         out = new
@@ -291,6 +328,9 @@ def _expand_macro_value(raw: str, macros: dict[str, str], bconds: dict[str, int]
     text = _normalize_numeric_tokens(text.strip())
     if re.fullmatch(r"[-+]?[0-9]+", text or ""):
         return str(int(text or "0"))
+    # dotted versions like 2.6 / 15.0.7 stay literal (do not bool-eval)
+    if re.fullmatch(r"[-+]?\d+(?:\.\d+)+(?:[.~^].*)?", text or ""):
+        return text
     low = text.lower()
     if low in ("true", "yes", "on"):
         return "1"
@@ -299,6 +339,9 @@ def _expand_macro_value(raw: str, macros: dict[str, str], bconds: dict[str, int]
     try:
         cleaned = re.sub(r"[^0-9A-Za-z_.<>=!()\s]", " ", text)
         if not cleaned.strip():
+            return text
+        # only treat as a bool expression when operators are present
+        if not re.search(r"[<>=!&|()]", cleaned):
             return text
         return "1" if bool(eval(cleaned, {"__builtins__": {}}, {})) else "0"
     except Exception:

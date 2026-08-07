@@ -4,6 +4,7 @@ import re
 from typing import Any
 
 _RE_VERSION_TRIM = re.compile(r"\s+(?=[<>=])")
+_RE_ELF_MARKER = re.compile(r"\(\)\((?:64bit|32bit|none)\)$")
 _RE_VERSIONED = re.compile(r"\s[<>=]")
 _RE_VERSIONED_REQ = re.compile(
     r"^(?P<name>.+?)\s*(?P<op><=|>=|==|!=|<|>|=)\s*(?P<ver>\S+)\s*$"
@@ -336,6 +337,7 @@ def rpm_requirement_primary(requirement: str) -> str | None:
         return None
     if "%" in base:
         return None
+    base = _RE_ELF_MARKER.sub("", base)
     return base
 
 
@@ -420,7 +422,11 @@ def rpm_requirement_tokens_from_value(value: str) -> list[str]:
     seen: set[str] = set()
     for chunk in _requirement_chunks(value):
         tok = " ".join((chunk or "").split())
+        # spec line continuations leave trailing '\'
+        tok = tok.rstrip("\\").strip().strip("{}")
         if not tok or tok in seen:
+            continue
+        if len(tok) == 1 and not tok.isalnum():
             continue
         primary = rpm_requirement_primary(tok)
         if not primary:
@@ -536,6 +542,23 @@ def rpm_requirement_primary_capabilities_from_value(value: str) -> list[str]:
     return caps
 
 
+_RE_VIRTUAL_RPM_CAP = re.compile(
+    r"^(?:"
+    r"crate|python3(?:\.\d+)?dist|golang|pkgconfig|perl|gem|npm|mvn|cmake|"
+    r"ghc-devel|ghc-prof|tex|font|mono|mingw(?:32|64)|ocaml|rubygem"
+    r")\(",
+    re.IGNORECASE,
+)
+
+
+def is_virtual_rpm_capability(cap: str) -> bool:
+    c = (cap or "").strip()
+    if not c:
+        return False
+    primary = rpm_requirement_primary(c) or c
+    return bool(_RE_VIRTUAL_RPM_CAP.match(primary))
+
+
 def requirement_check_capabilities(requirement: str) -> list[str]:
     caps: list[str] = []
     seen: set[str] = set()
@@ -588,3 +611,26 @@ def requirement_check_capabilities(requirement: str) -> list[str]:
     for cap in rpm_requirement_capabilities(requirement):
         add_leaf(cap)
     return caps
+
+
+def install_check_capabilities(requirement: str) -> list[str]:
+    """Installability caps only (no discovery source-name aliases)."""
+    raw = (requirement or "").strip()
+    if not raw:
+        return []
+    caps = requirement_check_capabilities(raw)
+    if not any(is_virtual_rpm_capability(c) for c in caps) and not is_virtual_rpm_capability(raw):
+        return caps
+    out: list[str] = []
+    seen: set[str] = set()
+    for cap in caps:
+        if not is_virtual_rpm_capability(cap):
+            continue
+        if cap in seen:
+            continue
+        seen.add(cap)
+        out.append(cap)
+    if out:
+        return out
+    primary = rpm_requirement_primary(raw) or raw
+    return [primary] if primary else []
