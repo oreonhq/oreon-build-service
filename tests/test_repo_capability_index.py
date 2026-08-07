@@ -199,6 +199,34 @@ def test_rpmlib_is_always_satisfied() -> None:
     assert repo.satisfies_requirement("rpmlib(CompressedFileNames) <= 3.0.4-1")
 
 
+def test_virtual_caps_need_real_provides_not_source_name_aliases() -> None:
+    """python3dist/crate installability is the virtual Provide, not a guessed src name."""
+    repo = RepoCapabilityIndex(
+        source_names={"python-requests", "python3", "rust-askalono", "rust"},
+        binary_names={"python3", "rust"},
+        provides={"python3", "rust"},
+    )
+    repo.finalize_lookups()
+    assert not repo.satisfies_requirement("python3dist(requests)")
+    assert not repo.satisfies_requirement("crate(askalono)")
+    assert not repo.satisfies_requirement(
+        "(crate(askalono/default) >= 0.5.0 with crate(askalono/default) < 0.6.0~)"
+    )
+
+    ok = RepoCapabilityIndex(
+        provides={
+            "python3dist(requests)",
+            "crate(askalono)",
+            "crate(askalono/default)",
+        },
+        binary_names={"python3-requests", "rust-askalono"},
+        source_names={"python-requests", "rust-askalono"},
+    )
+    ok.finalize_lookups()
+    assert ok.satisfies_requirement("python3dist(requests)")
+    assert ok.satisfies_requirement("crate(askalono)")
+
+
 def test_ingest_filelists_adds_path_provides() -> None:
     from oreon_build.services.repo_capability_index import _ingest_filelists_xml
 
@@ -524,3 +552,25 @@ def test_satisfies_requirement_checks_provide_evr() -> None:
     assert repo.satisfies_requirement("wayland-protocols-devel >= 1.47")
     assert not repo.satisfies_requirement("wayland-protocols-devel >= 1.48")
     assert not repo.satisfies_requirement("wayland-protocols-devel > 1.47")
+
+
+def test_source_is_repo_current_presence_and_evr() -> None:
+    repo = RepoCapabilityIndex(
+        binary_names={"rust-clap"},
+        provides={"rust-clap", "crate(clap)"},
+        capability_providers={"crate(clap)": {"rust-clap"}, "rust-clap": {"rust-clap"}},
+        capability_evrs={
+            "rust-clap": [("0", "4.5.0", "1.or11")],
+            "crate(clap)": [("0", "4.5.0", "")],
+        },
+        binary_source={"rust-clap": "rust-clap"},
+        source_names={"rust-clap"},
+    )
+    repo.finalize_lookups()
+    assert repo.source_present_in_repo("rust-clap")
+    assert repo.source_is_repo_current("rust-clap")
+    assert not repo.source_is_repo_current("rust-clap", require_evr=True)
+    assert repo.source_is_repo_current("rust-clap", 0, "4.5.0", "1.or11", require_evr=True)
+    assert repo.source_is_repo_current("rust-clap", 0, "4.4.0", "1.or11", require_evr=True)
+    assert not repo.source_is_repo_current("rust-clap", 0, "4.6.0", "1.or11", require_evr=True)
+    assert not repo.source_is_repo_current("rust-missing", 0, "1.0.0", "1")

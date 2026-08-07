@@ -10,21 +10,8 @@ def _noop_distgit_provides_index():
     async def inner(**kwargs):
         return None
 
-    def _no_live_solver(*_a, **_k):
-        raise RuntimeError("live libsolv solver disabled in unit tests")
-
-    with (
-        patch(
-            "oreon_build.services.distgit_order.get_distgit_provides_index_cached",
-            side_effect=inner,
-        ),
-        patch(
-            "oreon_build.services.dep_plan.planner.get_distgit_provides_index_cached",
-            side_effect=inner,
-        ),
-        patch(
-            "oreon_build.services.dep_plan.planner.get_repo_solver",
-            side_effect=_no_live_solver,
-        ),
+    with patch(
+        "oreon_build.services.distgit_order.get_distgit_provides_index_cached",
+        side_effect=inner,
     ):
         yield

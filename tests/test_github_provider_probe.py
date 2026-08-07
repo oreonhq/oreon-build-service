@@ -119,6 +119,31 @@ x
     assert "crate(nom7)" not in provided2
 
 
+def test_lightweight_bcond_compat_pkg_name() -> None:
+    # llvm15-style: %bcond_without compat_build → Name becomes llvm15 not llvm
+    spec = """
+%bcond_without compat_build
+%global maj_ver 15
+%if %{with compat_build}
+%global pkg_name llvm%{maj_ver}
+%else
+%global pkg_name llvm
+%endif
+Name:           %{pkg_name}
+Version:        15.0.7
+%package static
+%package cmake-utils
+%description
+x
+%files
+"""
+    provided = _lightweight_provides_from_spec_text("llvm15", spec)
+    assert "llvm15" in provided
+    assert "llvm15-static" in provided
+    assert "llvm15-cmake-utils" in provided
+    assert "llvm-static" not in provided
+
+
 def test_lightweight_soname_from_files() -> None:
     spec = """
 Name: DevIL
@@ -349,3 +374,142 @@ async def test_github_search_verifies_hit_spec() -> None:
         distgit_branch="dev/pre-beta-1",
     )
     assert srcs == {"libxml++"}
+
+
+def test_lightweight_perl_module_from_file_path() -> None:
+    spec = """
+Name: perl-MIME-Entity
+%files
+%{_datadir}/perl5/MIME/Entity.pm
+"""
+    provided = _lightweight_provides_from_spec_text("perl-MIME-Entity", spec)
+    assert "perl(MIME::Entity)" in provided
+
+
+def test_lightweight_bindir_glob_stored_for_later_matching() -> None:
+    spec = """
+Name: binutils
+%files
+%{_bindir}/[!l]*
+"""
+    provided = _lightweight_provides_from_spec_text("binutils", spec)
+    assert "__glob__/usr/bin/[!l]*" in provided
+
+
+def test_lightweight_ghc_lib_subpackage_vendored_lib() -> None:
+    spec = """
+Name: ghc-vector-algorithms
+%global bitvec bitvec-1.1.5.0
+%global subpkgs %{bitvec}
+%package -n ghc-vector-algorithms-devel
+%package -n ghc-vector-algorithms-doc
+%package -n ghc-vector-algorithms-prof
+%prep
+%build
+%ghc_lib_subpackage -l BSD-3-Clause %{bitvec}
+%files
+"""
+    provided = _lightweight_provides_from_spec_text("ghc-vector-algorithms", spec)
+    assert "ghc-libhs(bitvec)" in provided
+
+
+def test_lightweight_cmake_module_from_file_path() -> None:
+    spec = """
+Name: libbson
+%files
+%{_libdir}/cmake/bson-1.0/bson-targets.cmake
+"""
+    provided = _lightweight_provides_from_spec_text("libbson", spec)
+    assert "cmake(bson-1.0)" in provided
+
+
+def test_lightweight_perl_nested_module_from_file_path() -> None:
+    spec = """
+Name: perl-Log-Report-Minimal
+%files
+%{_datadir}/perl5/Log/Report/Minimal/Domain.pm
+"""
+    provided = _lightweight_provides_from_spec_text("perl-Log-Report-Minimal", spec)
+    assert "perl(Log::Report::Minimal::Domain)" in provided
+
+
+def test_lightweight_nested_version_macro_cmake_and_mingw_dll() -> None:
+    mongo = """
+%global up_version 2.3.1
+Name: mongo-c-driver
+Version: %{up_version}%{?up_prever:~%{up_prever}}
+%files -n libbson-devel
+%{_libdir}/cmake/bson-%{version}
+"""
+    provided = _lightweight_provides_from_spec_text("mongo-c-driver", mongo)
+    assert "cmake(bson-2.3.1)" in provided
+    assert "cmake(bson-)" not in provided
+
+    mingw = """
+Name: mingw-hunspell
+%files -n mingw32-hunspell
+%{mingw32_bindir}/libhunspell-1.7-0.dll
+%files -n mingw64-hunspell
+%{mingw64_bindir}/libhunspell-1.7-0.dll
+"""
+    provided = _lightweight_provides_from_spec_text("mingw-hunspell", mingw)
+    assert "mingw32(libhunspell-1.7-0.dll)" in provided
+    assert "mingw64(libhunspell-1.7-0.dll)" in provided
+
+
+def test_perl_metacpan_dist_maps_unprefixed_dpkg() -> None:
+    from oreon_build.services.perl_resolve import distgit_sources_for_perl_module
+
+    assert distgit_sources_for_perl_module("Dpkg::Version", {"dpkg"}) == {"dpkg"}
+
+
+def test_lightweight_goipath_global_maps_to_golang_provide() -> None:
+    spec = """
+%global goipath github.com/briandowns/spinner
+Name: golang-github-briandowns-spinner
+Version: 1.23.2
+%gometa -f
+%files
+"""
+    provided = _lightweight_provides_from_spec_text("golang-github-briandowns-spinner", spec)
+    assert "golang(github.com/briandowns/spinner)" in provided
+
+
+def test_lightweight_versioned_soname_from_files_macro_expand() -> None:
+    spec = """
+Name: boost
+%files python3
+%{_libdir}/libboost_python314.so.1.83.0
+"""
+    provided = _lightweight_provides_from_spec_text("boost", spec)
+    assert "libboost_python314.so.1.83.0" in provided
+
+
+def test_lightweight_bare_star_soname_uses_package_name() -> None:
+    spec = """
+Name: libcerf
+%global sover 3
+%files
+%{_libdir}/*.so.%{sover}*
+"""
+    provided = _lightweight_provides_from_spec_text("libcerf", spec)
+    assert "libcerf.so.3" in provided
+
+
+def test_local_source_negative_cache_skips_repeat_fetch() -> None:
+    """A permanently-404 patch must not be re-hit on every fixed-point wave."""
+    import time as time_mod
+
+    from oreon_build.services import distgit_order as do
+
+    url = "https://raw.githubusercontent.com/x/y/z/rel/pkg/never-exists.patch"
+    do._LOCAL_SOURCE_FAIL_CACHE.pop(url, None)
+    try:
+        assert not do._local_source_fail_cached(url)
+        do._local_source_mark_failed(url)
+        assert do._local_source_fail_cached(url)
+        # expired entries dont block forever
+        do._LOCAL_SOURCE_FAIL_CACHE[url] = time_mod.monotonic() - do._LOCAL_SOURCE_FAIL_TTL_SEC - 1
+        assert not do._local_source_fail_cached(url)
+    finally:
+        do._LOCAL_SOURCE_FAIL_CACHE.pop(url, None)

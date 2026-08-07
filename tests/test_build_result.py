@@ -49,3 +49,17 @@ def test_prepare_build_error_message_keeps_tail_for_other_errors() -> None:
     msg = prepare_build_error_message(body, limit=200)
     assert "FINAL_ERROR_MARKER" in msg
     assert len(msg) <= 200
+
+
+def test_prepare_build_error_message_keeps_nothing_provides_from_mock_tail() -> None:
+    head = "## Binary RPM build (mock --rebuild)\n" + ("Installed: fluff\n" * 400)
+    tail = (
+        "Error:\n"
+        "Problem 1: nothing provides requested (crate(askalono/default) >= 0.5.0 with crate(askalono/default) < 0.6.0~)\n"
+        "Problem 2: nothing provides requested (crate(rayon/default) >= 1.10.0 with crate(rayon/default) < 2.0.0~)\n"
+    )
+    full = head + tail
+    assert "nothing provides" not in full[:2000]
+    msg = prepare_build_error_message(full)
+    assert "nothing provides requested (crate(askalono/default)" in msg
+    assert "crate(rayon/default)" in msg

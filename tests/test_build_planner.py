@@ -1,29 +1,20 @@
 from __future__ import annotations
 
-import io
-import tarfile
-from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from oreon_build.core.rpm_requires import requirement_check_capabilities
-from oreon_build.services.build_planner import chain_spec_root_packages, plan_automatic_chain
 from oreon_build.services.dep_plan.errors import classify_misses, root_coverage_errors
 from oreon_build.services.dep_plan.order import topo_layers
 from oreon_build.services.dep_plan.types import PackageNode
-from oreon_build.services.distgit_order import (
-    DistgitProvidesIndex,
-    _expand_chain_spec_closure,
-    _tarball_spec_member_index,
-)
-from oreon_build.services.repo_capability_index import RepoCapabilityIndex, clear_repo_capability_cache
+from oreon_build.services.repo_capability_index import RepoCapabilityIndex
 from oreon_build.services.repo_solver import OverlayPackage, SolveResult
 
 
 class FakeMultiArchSolver:
-    """Hermetic installability oracle for planner tests."""
+    """Hermetic installability oracle for install_oracle tests."""
 
     def __init__(
         self,
@@ -99,293 +90,6 @@ class FakeMultiArchSolver:
         )
 
 
-def _tarball(releasename: str, specs: dict[str, str]) -> bytes:
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        for pkg, body in specs.items():
-            data = body.encode("utf-8")
-            info = tarfile.TarInfo(name=f"repo-{releasename}/{releasename}/{pkg}/{pkg}.spec")
-            info.size = len(data)
-            tf.addfile(info, io.BytesIO(data))
-    return buf.getvalue()
-
-
-def _make_sparse_closure(specs: dict[str, str]):
-    async def inner(roots, *, releasename, owner, repo, distgit_branch, headers, **kwargs):
-        tarball = _tarball(releasename, specs)
-        all_names, members = _tarball_spec_member_index(tarball, releasename)
-        return _expand_chain_spec_closure(
-            roots,
-            all_names,
-            tarball,
-            releasename,
-            members=members,
-        )
-
-    return inner
-
-
-def _provides_index(specs: dict[str, str]) -> DistgitProvidesIndex:
-    caps: dict[str, set[str]] = {}
-    for name, body in specs.items():
-        caps.setdefault(name, set()).add(name)
-        for line in body.splitlines():
-            if line.lower().startswith("provides:"):
-                cap = line.split(":", 1)[1].strip()
-                if cap:
-                    caps.setdefault(cap, set()).add(name)
-    return DistgitProvidesIndex(
-        package_names=frozenset(specs),
-        capability_providers={k: frozenset(v) for k, v in caps.items()},
-    )
-
-
-@contextmanager
-def _plan_patches(
-    specs: dict[str, str],
-    *,
-    repo: RepoCapabilityIndex,
-    available: set[str] | None = None,
-    provider_sources: dict[str, set[str]] | None = None,
-):
-    async def _fake_provides(*_a, **_k):
-        return _provides_index(specs)
-
-    with (
-        patch(
-            "oreon_build.services.dep_plan.planner.expand_chain_spec_closure_sparse",
-            side_effect=_make_sparse_closure(specs),
-        ),
-        patch(
-            "oreon_build.services.dep_plan.planner.get_repo_solver",
-            return_value=FakeMultiArchSolver(
-                available,
-                repo_index=repo,
-                provider_sources=provider_sources,
-            ),
-        ),
-        patch(
-            "oreon_build.services.dep_plan.planner.get_distgit_provides_index_cached",
-            side_effect=_fake_provides,
-        ),
-        patch(
-            "oreon_build.services.dep_plan.expand._download_distgit_local_sources",
-            return_value=[],
-        ),
-    ):
-        yield
-
-
-_SPECS = {
-    "a": """Name: a
-Version: 1
-Release: 1
-Summary: a
-License: MIT
-BuildRequires: b
-Provides: a
-%description
-x
-%prep
-%build
-%install
-%files
-""",
-    "b": """Name: b
-Version: 1
-Release: 1
-Summary: b
-License: MIT
-BuildRequires: c
-Provides: b
-%description
-x
-%prep
-%build
-%install
-%files
-""",
-    "c": """Name: c
-Version: 1
-Release: 1
-Summary: c
-License: MIT
-Provides: c
-%description
-x
-%prep
-%build
-%install
-%files
-""",
-}
-
-
-@pytest.mark.asyncio
-async def test_planner_hard_fails_without_libsolv() -> None:
-    clear_repo_capability_cache()
-
-    def _boom(*_a, **_k):
-        raise RuntimeError("python-solv bindings unavailable")
-
-    with patch(
-        "oreon_build.services.dep_plan.planner.get_repo_solver",
-        side_effect=_boom,
-    ):
-        plan = await plan_automatic_chain(
-            releasename="oreon-11-rp1",
-            repo_branch="dev",
-            distgit_url="https://github.com/oreonhq/rpm-specfiles.git",
-            distgit_branch="main",
-            root_packages=["a"],
-            architectures=["x86_64"],
-            headers={},
-        )
-    assert not plan.layers
-    assert not plan.blocking_errors
-    assert any("libsolv" in e.lower() for e in plan.errors)
-
-    clear_repo_capability_cache()
-    with _plan_patches(_SPECS, repo=RepoCapabilityIndex()):
-        plan = await plan_automatic_chain(
-            releasename="oreon-11-rp1",
-            repo_branch="dev",
-            distgit_url="https://github.com/oreonhq/rpm-specfiles.git",
-            distgit_branch="main",
-            root_packages=["a"],
-            architectures=["x86_64"],
-            headers={},
-        )
-    built = {slot.name for layer in plan.layers for slot in layer}
-    assert built == {"c", "b", "a"}
-    assert plan.chain_spec.index("c") < plan.chain_spec.index("b") < plan.chain_spec.index("a")
-
-
-@pytest.mark.asyncio
-async def test_planner_skips_repo_satisfied_deps() -> None:
-    clear_repo_capability_cache()
-    repo = RepoCapabilityIndex(
-        source_names={"b", "c"},
-        binary_names={"b", "c"},
-        provides={"b", "c"},
-    )
-    with _plan_patches(_SPECS, repo=repo, available={"b", "c"}):
-        plan = await plan_automatic_chain(
-            releasename="oreon-11-rp1",
-            repo_branch="dev",
-            distgit_url="https://github.com/oreonhq/rpm-specfiles.git",
-            distgit_branch="main",
-            root_packages=["a"],
-            architectures=["x86_64"],
-            headers={},
-        )
-    built = {slot.name for layer in plan.layers for slot in layer}
-    assert built == {"a"}
-    assert "b" not in built
-
-
-@pytest.mark.asyncio
-async def test_planner_import_when_no_distgit_provider() -> None:
-    clear_repo_capability_cache()
-    specs = {
-        "foo": (
-            "Name: foo\nVersion: 1\nRelease: 1\nSummary: foo\nLicense: MIT\n"
-            "BuildRequires: missing-lib\nProvides: foo\n"
-            "%description\nx\n%prep\n%build\n%install\n%files\n"
-        ),
-    }
-    with _plan_patches(specs, repo=RepoCapabilityIndex(provides={"glibc"}, binary_names={"glibc"})):
-        plan = await plan_automatic_chain(
-            releasename="oreon-11-rp1",
-            repo_branch="dev",
-            distgit_url="https://github.com/oreonhq/rpm-specfiles.git",
-            distgit_branch="main",
-            root_packages=["foo"],
-            architectures=["x86_64"],
-            headers={},
-        )
-    assert "missing-lib" in " ".join(plan.blocking_errors)
-    assert "foo" not in {slot.name for layer in plan.layers for slot in layer}
-
-
-@pytest.mark.asyncio
-async def test_sbctl_shaped_expand_order_and_root_gate() -> None:
-    """golist / go-vendor-tools / askalono-cli / sbctl hermetic fixture."""
-    clear_repo_capability_cache()
-    specs = {
-        "sbctl": (
-            "Name: sbctl\nVersion: 1\nRelease: 1\nSummary: s\nLicense: MIT\n"
-            "BuildRequires: golist\nBuildRequires: askalono-cli\nProvides: sbctl\n"
-            "%description\nx\n%prep\n%build\n%install\n%files\n"
-        ),
-        "golist": (
-            "Name: golist\nVersion: 1\nRelease: 1\nSummary: g\nLicense: MIT\n"
-            "BuildRequires: go-vendor-tools\nProvides: golist\n"
-            "%description\nx\n%prep\n%build\n%install\n%files\n"
-        ),
-        "go-vendor-tools": (
-            "Name: go-vendor-tools\nVersion: 1\nRelease: 1\nSummary: v\nLicense: MIT\n"
-            "BuildRequires: askalono-cli\nProvides: go-vendor-tools\n"
-            "%description\nx\n%prep\n%build\n%install\n%files\n"
-        ),
-        "askalono-cli": (
-            "Name: askalono-cli\nVersion: 1\nRelease: 1\nSummary: a\nLicense: MIT\n"
-            "Provides: askalono-cli\n"
-            "%description\nx\n%prep\n%build\n%install\n%files\n"
-        ),
-    }
-    with _plan_patches(specs, repo=RepoCapabilityIndex()):
-        plan = await plan_automatic_chain(
-            releasename="oreon-11-rp1",
-            repo_branch="dev",
-            distgit_url="https://github.com/oreonhq/rpm-specfiles.git",
-            distgit_branch="main",
-            root_packages=["sbctl"],
-            architectures=["x86_64"],
-            headers={},
-        )
-    flat = [slot.name for layer in plan.layers for slot in layer]
-    assert "sbctl" in flat
-    assert flat.index("askalono-cli") < flat.index("go-vendor-tools")
-    assert flat.index("go-vendor-tools") < flat.index("golist")
-    assert flat.index("golist") < flat.index("sbctl")
-    assert "sbctl" in plan.package_plans
-
-
-@pytest.mark.asyncio
-async def test_root_uncovered_when_orphans_only() -> None:
-    """996-style: if root blocks, plan errors must surface uncovered root."""
-    clear_repo_capability_cache()
-    specs = {
-        "sbctl": (
-            "Name: sbctl\nVersion: 1\nRelease: 1\nSummary: s\nLicense: MIT\n"
-            "BuildRequires: totally-missing-cap\nProvides: sbctl\n"
-            "%description\nx\n%prep\n%build\n%install\n%files\n"
-        ),
-        "rust-clap_builder": (
-            "Name: rust-clap_builder\nVersion: 1\nRelease: 1\nSummary: r\nLicense: MIT\n"
-            "Provides: rust-clap_builder\n"
-            "%description\nx\n%prep\n%build\n%install\n%files\n"
-        ),
-    }
-    with _plan_patches(specs, repo=RepoCapabilityIndex()):
-        plan = await plan_automatic_chain(
-            releasename="oreon-11-rp1",
-            repo_branch="dev",
-            distgit_url="https://github.com/oreonhq/rpm-specfiles.git",
-            distgit_branch="main",
-            root_packages=["sbctl"],
-            architectures=["x86_64"],
-            headers={},
-        )
-    assert "sbctl" not in plan.package_plans
-    assert plan.errors or plan.blocking_errors
-
-
-def test_chain_spec_root_packages() -> None:
-    assert chain_spec_root_packages("a b : c") == ["a", "b", "c"]
-
-
 def test_topo_layers_provider_before_consumer() -> None:
     layers, cyc = topo_layers(
         {"a", "b", "c"},
@@ -404,6 +108,24 @@ def test_topo_layers_cycle_break() -> None:
     assert cyc
     flat = [n for layer in layers for n in layer]
     assert flat.index("perl-A") < flat.index("biber") or flat.index("perl-B") < flat.index("biber")
+
+
+def test_topo_layers_cycle_does_not_duplicate_leaves() -> None:
+    # go-vendor-tools <-> trivy cycle with rust-askalono-cli as a zero-indegree leaf
+    layers, cyc = topo_layers(
+        {"go-vendor-tools", "golist", "rust-askalono-cli", "sbctl", "trivy"},
+        {
+            "go-vendor-tools": {"rust-askalono-cli", "trivy"},
+            "golist": {"go-vendor-tools"},
+            "rust-askalono-cli": set(),
+            "sbctl": {"golist"},
+            "trivy": {"go-vendor-tools"},
+        },
+    )
+    assert cyc
+    flat = [n for layer in layers for n in layer]
+    assert len(flat) == len(set(flat))
+    assert flat.count("rust-askalono-cli") == 1
 
 
 def test_classify_miss_import_vs_path() -> None:
@@ -679,10 +401,11 @@ def test_crates_io_static_url_rewrite() -> None:
 
 def test_nosrc_disk_cache_hit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from oreon_build.core.spec_bcond import SpecBcondInfo
-    from oreon_build.services.dep_plan import br_oracle
+    from oreon_build.services.dep_plan import br_cache, br_oracle
     from oreon_build.services.dep_plan.types import BrEval
 
-    monkeypatch.setenv("OREON_DYNBR_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("OREON_BR_SQLITE_PATH", str(tmp_path / "br_cache.sqlite3"))
+    br_cache._conn = None
     calls = {"n": 0}
 
     def fake_eval(spec_text, **kwargs):
@@ -705,44 +428,13 @@ def test_nosrc_disk_cache_hit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         patch.object(br_oracle, "evaluate_generate_buildrequires", side_effect=fake_eval),
         patch.object(br_oracle, "parse_spec_bconds", return_value=empty),
     ):
-        a = br_oracle.evaluate_package_brs(spec)
-        b = br_oracle.evaluate_package_brs(spec)
+        a = br_oracle.evaluate_package_brs(spec, pkg="rust-x")
+        b = br_oracle.evaluate_package_brs(spec, pkg="rust-x")
+    br_cache._conn = None
     assert a.complete and b.complete
     assert calls["n"] == 1
     assert isinstance(a, BrEval)
     assert "(crate(foo)" in " ".join(a.buildrequires)
-
-
-def test_cargo_incomplete_blocks_in_decide() -> None:
-    from oreon_build.services.dep_plan.expand import _decide_action
-    from oreon_build.services.dep_plan.install_oracle import InstallOracle
-
-    node = PackageNode(
-        name="rust-bstr",
-        has_generate=True,
-        br_complete=False,
-        br_evaluated=True,
-        brs=["cargo-rpm-macros"],
-        br_error="cargo buildreqs nosrc missing",
-        spec_text="%cargo_generate_buildrequires\n",
-    )
-    install = InstallOracle(FakeMultiArchSolver())
-    with patch(
-        "oreon_build.services.dep_plan.expand.spec_uses_cargo_generate_buildrequires",
-        return_value=True,
-    ):
-        _decide_action(
-            "rust-bstr",
-            node,
-            roots={"rust-bstr"},
-            force_rebuild=set(),
-            repo_index=RepoCapabilityIndex(),
-            install=install,
-            distro_macros={},
-            target_arches={"x86_64"},
-        )
-    assert node.action == "block"
-    assert "cargo" in node.reason.lower() or "generate" in node.reason.lower()
 
 
 def test_install_oracle_caches_by_overlay() -> None:

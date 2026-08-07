@@ -4,7 +4,16 @@ from oreon_build.core.rpm_requires import (
     requirement_check_capabilities,
     rpm_requirement_capabilities,
     rpm_requirement_capabilities_from_value,
+    rpm_requirement_primary,
 )
+
+
+def test_soname_elf_marker_stripped_for_matching() -> None:
+    assert rpm_requirement_primary("libboost_python314.so.1.83.0()(64bit)") == (
+        "libboost_python314.so.1.83.0"
+    )
+    assert rpm_requirement_primary("libcerf.so.3()(64bit)") == "libcerf.so.3"
+    assert rpm_requirement_primary("libcerf.so.3()(32bit)") == "libcerf.so.3"
 
 
 def test_pkgconfig_expands_inner_name() -> None:

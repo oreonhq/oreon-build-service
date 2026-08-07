@@ -1,10 +1,26 @@
 from __future__ import annotations
 
+import io
+import tarfile
+from pathlib import Path
+
 from oreon_build.services.dynamic_brs import (
+    _evaluate_cargo_buildrequires_fast,
+    _extract_cargo_toml_from_tarball,
     merge_buildrequires,
     rpmspec_query_buildrequires,
     spec_has_generate_buildrequires,
 )
+
+
+def _make_crate_tarball(cargo_toml: str) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        data = cargo_toml.encode()
+        info = tarfile.TarInfo(name="demo-crate-0.1.0/Cargo.toml")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
 
 
 def test_detect_generate_buildrequires() -> None:
@@ -151,6 +167,57 @@ x
     assert "askalono-fix-metadata-auto.diff" in names
     assert "extra-local.patch" in names
     assert "askalono-0.5.0.crate" not in names
+
+
+def test_extract_cargo_toml_from_tarball(tmp_path) -> None:
+    data = _make_crate_tarball('[package]\nname = "demo-crate"\nversion = "0.1.0"\n')
+    out = _extract_cargo_toml_from_tarball(data, tmp_path)
+    assert out is not None
+    assert out.name == "Cargo.toml"
+    assert 'name = "demo-crate"' in out.read_text()
+
+
+def test_cargo_fast_path_from_local_source(tmp_path) -> None:
+    cargo_toml = """
+[package]
+name = "demo-crate"
+version = "0.1.0"
+edition = "2018"
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"
+"""
+    crate_path = tmp_path / "demo-crate-0.1.0.crate"
+    crate_path.write_bytes(_make_crate_tarball(cargo_toml))
+    spec = """
+Name: rust-demo-crate
+Version: 0.1.0
+Release: 1%{?dist}
+Summary: demo
+License: MIT
+Source0: demo-crate-0.1.0.crate
+%generate_buildrequires
+%cargo_generate_buildrequires
+%description
+x
+%prep
+%build
+%install
+%files
+"""
+    result = _evaluate_cargo_buildrequires_fast(
+        spec, defines=None, local_source_paths=[crate_path], target_arches=None
+    )
+    assert result is not None
+    assert result.complete
+    assert any("libc" in br for br in result.buildrequires)
 
 
 def test_requires_from_nosrc_via_python_rpm(tmp_path) -> None:

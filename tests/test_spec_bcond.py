@@ -85,6 +85,41 @@ BuildRequires: make
     assert "make" in info.unconditional_brs
 
 
+def test_nested_conditional_version_macro() -> None:
+    from oreon_build.core.spec_bcond import _expand_br_macros
+
+    assert (
+        _expand_br_macros(
+            "%{up_version}%{?up_prever:~%{up_prever}}",
+            {"up_version": "2.3.1"},
+        )
+        == "2.3.1"
+    )
+    assert (
+        _expand_br_macros(
+            "%{up_version}%{?up_prever:~%{up_prever}}",
+            {"up_version": "2.3.1", "up_prever": "rc1"},
+        )
+        == "2.3.1~rc1"
+    )
+
+
+def test_global_dotted_version_not_bool_eval() -> None:
+    spec = """
+%bcond_without compat_build
+%global maj_ver 15
+%global api_ver 2.6
+%if %{with compat_build}
+%global pkg_name llvm%{maj_ver}
+%else
+%global pkg_name llvm
+%endif
+"""
+    info = parse_spec_bconds(spec)
+    assert info.macros.get("api_ver") == "2.6"
+    assert info.macros.get("pkg_name") == "llvm15"
+
+
 def test_default_build_defines_uses_spec_defaults() -> None:
     spec = """
 %bcond_without ecore
