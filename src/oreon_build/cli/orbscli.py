@@ -498,9 +498,10 @@ def cmd_build(
         for job in jobs_out:
             _wait_job_and_maybe_log(api_base, token, int(job["id"]), log_path)
 
-@cli.command("chain-build")
+@cli.command("layer-build")
 @click.argument("spec_parts", nargs=-1, required=True)
 @click.option("--release", "release_ref", required=True, help="Release id or releasename (e.g. oreon-11-rp1)")
+@click.option("--side-tag", "side_tag_ref", required=True, help="Side tag id to publish into")
 @click.option(
     "--arch",
     default="x86_64,aarch64",
@@ -511,12 +512,12 @@ def cmd_build(
     "log_dir",
     type=click.Path(),
     default=None,
-    help="Directory for per-job logs for first-stage jobs only",
+    help="Directory for per-job logs for immediately-queued jobs only",
 )
 @click.option(
     "--wait/--no-wait",
     default=False,
-    help="Poll until each first-stage job reaches a terminal state",
+    help="Poll until each immediately-queued job reaches a terminal state",
 )
 @click.option(
     "--distgit-url",
@@ -530,22 +531,24 @@ def cmd_build(
     default="main",
     help="Branch fragment in distgit URL",
 )
-def cmd_chain_build(
+def cmd_layer_build(
     spec_parts: tuple[str, ...],
     release_ref: str,
+    side_tag_ref: str,
     arch: str,
     log_dir: str | None,
     wait: bool,
     distgit_url: str,
     distgit_branch: str,
 ) -> None:
+    """Queue root package(s); dependencies are discovered and built reactively."""
     token = require_auth(get_token())
     require_maintainer(token)
     api_base = get_api_url()
     rid = resolve_release_id(api_base, token, release_ref)
-    chain_spec = " ".join(spec_parts).strip()
-    if not chain_spec:
-        click.echo("Empty chain spec.", err=True)
+    packages = [p.strip() for p in spec_parts if p.strip()]
+    if not packages:
+        click.echo("No package names given.", err=True)
         sys.exit(2)
     arches = [a.strip() for a in arch.split(",") if a.strip()]
     log_path = Path(log_dir) if log_dir else None
@@ -553,20 +556,20 @@ def cmd_chain_build(
         log_path.mkdir(parents=True, exist_ok=True)
 
     body: dict[str, Any] = {
-        "chain_spec": chain_spec,
+        "packages": packages,
         "release_id": rid,
+        "side_tag_id": int(side_tag_ref),
         "architectures": arches,
         "distgit_url": distgit_url,
         "distgit_branch": distgit_branch,
     }
-    data = http_json("POST", api_base, "/api/builds/chain-trigger", token=token, json_body=body, timeout=300.0)
+    data = http_json("POST", api_base, "/api/builds/layer-trigger", token=token, json_body=body, timeout=300.0)
     if not isinstance(data, dict):
-        click.echo("Unexpected chain-trigger response", err=True)
+        click.echo("Unexpected layer-trigger response", err=True)
         sys.exit(1)
-    cid = data.get("chain_id")
-    click.echo("chain_id=%s status=%s" % (cid, data.get("chain_status") or ""))
-    if data.get("accepted"):
-        click.echo(data.get("message") or "Chain accepted; jobs queue in the background.")
+    lid = data.get("layer_plan_id")
+    click.echo("layer_plan_id=%s status=%s" % (lid, data.get("layer_plan_status") or ""))
+    click.echo(data.get("message") or "Layer accepted.")
     jobs = data.get("jobs") or []
     if not isinstance(jobs, list):
         jobs = []
@@ -576,10 +579,16 @@ def cmd_chain_build(
             continue
         jid = int(job["id"])
         click.echo(
-            "queued build job %s arch=%s chain_stage=%s"
-            % (jid, job.get("architecture") or "", job.get("chain_stage_index") if job.get("chain_stage_index") is not None else "")
+            "job %s arch=%s status=%s layer_index=%s"
+            % (
+                jid,
+                job.get("architecture") or "",
+                job.get("status") or "",
+                job.get("layer_index") if job.get("layer_index") is not None else "",
+            )
         )
-        jobs_out.append(job)
+        if job.get("status") == "queued":
+            jobs_out.append(job)
 
     need_poll = wait or log_path is not None
     if need_poll and jobs_out:
