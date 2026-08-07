@@ -247,8 +247,8 @@ class Settings(BaseSettings):
     ci_callback_url: Optional[str] = Field(
         default=None,
         description=(
-            "When set, the build service POSTs {chain_id, status, error_message} to this URL "
-            "whenever a build chain reaches a terminal state (success/failed/cancelled). "
+            "When set, the build service POSTs {layer_plan_id, status, error_message} to this URL "
+            "whenever a layer plan reaches a terminal state (success/failed/cancelled). "
             "Used by oreon-server to update GitHub check runs without polling. Env CI_CALLBACK_URL."
         ),
     )
