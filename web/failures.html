@@ -45,30 +45,9 @@
         </table>
       </div>
     </section>
-    <section class="card" style="margin-top:1.25rem;">
-      <h2>Chain build failures</h2>
-      <p class="failures-hint">Same latest-per-arch rule, but only for jobs that were part of a chain build.</p>
-      <div id="chain-failures-status" class="failures-hint">Loading</div>
-      <div id="chain-failures-table-wrap" style="display:none;">
-        <table class="failures-table" id="chain-failures-table">
-          <thead>
-            <tr>
-              <th>Job</th>
-              <th>Package</th>
-              <th>Release</th>
-              <th>Arch</th>
-              <th>Chain</th>
-              <th>Completed</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-          <tbody id="chain-failures-tbody"></tbody>
-        </table>
-      </div>
-    </section>
   </main>
   <footer class="footer">Oreon Build Service</footer>
-  <script src="/static/app.js?v=15"></script>
+  <script src="/static/app.js?v=18"></script>
   <script>
     (function() {
       var api = window.oreonApi;
@@ -77,29 +56,23 @@
         d.textContent = s == null ? '' : String(s);
         return d.innerHTML;
       }
-      function renderFailureRows(rows, tbody, opts) {
-        opts = opts || {};
-        var showChain = !!opts.showChain;
+      function renderFailureRows(rows, tbody) {
         tbody.innerHTML = rows.map(function(r) {
           var completed = r.completed_at ? r.completed_at.slice(0, 19).replace('T', ' ') : '—';
           var aid = r.last_attempt_id;
           var logBtn = aid
             ? '<button type="button" class="btn failure-log-btn" data-attempt-id="' + encodeURIComponent(aid) + '">Log</button>'
             : '<button type="button" class="btn" disabled title="No attempt id">Log</button>';
-          var chainCell = showChain
-            ? '<td>' + (r.chain_id != null ? escapeHtml(String(r.chain_id)) : '—') + '</td>'
-            : '';
           return '<tr class="failure-main">' +
             '<td>' + escapeHtml(String(r.id)) + '</td>' +
             '<td>' + escapeHtml(r.package_name || '') + ' <span class="failures-hint">(' + r.package_id + ')</span></td>' +
             '<td>' + escapeHtml(r.release_name || '') + ' <span class="failures-hint">(' + r.release_id + ')</span></td>' +
             '<td>' + escapeHtml(r.architecture || '—') + '</td>' +
-            chainCell +
             '<td>' + escapeHtml(completed) + '</td>' +
             '<td><div class="failure-actions"><a href="/build.html?job_id=' + encodeURIComponent(r.id) + '">View</a>' + logBtn + '</div></td>' +
             '</tr>' +
             '<tr class="failure-log-expand" style="display:none">' +
-            '<td colspan="' + (showChain ? '7' : '6') + '"><pre class="log-viewer failure-log-pre"></pre></td>' +
+            '<td colspan="6"><pre class="log-viewer failure-log-pre"></pre></td>' +
             '</tr>';
         }).join('');
         bindFailureLogButtons(tbody);
@@ -139,34 +112,18 @@
         var statusEl = document.getElementById('failures-status');
         var wrap = document.getElementById('failures-table-wrap');
         var tbody = document.getElementById('failures-tbody');
-        var chainStatusEl = document.getElementById('chain-failures-status');
-        var chainWrap = document.getElementById('chain-failures-table-wrap');
-        var chainTbody = document.getElementById('chain-failures-tbody');
         statusEl.textContent = 'Loading';
-        chainStatusEl.textContent = 'Loading';
         wrap.style.display = 'none';
-        chainWrap.style.display = 'none';
         tbody.innerHTML = '';
-        chainTbody.innerHTML = '';
-        return Promise.all([
-          api.get('/builds/current-failures'),
-          api.get('/builds/current-failures?chain_only=true')
-        ]).then(function(parts) {
-          var rows = Array.isArray(parts[0]) ? parts[0] : [];
-          var chainRows = Array.isArray(parts[1]) ? parts[1] : [];
+        return api.get('/builds/current-failures').then(function(rows) {
+          rows = Array.isArray(rows) ? rows : [];
           statusEl.textContent = rows.length ? (rows.length + ' package slot(s) need attention.') : 'No current failures.';
-          chainStatusEl.textContent = chainRows.length ? (chainRows.length + ' chain slot(s) still failed.') : 'No current chain build failures.';
           if (rows.length) {
             wrap.style.display = 'block';
-            renderFailureRows(rows, tbody, { showChain: false });
-          }
-          if (chainRows.length) {
-            chainWrap.style.display = 'block';
-            renderFailureRows(chainRows, chainTbody, { showChain: true });
+            renderFailureRows(rows, tbody);
           }
         }).catch(function(e) {
           statusEl.textContent = 'Could not load failures: ' + (e && e.message ? e.message : String(e));
-          chainStatusEl.textContent = '';
         });
       }
       document.getElementById('btn-refresh-failures').addEventListener('click', function() {
