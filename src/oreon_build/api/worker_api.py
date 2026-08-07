@@ -335,7 +335,7 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
     )
     if get_settings().rpmbuild_strict_gate_enabled:
         q = q.outerjoin(RpmbuildPlan, BuildJob.rpmbuild_plan_id == RpmbuildPlan.id).where(
-            (BuildJob.chain_id.isnot(None))
+            (BuildJob.layer_plan_id.isnot(None))
             | (BuildJob.rpmbuild_plan_id.is_(None))
             | (
                 RpmbuildPlan.status.in_((RpmbuildPlanStatus.RUNNING, RpmbuildPlanStatus.WAITING_SETTLE))
@@ -1270,38 +1270,69 @@ async def worker_build_log_complete(
     if len(want_sha) != 64 or any(c not in "0123456789abcdef" for c in want_sha):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid checksum_sha256")
     sz = int(body.size_bytes)
+    verify_retries = max(
+        1, int((os.environ.get("OREON_WORKER_BUILD_LOG_COMPLETE_RETRIES") or "6").strip() or "6")
+    )
 
     def _verify() -> str:
-        r2 = get_r2_client()
-        cl = r2.head_object_content_length(key)
-        if cl is None:
-            raise FileNotFoundError("Build log not in R2 yet (complete presigned PUT first)")
-        if cl != sz:
-            raise ValueError(f"Size mismatch: R2 has {cl} bytes, worker claimed {sz}")
+        import time as _time
 
-        meta = r2.head_object_metadata(key)
-        if meta:
-            meta_sha = (meta.get("sha256") or meta.get("checksum_sha256") or "").strip().lower()
-            meta_sz_raw = (meta.get("size_bytes") or meta.get("size") or "").strip()
-            meta_ok = meta_sha == want_sha and meta_sz_raw.isdigit() and int(meta_sz_raw) == sz
-            if meta_ok:
+        last_err: Exception | None = None
+        for round_i in range(verify_retries):
+            try:
+                r2 = get_r2_client()
+                cl = r2.head_object_content_length(key)
+                if cl is None:
+                    raise FileNotFoundError("Build log not in R2 yet (complete presigned PUT first)")
+                if cl != sz:
+                    raise ValueError(f"Size mismatch: R2 has {cl} bytes, worker claimed {sz}")
+
+                meta = r2.head_object_metadata(key)
+                if meta:
+                    meta_sha = (
+                        meta.get("sha256") or meta.get("checksum_sha256") or ""
+                    ).strip().lower()
+                    meta_sz_raw = (meta.get("size_bytes") or meta.get("size") or "").strip()
+                    meta_ok = (
+                        meta_sha == want_sha
+                        and meta_sz_raw.isdigit()
+                        and int(meta_sz_raw) == sz
+                    )
+                    if meta_ok:
+                        return key
+
+                stream = r2.get_object_stream(key)
+                if stream is None:
+                    raise FileNotFoundError("Build log not in R2")
+                h = hashlib.sha256()
+                try:
+                    while True:
+                        chunk = stream.read(8 * 1024 * 1024)
+                        if not chunk:
+                            break
+                        h.update(chunk)
+                finally:
+                    stream.close()
+                if h.hexdigest() != want_sha:
+                    raise ValueError("SHA256 of uploaded log does not match checksum_sha256")
                 return key
-
-        stream = r2.get_object_stream(key)
-        if stream is None:
-            raise FileNotFoundError("Build log not in R2")
-        h = hashlib.sha256()
-        try:
-            while True:
-                chunk = stream.read(8 * 1024 * 1024)
-                if not chunk:
+            except (FileNotFoundError, ValueError) as e:
+                last_err = e
+                if round_i + 1 >= verify_retries:
                     break
-                h.update(chunk)
-        finally:
-            stream.close()
-        if h.hexdigest() != want_sha:
-            raise ValueError("SHA256 of uploaded log does not match checksum_sha256")
-        return key
+                delay = min(1.5 * (1.4**round_i), 12.0)
+                logger.warning(
+                    "build-log complete verify retry key=%s attempt_id=%s round=%s/%s sleep=%.1fs: %s",
+                    key,
+                    attempt_id,
+                    round_i + 1,
+                    verify_retries,
+                    delay,
+                    e,
+                )
+                _time.sleep(delay)
+        assert last_err is not None
+        raise last_err
 
     try:
         await asyncio.to_thread(_verify)
@@ -1753,18 +1784,11 @@ async def report_result(
 
     if st_l in ("failed", "cancelled"):
         try:
-            from oreon_build.services.build_chain import notify_chain_job_terminal_after_result
+            from oreon_build.services.layer_plan import notify_layer_job_terminal_after_result
 
-            await notify_chain_job_terminal_after_result(job.id, st_l, err_msg)
+            await notify_layer_job_terminal_after_result(job.id, st_l, err_msg)
         except Exception:
-            logger.exception("chain notify after terminal job result job_id=%s", job.id)
-    elif st_l == "skipped":
-        try:
-            from oreon_build.services.build_chain import notify_chain_job_skipped_after_result
-
-            await notify_chain_job_skipped_after_result(attempt_id)
-        except Exception:
-            logger.exception("chain notify after skipped job result job_id=%s", job.id)
+            logger.exception("layer notify after terminal job result job_id=%s", job.id)
     for a in payload.artifacts:
         stmt = (
             pg_insert(Artifact.__table__)

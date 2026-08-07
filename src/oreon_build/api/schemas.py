@@ -301,16 +301,14 @@ class BuildTrigger(BaseModel):
         return self
 
 
-class ChainBuildTrigger(BaseModel):
+class LayerBuildTrigger(BaseModel):
 
-    chain_spec: str = Field(
+    packages: List[str] = Field(
         ...,
         min_length=1,
-        max_length=4096,
         description=(
-            "Package names. Colon ``:`` splits stages. Names in the same segment (between colons) build in "
-            "parallel; each segment is one stage and stages run in order. A colon does not mean serial queue. "
-            "With no colon, whitespace-separated names are strictly sequential (one package per stage)."
+            "Root package names to build. Dependencies are discovered and queued automatically; "
+            "you never need to specify a dependency chain yourself."
         ),
     )
     release_id: int = Field(..., description="Release to build for")
@@ -320,7 +318,7 @@ class ChainBuildTrigger(BaseModel):
         description="Architectures to build for (same as single trigger)",
     )
     preferred_mock_environment_id: Optional[int] = Field(
-        None, description="Mock env for this chain/batch (must belong to the release)"
+        None, description="Mock env for this layer plan (must belong to the release)"
     )
     distgit_url: Optional[str] = Field(
         None,
@@ -329,21 +327,9 @@ class ChainBuildTrigger(BaseModel):
     )
     distgit_branch: Optional[str] = Field(None, max_length=128, description="Branch fragment in distgit URL")
     priority: int = 0
-    auto_resolve: bool = Field(
-        True,
-        description=(
-            "When true, treat chain_spec package names as roots and auto-resolve BuildRequires/Requires "
-            "closure, repo pruning, layer ordering, and bootstrap profiles. When false, use chain_spec stages literally."
-        ),
-    )
 
 
-class ChainResumeRequest(BaseModel):
-
-    from_chain_id: int = Field(..., ge=1, description="Previous build chain id (failed, cancelled, or success)")
-
-
-class CIChainTrigger(BaseModel):
+class CILayerTrigger(BaseModel):
 
     packages: List[str] = Field(
         ...,
@@ -372,12 +358,11 @@ class CIChainTrigger(BaseModel):
     )
 
 
-class CIChainTriggerResponse(BaseModel):
+class CILayerTriggerResponse(BaseModel):
 
-    chain_id: int
-    chain_status: str
-    stages: List[List[str]]
-    chain_spec: str
+    layer_plan_id: int
+    layer_plan_status: str
+    root_packages: List[str]
     accepted: bool = True
     message: Optional[str] = None
 
@@ -397,34 +382,30 @@ class BuildJobResponse(BaseModel):
     priority: int
     created_at: datetime
     completed_at: Optional[datetime] = None
-    chain_id: Optional[int] = None
+    layer_plan_id: Optional[int] = None
     side_tag_id: Optional[int] = None
     side_tag_name: Optional[str] = None
     branch: Optional[str] = None
-    chain_stage_index: Optional[int] = None
+    layer_index: Optional[int] = None
+    blocked_reason: Optional[str] = None
     rpmbuild_plan_id: Optional[int] = None
     rpmbuild_layer_index: Optional[int] = None
 
     model_config = ConfigDict(from_attributes=True)
 
 
-class ChainBuildTriggerResponse(BaseModel):
-    chain_id: int
-    chain_status: str
-    stages: List[List[str]]
-    chain_spec: str
+class LayerBuildTriggerResponse(BaseModel):
+    layer_plan_id: int
+    layer_plan_status: str
+    root_packages: List[str]
     jobs: List[BuildJobResponse] = Field(default_factory=list)
-    accepted: bool = Field(
-        default=False,
-        description="True when job enqueue continues in the background after this response.",
-    )
     message: Optional[str] = None
 
 
 class BuildTriggerAccepted(BaseModel):
     status: str = "accepted"
     message: str
-    chain_id: Optional[int] = None
+    layer_plan_id: Optional[int] = None
     package_count: Optional[int] = None
 
 
@@ -503,16 +484,42 @@ class SideTagPackageRow(BaseModel):
     updated_at: Optional[datetime] = None
 
 
-class ChainStatusResponse(BaseModel):
-    chain_id: int
+class LayerJobBlockerRow(BaseModel):
+    build_job_id: int
+    package_name: Optional[str] = None
+    blocking_source: str
+
+
+class LayerJobRow(BaseModel):
+    job_id: int
+    package_name: str
     status: str
-    active_stage_index: int
-    stages: List[List[str]]
-    chain_spec: str
-    error_message: Optional[str] = None
-    job_count: int = 0
-    planning: bool = False
+    layer_index: Optional[int] = None
+    blocked_reason: Optional[str] = None
+    architecture: Optional[str] = None
+    blocked_on: List[str] = Field(default_factory=list)
+
+
+class LayerPlanSummary(BaseModel):
+    layer_plan_id: int
+    status: str
+    root_packages: List[str]
     releasename: Optional[str] = None
+    side_tag_name: Optional[str] = None
+    counts: dict = Field(default_factory=dict)
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class LayerPlanStatusResponse(BaseModel):
+    layer_plan_id: int
+    status: str
+    root_packages: List[str]
+    jobs: List[LayerJobRow] = Field(default_factory=list)
+    counts: dict = Field(default_factory=dict)
+    error_message: Optional[str] = None
+    releasename: Optional[str] = None
+    side_tag_name: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -558,7 +565,7 @@ class CurrentFailureItem(BaseModel):
     priority: int
     created_at: datetime
     completed_at: Optional[datetime] = None
-    chain_id: Optional[int] = None
+    layer_plan_id: Optional[int] = None
     last_attempt_id: Optional[int] = None
     last_error_message: Optional[str] = None
 

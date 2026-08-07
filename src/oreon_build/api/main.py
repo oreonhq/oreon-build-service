@@ -139,22 +139,21 @@ async def lifespan(app: FastAPI):
             logger.exception("Skipping role/admin startup bootstrap due to startup DB error")
 
     try:
-        from oreon_build.services.build_chain import list_interrupted_chain_planning
-        from oreon_build.services.build_trigger_bg import run_auto_chain_plan_and_enqueue, spawn
+        from oreon_build.services.layer_plan import cancel_interrupted_layer_planning
 
         async with async_session_maker() as db:
             try:
-                resume_ids = await list_interrupted_chain_planning(db)
+                cancelled_ids = await cancel_interrupted_layer_planning(db)
                 await db.commit()
             except Exception:
                 await db.rollback()
                 raise
-        if resume_ids:
-            logger.info("Resuming interrupted chain planning chain_ids=%s", resume_ids)
-            for cid in resume_ids:
-                spawn(run_auto_chain_plan_and_enqueue(cid))
+        if cancelled_ids:
+            logger.info(
+                "Cancelled layer plan seeding interrupted by restart layer_plan_ids=%s", cancelled_ids
+            )
     except Exception:
-        logger.exception("Failed resuming interrupted chain planning on startup")
+        logger.exception("Failed cancelling interrupted layer plan seeding on startup")
 
     try:
         from oreon_build.services.distgit_warmup import spawn_distgit_warmup
@@ -179,30 +178,30 @@ async def lifespan(app: FastAPI):
             try:
                 s = get_settings()
                 interval = max(60, s.stale_build_sweep_interval_seconds)
-                chain_terminal_jobs: list[tuple[int, str]] = []
+                layer_terminal_jobs: list[tuple[int, str]] = []
                 async with async_session_maker() as db:
                     try:
                         _, _, _, cj1 = await reconcile_queue_inconsistencies(db)
-                        chain_terminal_jobs.extend(cj1)
+                        layer_terminal_jobs.extend(cj1)
                         await reclaim_publish_tasks_stuck_running(db, s)
                         if s.build_stale_running_minutes > 0 or s.build_stale_worker_heartbeat_minutes > 0:
                             _, cj2 = await sweep_stale_running_builds(db, s)
-                            chain_terminal_jobs.extend(cj2)
+                            layer_terminal_jobs.extend(cj2)
                         if s.build_stale_pending_minutes > 0:
                             _, cj3 = await sweep_stale_pending_builds(db, s)
-                            chain_terminal_jobs.extend(cj3)
+                            layer_terminal_jobs.extend(cj3)
                         await db.commit()
                     except Exception:
                         await db.rollback()
                         raise
-                for job_id, reason in chain_terminal_jobs:
+                for job_id, reason in layer_terminal_jobs:
                     try:
-                        from oreon_build.services.build_chain import (
-                            notify_chain_job_terminal_after_result,
+                        from oreon_build.services.layer_plan import (
+                            notify_layer_job_terminal_after_result,
                         )
-                        await notify_chain_job_terminal_after_result(job_id, "failed", reason)
+                        await notify_layer_job_terminal_after_result(job_id, "failed", reason)
                     except Exception:
-                        logger.exception("chain notify after stale sweep job_id=%s", job_id)
+                        logger.exception("layer notify after stale sweep job_id=%s", job_id)
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 break
@@ -292,7 +291,7 @@ async def lifespan(app: FastAPI):
                         .join(BuildJob, BuildJob.id == PublishTask.build_job_id, isouter=True)
                         .where(PublishTask.status == "pending")
                         .order_by(
-                            BuildJob.chain_id.isnot(None).desc(),
+                            BuildJob.layer_plan_id.isnot(None).desc(),
                             PublishTask.created_at.asc(),
                         )
                         .limit(batch)
@@ -326,23 +325,23 @@ async def lifespan(app: FastAPI):
 
     publish_task = asyncio.create_task(_publish_tasks_loop(), name="publish-tasks")
 
-    async def _chain_settle_loop() -> None:
-        from oreon_build.services.build_chain import advance_settled_chains
+    async def _layer_reconcile_loop() -> None:
+        from oreon_build.services.layer_engine import reconcile_settled_layer_plans
 
         while True:
             try:
-                await advance_settled_chains()
-                await asyncio.sleep(5)
+                await reconcile_settled_layer_plans()
+                await asyncio.sleep(15)
             except asyncio.CancelledError:
                 break
             except Exception:
-                logger.exception("Chain settle advance loop error")
+                logger.exception("Layer plan reconcile sweep error")
                 try:
                     await asyncio.sleep(30)
                 except asyncio.CancelledError:
                     break
 
-    chain_settle_task = asyncio.create_task(_chain_settle_loop(), name="chain-settle")
+    chain_settle_task = asyncio.create_task(_layer_reconcile_loop(), name="layer-reconcile")
 
     async def _mass_rebuild_loop() -> None:
         from oreon_build.db.session import async_session_maker
@@ -498,7 +497,7 @@ async def lifespan(app: FastAPI):
         (sweep_task, "stale-build-sweep"),
         (catchup_task, "github-push-catchup"),
         (publish_task, "publish-tasks"),
-        (chain_settle_task, "chain-settle"),
+        (chain_settle_task, "layer-reconcile"),
         (mass_rebuild_task, "mass-rebuild"),
         (rpmbuild_settle_task, "rpmbuild-settle"),
         (burst_vm_task, "burst-vm-watcher"),
@@ -596,7 +595,10 @@ def create_app() -> FastAPI:
 
         @app.get("/chains.html")
         def _chains_removed():
-            return RedirectResponse(url="/builds.html", status_code=302)
+            return RedirectResponse(url="/side-tags.html", status_code=302)
+        @app.get("/layers.html")
+        def _layers_removed():
+            return RedirectResponse(url="/side-tags.html", status_code=302)
     return app
 
 app = create_app()
