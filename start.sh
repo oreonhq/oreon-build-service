@@ -116,12 +116,12 @@ fi
 LOG_DIR="${OREON_LOG_DIR:-.oreon-logs}"
 mkdir -p "$LOG_DIR"
 
-nohup uvicorn oreon_build.api.main:app --host 0.0.0.0 --port 8000 \
+setsid nohup uvicorn oreon_build.api.main:app --host 0.0.0.0 --port 8000 \
   > "$LOG_DIR/oreon-api.log" 2>&1 &
 echo $! > .oreon-api.pid
 echo "API started (PID $(cat .oreon-api.pid)), http://localhost:8000"
 
-nohup oreon-scheduler \
+setsid nohup oreon-scheduler \
   > "$LOG_DIR/oreon-scheduler.log" 2>&1 &
 echo $! > .oreon-scheduler.pid
 echo "Scheduler started (PID $(cat .oreon-scheduler.pid))"
@@ -136,7 +136,7 @@ else
   WATCHDOG_PORT=8001
 fi
 
-nohup uvicorn oreon_build.watchdog.main:app --host 0.0.0.0 --port "$WATCHDOG_PORT" \
+setsid nohup uvicorn oreon_build.watchdog.main:app --host 0.0.0.0 --port "$WATCHDOG_PORT" \
   > "$LOG_DIR/oreon-watchdog.log" 2>&1 &
 echo $! > .oreon-watchdog.pid
 echo "Oreon Watchdog started (PID $(cat .oreon-watchdog.pid)), http://localhost:${WATCHDOG_PORT}"
