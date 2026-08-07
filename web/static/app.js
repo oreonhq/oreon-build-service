@@ -309,16 +309,6 @@ function updateAuthUI() {
   }
 }
 
-function oreonStripChainsNavLink() {
-  try {
-    document.querySelectorAll('header.header nav a').forEach(function(a) {
-      var href = (a.getAttribute('href') || '');
-      var label = (a.textContent || '').trim();
-      if (href.indexOf('chains.html') >= 0 || /^chains$/i.test(label)) a.remove();
-    });
-  } catch (_) {}
-}
-
 var OREON_NAV_ITEMS = [
   { href: '/', label: 'Dashboard', match: function(p) { return p === '/' || p === '/index.html'; } },
   { href: '/builds.html', label: 'Builds', match: function(p) { return p === '/builds.html' || p === '/build.html'; } },
@@ -353,7 +343,6 @@ function oreonNavbarSearchQuery() {
 }
 
 function oreonInitNavbar() {
-  oreonStripChainsNavLink();
   var header = document.querySelector('header.header');
   if (!header || oreonNavbarShouldSkip(header)) return;
   var nav = header.querySelector('nav');
@@ -364,7 +353,6 @@ function oreonInitNavbar() {
   var parts = [];
   for (var i = 0; i < OREON_NAV_ITEMS.length; i++) {
     var item = OREON_NAV_ITEMS[i];
-    if (item.href === '/chains.html' || item.label === 'Chains') continue;
     if (item.auth && !(window.oreonApi && window.oreonApi.token)) continue;
     var active = item.match(path);
     parts.push(
@@ -465,12 +453,6 @@ function oreonControllerKeyHtml(signingStatus) {
 window.oreonSigningKeyHtml = oreonSigningKeyHtml;
 window.oreonControllerKeyHtml = oreonControllerKeyHtml;
 window.oreonJobDisplayStatus = oreonJobDisplayStatus;
-
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', oreonStripChainsNavLink);
-} else {
-  oreonStripChainsNavLink();
-}
 
 document.addEventListener('DOMContentLoaded', function() {
   oreonInitNavbar();
