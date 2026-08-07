@@ -11,7 +11,6 @@ from oreon_build.models import (
     Artifact,
     BuildAttempt,
     BuildAttemptFinalization,
-    BuildChainPublishReceipt,
     BuildJob,
     BuildTarget,
     Package,
@@ -139,9 +138,6 @@ async def delete_package_record(
             delete(BuildAttemptFinalization).where(BuildAttemptFinalization.attempt_id.in_(attempt_ids))
         )
         await db.execute(delete(RpmCompleteLock).where(RpmCompleteLock.attempt_id.in_(attempt_ids)))
-        await db.execute(
-            delete(BuildChainPublishReceipt).where(BuildChainPublishReceipt.build_attempt_id.in_(attempt_ids))
-        )
 
     await db.execute(
         delete(Artifact).where(

@@ -23,7 +23,7 @@ from oreon_build.models import (
     Source,
     Worker,
 )
-from oreon_build.services.build_chain import distgit_new_package_dict
+from oreon_build.services.layer_plan import distgit_new_package_dict
 from oreon_build.services.build_target_util import (
     get_or_create_build_target,
     has_successful_build_for_target,

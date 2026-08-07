@@ -112,8 +112,14 @@ def distgit_sources_for_perl_module(
     dist = metacpan_distribution_for_module(module)
     if not dist:
         return out
-    # Data-Printer → perl-Data-Printer
-    pkg = "perl-" + dist.replace("::", "-")
-    if pkg in known:
-        out.add(pkg)
+    # Data-Printer → perl-Data-Printer; Dpkg → dpkg (dist name itself)
+    leaf = dist.replace("::", "-")
+    for cand in (
+        f"perl-{leaf}",
+        f"perl-{leaf.lower()}",
+        leaf,
+        leaf.lower(),
+    ):
+        if cand in known:
+            out.add(cand)
     return out

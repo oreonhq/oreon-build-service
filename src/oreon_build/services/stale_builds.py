@@ -125,7 +125,7 @@ async def reconcile_queue_inconsistencies(
             job.status = BuildStatus.FAILED
             job.completed_at = now
             jobs_fixed += 1
-            if job.chain_id is not None:
+            if job.layer_plan_id is not None:
                 chain_terminal_jobs.append((job.id, "Job had no attempts row (reconciled)"))
             logger.warning(
                 "Reconciled build_job id=%s from RUNNING to FAILED (no attempts row)",
@@ -137,7 +137,7 @@ async def reconcile_queue_inconsistencies(
         job.status = latest.status
         job.completed_at = latest.finished_at or now
         jobs_fixed += 1
-        if job.chain_id is not None and latest.status in (BuildStatus.FAILED, BuildStatus.CANCELLED):
+        if job.layer_plan_id is not None and latest.status in (BuildStatus.FAILED, BuildStatus.CANCELLED):
             chain_terminal_jobs.append((job.id, f"Latest attempt {latest.id} was {latest.status.value}"))
         logger.warning(
             "Reconciled build_job id=%s from RUNNING to %s (latest attempt id=%s)",
@@ -289,7 +289,7 @@ async def sweep_stale_running_builds(
         if job is not None and job.status == BuildStatus.RUNNING:
             job.status = BuildStatus.FAILED
             job.completed_at = now
-            if job.chain_id is not None:
+            if job.layer_plan_id is not None:
                 chain_terminal_jobs.append((job.id, msg))
 
         await db.flush()
@@ -384,7 +384,7 @@ async def sweep_stale_pending_builds(
         job.status = BuildStatus.FAILED
         job.completed_at = now
         updated += 1
-        if job.chain_id is not None:
+        if job.layer_plan_id is not None:
             chain_terminal_jobs.append((job.id, reason))
         await db.flush()
         await log_audit(

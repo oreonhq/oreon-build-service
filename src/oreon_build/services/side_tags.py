@@ -11,8 +11,8 @@ from sqlalchemy.orm import selectinload
 
 from oreon_build.models import (
     Account,
-    BuildChain,
-    BuildChainStatus,
+    LayerPlan,
+    LayerPlanStatus,
     BuildJob,
     BuildStatus,
     SideTag,
@@ -202,10 +202,10 @@ async def side_tag_is_busy(db: Any, side_tag_id: int) -> bool:
     if open_job.scalar_one_or_none() is not None:
         return True
     open_chain = await db.execute(
-        select(BuildChain.id)
+        select(LayerPlan.id)
         .where(
-            BuildChain.side_tag_id == int(side_tag_id),
-            BuildChain.status.in_([BuildChainStatus.PENDING, BuildChainStatus.RUNNING]),
+            LayerPlan.side_tag_id == int(side_tag_id),
+            LayerPlan.status.in_([LayerPlanStatus.PENDING, LayerPlanStatus.RUNNING]),
         )
         .limit(1)
     )
@@ -250,13 +250,13 @@ async def cancel_open_work_for_side_tag(db: Any, side_tag_id: int) -> None:
         .values(status=BuildStatus.CANCELLED, completed_at=now)
     )
     await db.execute(
-        update(BuildChain)
+        update(LayerPlan)
         .where(
-            BuildChain.side_tag_id == int(side_tag_id),
-            BuildChain.status.in_([BuildChainStatus.PENDING, BuildChainStatus.RUNNING]),
+            LayerPlan.side_tag_id == int(side_tag_id),
+            LayerPlan.status.in_([LayerPlanStatus.PENDING, LayerPlanStatus.RUNNING]),
         )
         .values(
-            status=BuildChainStatus.CANCELLED,
+            status=LayerPlanStatus.CANCELLED,
             error_message="Side tag scrapped",
         )
     )
@@ -276,7 +276,7 @@ async def scrap_side_tag(db: Any, tag: SideTag, *, releasename: str) -> dict[str
         update(BuildJob).where(BuildJob.side_tag_id == tag_id).values(side_tag_id=None)
     )
     await db.execute(
-        update(BuildChain).where(BuildChain.side_tag_id == tag_id).values(side_tag_id=None)
+        update(LayerPlan).where(LayerPlan.side_tag_id == tag_id).values(side_tag_id=None)
     )
     await db.execute(delete(SideTag).where(SideTag.id == tag_id))
     await db.flush()

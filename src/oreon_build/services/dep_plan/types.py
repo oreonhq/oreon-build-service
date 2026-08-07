@@ -29,6 +29,9 @@ class PackageNode:
     provides: set[str] = field(default_factory=set)
     exclusive_arches: set[str] | None = None
     has_generate: bool = False
+    epoch: int = 0
+    version: str = ""
+    release: str = ""
 
 
 @dataclass

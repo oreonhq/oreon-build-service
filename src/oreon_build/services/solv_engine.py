@@ -591,7 +591,8 @@ class SolvArchEngine:
                 c = (cap or "").strip()
                 if not c or not _overlay_cap_ok(c) or c == pkg.source_name:
                     continue
-                s.add_deparray(solv.SOLVABLE_PROVIDES, pool.str2id(c, True))
+                # versioned Provide only. bare unversioned Provides satisfy any
+                # versioned Require in rpm/libsolv and lie about crate majors.
                 s.add_deparray(
                     solv.SOLVABLE_PROVIDES,
                     pool.rel2id(

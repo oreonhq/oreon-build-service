@@ -278,28 +278,63 @@ async def _mark_publish_tasks_failed(task_ids: list[int], attempt_ids: list[int]
         _publish_completed_attempts.add(attempt_id)
     _cleanup_old_locks()
 
+async def _source_and_release_for_attempt(attempt_id: int) -> tuple[str, str] | None:
+    from sqlalchemy import select as _select
+
+    from oreon_build.models import BuildAttempt, BuildJob, Package, Release
+
+    async with async_session_maker() as db:
+        row = await db.execute(
+            _select(Package.name, Release.releasename)
+            .join(BuildJob, BuildJob.package_id == Package.id)
+            .join(BuildAttempt, BuildAttempt.build_job_id == BuildJob.id)
+            .join(Release, Release.id == BuildJob.release_id)
+            .where(BuildAttempt.id == attempt_id)
+            .limit(1)
+        )
+        hit = row.first()
+        if not hit:
+            return None
+        return str(hit[0]), str(hit[1] or "")
+
+
 async def _notify_publish_success(attempt_ids: list[int]) -> None:
-    from oreon_build.services.build_chain import on_repo_publish_success_for_chain
+    from oreon_build.services.layer_engine import on_package_published
     from oreon_build.services.rpmbuild_settle import on_repo_publish_event_for_rpmbuild
 
     for attempt_id in attempt_ids:
         try:
-            await on_repo_publish_success_for_chain(attempt_id)
+            info = await _source_and_release_for_attempt(attempt_id)
+            if info:
+                await on_package_published(info[0], info[1])
         except Exception:
-            logger.exception("build chain advance after publish attempt_id=%s", attempt_id)
+            logger.exception("layer engine unblock after publish attempt_id=%s", attempt_id)
         try:
             await on_repo_publish_event_for_rpmbuild(attempt_id)
         except Exception:
             logger.exception("rpmbuild settle notify after publish attempt_id=%s", attempt_id)
 
 async def _notify_publish_failed(attempt_ids: list[int], err: str) -> None:
-    from oreon_build.services.build_chain import on_repo_publish_failed_for_chain
+    from sqlalchemy import select as _select
+
+    from oreon_build.models import BuildAttempt, BuildJob
+    from oreon_build.services.layer_plan import on_build_job_failed_for_layer
 
     for attempt_id in attempt_ids:
         try:
-            await on_repo_publish_failed_for_chain(attempt_id, err)
+            async with async_session_maker() as db:
+                job_r = await db.execute(
+                    _select(BuildJob)
+                    .join(BuildAttempt, BuildAttempt.build_job_id == BuildJob.id)
+                    .where(BuildAttempt.id == attempt_id)
+                    .limit(1)
+                )
+                job = job_r.scalar_one_or_none()
+                if job is not None:
+                    await on_build_job_failed_for_layer(db, job, err or "Repo publish failed")
+                    await db.commit()
         except Exception:
-            logger.exception("build chain notify publish failure attempt_id=%s", attempt_id)
+            logger.exception("layer engine notify publish failure attempt_id=%s", attempt_id)
 
 async def _run_prefix_publish_batch(batch: _PrefixPublishBatch) -> None:
     await _mark_publish_tasks_running(batch.publish_task_ids)

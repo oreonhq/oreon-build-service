@@ -13,6 +13,36 @@ from oreon_build.services.repo_solver import (
 
 logger = logging.getLogger(__name__)
 
+_SOURCE_CAPS_CACHE: dict[tuple[int, int], dict[str, set[str]]] = {}
+_SOURCE_CAPS_CACHE_MAX = 4
+
+
+def _source_to_caps(provider_map: dict[str, Any]) -> dict[str, set[str]]:
+    """Invert cap->sources into source->caps once per provider_map version.
+
+    overlay_from_nodes used to scan the whole (200k+ entry) provider_map on
+    every call to find what a handful of in-flight nodes provide. Caching
+    the inverted index turns that per-call O(len(provider_map)) scan into an
+    O(1) lookup on repeat calls with the same map. Keyed by (identity, len)
+    rather than identity alone so an in-place mutation (new key added)
+    invalidates the cache instead of silently returning stale results.
+    """
+    key = (id(provider_map), len(provider_map))
+    hit = _SOURCE_CAPS_CACHE.get(key)
+    if hit is not None:
+        return hit
+    inverted: dict[str, set[str]] = {}
+    for cap, srcs in (provider_map or {}).items():
+        if cap == "__lower__" or not isinstance(srcs, (set, frozenset, list, tuple)):
+            continue
+        for src in srcs:
+            if src:
+                inverted.setdefault(src, set()).add(cap)
+    if len(_SOURCE_CAPS_CACHE) >= _SOURCE_CAPS_CACHE_MAX:
+        _SOURCE_CAPS_CACHE.clear()
+    _SOURCE_CAPS_CACHE[key] = inverted
+    return inverted
+
 
 class InstallOracle:
     def __init__(self, solver: MultiArchRepoSolver) -> None:
@@ -29,7 +59,8 @@ class InstallOracle:
     def set_overlay(self, packages: dict[str, OverlayPackage]) -> None:
         self._solver.set_overlay(packages)
         fp = "|".join(
-            f"{k}={','.join(sorted(getattr(v, 'provides', ()) or ()))}"
+            f"{k}={getattr(v, 'epoch', 0)}:{getattr(v, 'version', '0')}-"
+            f"{getattr(v, 'release', '0')}+{','.join(sorted(getattr(v, 'provides', ()) or ()))}"
             for k, v in sorted(packages.items())
         )
         if fp != self._overlay_fp:
@@ -72,25 +103,32 @@ class InstallOracle:
 def overlay_from_nodes(
     nodes: dict[str, Any],
     provider_map: dict[str, set[str]],
+    *,
+    actions: set[str] | None = None,
 ) -> dict[str, OverlayPackage]:
-    """Build overlay solvables for packages we plan to build (Provides only)."""
+    """Overlay solvables for packages we still intend to produce.
+
+    Only build/pending nodes. Blocked/skipped must not fake Provides or
+    consumers look installable while their deps can never ship.
+    """
     import re
 
     from oreon_build.services.distgit_order import _rust_crate_name_from_package
 
-    by_src: dict[str, set[str]] = {}
-    want = set(nodes)
-    for cap, srcs in (provider_map or {}).items():
-        if cap == "__lower__" or not isinstance(srcs, (set, frozenset, list, tuple)):
-            continue
-        hit = want.intersection(srcs) if not isinstance(srcs, set) else (want & srcs)
-        if not hit:
-            continue
-        for src in hit:
-            by_src.setdefault(src, set()).add(cap)
+    allowed = actions if actions is not None else {"build", "pending"}
+    want = {
+        n
+        for n, node in nodes.items()
+        if (getattr(node, "action", "pending") or "pending") in allowed
+    }
+    source_caps = _source_to_caps(provider_map)
+    by_src: dict[str, set[str]] = {n: source_caps[n] for n in want if n in source_caps}
 
     out: dict[str, OverlayPackage] = {}
     for name, node in nodes.items():
+        act = getattr(node, "action", "pending") or "pending"
+        if act not in allowed:
+            continue
         caps = set(by_src.get(name, set()))
         caps.add(name)
         provides = getattr(node, "provides", None) or set()
@@ -98,7 +136,9 @@ def overlay_from_nodes(
         for b in getattr(node, "binaries", None) or ():
             if b:
                 caps.add(b)
-        crate = _rust_crate_name_from_package(name)
+        crate = _rust_crate_name_from_package(
+            name, version=(getattr(node, "version", None) or "").strip() or None
+        )
         if crate:
             caps.add(f"crate({crate})")
         for cap in list(caps):
@@ -115,7 +155,20 @@ def overlay_from_nodes(
         clean = {c for c in caps if _cap_ok(c)}
         if not clean:
             clean = {name}
-        out[name] = OverlayPackage(source_name=name, provides=frozenset(clean))
+        ver = (getattr(node, "version", None) or "").strip() or "0"
+        if "%" in ver:
+            ver = "0"
+        rel = (getattr(node, "release", None) or "").strip() or "0"
+        if "%" in rel:
+            rel = "0"
+        epoch = int(getattr(node, "epoch", 0) or 0)
+        out[name] = OverlayPackage(
+            source_name=name,
+            provides=frozenset(clean),
+            epoch=epoch,
+            version=ver,
+            release=rel,
+        )
     return out
 
 

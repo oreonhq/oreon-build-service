@@ -1,8 +1,14 @@
-"""Three-oracle dependency planner: rpmbuild -br, libsolv, networkx."""
+"""Dependency-resolution primitives shared by the layer engine.
+
+The old three-oracle multi-wave planner (`planner.py`/`expand.py`) is gone -
+the layer engine now does one static-BR-only pass to seed, then reactively
+evaluates dynamic BRs per-package off real publish events. What's left here
+(`providers.py`, `order.py`, `install_oracle.py`, `br_oracle.py`, `types.py`)
+are still used directly by `layer_engine.py`.
+"""
 
 from __future__ import annotations
 
-from oreon_build.services.dep_plan.planner import plan_automatic_chain
 from oreon_build.services.dep_plan.types import (
     BrEval,
     PackageNode,
@@ -17,5 +23,4 @@ __all__ = [
     "PackageNode",
     "PlanLayer",
     "PlannedPackage",
-    "plan_automatic_chain",
 ]

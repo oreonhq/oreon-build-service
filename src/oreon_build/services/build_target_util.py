@@ -46,7 +46,7 @@ async def resolve_package_by_name(
     name: str,
     *,
     release_id: int | None = None,
-    chain_ids: list[int] | None = None,
+    layer_plan_ids: list[int] | None = None,
 ) -> Package | None:
     pkg_name = (name or "").strip()
     if not pkg_name:
@@ -61,14 +61,14 @@ async def resolve_package_by_name(
         return rows[0]
 
     prefer_ids: list[int] = []
-    if chain_ids:
-        chain_r = await db.execute(
+    if layer_plan_ids:
+        layer_r = await db.execute(
             select(BuildJob.package_id)
             .join(Package, Package.id == BuildJob.package_id)
-            .where(Package.name == pkg_name, BuildJob.chain_id.in_(chain_ids))
+            .where(Package.name == pkg_name, BuildJob.layer_plan_id.in_(layer_plan_ids))
             .order_by(BuildJob.id.desc())
         )
-        prefer_ids.extend(int(x) for x in chain_r.scalars().all() if x is not None)
+        prefer_ids.extend(int(x) for x in layer_r.scalars().all() if x is not None)
     if release_id is not None:
         rel_r = await db.execute(
             select(BuildJob.package_id)

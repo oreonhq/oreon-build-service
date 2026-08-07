@@ -47,7 +47,7 @@ class CurrentFailureRow:
 async def fetch_current_failure_rows(
     db: Any,
     *,
-    chain_only: bool = False,
+    layer_plan_only: bool = False,
 ) -> list[CurrentFailureRow]:
     ranked = latest_job_slot_subquery()
     stmt = (
@@ -59,8 +59,8 @@ async def fetch_current_failure_rows(
         .where(ranked.c.rn == 1)
         .where(BuildJob.status == BuildStatus.FAILED)
     )
-    if chain_only:
-        stmt = stmt.where(BuildJob.chain_id.isnot(None))
+    if layer_plan_only:
+        stmt = stmt.where(BuildJob.layer_plan_id.isnot(None))
     stmt = stmt.order_by(BuildJob.completed_at.desc().nullslast(), BuildJob.id.desc())
     result = await db.execute(stmt)
     rows = result.all()

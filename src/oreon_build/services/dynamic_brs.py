@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import logging
 import os
 import re
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import urllib.request
 from dataclasses import dataclass
@@ -29,6 +31,29 @@ _RE_CARGO_SPEC = re.compile(
 )
 _CACHE: dict[str, tuple[float, list[str], bool]] = {}
 _CACHE_TTL = 1800.0
+
+
+def _scratch_base_dir() -> str | None:
+    """Prefer tmpfs for the rpmbuild -br scratch tree.
+
+    Unpack+patch+%generate_buildrequires is real disk I/O for every package
+    that goes through this path. /dev/shm is memory-backed, so putting the
+    scratch tree there turns that I/O into memory copies. Falls back to the
+    default tempdir (disk) if /dev/shm isn't there or doesn't have room.
+    """
+    raw = (os.getenv("OREON_BR_SCRATCH_DIR") or "").strip()
+    candidates = [raw] if raw else ["/dev/shm"]
+    for cand in candidates:
+        if not cand:
+            continue
+        try:
+            st = os.statvfs(cand)
+            free = st.f_bavail * st.f_frsize
+            if free > 512 * 1024 * 1024 and os.access(cand, os.W_OK):
+                return cand
+        except OSError:
+            continue
+    return None
 
 
 @dataclass
@@ -101,21 +126,58 @@ def rpmspec_query_buildrequires(
         return out
 
 
-def _parse_source_entries(spec_text: str, defines: dict[str, str] | None) -> list[tuple[str, str]]:
-    """Return (basename, url_or_empty) for each SourceN after macro expand."""
-    return _parse_tag_file_entries(spec_text, defines, _RE_SOURCE)
-
-
-def _parse_patch_entries(spec_text: str, defines: dict[str, str] | None) -> list[tuple[str, str]]:
-    """Return (basename, url_or_empty) for each PatchN after macro expand."""
-    return _parse_tag_file_entries(spec_text, defines, _RE_PATCH)
-
-
-def _parse_tag_file_entries(
-    spec_text: str,
-    defines: dict[str, str] | None,
-    tag_re: re.Pattern[str],
+def _entries_from_blob(
+    blob: str, tag_re: re.Pattern[str]
 ) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for m in tag_re.finditer(blob):
+        raw = (m.group(1) or "").strip()
+        if not raw:
+            continue
+        url = ""
+        name = raw
+        if raw.startswith(("http://", "https://", "ftp://")):
+            url = raw
+            if "#/" in raw:
+                name = raw.rsplit("#/", 1)[-1]
+            else:
+                name = raw.rstrip("/").rsplit("/", 1)[-1] or "Source"
+        name = name.split("?", 1)[0].strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append((name, url))
+    return out
+
+
+_TAG_ENTRIES_CACHE: dict[str, tuple[list[tuple[str, str]], list[tuple[str, str]]]] = {}
+_TAG_ENTRIES_CACHE_MAX = 512
+
+
+def _tag_entries_cache_key(spec_text: str, defines: dict[str, str] | None) -> str:
+    h = hashlib.sha256()
+    h.update((spec_text or "").encode("utf-8", errors="replace"))
+    for k in sorted((defines or {}).keys()):
+        h.update(f"{k}={(defines or {})[k]}\n".encode())
+    return h.hexdigest()
+
+
+def _source_and_patch_entries(
+    spec_text: str, defines: dict[str, str] | None
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """One rpmspec -P call for both Source*/Patch* tags (not one call each).
+
+    rpmspec -P re-expands the whole spec through the macro engine; every
+    extra invocation is a real subprocess fork+exec, not free. Called
+    multiple times per package (locals, url sources) in the BR pipeline, so
+    this is memoized per (spec_text, defines) within the process, avoiding
+    duplicate spawns for the exact same macro-expansion work.
+    """
+    key = _tag_entries_cache_key(spec_text, defines)
+    hit = _TAG_ENTRIES_CACHE.get(key)
+    if hit is not None:
+        return hit
     with tempfile.TemporaryDirectory(prefix="oreon-rpmspec-src-") as td:
         spec_path = Path(td) / "pkg.spec"
         spec_path.write_text(spec_text or "", encoding="utf-8")
@@ -123,26 +185,21 @@ def _parse_tag_file_entries(
         cmd.extend(_define_args(defines))
         proc = _run(cmd, timeout=60)
         blob = proc.stdout or ""
-        out: list[tuple[str, str]] = []
-        seen: set[str] = set()
-        for m in tag_re.finditer(blob):
-            raw = (m.group(1) or "").strip()
-            if not raw:
-                continue
-            url = ""
-            name = raw
-            if raw.startswith(("http://", "https://", "ftp://")):
-                url = raw
-                if "#/" in raw:
-                    name = raw.rsplit("#/", 1)[-1]
-                else:
-                    name = raw.rstrip("/").rsplit("/", 1)[-1] or "Source"
-            name = name.split("?", 1)[0].strip()
-            if not name or name in seen:
-                continue
-            seen.add(name)
-            out.append((name, url))
-        return out
+    result = (_entries_from_blob(blob, _RE_SOURCE), _entries_from_blob(blob, _RE_PATCH))
+    if len(_TAG_ENTRIES_CACHE) >= _TAG_ENTRIES_CACHE_MAX:
+        _TAG_ENTRIES_CACHE.clear()
+    _TAG_ENTRIES_CACHE[key] = result
+    return result
+
+
+def _parse_source_entries(spec_text: str, defines: dict[str, str] | None) -> list[tuple[str, str]]:
+    """Return (basename, url_or_empty) for each SourceN after macro expand."""
+    return _source_and_patch_entries(spec_text, defines)[0]
+
+
+def _parse_patch_entries(spec_text: str, defines: dict[str, str] | None) -> list[tuple[str, str]]:
+    """Return (basename, url_or_empty) for each PatchN after macro expand."""
+    return _source_and_patch_entries(spec_text, defines)[1]
 
 
 def _parse_source_urls(spec_text: str, defines: dict[str, str] | None) -> list[str]:
@@ -153,15 +210,17 @@ def local_source_basenames(spec_text: str, defines: dict[str, str] | None = None
     """Local SourceN + PatchN files that live beside the spec in distgit."""
     names: list[str] = []
     seen: set[str] = set()
-    for name, url in (
-        *_parse_source_entries(spec_text, defines),
-        *_parse_patch_entries(spec_text, defines),
-    ):
+    sources, patches = _source_and_patch_entries(spec_text, defines)
+    for name, url in (*sources, *patches):
         if url or not name or name in seen:
             continue
         seen.add(name)
         names.append(name)
     return names
+
+
+def clear_tag_entries_cache() -> None:
+    _TAG_ENTRIES_CACHE.clear()
 
 
 def _parse_source0_url(spec_text: str, defines: dict[str, str] | None) -> str | None:
@@ -282,6 +341,102 @@ def _requires_from_nosrc_rpm_cli(path: Path) -> list[str]:
     return out
 
 
+def _http_get_bytes(url: str, *, timeout: int = 60) -> bytes:
+    urls = [url]
+    alt = _crates_io_static_url(url)
+    if alt and alt not in urls:
+        urls = [alt, url]
+    last_err: Exception | None = None
+    for u in urls:
+        try:
+            req = urllib.request.Request(
+                u, headers={"User-Agent": "oreon-build-service/dynamic-brs"}
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except Exception as exc:
+            last_err = exc
+            continue
+    raise last_err or RuntimeError(f"download failed for {url}")
+
+
+def _extract_cargo_toml_from_tarball(data: bytes, dest_dir: Path) -> Path | None:
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tf:
+            candidates = [m for m in tf.getmembers() if m.isfile() and m.name.endswith("/Cargo.toml")]
+            if not candidates:
+                candidates = [m for m in tf.getmembers() if m.isfile() and m.name == "Cargo.toml"]
+            if not candidates:
+                return None
+            member = min(candidates, key=lambda m: m.name.count("/"))
+            fobj = tf.extractfile(member)
+            if fobj is None:
+                return None
+            out = dest_dir / "Cargo.toml"
+            out.write_bytes(fobj.read())
+            return out
+    except Exception:
+        logger.warning("cargo tarball Cargo.toml extraction failed", exc_info=True)
+        return None
+
+
+def _cargo2rpm_buildrequires(manifest: Path) -> list[str] | None:
+    proc = _run(["cargo2rpm", "--path", str(manifest), "buildrequires"], timeout=30)
+    if proc.returncode != 0:
+        return None
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in (proc.stdout or "").splitlines():
+        br = line.strip()
+        if not br or br in seen:
+            continue
+        seen.add(br)
+        out.append(br)
+    return out
+
+
+def _evaluate_cargo_buildrequires_fast(
+    spec_text: str,
+    *,
+    defines: dict[str, str] | None,
+    local_source_paths: list[Path] | None,
+    target_arches: set[str] | None,
+) -> DynBrResult | None:
+    from oreon_build.services.cargo_target_brs import filter_foreign_target_crate_brs
+
+    url = _parse_source0_url(spec_text, defines)
+    data: bytes | None = None
+    if url:
+        try:
+            data = _http_get_bytes(url)
+        except Exception:
+            data = None
+    if data is None:
+        sources, _patches = _source_and_patch_entries(spec_text, defines)
+        if sources:
+            name0 = sources[0][0]
+            for p in local_source_paths or []:
+                if p and p.name == name0 and p.is_file():
+                    try:
+                        data = p.read_bytes()
+                    except Exception:
+                        data = None
+                    break
+    if data is None:
+        return None
+    with tempfile.TemporaryDirectory(prefix="oreon-cargo2rpm-", dir=_scratch_base_dir()) as td:
+        manifest = _extract_cargo_toml_from_tarball(data, Path(td))
+        if manifest is None:
+            return None
+        brs = _cargo2rpm_buildrequires(manifest)
+        if brs is None:
+            return None
+        brs = filter_foreign_target_crate_brs(
+            brs, cargo_tomls=[manifest], arches=target_arches
+        )
+        return DynBrResult(buildrequires=brs, complete=True)
+
+
 def evaluate_generate_buildrequires(
     spec_text: str,
     *,
@@ -289,6 +444,7 @@ def evaluate_generate_buildrequires(
     local_source_paths: list[Path] | None = None,
     allow_source_download: bool = True,
     target_arches: set[str] | None = None,
+    static_brs: list[str] | None = None,
 ) -> DynBrResult:
     """Run rpmbuild -br and read Requires from the buildreqs nosrc rpm.
 
@@ -316,7 +472,18 @@ def evaluate_generate_buildrequires(
     if hit and now - hit[0] < _CACHE_TTL:
         return DynBrResult(buildrequires=list(hit[1]), complete=bool(hit[2]))
 
-    with tempfile.TemporaryDirectory(prefix="oreon-rpmbr-") as td:
+    if spec_uses_cargo_generate_buildrequires(spec_text):
+        fast = _evaluate_cargo_buildrequires_fast(
+            spec_text,
+            defines=defines,
+            local_source_paths=local_source_paths,
+            target_arches=target_arches,
+        )
+        if fast is not None:
+            _CACHE[key] = (now, list(fast.buildrequires), fast.complete)
+            return fast
+
+    with tempfile.TemporaryDirectory(prefix="oreon-rpmbr-", dir=_scratch_base_dir()) as td:
         top = Path(td)
         for sub in ("BUILD", "RPMS", "SOURCES", "SPECS", "SRPMS"):
             (top / sub).mkdir(parents=True, exist_ok=True)
@@ -371,7 +538,13 @@ def evaluate_generate_buildrequires(
             _CACHE[key] = (now, list(brs), True)
             return DynBrResult(buildrequires=brs, complete=True)
 
-        static = rpmspec_query_buildrequires(spec_text, defines=defines)
+        # caller (evaluate_package_brs) already computed this once; dont
+        # fork+exec rpmspec a second time for the same spec+defines.
+        static = (
+            list(static_brs)
+            if static_brs is not None
+            else rpmspec_query_buildrequires(spec_text, defines=defines)
+        )
         err = (proc.stderr or proc.stdout or "")[-400:].strip()
         if source_fail and not err:
             err = "source download failed"

@@ -10,8 +10,8 @@ def job_options_dict(job: BuildJob) -> dict[str, Any]:
     return dict(raw) if isinstance(raw, dict) else {}
 
 
-def package_plan_from_chain(chain_options: dict[str, Any], pkg_name: str) -> dict[str, Any]:
-    plans = chain_options.get("package_plans")
+def package_plan_from_options(plan_options: dict[str, Any], pkg_name: str) -> dict[str, Any]:
+    plans = plan_options.get("package_plans")
     if not isinstance(plans, dict):
         return {}
     hit = plans.get(pkg_name)

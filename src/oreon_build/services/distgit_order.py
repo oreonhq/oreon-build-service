@@ -47,6 +47,7 @@ from oreon_build.core.spec_bcond import (
     default_build_defines,
     default_distro_macros,
     parse_spec_bconds,
+    _expand_br_macros,
 )
 from oreon_build.services.r2 import get_r2_client
 
@@ -184,6 +185,10 @@ _RE_GLOBAL_LINE = re.compile(r"^%\s*global\s+(\S+)\s+(.+)$", re.IGNORECASE)
 _RE_GLOBAL_IN_CONDITIONAL = re.compile(r"%global\s+(\S+)\s+([^}%]+)", re.IGNORECASE)
 _RE_PC_FILE = re.compile(r"([^/\s]+)\.pc\b")
 _RE_SO_FILE = re.compile(r"(lib[A-Za-z0-9_+.-]+)\.so(?:\.\*|(?:\.\d+)*)?")
+_RE_PERL_MODULE_FILE = re.compile(
+    r"(?:/perl5/|/perl/)(?:vendor_perl/|core_perl/|site_perl/)?((?:[^/\s]+/)*[^/\s]+\.pm)"
+)
+_RE_CMAKE_MODULE_FILE = re.compile(r"/cmake/([^/%*\s]+)")
 _RE_FILES_KEEP = re.compile(
     r"^%(?:if\b|ifarch\b|ifnarch\b|else\b|endif\b|elif\b|license\b|doc\b|config\b|"
     r"attr\b|defattr\b|ghost\b|verify\b|dir\b|exclude\b|readme\b|caps\b|missingok\b|files\b)",
@@ -230,23 +235,8 @@ def _parse_spec_macro_table(spec_text: str) -> dict[str, str]:
 
 
 def _expand_rpm_macros(value: str, macros: dict[str, str], *, max_rounds: int = 24) -> str:
-    out = value or ""
-    for _ in range(max_rounds):
-        changed = False
-
-        def repl(match: re.Match[str]) -> str:
-            nonlocal changed
-            key = match.group(1)
-            if key in macros:
-                changed = True
-                return macros[key]
-            return match.group(0)
-
-        new = _RE_RPM_MACRO.sub(repl, out)
-        if not changed:
-            break
-        out = new
-    return out
+    # honor %{?foo:bar} so Version: %{up_version}%{?up_prever:...} actually expands
+    return _expand_br_macros(value or "", macros, max_rounds=max_rounds)
 
 
 def _extract_br_tokens_from_tag_value(value: str) -> list[str]:
@@ -468,6 +458,8 @@ def _parse_spec_text(
             m = _RE_SO_FILE.search(expanded)
             if m and "%" not in m.group(1):
                 provided.update(_so_file_provides(m.group(1)))
+                if "%" not in m.group(0) and "*" not in m.group(0):
+                    provided.add(m.group(0))
     macros["name"] = source_name
     from oreon_build.services.dynamic_brs import spec_has_generate_buildrequires
 
@@ -682,6 +674,75 @@ def _perl_provide_from_package_name(pkg: str) -> str | None:
     return f"perl({rest.replace('-', '::')})"
 
 
+_PERL_SUBDIRS = ("vendor_perl", "core_perl", "site_perl")
+
+
+def _perl_module_from_file_path(path: str) -> str | None:
+    """Derive perl(Module::Name) from a Perl module file path."""
+    if not path:
+        return None
+    m = _RE_PERL_MODULE_FILE.search(path)
+    if not m:
+        return None
+    rel = m.group(1)
+    if "%" in rel or "*" in rel:
+        return None
+    for subdir in _PERL_SUBDIRS:
+        if rel.startswith(f"{subdir}/"):
+            rel = rel[len(f"{subdir}/"):]
+            break
+    if not rel or not rel.endswith(".pm"):
+        return None
+    module = rel[:-3].replace("/", "::")
+    if not module or module.startswith("::"):
+        return None
+    return f"perl({module})"
+
+
+def _cmake_module_from_file_path(path: str) -> str | None:
+    """Derive cmake(project) from a CMake module file path."""
+    if not path:
+        return None
+    m = _RE_CMAKE_MODULE_FILE.search(path)
+    if not m:
+        return None
+    name = m.group(1)
+    if not name or "%" in name or "*" in name:
+        return None
+    # bson- from failed %{version} expand is junk
+    if name.endswith("-") or name.startswith("-"):
+        return None
+    return f"cmake({name})"
+
+
+_RE_MINGW_DLL_FILE = re.compile(
+    r"/(?:usr/)?(?P<arch>i686|x86_64)-w64-mingw32/sys-root/mingw/bin/"
+    r"(?P<dll>lib[A-Za-z0-9_+.-]+\.dll)\b",
+    re.IGNORECASE,
+)
+_RE_MINGW_DLL_MACRO = re.compile(
+    r"%\{?mingw(?P<bits>32|64)_bindir\}?/(?P<dll>lib[A-Za-z0-9_+.-]+\.dll)\b",
+    re.IGNORECASE,
+)
+
+
+def _mingw_dll_provides_from_path(path: str) -> set[str]:
+    """mingw32(libfoo.dll) from %files dll paths."""
+    raw = path or ""
+    if not raw:
+        return set()
+    out: set[str] = set()
+    m = _RE_MINGW_DLL_MACRO.search(raw)
+    if m:
+        out.add(f"mingw{m.group('bits')}({m.group('dll')})")
+        return out
+    m = _RE_MINGW_DLL_FILE.search(raw)
+    if m:
+        bits = "32" if m.group("arch") == "i686" else "64"
+        out.add(f"mingw{bits}({m.group('dll')})")
+    return out
+
+
 def _python_dist_provides_from_package_name(pkg: str) -> set[str]:
     """python3-foo-bar / python-foo -> python3dist(foo-bar) (+ underscore form)."""
     n = (pkg or "").strip()
@@ -798,7 +859,7 @@ _PROVIDES_INDEX_CACHE: dict[tuple[str, str, str, str, str], tuple[float, Distgit
 _provides_index_tasks: dict[tuple[str, str, str, str, str], asyncio.Task[DistgitProvidesIndex | None]] = {}
 _PACKAGE_NAMES_CACHE: dict[tuple[str, str, str, str], tuple[float, frozenset[str]]] = {}
 _PACKAGE_NAMES_CACHE_TTL_SEC = 1800.0
-_PROVIDES_INDEX_DISK_VERSION = "v8"
+_PROVIDES_INDEX_DISK_VERSION = "v13"
 
 
 def _so_file_provides(libstem: str) -> set[str]:
@@ -846,10 +907,25 @@ def _lightweight_provides_from_spec_text(pkg: str, spec_text: str) -> set[str]:
     macros.setdefault("_sbindir", "/usr/sbin")
     macros.setdefault("_libexecdir", "/usr/libexec")
     macros.setdefault("_libdir", "/usr/lib64")
+    macros.setdefault("_datadir", "/usr/share")
     macros.setdefault("_prefix", "/usr")
-    macros.update(_parse_spec_macro_table(spec_text))
-    macros["name"] = pkg
+    macros.setdefault(
+        "mingw32_bindir", "/usr/i686-w64-mingw32/sys-root/mingw/bin"
+    )
+    macros.setdefault(
+        "mingw64_bindir", "/usr/x86_64-w64-mingw32/sys-root/mingw/bin"
+    )
+    macros.setdefault("mingw32_libdir", "/usr/i686-w64-mingw32/sys-root/mingw/lib")
+    macros.setdefault("mingw64_libdir", "/usr/x86_64-w64-mingw32/sys-root/mingw/lib")
+    # honor %bcond / %if so compat packages keep llvm15 not llvm from the %else branch
+    bcond = parse_spec_bconds(spec_text, distro_macros=macros)
+    macros.update(bcond.macros)
+    macros.setdefault("name", pkg)
     rpm_version = (macros.get("version") or "").strip()
+    goipath = (macros.get("goipath") or "").strip()
+    if goipath and "%" not in goipath:
+        provided.add(f"golang({goipath})")
+        provided.add(f"__goprefix__{goipath}")
     in_files = False
     for line in (spec_text or "").splitlines():
         s = line.strip()
@@ -884,6 +960,32 @@ def _lightweight_provides_from_spec_text(pkg: str, spec_text: str) -> set[str]:
             if pkg_name and "%" not in pkg_name:
                 provided.add(pkg_name)
             continue
+        if low.startswith("%ghc_lib_subpackage"):
+            rest = s.split(None, 1)[1].strip() if len(s.split(None, 1)) > 1 else ""
+            rest = _expand_rpm_macros(rest, macros)
+            tokens = rest.split()
+            i = 0
+            while i < len(tokens):
+                tok = tokens[i]
+                if tok == "-l":
+                    i += 2
+                    continue
+                if tok.startswith("-"):
+                    i += 1
+                    continue
+                if "%" not in tok:
+                    lm = re.match(r"^([A-Za-z0-9_]+(?:-[A-Za-z0-9_]+)*)-\d[\w.]*$", tok)
+                    libname = lm.group(1) if lm else tok
+                    provided.add(f"ghc-libhs({libname})")
+                i += 1
+            continue
+        if low.startswith("%py_provides") or low.startswith("%py3_provides"):
+            rest = s.split(None, 1)[1].strip() if len(s.split(None, 1)) > 1 else ""
+            rest = _expand_rpm_macros(rest, macros).split()[0] if rest else ""
+            if rest and "%" not in rest:
+                provided.add(rest)
+                provided.update(_python_dist_provides_from_package_name(rest))
+            continue
         keep = _files_section_continues(s, in_files=in_files)
         if keep is not None:
             in_files = keep
@@ -895,18 +997,48 @@ def _lightweight_provides_from_spec_text(pkg: str, spec_text: str) -> set[str]:
             m = _RE_PC_FILE.search(expanded)
             if m and "%" not in m.group(1) and "*" not in m.group(1):
                 provided.add(f"pkgconfig({m.group(1)})")
+            elif "*" in expanded and "/pkgconfig/" in expanded:
+                # Fcitx5*.pc → at least pkgconfig(Fcitx5) prefix for map hits
+                gm = re.search(r"/pkgconfig/([A-Za-z0-9_+.-]+)\*\.pc\b", expanded)
+                if gm and gm.group(1):
+                    provided.add(f"pkgconfig({gm.group(1)})")
         if ".so" in expanded:
             m = _RE_SO_FILE.search(expanded)
             if m and "%" not in m.group(1):
                 provided.update(_so_file_provides(m.group(1)))
-        # absolute file paths from %files (same solv surface mock uses via filelists)
+                if "%" not in m.group(0) and "*" not in m.group(0):
+                    provided.add(m.group(0))
+            elif "%" not in expanded:
+                gm = re.search(r"/\*\.so\.([0-9][0-9.]*)\*?\s*$", expanded)
+                if gm:
+                    pkgname = (macros.get("name") or "").strip()
+                    if pkgname.startswith("lib"):
+                        provided.add(f"{pkgname}.so.{gm.group(1)}")
+        if ".pm" in expanded:
+            perl_cap = _perl_module_from_file_path(expanded)
+            if perl_cap:
+                provided.add(perl_cap)
+        if "/cmake/" in expanded:
+            cmake_cap = _cmake_module_from_file_path(expanded)
+            if cmake_cap:
+                provided.add(cmake_cap)
+        if ".dll" in expanded.lower() or "mingw" in expanded.lower():
+            provided.update(_mingw_dll_provides_from_path(expanded))
+            provided.update(_mingw_dll_provides_from_path(s))
         if "%" not in expanded:
             path = expanded.split()[0] if expanded.split() else ""
-            if path.startswith("/") and "*" not in path and "?" not in path:
+            if path.startswith("/") and "*" not in path and "?" not in path and "[" not in path:
                 provided.add(path)
                 base = path.rsplit("/", 1)[-1]
                 if base and "." not in base:
                     provided.add(base)
+            elif path.startswith("/usr/bin/") and path.endswith("-*"):
+                stem = path[len("/usr/bin/") : -2]
+                if stem and "%" not in stem:
+                    provided.add(f"/usr/bin/{stem}")
+                    provided.add(stem)
+            elif path.startswith("/") and any(c in path for c in "*?["):
+                provided.add(f"__glob__{path}")
     provided.add(source_name)
     crate_macro = (macros.get("crate") or "").strip()
     if crate_macro and "%" not in crate_macro:
@@ -927,7 +1059,6 @@ def _lightweight_provides_from_spec_text(pkg: str, spec_text: str) -> set[str]:
             provided.add(perl_cap)
         provided.update(_python_dist_provides_from_package_name(name))
     return provided
-
 
 def _build_provides_index_from_tarball_sync(tarball: bytes, releasename: str) -> DistgitProvidesIndex:
     """One sequential gzip pass. Dont seek extractfile per package (that re-decompresses forever)."""
@@ -1306,6 +1437,50 @@ def _enrich_one_spec_brs(
     return parsed
 
 
+_LOCAL_SOURCE_FAIL_CACHE: dict[str, float] = {}
+_LOCAL_SOURCE_FAIL_TTL_SEC = 15 * 60
+
+
+def _local_source_fail_cached(url: str) -> bool:
+    ts = _LOCAL_SOURCE_FAIL_CACHE.get(url)
+    if ts is None:
+        return False
+    if time.monotonic() - ts > _LOCAL_SOURCE_FAIL_TTL_SEC:
+        _LOCAL_SOURCE_FAIL_CACHE.pop(url, None)
+        return False
+    return True
+
+
+def _local_source_mark_failed(url: str) -> None:
+    _LOCAL_SOURCE_FAIL_CACHE[url] = time.monotonic()
+
+
+def _fetch_one_local_source(
+    name: str, url: str, dest: Path, headers: dict[str, str], pkg: str
+) -> Path | None:
+    if dest.is_file() and dest.stat().st_size > 0:
+        return dest
+    if _local_source_fail_cached(url):
+        return None
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "oreon-build-service/dynamic-brs",
+                **{k: v for k, v in (headers or {}).items() if k.lower() != "user-agent"},
+            },
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp, open(dest, "wb") as fh:
+            shutil.copyfileobj(resp, fh)
+        if dest.is_file() and dest.stat().st_size > 0:
+            return dest
+        logger.warning("empty distgit source %s for %s", name, pkg)
+    except Exception:
+        logger.debug("distgit source fetch failed %s/%s", pkg, name, exc_info=True)
+    _local_source_mark_failed(url)
+    return None
+
+
 def _download_distgit_local_sources(
     *,
     pkg: str,
@@ -1318,7 +1493,11 @@ def _download_distgit_local_sources(
     distro_macros: dict[str, str] | None,
     dest_dir: Path,
 ) -> list[Path]:
-    """Pull non-URL SourceN / PatchN files from the package dir in distgit."""
+    """Pull non-URL SourceN / PatchN files from the package dir in distgit.
+
+    Fetches in parallel and skips URLs that recently 404'd (never-block on
+    the same permanently-missing patch every fixed-point wave).
+    """
     from oreon_build.core.spec_bcond import default_build_defines, parse_spec_bconds
     from oreon_build.services.dynamic_brs import local_source_basenames
 
@@ -1328,33 +1507,21 @@ def _download_distgit_local_sources(
     if not names:
         return []
     dest_dir.mkdir(parents=True, exist_ok=True)
-    out: list[Path] = []
     base = (
         f"https://raw.githubusercontent.com/{owner}/{repo}/"
         f"{distgit_branch}/{releasename}/{pkg}"
     )
-    for name in names:
-        dest = dest_dir / name
-        if dest.is_file() and dest.stat().st_size > 0:
-            out.append(dest)
-            continue
-        url = f"{base}/{name}"
-        try:
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": "oreon-build-service/dynamic-brs",
-                    **{k: v for k, v in (headers or {}).items() if k.lower() != "user-agent"},
-                },
-            )
-            with urllib.request.urlopen(req, timeout=120) as resp, open(dest, "wb") as fh:
-                shutil.copyfileobj(resp, fh)
-            if dest.is_file() and dest.stat().st_size > 0:
-                out.append(dest)
-            else:
-                logger.warning("empty distgit source %s for %s", name, pkg)
-        except Exception:
-            logger.warning("distgit source fetch failed %s/%s", pkg, name, exc_info=True)
+    jobs = [(name, f"{base}/{name}", dest_dir / name) for name in names]
+    out: list[Path] = []
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(jobs)))) as pool:
+        futs = {
+            pool.submit(_fetch_one_local_source, name, url, dest, headers, pkg): name
+            for name, url, dest in jobs
+        }
+        for fut in as_completed(futs):
+            result = fut.result()
+            if result is not None:
+                out.append(result)
     return out
 
 
@@ -1391,9 +1558,8 @@ async def enrich_specs_buildrequires_with_rpm(
     tmp_root = None
     if gen and owner and repo and distgit_branch:
         tmp_root = tempfile.TemporaryDirectory(prefix="oreon-dynsrc-")
-        for pkg, text, _parsed, run_gen in jobs:
-            if not run_gen:
-                continue
+
+        async def _fetch_for(pkg: str, text: str) -> tuple[str, list[Path]]:
             dest = Path(tmp_root.name) / pkg
             paths = await asyncio.to_thread(
                 _download_distgit_local_sources,
@@ -1407,8 +1573,15 @@ async def enrich_specs_buildrequires_with_rpm(
                 distro_macros=macros,
                 dest_dir=dest,
             )
-            if paths:
-                local_by_pkg[pkg] = paths
+            return pkg, (paths or [])
+
+        gen_jobs = [(pkg, text) for pkg, text, _parsed, run_gen in jobs if run_gen]
+        if gen_jobs:
+            for pkg, paths in await asyncio.gather(
+                *(_fetch_for(pkg, text) for pkg, text in gen_jobs)
+            ):
+                if paths:
+                    local_by_pkg[pkg] = paths
 
     pool = _distgit_spec_parse_executor()
     futs = {
@@ -1446,6 +1619,7 @@ async def expand_chain_spec_closure_sparse(
     repo_index: Any | None = None,
     target_arches: set[str] | None = None,
     distgit_providers: dict[str, set[str]] | None = None,
+    always_build: set[str] | None = None,
 ) -> tuple[dict[str, str], dict[str, _SpecParseResult], list[str]]:
     err: list[str] = []
     specs: dict[str, str] = {}
@@ -1456,6 +1630,7 @@ async def expand_chain_spec_closure_sparse(
     known: set[str] = set()
     needed: set[str] = set()
     queue: deque[str] = deque()
+    force_build = {(x or "").strip() for x in (always_build or roots or []) if (x or "").strip()}
 
     for r in roots:
         rn = (r or "").strip()
@@ -1528,6 +1703,19 @@ async def expand_chain_spec_closure_sparse(
                     if cap == "__lower__":
                         continue
                     add_capability_providers(provider_map, cap, srcs)
+                # repo-current transitive pkgs: keep parse for provides, do not fan out
+                if (
+                    pkg not in force_build
+                    and repo_index is not None
+                    and hasattr(repo_index, "source_is_repo_current")
+                    and repo_index.source_is_repo_current(
+                        pkg,
+                        getattr(parsed, "epoch", 0) or 0,
+                        getattr(parsed, "version", "") or "",
+                        getattr(parsed, "release", "") or "",
+                    )
+                ):
+                    continue
                 for dep in dependency_capabilities(parsed):
                     if repo_index is not None and repo_index.satisfies_requirement(dep):
                         continue

@@ -34,9 +34,7 @@ def topo_layers(
     while remaining:
         sub = G.subgraph(remaining)
         try:
-            for gen in nx.topological_generations(sub):
-                layers.append(sorted(gen))
-            return layers, cycle
+            gens = [sorted(gen) for gen in nx.topological_generations(sub)]
         except nx.NetworkXUnfeasible:
             cycle = True
             in_deg = {n: int(sub.in_degree(n)) for n in remaining}
@@ -50,6 +48,9 @@ def topo_layers(
             )
             layers.append([pick])
             remaining.discard(pick)
+            continue
+        layers.extend(gens)
+        return layers, cycle
     return layers, cycle
 
 

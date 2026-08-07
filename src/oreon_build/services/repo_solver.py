@@ -58,6 +58,7 @@ def nevra_to_name(nevra: str) -> str:
 
 _SOLVER_CACHE: dict[tuple[Any, ...], tuple[float, "OreonRepoSolver"]] = {}
 _SOLVER_CACHE_TTL_SEC = 900.0
+_SOLVER_CACHE_MAX = 1
 
 
 def _overlay_cap_ok(cap: str) -> bool:
@@ -549,6 +550,11 @@ def get_repo_solver(
         if now - ts >= _SOLVER_CACHE_TTL_SEC or k == key:
             _SOLVER_CACHE.pop(k, None)
             _close_solver(sol)
+    # solv pools are multi-GB. keep at most one warm solver.
+    while len(_SOLVER_CACHE) >= _SOLVER_CACHE_MAX:
+        oldest_k = min(_SOLVER_CACHE.items(), key=lambda kv: kv[1][0])[0]
+        _ts, sol = _SOLVER_CACHE.pop(oldest_k)
+        _close_solver(sol)
 
     solvers = [
         OreonRepoSolver(releasename=releasename, branches=branches, arch=a)

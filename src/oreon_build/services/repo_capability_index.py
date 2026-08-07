@@ -8,6 +8,7 @@ import logging
 import lzma
 import os
 import re
+import threading
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -16,6 +17,7 @@ from typing import Any
 
 from oreon_build.core.rpm_requires import (
     evr_satisfies,
+    install_check_capabilities,
     is_arch_qualified_rpm_dependency,
     is_distgit_source_name,
     parse_versioned_requirement,
@@ -29,7 +31,9 @@ from oreon_build.services.r2 import get_r2_client
 logger = logging.getLogger(__name__)
 
 _CACHE_TTL_SEC = 1800.0
+_CACHE_MAX = 1
 _cache: dict[tuple[str, str, str], tuple[float, RepoCapabilityIndex]] = {}
+_cache_lock = threading.Lock()
 
 _RE_REPO_CHANNEL = re.compile(
     r"/(?P<rel>[^/]+)/(?P<channel>dev|testing|stable)/(?:\$basearch|\$arch|x86_64|aarch64|noarch|src)(?:/|$)",
@@ -163,9 +167,8 @@ class RepoCapabilityIndex:
         if not name:
             return False
         if not self.has_capability(name):
-            # also try expanded aliases (pkgconfig inner etc) without version
             if op is None:
-                for cap in requirement_check_capabilities(d):
+                for cap in install_check_capabilities(d):
                     if self.has_capability(cap):
                         return True
             return False
@@ -198,7 +201,7 @@ class RepoCapabilityIndex:
             return True
         if is_rich_dependency(t):
             return self._satisfies_rich_dependency(t)
-        for cap in requirement_check_capabilities(t):
+        for cap in install_check_capabilities(t):
             if self.has_capability(cap):
                 return True
         return False
@@ -505,6 +508,70 @@ class RepoCapabilityIndex:
         if self.has_capability(c):
             return set()
         return self.owner_sources_for_capability(c)
+
+    def source_present_in_repo(self, name: str) -> bool:
+        n = (name or "").strip()
+        if not n:
+            return False
+        if n in self.source_names or n in self.source_names_any:
+            return True
+        if n in self.binary_names or n in self.binary_names_any:
+            return True
+        return any(src == n for src in self.binary_source.values())
+
+    def _source_repo_evrs(self, name: str) -> list[tuple[str, str, str]]:
+        n = (name or "").strip()
+        if not n:
+            return []
+        out: list[tuple[str, str, str]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for evr in self.capability_evrs.get(n) or []:
+            if evr not in seen:
+                seen.add(evr)
+                out.append(evr)
+        for bin_name, src in self.binary_source.items():
+            if src != n:
+                continue
+            for evr in self.capability_evrs.get(bin_name) or []:
+                if evr not in seen:
+                    seen.add(evr)
+                    out.append(evr)
+        return out
+
+    def source_is_repo_current(
+        self,
+        name: str,
+        epoch: int | str = 0,
+        version: str = "",
+        release: str = "",
+        *,
+        require_evr: bool = False,
+    ) -> bool:
+        """True when repo already has this source at EVR >= distgit EVR.
+
+        Without distgit version: presence counts as current unless require_evr=True
+        (used when deciding whether to rebuild a provider for an unmet capability).
+        """
+        n = (name or "").strip()
+        if not n or not self.source_present_in_repo(n):
+            return False
+        dist_ver = (version or "").strip()
+        dist_rel = (release or "").strip()
+        if not dist_ver:
+            return not require_evr
+        try:
+            dist_epoch = str(int(epoch or 0))
+        except (TypeError, ValueError):
+            dist_epoch = "0"
+        dist_evr = (dist_epoch, dist_ver, dist_rel or "0")
+        repo_evrs = self._source_repo_evrs(n)
+        if not repo_evrs:
+            return not require_evr
+        best = repo_evrs[0]
+        for evr in repo_evrs[1:]:
+            if rpm_evr_compare(evr, best) > 0:
+                best = evr
+        return rpm_evr_compare(best, dist_evr) >= 0
 
 
 def _dedupe_caps(caps: list[str]) -> list[str]:
@@ -908,31 +975,44 @@ def load_repo_capability_index(
     arch_key = ",".join(arches)
     branch_key = "+".join(branches)
     cache_key = (rel, branch_key, arch_key)
-    now = time.monotonic()
-    for k, (ts, _idx) in list(_cache.items()):
-        if now - ts >= _CACHE_TTL_SEC:
-            _cache.pop(k, None)
-    hit = _cache.get(cache_key)
-    if hit and now - hit[0] < _CACHE_TTL_SEC:
-        return hit[1]
 
-    parts: list[RepoCapabilityIndex] = []
-    for a in arches:
-        per_branch = [_load_arch_metadata(rel, b, a) for b in branches]
-        parts.append(_union_indexes(per_branch) if len(per_branch) > 1 else (per_branch[0] if per_branch else RepoCapabilityIndex()))
-    index = _merge_arch_indexes(parts)
-    _cache[cache_key] = (now, index)
-    logger.info(
-        "repo capability index %s/%s arches=%s sources=%s binaries=%s provides=%s",
-        rel,
-        branch_key,
-        arch_key or "(none)",
-        len(index.source_names),
-        len(index.binary_names),
-        len(index.provides),
-    )
-    return index
+    with _cache_lock:
+        now = time.monotonic()
+        for k, (ts, _idx) in list(_cache.items()):
+            if now - ts >= _CACHE_TTL_SEC:
+                _cache.pop(k, None)
+        hit = _cache.get(cache_key)
+        if hit and now - hit[0] < _CACHE_TTL_SEC:
+            return hit[1]
+
+        # drop any other key first so peak stays ~1 index (these are multi-GB)
+        _cache.clear()
+        import gc
+
+        gc.collect()
+
+        parts: list[RepoCapabilityIndex] = []
+        for a in arches:
+            per_branch = [_load_arch_metadata(rel, b, a) for b in branches]
+            parts.append(
+                _union_indexes(per_branch)
+                if len(per_branch) > 1
+                else (per_branch[0] if per_branch else RepoCapabilityIndex())
+            )
+        index = _merge_arch_indexes(parts)
+        _cache[cache_key] = (now, index)
+        logger.info(
+            "repo capability index %s/%s arches=%s sources=%s binaries=%s provides=%s",
+            rel,
+            branch_key,
+            arch_key or "(none)",
+            len(index.source_names),
+            len(index.binary_names),
+            len(index.provides),
+        )
+        return index
 
 
 def clear_repo_capability_cache() -> None:
-    _cache.clear()
+    with _cache_lock:
+        _cache.clear()

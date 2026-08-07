@@ -73,20 +73,8 @@ async def _warmup_once() -> None:
             logger.info("solv warmup ready %s/testing", releasename)
         except Exception:
             logger.warning("solv warmup failed for %s", releasename, exc_info=True)
-        try:
-            from oreon_build.services.repo_capability_index import load_repo_capability_index
-
-            await asyncio.to_thread(
-                lambda: load_repo_capability_index(
-                    releasename,
-                    "testing",
-                    ["x86_64"],
-                    extra_branches=["dev", "stable"],
-                )
-            )
-            logger.info("capability index warmup ready %s/testing", releasename)
-        except Exception:
-            logger.warning("capability index warmup failed for %s", releasename, exc_info=True)
+        # skip capability-index warmup. that object is multi-GB and OOMs this host
+        # when layered on solv + side-tag reloads. load on demand only.
 
 
 async def _warmup_loop() -> None:
