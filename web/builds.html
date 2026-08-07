@@ -50,7 +50,7 @@
             <th>Arch</th>
             <th>Status</th>
             <th>Signing</th>
-            <th>Chain</th>
+            <th>Layer</th>
             <th>Created</th>
             <th>Actions</th>
           </tr>
@@ -59,7 +59,7 @@
       </table>
     </section>
   </main>
-  <script src="/static/app.js?v=16"></script>
+  <script src="/static/app.js?v=18"></script>
   <script>
     (function() {
       const api = window.oreonApi;
@@ -81,23 +81,6 @@
       }
       function markBuildJobRetried(jobId) { retriedBuildJobIds.add(String(jobId)); }
       function isBuildJobRetried(jobId) { return retriedBuildJobIds.has(String(jobId)); }
-      function copyTextToClipboard(text) {
-        var t = String(text);
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-          return navigator.clipboard.writeText(t).then(function() { return true; });
-        }
-        var ta = document.createElement('textarea');
-        ta.value = t;
-        ta.setAttribute('readonly', '');
-        ta.style.position = 'fixed';
-        ta.style.left = '-9999px';
-        document.body.appendChild(ta);
-        ta.select();
-        try { document.execCommand('copy'); } catch (e) {}
-        document.body.removeChild(ta);
-        return Promise.resolve(true);
-      }
-
       var buildsTableSel = window.oreonBindTableSelection(document.getElementById('builds-tbody'), {
         rowCheckboxSelector: '.build-row-cb',
         selectAll: document.getElementById('builds-select-all'),
@@ -187,22 +170,25 @@
             } else if (j.branch) {
               sideTag = '<span style="color:var(--text-muted)">' + escapeHtml(j.branch) + '</span>';
             }
-            var chainPart = '—';
-            if (j.chain_id != null && j.chain_id !== undefined) {
-              var chainIdStr = String(j.chain_id);
-              var stgNote = (j.chain_stage_index != null && j.chain_stage_index !== undefined)
-                ? ' <span style="color:var(--text-muted); font-size:0.85em">(S' + j.chain_stage_index + ')</span>' : '';
-              var copyChainBtn = '<button type="button" class="btn copy-chain-id" data-chain-id="' + escapeAttr(chainIdStr) + '" title="Copy chain id" style="padding:0.2rem 0.45rem; font-size:0.8rem; margin-left:0.3rem;">Copy</button>';
-              var resumeChainBtn = canAct
-                ? '<button type="button" class="btn chain-resume-row" data-chain-id="' + escapeAttr(chainIdStr) + '" style="padding:0.2rem 0.5rem; font-size:0.8rem; margin-left:0.2rem;">Resume chain</button>'
-                : '';
-              chainPart = chainIdStr + stgNote + copyChainBtn + resumeChainBtn;
+            var layerPart = '—';
+            if (j.layer_plan_id != null && j.layer_plan_id !== undefined) {
+              var layerIdStr = String(j.layer_plan_id);
+              var idxNote = (j.layer_index != null && j.layer_index !== undefined)
+                ? ' <span style="color:var(--text-muted); font-size:0.85em">(L' + j.layer_index + ')</span>' : '';
+              if (j.side_tag_id != null) {
+                layerPart = '<a href="/side-tag.html?id=' + j.side_tag_id + '&layer_plan_id=' + layerIdStr + '">' + layerIdStr + '</a>' + idxNote;
+              } else {
+                layerPart = layerIdStr + idxNote;
+              }
+              if (j.status === 'blocked' && j.blocked_reason) {
+                layerPart += ' <span style="color:var(--text-muted); font-size:0.82em;" title="' + escapeAttr(j.blocked_reason) + '">(blocked)</span>';
+              }
             }
             return '<tr data-id="' + j.id + '" data-status="' + escapeAttr(j.status || '') + '">' +
               '<td class="col-checkbox"><input type="checkbox" class="build-row-cb" data-id="' + j.id + '"></td>' +
               '<td>' + j.id + '</td><td>' + pkg + '</td><td>' + rel + '</td><td>' + sideTag + '</td><td>' + arch + '</td>' +
               '<td><span class="' + statusClass(sd) + '">' + escapeHtml(sd) + '</span></td>' +
-              '<td>' + signCell + '</td><td style="white-space:normal; max-width:16rem;">' + chainPart + '</td>' +
+              '<td>' + signCell + '</td><td style="white-space:normal; max-width:16rem;">' + layerPart + '</td>' +
               '<td>' + (j.created_at || '').slice(0, 19) + '</td>' +
               '<td><a href="/build.html?job_id=' + j.id + '">View</a>' + retryBtn + cancelBtn + '</td></tr>';
           }).join('') || '<tr><td colspan="11">No builds</td></tr>';
@@ -222,30 +208,6 @@
             btn.addEventListener('click', function() {
               oreonWithLoading(btn, function() {
                 return api.post('/builds/jobs/' + btn.dataset.id + '/cancel').then(render).catch(function(e) { alert(e.message); });
-              });
-            });
-          });
-          tbody.querySelectorAll('.copy-chain-id').forEach(function(btn) {
-            btn.addEventListener('click', function() {
-              var raw = btn.getAttribute('data-chain-id');
-              if (raw == null || raw === '') return;
-              copyTextToClipboard(raw).then(function() {
-                var prev = btn.textContent;
-                btn.textContent = 'Copied';
-                btn.disabled = true;
-                setTimeout(function() { btn.textContent = prev; btn.disabled = false; }, 1200);
-              });
-            });
-          });
-          tbody.querySelectorAll('.chain-resume-row').forEach(function(btn) {
-            btn.addEventListener('click', function() {
-              if (!api.token) { alert('Log in to resume a chain.'); return; }
-              var fromId = parseInt(btn.getAttribute('data-chain-id'), 10);
-              if (!fromId) return;
-              oreonWithLoading(btn, function() {
-                return api.post('/builds/chain-resume', { from_chain_id: fromId })
-                  .then(function() { render(); alert('Chain resume queued.'); })
-                  .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
               });
             });
           });
