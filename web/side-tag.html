@@ -420,6 +420,9 @@
         el.style.display = 'block';
         el.className = 'layer-alert-' + (kind || 'info');
         var actions = '<div class="layer-alert-actions">';
+        if (opts.showResume) {
+          actions += '<button type="button" class="btn" id="layer-alert-resume">Resume layer</button>';
+        }
         if (opts.showCancel) {
           actions += '<button type="button" class="btn" id="layer-alert-cancel">Cancel layer</button>';
         }
@@ -427,6 +430,23 @@
         el.innerHTML = '<h3>' + escapeHtml(title) + '</h3>' + bodyHtml + actions;
         var dismiss = document.getElementById('layer-alert-dismiss');
         if (dismiss) dismiss.onclick = function() { el.style.display = 'none'; stopLayerPoll(); };
+        var resumeBtn = document.getElementById('layer-alert-resume');
+        if (resumeBtn) {
+          resumeBtn.onclick = function() {
+            var lid = watchedLayerId || opts.layerId;
+            if (!lid) return;
+            if (!confirm('Resume layer ' + lid + '? Retries failed/cancelled jobs, keeps successes.')) return;
+            resumeBtn.disabled = true;
+            api.post('/builds/layer/' + lid + '/resume').then(function(data) {
+              renderLayerAlertFromStatus(data);
+              pollLayerStatus(lid);
+              render();
+            }).catch(function(e) {
+              resumeBtn.disabled = false;
+              alert(e.message || e);
+            });
+          };
+        }
         var cancelBtn = document.getElementById('layer-alert-cancel');
         if (cancelBtn) {
           cancelBtn.onclick = function() {
@@ -444,6 +464,20 @@
           };
         }
       }
+      function renderLayerFailedJobs(data) {
+        var jobs = (data.jobs || []).filter(function(j) {
+          return (j.status || '').toLowerCase() === 'failed';
+        });
+        if (!jobs.length) return '';
+        var items = jobs.map(function(j) {
+          var label = j.package_name || ('job-' + j.job_id);
+          if (j.architecture) label += ' (' + j.architecture + ')';
+          return '<li style="margin:0.2rem 0;"><a href="/build.html?job_id=' + encodeURIComponent(j.job_id) + '">'
+            + escapeHtml(label) + '</a></li>';
+        });
+        return '<p style="margin:0.5rem 0 0.25rem 0;">Failed packages</p>'
+          + '<ul style="margin:0 0 0.75rem 1.1rem;padding:0;list-style:disc;">' + items.join('') + '</ul>';
+      }
       function renderLayerAlertFromStatus(data) {
         if (!data) return;
         watchedLayerId = data.layer_plan_id;
@@ -455,9 +489,12 @@
         var live = (st === 'pending' || st === 'running');
         if (st === 'failed' || st === 'cancelled') {
           var err = (data.error_message || '').trim();
+          var summary = err.replace(/\s*Primary:\s*.*$/, '').trim();
           showLayerAlert('error', 'Layer ' + data.layer_plan_id + ' ' + st,
-            (err ? '<pre style="white-space:pre-wrap;font-size:0.88rem;margin:0 0 0.75rem 0;background:transparent;color:inherit;">' + escapeHtml(err) + '</pre>' : '') +
-            (bits ? '<p>' + escapeHtml(bits) + '</p>' : ''));
+            (summary ? '<p style="margin:0 0 0.5rem 0;font-size:0.9rem;">' + escapeHtml(summary) + '</p>' : '') +
+            renderLayerFailedJobs(data) +
+            (bits ? '<p style="margin:0;color:var(--text-muted);font-size:0.88rem;">' + escapeHtml(bits) + '</p>' : ''),
+            { showResume: true, layerId: data.layer_plan_id });
           stopLayerPoll();
           return;
         }
