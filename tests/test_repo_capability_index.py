@@ -554,6 +554,36 @@ def test_satisfies_requirement_checks_provide_evr() -> None:
     assert not repo.satisfies_requirement("wayland-protocols-devel > 1.47")
 
 
+def test_rich_crate_with_version_bounds_not_satisfied_by_old_evr() -> None:
+    """0.10 must not satisfy (crate(env_logger) >= 0.11 with < 0.12)."""
+    repo = RepoCapabilityIndex(
+        binary_names={"rust-env_logger0.10"},
+        provides={"crate(env_logger)", "crate(env_logger/default)", "crate(env_logger/regex)"},
+        capability_providers={
+            "crate(env_logger)": {"rust-env_logger0.10"},
+            "crate(env_logger/default)": {"rust-env_logger0.10"},
+            "crate(env_logger/regex)": {"rust-env_logger0.10"},
+        },
+        capability_evrs={
+            "crate(env_logger)": [("0", "0.10.2", "")],
+            "crate(env_logger/default)": [("0", "0.10.2", "")],
+            "crate(env_logger/regex)": [("0", "0.10.2", "")],
+        },
+        binary_source={"rust-env_logger0.10": "rust-env_logger0.10"},
+        source_names={"rust-env_logger0.10"},
+    )
+    repo.finalize_lookups()
+    assert repo.has_capability("crate(env_logger)")
+    assert repo.satisfies_requirement("crate(env_logger)")
+    assert not repo.satisfies_requirement("crate(env_logger) >= 0.11.0")
+    assert not repo.satisfies_requirement(
+        "(crate(env_logger) >= 0.11.0 with crate(env_logger) < 0.12.0~)"
+    )
+    assert not repo.satisfies_requirement(
+        "(crate(env_logger/default) >= 0.11.0 with crate(env_logger/default) < 0.12.0~)"
+    )
+
+
 def test_source_is_repo_current_presence_and_evr() -> None:
     repo = RepoCapabilityIndex(
         binary_names={"rust-clap"},

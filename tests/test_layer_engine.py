@@ -233,6 +233,113 @@ async def test_static_close_skips_evr_current_transitive_provider():
     assert errors == []
 
 
+@pytest.mark.asyncio
+async def test_static_close_skips_runtime_requires_already_in_repo():
+    """Runtime Requires that repo already satisfies do not expand rebuilds."""
+    parsed = {
+        "or11-backgrounds": _SpecParseResult(
+            source_name="or11-backgrounds",
+            build_requires=["kde-filesystem", "make"],
+            provided_binary_names={"or11-backgrounds"},
+            build_requires_raw=["kde-filesystem", "make"],
+            requires=["oreon-wallpapers", "xfdesktop"],
+            requires_raw=["oreon-wallpapers", "xfdesktop"],
+        ),
+        "xfdesktop": _SpecParseResult(
+            source_name="xfdesktop",
+            build_requires=["libxfce4ui-devel"],
+            provided_binary_names={"xfdesktop"},
+            build_requires_raw=["libxfce4ui-devel"],
+        ),
+    }
+    cap_index = _index_with(
+        provides={"kde-filesystem", "make", "oreon-wallpapers", "xfdesktop"},
+        source_names={"or11-backgrounds", "oreon-wallpapers", "xfdesktop"},
+    )
+
+    with patch(
+        "oreon_build.services.layer_engine.get_distgit_provides_index_cached",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "oreon_build.services.layer_engine.expand_chain_spec_closure_sparse",
+        new=AsyncMock(
+            return_value=(
+                {"or11-backgrounds": "spec"},
+                {"or11-backgrounds": parsed["or11-backgrounds"]},
+                [],
+            )
+        ),
+    ), patch(
+        "oreon_build.services.layer_engine.get_repo_solver",
+        return_value=_ok_solver(),
+    ):
+        deps, known, errors, unresolved = await _static_close_dependencies(
+            ["or11-backgrounds"],
+            cap_index=cap_index,
+            **_close_kwargs(),
+        )
+
+    assert known == {"or11-backgrounds"}
+    assert "xfdesktop" not in known
+    assert deps.get("or11-backgrounds", set()) == set()
+    assert errors == []
+
+
+@pytest.mark.asyncio
+async def test_static_close_expands_missing_runtime_requires():
+    """Missing runtime Requires expand the provider so install-time still works."""
+    parsed = {
+        "or11-backgrounds": _SpecParseResult(
+            source_name="or11-backgrounds",
+            build_requires=["make"],
+            provided_binary_names={"or11-backgrounds"},
+            build_requires_raw=["make"],
+            requires=["xfdesktop"],
+            requires_raw=["xfdesktop"],
+        ),
+        "xfdesktop": _SpecParseResult(
+            source_name="xfdesktop",
+            build_requires=[],
+            provided_binary_names={"xfdesktop"},
+            build_requires_raw=[],
+        ),
+    }
+    cap_index = _index_with(
+        provides={"make"},
+        source_names={"or11-backgrounds"},
+    )
+
+    with patch(
+        "oreon_build.services.layer_engine.get_distgit_provides_index_cached",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "oreon_build.services.layer_engine.expand_chain_spec_closure_sparse",
+        new=AsyncMock(
+            return_value=(
+                {"or11-backgrounds": "a", "xfdesktop": "b"},
+                parsed,
+                [],
+            )
+        ),
+    ), patch(
+        "oreon_build.services.layer_engine.providers_for_requirement",
+        return_value={"xfdesktop"},
+    ), patch(
+        "oreon_build.services.layer_engine.get_repo_solver",
+        return_value=_ok_solver(),
+    ):
+        deps, known, errors, unresolved = await _static_close_dependencies(
+            ["or11-backgrounds"],
+            cap_index=cap_index,
+            **_close_kwargs(),
+        )
+
+    assert known == {"or11-backgrounds", "xfdesktop"}
+    assert deps.get("or11-backgrounds") == {"xfdesktop"}
+    assert errors == []
+    assert unresolved.get("or11-backgrounds", set()) == set()
+
+
 def test_filter_build_set_keeps_root_drops_evr_current():
     parsed = {
         "sbctl": _SpecParseResult(source_name="sbctl", build_requires=[], provided_binary_names={"sbctl"}),
@@ -350,7 +457,8 @@ async def test_static_close_unmet_crate_enqueues_only_missing_provider():
 
 
 @pytest.mark.asyncio
-async def test_autofix_noop_when_miss_already_satisfied():
+async def test_autofix_still_expands_when_cap_index_lies_about_satisfied():
+    """Mock already failed with nothing provides. Dont trust cap_index.satisfies."""
     plan = MagicMock()
     plan.id = 7
     plan.status = LayerPlanStatus.RUNNING
@@ -367,8 +475,8 @@ async def test_autofix_noop_when_miss_already_satisfied():
     job.package_id = 2
     job.branch = "test-side"
     job.status = BuildStatus.FAILED
+    job.completed_at = object()
     job.target_id = 99
-    # no lazy architecture property. resolve via target_id
     if "architecture" in getattr(job, "__dict__", {}):
         del job.__dict__["architecture"]
     release = MagicMock()
@@ -394,6 +502,9 @@ async def test_autofix_noop_when_miss_already_satisfied():
             result.scalars.return_value.all.return_value = []
             return result
 
+        async def scalar(self, stmt):
+            return None
+
         async def flush(self):
             return None
 
@@ -407,9 +518,21 @@ async def test_autofix_noop_when_miss_already_satisfied():
             return_value="main",
         ),
         patch(
+            "oreon_build.services.layer_engine._provider_sources_for_miss",
+            return_value={"rust-askalono"},
+        ),
+        patch(
             "oreon_build.services.layer_engine._spawn_layer_dep_sources",
-            new=AsyncMock(return_value=set()),
+            new=AsyncMock(return_value={"rust-askalono"}),
         ) as spawn,
+        patch(
+            "oreon_build.services.layer_engine.resolve_layer_blocker_cycles",
+            new=AsyncMock(return_value=0),
+        ),
+        patch(
+            "oreon_build.services.layer_engine._revive_upstream_cancelled_dependents",
+            new=AsyncMock(return_value=0),
+        ),
     ):
         ok = await try_autofix_layer_missing_provides(
             _DB(),
@@ -417,10 +540,11 @@ async def test_autofix_noop_when_miss_already_satisfied():
             "nothing provides requested crate(askalono)",
             package_name="rust-askalono-cli",
         )
-    assert ok is False
-    spawn.assert_not_called()
+    assert ok is True
+    spawn.assert_called_once()
     load_idx.assert_called_once()
     assert load_idx.call_args.args[2] == ["x86_64"]
+    assert job.status == BuildStatus.BLOCKED
 
 
 @pytest.mark.asyncio
@@ -484,6 +608,9 @@ async def test_autofix_uses_job_arch_not_plan_arch_intersection():
             result.scalars.return_value.all.return_value = []
             return result
 
+        async def scalar(self, stmt):
+            return None
+
         async def flush(self):
             return None
 
@@ -493,6 +620,14 @@ async def test_autofix_uses_job_arch_not_plan_arch_intersection():
         patch("oreon_build.services.layer_engine._github_headers", return_value={}),
         patch("oreon_build.services.layer_engine.load_repo_capability_index", return_value=sat) as load_idx,
         patch("oreon_build.services.layer_engine.release_distgit_branch", return_value="main"),
+        patch(
+            "oreon_build.services.layer_engine._provider_sources_for_miss",
+            return_value=set(),
+        ),
+        patch(
+            "oreon_build.services.layer_engine._provider_sources_for_miss_unfiltered",
+            return_value=set(),
+        ),
         patch(
             "oreon_build.services.layer_engine._spawn_layer_dep_sources",
             new=AsyncMock(return_value=set()),
@@ -628,7 +763,8 @@ async def test_recheck_job_ready_queues_when_all_deps_resolved():
     with (
         patch("oreon_build.services.layer_engine._refetch_spec_text", new=AsyncMock(return_value="Name: topapp\n")),
         patch("oreon_build.services.layer_engine._spec_parse_fn", return_value=lambda text, name: object()),
-        patch("oreon_build.services.layer_engine.dependency_capabilities", return_value=[]),
+        patch("oreon_build.services.layer_engine.build_dependency_capabilities", return_value=[]),
+        patch("oreon_build.services.layer_engine.runtime_dependency_capabilities", return_value=[]),
         patch(
             "oreon_build.services.layer_engine.get_distgit_provides_index_cached",
             new=AsyncMock(return_value=None),
@@ -666,7 +802,8 @@ async def test_recheck_job_ready_stays_blocked_on_static_hole():
     with (
         patch("oreon_build.services.layer_engine._refetch_spec_text", new=AsyncMock(return_value="Name: topapp\n")),
         patch("oreon_build.services.layer_engine._spec_parse_fn", return_value=lambda text, name: object()),
-        patch("oreon_build.services.layer_engine.dependency_capabilities", return_value=["libbar-devel"]),
+        patch("oreon_build.services.layer_engine.build_dependency_capabilities", return_value=["libbar-devel"]),
+        patch("oreon_build.services.layer_engine.runtime_dependency_capabilities", return_value=[]),
         patch(
             "oreon_build.services.layer_engine.get_distgit_provides_index_cached",
             new=AsyncMock(return_value=None),
