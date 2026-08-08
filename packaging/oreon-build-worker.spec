@@ -9,7 +9,7 @@
 
 Name:           oreon-build-worker
 Version:        1.0.0
-Release:        67%{?dist}
+Release:        68%{?dist}
 Summary:        Oreon Build Service worker daemon
 License:        GPLv3
 URL:            https://github.com/oreon/oreon-build-service
