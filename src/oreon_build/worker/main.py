@@ -1542,22 +1542,103 @@ def _parse_distgit_url(distgit_url: str) -> tuple[str, str | None, str | None]:
             branch = frag or None
     return repo, branch, spec_rel
 
+_GIT_CLONE_MAX_ATTEMPTS = 11
+_GIT_LFS_MAX_ATTEMPTS = 11
+
+def _git_transient_failure(rc: int, out: str) -> bool:
+    if rc == 0:
+        return False
+    if rc == 124:
+        return True
+    text = (out or "").lower()
+    if "timed out" in text or "timeout" in text:
+        return True
+    needles = (
+        "could not resolve host",
+        "unable to access",
+        "connection reset",
+        "connection timed out",
+        "failed to connect",
+        "early eof",
+        "rpc failed",
+        "the remote end hung up",
+        "http/2 stream",
+        "gnutls_handshake",
+        "ssl_error",
+        "tls",
+        "network is unreachable",
+        "temporary failure",
+        "error: 502",
+        "error: 503",
+        "error: 504",
+        "502 bad gateway",
+        "503 service",
+        "504 gateway",
+    )
+    return any(n in text for n in needles)
+
+
 def _clone_repo(repo: str, branch: str | None, dst: Path) -> tuple[bool, str]:
     cmd = ["git", "clone", "--quiet", "--depth", "1"]
     if branch:
         cmd += ["-b", branch]
     cmd += [repo, str(dst)]
-    rc, out = _run(cmd, timeout_s=600)
-    return rc == 0, out
+    logs: list[str] = []
+    attempts = max(1, int(_GIT_CLONE_MAX_ATTEMPTS))
+    for attempt in range(1, attempts + 1):
+        if dst.exists():
+            shutil.rmtree(dst, ignore_errors=True)
+        rc, out = _run(cmd, timeout_s=600)
+        chunk = (out or "").strip()
+        if chunk:
+            logs.append(f"git clone attempt {attempt}/{attempts} rc={rc}\n{chunk}")
+        else:
+            logs.append(f"git clone attempt {attempt}/{attempts} rc={rc}")
+        if rc == 0:
+            return True, "\n\n".join(logs)
+        if attempt >= attempts or not _git_transient_failure(rc, out):
+            return False, "\n\n".join(logs)
+        logger.warning(
+            "git clone transient fail attempt=%s/%s rc=%s repo=%s",
+            attempt,
+            attempts,
+            rc,
+            repo,
+        )
+        _sleep_with_jitter(min(60.0, 3.0 * attempt))
+    return False, "\n\n".join(logs)
+
 
 def _maybe_git_lfs_pull(repo_dir: Path) -> tuple[int, str]:
     ga = repo_dir / ".gitattributes"
     try:
-        if ga.is_file() and "filter=lfs" in ga.read_text(encoding="utf-8", errors="replace"):
-            return _run(["git", "-C", str(repo_dir), "lfs", "pull", "-q"], timeout_s=1200)
+        if not (ga.is_file() and "filter=lfs" in ga.read_text(encoding="utf-8", errors="replace")):
+            return 0, ""
     except OSError:
-        pass
-    return 0, ""
+        return 0, ""
+    cmd = ["git", "-C", str(repo_dir), "lfs", "pull", "-q"]
+    logs: list[str] = []
+    attempts = max(1, int(_GIT_LFS_MAX_ATTEMPTS))
+    for attempt in range(1, attempts + 1):
+        rc, out = _run(cmd, timeout_s=1200)
+        chunk = (out or "").strip()
+        if chunk:
+            logs.append(f"git lfs pull attempt {attempt}/{attempts} rc={rc}\n{chunk}")
+        else:
+            logs.append(f"git lfs pull attempt {attempt}/{attempts} rc={rc}")
+        if rc == 0:
+            return 0, "\n\n".join(logs)
+        if attempt >= attempts or not _git_transient_failure(rc, out):
+            return rc, "\n\n".join(logs)
+        logger.warning(
+            "git lfs pull transient fail attempt=%s/%s rc=%s dir=%s",
+            attempt,
+            attempts,
+            rc,
+            repo_dir,
+        )
+        _sleep_with_jitter(min(60.0, 3.0 * attempt))
+    return 1, "\n\n".join(logs)
 
 _SPECTOOL_LIST_ENTRY = re.compile(
     r"^(?:Source|Patch)(\d+)(?:\s*\([^)]+\))?:\s*(.+)$",
