@@ -593,6 +593,20 @@ async def cancel_layer_build_endpoint(
     return await _layer_plan_to_status_response(db, plan)
 
 
+@router.post("/layer/{layer_plan_id}/resume", response_model=LayerPlanStatusResponse)
+async def resume_layer_build_endpoint(
+    layer_plan_id: int,
+    request: Request,
+    db: DbSession,
+    user: CurrentUser,
+):
+    from oreon_build.services.layer_plan import resume_layer_plan_by_user
+
+    plan = await resume_layer_plan_by_user(db, request, user, layer_plan_id=layer_plan_id)
+    await db.commit()
+    return await _layer_plan_to_status_response(db, plan)
+
+
 @router.post("/mass-rebuild/run", response_model=dict)
 async def mass_rebuild_run_once(
     db: DbSession,
