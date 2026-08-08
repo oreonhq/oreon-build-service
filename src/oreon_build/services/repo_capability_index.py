@@ -212,8 +212,14 @@ class RepoCapabilityIndex:
             return True
         if is_rich_dependency(s):
             return self._satisfies_rich_dependency(s)
-        primary = rpm_requirement_primary(s) or s
-        return self._leaf_capability_present(primary)
+        name, op, ver = parse_versioned_requirement(s)
+        if name and op is not None and ver is not None:
+            # EVR when we have it. No EVR metadata -> presence only (arch if deps).
+            evrs = self._capability_evrs_for(name)
+            if evrs:
+                return self.satisfies_requirement(s)
+            return self._leaf_capability_present(s)
+        return self._leaf_capability_present(s)
 
     def _satisfies_rich_dependency(self, dep: str) -> bool:
         text = (dep or "").strip()

@@ -73,7 +73,7 @@ def _color_for_action(action: str, details: str | None = None) -> int:
     if action in ("build.chain_plan_failed", "build.chain_failed"):
         return DISCORD_COLOR_FAILED
 
-    if action in ("build.chain_trigger", "build.chain_resume"):
+    if action in ("build.chain_trigger", "build.chain_resume", "build.layer_resume", "build.layer_cancel"):
         return DISCORD_COLOR_INFO
 
     if action in ("package.delete", "account.delete", "release.delete", "mock_env.delete", "schedule.delete"):

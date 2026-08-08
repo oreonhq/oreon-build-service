@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import TYPE_CHECKING, Any
 
 from fastapi import HTTPException, Request, status
@@ -21,6 +22,9 @@ from oreon_build.models import (
 )
 from oreon_build.services.distgit_order import db_safe_spec_evr
 from oreon_build.services.ci_callback import notify_layer_plan_terminal
+
+_RE_UPSTREAM_FAILED = re.compile(r"^upstream\s+(\S+)\s+failed\b", re.IGNORECASE)
+_RE_WAITING_TRAIL = re.compile(r"\s*\([^)]*\)\s*$")
 
 if TYPE_CHECKING:
     from oreon_build.models import Account
@@ -349,6 +353,127 @@ async def cancel_layer_plan_by_user(
     return plan
 
 
+def _blocker_sources_from_reason(reason: str | None) -> list[str]:
+    r = (reason or "").strip()
+    if not r:
+        return []
+    if r.startswith("Layer plan stopped:") or r == "Cancelled by user":
+        return []
+    m = _RE_UPSTREAM_FAILED.match(r)
+    if m:
+        return [m.group(1)]
+    if not r.startswith("waiting on:"):
+        return []
+    rest = r[len("waiting on:") :].strip()
+    out: list[str] = []
+    seen: set[str] = set()
+    for bit in rest.split(","):
+        name = _RE_WAITING_TRAIL.sub("", bit.strip()).strip()
+        if not name or name == "..." or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+async def _replace_job_blockers(db: Any, job_id: int, sources: list[str]) -> None:
+    old_r = await db.execute(select(LayerJobBlocker).where(LayerJobBlocker.build_job_id == job_id))
+    for row in old_r.scalars().all():
+        await db.delete(row)
+    for src in sources:
+        s = (src or "").strip()
+        if s:
+            db.add(LayerJobBlocker(build_job_id=job_id, blocking_source=s))
+
+
+async def resume_layer_plan_by_user(
+    db: Any,
+    request: Request,
+    user: "Account",
+    *,
+    layer_plan_id: int,
+) -> LayerPlan:
+    result = await db.execute(select(LayerPlan).where(LayerPlan.id == layer_plan_id).with_for_update())
+    plan = result.scalar_one_or_none()
+    if not plan:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Layer plan not found")
+    if plan.status not in (LayerPlanStatus.FAILED, LayerPlanStatus.CANCELLED):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Layer plan is {plan.status.value}, resume only works for failed/cancelled",
+        )
+    jobs_r = await db.execute(
+        select(BuildJob)
+        .options(selectinload(BuildJob.package))
+        .where(BuildJob.layer_plan_id == plan.id)
+    )
+    jobs = list(jobs_r.scalars().all())
+    if not jobs:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Layer has no jobs to resume, trigger a new layer instead",
+        )
+
+    by_name: dict[str, list[BuildJob]] = {}
+    for j in jobs:
+        if j.package is None or not j.package.name:
+            continue
+        by_name.setdefault(j.package.name, []).append(j)
+
+    def _source_done(src: str) -> bool:
+        src_jobs = by_name.get(src) or []
+        if not src_jobs:
+            return True
+        return all(x.status in (BuildStatus.SUCCESS, BuildStatus.SKIPPED) for x in src_jobs)
+
+    reopen = [j for j in jobs if j.status in (BuildStatus.FAILED, BuildStatus.CANCELLED)]
+    if not reopen:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Nothing left to resume (no failed/cancelled jobs)",
+        )
+
+    blocker_rows = await db.execute(
+        select(LayerJobBlocker).where(
+            LayerJobBlocker.build_job_id.in_([j.id for j in reopen])
+        )
+    )
+    blockers_by_job: dict[int, list[str]] = {}
+    for row in blocker_rows.scalars().all():
+        blockers_by_job.setdefault(int(row.build_job_id), []).append(row.blocking_source)
+
+    plan.status = LayerPlanStatus.RUNNING
+    plan.error_message = None
+
+    for job in reopen:
+        sources = list(blockers_by_job.get(int(job.id)) or [])
+        if not sources:
+            sources = _blocker_sources_from_reason(job.blocked_reason)
+        still = [s for s in sources if s and not _source_done(s)]
+        job.completed_at = None
+        if still:
+            job.status = BuildStatus.BLOCKED
+            job.blocked_reason = f"waiting on: {', '.join(still[:8])}"[:500]
+            await _replace_job_blockers(db, int(job.id), still)
+        else:
+            job.status = BuildStatus.PENDING
+            job.blocked_reason = None
+            await _replace_job_blockers(db, int(job.id), [])
+
+    await db.flush()
+    await log_audit(
+        db,
+        "build.layer_resume",
+        account_id=user.id,
+        resource_type="layer_plan",
+        resource_id=str(plan.id),
+        details=f"reopened {len(reopen)} job(s)",
+        ip_address=get_client_ip(request),
+        user_agent=get_user_agent(request),
+    )
+    return plan
+
+
 async def maybe_settle_layer_plan(db: Any, layer_plan_id: int) -> None:
     """Mark a plan terminal once every job it owns has reached a terminal state."""
     plan = await db.get(LayerPlan, layer_plan_id, with_for_update=True)
@@ -428,11 +553,9 @@ async def maybe_settle_layer_plan(db: Any, layer_plan_id: int) -> None:
     bits = [f"{n_ok} success", f"{n_fail} failed", f"{n_cancel} cancelled"]
     msg = "Layer finished with failures (" + ", ".join(bits) + ")."
     if primary:
-        msg += " Primary: " + ", ".join(primary[:12])
-        if len(primary) > 12:
-            msg += f" (+{len(primary) - 12} more)"
+        msg += " Primary: " + ", ".join(primary)
     plan.status = LayerPlanStatus.FAILED
-    plan.error_message = msg[:8000]
+    plan.error_message = msg
     notify_layer_plan_terminal(plan.id, LayerPlanStatus.FAILED.value, plan.error_message)
 
 

@@ -243,7 +243,7 @@ def _extract_br_tokens_from_tag_value(value: str) -> list[str]:
     return rpm_requirement_capabilities_from_value(value)
 
 
-def dependency_capabilities(parsed: _SpecParseResult) -> list[str]:
+def _caps_from_raw_and_names(raw_list: list[str], names: list[str]) -> list[str]:
     caps: list[str] = []
     seen: set[str] = set()
 
@@ -254,11 +254,36 @@ def dependency_capabilities(parsed: _SpecParseResult) -> list[str]:
         seen.add(c)
         caps.append(c)
 
-    for raw in list(parsed.build_requires_raw or []) + list(parsed.requires_raw or []):
+    for raw in raw_list:
         for cap in rpm_requirement_tokens_from_value(raw):
             add(cap)
-    for name in parsed.dependency_names():
+    for name in names:
         add(name)
+    return caps
+
+
+def build_dependency_capabilities(parsed: _SpecParseResult) -> list[str]:
+    return _caps_from_raw_and_names(
+        list(parsed.build_requires_raw or []),
+        list(parsed.build_requires or []),
+    )
+
+
+def runtime_dependency_capabilities(parsed: _SpecParseResult) -> list[str]:
+    return _caps_from_raw_and_names(
+        list(parsed.requires_raw or []),
+        list(parsed.requires or []),
+    )
+
+
+def dependency_capabilities(parsed: _SpecParseResult) -> list[str]:
+    caps: list[str] = []
+    seen: set[str] = set()
+    for cap in build_dependency_capabilities(parsed) + runtime_dependency_capabilities(parsed):
+        if cap in seen:
+            continue
+        seen.add(cap)
+        caps.append(cap)
     return caps
 
 

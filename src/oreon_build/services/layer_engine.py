@@ -45,10 +45,12 @@ from oreon_build.services.distgit_order import (
     _fetch_distgit_specs_batch,
     _github_owner_repo_from_git_url,
     _spec_parse_fn,
+    build_dependency_capabilities,
     dependency_capabilities,
     distgit_providers_dict,
     expand_chain_spec_closure_sparse,
     get_distgit_provides_index_cached,
+    runtime_dependency_capabilities,
 )
 from oreon_build.services.layer_plan import get_or_create_package
 from oreon_build.services.repo_capability_index import (
@@ -232,6 +234,64 @@ def _provider_sources_for_miss(
         miss, provider_map=provider_map, repo_index=cap_index, package_names=package_names
     )
     return {s for s in srcs if s and s != pkg}
+
+
+def _provider_sources_for_miss_unfiltered(
+    miss: str,
+    *,
+    pkg: str,
+    provider_map: dict[str, set[str]],
+    package_names: set[str],
+    cap_index: RepoCapabilityIndex,
+) -> set[str]:
+    """Like _provider_sources_for_miss but keep compat pkgs even if EVR series looks wrong.
+
+    Used only after a mock missing-provides failure so we still expand something
+    instead of hard-failing when the version gate is too aggressive.
+    """
+    from oreon_build.core.rpm_requires import requirement_check_capabilities
+    from oreon_build.services.dep_plan.providers import _map_sources, _crate_version_constraints
+
+    raw = (miss or "").strip()
+    out: set[str] = set()
+    # bypass version gate by querying caps without crate version filter
+    for cap in requirement_check_capabilities(raw):
+        for src in _map_sources(provider_map, cap):
+            if src and src != pkg:
+                out.add(src)
+        if cap in package_names and cap != pkg:
+            out.add(cap)
+    # rust-foo heuristic from crate(foo[/feature])
+    for crate, _op, _ver in _crate_version_constraints(raw) or []:
+        for cand in (f"rust-{crate}", crate):
+            if cand in package_names and cand != pkg:
+                out.add(cand)
+    if not out:
+        out = _provider_sources_for_miss(
+            miss,
+            pkg=pkg,
+            provider_map=provider_map,
+            package_names=package_names,
+            cap_index=cap_index,
+        )
+    # also ask providers without going through version filter path
+    if not out:
+        # temporary: providers_for_requirement always filters when constraints present.
+        # pull map hits from crate() leaves only.
+        import re as _re
+
+        for m in _re.finditer(r"crate\(([^)]+)\)", raw):
+            inner = (m.group(1) or "").strip()
+            base = inner.split("/", 1)[0].strip()
+            if not base:
+                continue
+            for cap in (f"crate({inner})", f"crate({base})", f"rust-{base}"):
+                for src in _map_sources(provider_map, cap):
+                    if src and src != pkg:
+                        out.add(src)
+                if cap in package_names and cap != pkg:
+                    out.add(cap)
+    return out
 
 
 def _miss_is_self_provided(
@@ -558,7 +618,7 @@ async def _static_close_dependencies(
                 install_done.add(pkg)
                 progressed = True
                 parsed = parsed_by_source[pkg]
-                brs = [c for c in dependency_capabilities(parsed) if c and "%" not in c]
+                brs = [c for c in build_dependency_capabilities(parsed) if c and "%" not in c]
                 if not brs:
                     unresolved.get(pkg, set()).clear()
                     continue
@@ -1105,7 +1165,7 @@ async def _recheck_job_ready(
     unresolved_caps: set[str] = set()
     leaf_ok: list[str] = []
 
-    for req in dependency_capabilities(parsed):
+    for req in build_dependency_capabilities(parsed):
         if not req or "%" in req:
             continue
         if cap_index.satisfies_requirement(req):
@@ -1119,6 +1179,33 @@ async def _recheck_job_ready(
             cap_index=cap_index,
         ):
             leaf_ok.append(req)
+            continue
+        srcs = _provider_sources_for_miss(
+            req,
+            pkg=pkg_name,
+            provider_map=provider_map,
+            package_names=package_names,
+            cap_index=cap_index,
+        )
+        if srcs:
+            still_missing |= srcs
+        else:
+            hint = _unresolved_hint(req)
+            if hint:
+                unresolved_caps.add(hint)
+
+    for req in runtime_dependency_capabilities(parsed):
+        if not req or "%" in req:
+            continue
+        if cap_index.satisfies_requirement(req):
+            continue
+        if _miss_is_self_provided(
+            req,
+            pkg=pkg_name,
+            provider_map=provider_map,
+            package_names=package_names,
+            cap_index=cap_index,
+        ):
             continue
         srcs = _provider_sources_for_miss(
             req,
@@ -1191,6 +1278,7 @@ async def _recheck_job_ready(
             arches=arches,
             cap_index=cap_index,
             force_build=True,
+            package_names=package_names,
         )
         leftover = still_missing - attached
         if attached:
@@ -1234,6 +1322,7 @@ async def _spawn_layer_dep_sources(
     arches: list[str],
     cap_index: RepoCapabilityIndex | None = None,
     force_build: bool = False,
+    package_names: set[str] | None = None,
 ) -> set[str]:
     """Create/link blocker sources for a job. Returns sources that were attached.
 
@@ -1243,6 +1332,7 @@ async def _spawn_layer_dep_sources(
     from oreon_build.services.distgit_order import _spec_parse_fn
 
     attached: set[str] = set()
+    known_pkgs = set(package_names or ())
     roots = {(r or "").strip() for r in (plan.root_packages or []) if (r or "").strip()}
     parse_fn = _spec_parse_fn(releasename, target_arches={a.lower() for a in arches if a} or None)
     for src in sorted(sources):
@@ -1277,8 +1367,26 @@ async def _spawn_layer_dep_sources(
             src, owner=owner, repo=repo, distgit_branch=distgit_branch, releasename=releasename, headers=headers
         )
         if not spec_check:
-            continue
-        if not force_build and cap_index is not None and src not in roots:
+            if force_build and src in known_pkgs:
+                logger.info(
+                    "layer_plan_id=%s spawn %s refetch missed but package is indexed, creating anyway",
+                    plan.id,
+                    src,
+                )
+            else:
+                logger.warning(
+                    "layer_plan_id=%s spawn skip %s: no distgit spec under %s/",
+                    plan.id,
+                    src,
+                    releasename,
+                )
+                continue
+        if (
+            spec_check
+            and not force_build
+            and cap_index is not None
+            and src not in roots
+        ):
             try:
                 parsed = await asyncio.to_thread(parse_fn, spec_check, f"{src}.spec")
             except Exception:
@@ -1313,6 +1421,12 @@ async def _spawn_layer_dep_sources(
             blocked_reason=None,
         )
         if not new_jobs:
+            logger.warning(
+                "layer_plan_id=%s spawn %s create returned no jobs arches=%s",
+                plan.id,
+                src,
+                arches,
+            )
             continue
         db.add(LayerJobBlocker(build_job_id=job.id, blocking_source=src))
         attached.add(src)
@@ -1392,8 +1506,7 @@ async def try_autofix_layer_missing_provides(
     if job.layer_plan_id is None:
         return False
     misses = parse_missing_provides_from_text(reason)
-    if not misses:
-        misses = await _misses_from_job_build_log(db, job)
+    misses |= await _misses_from_job_build_log(db, job)
     if not misses:
         return False
     plan = await db.get(LayerPlan, job.layer_plan_id, with_for_update=True)
@@ -1402,6 +1515,7 @@ async def try_autofix_layer_missing_provides(
 
     # claim blocked immediately so reconcile wont soft-settle waiters during expand
     prior_status = job.status
+    prior_completed = job.completed_at
     job.status = BuildStatus.BLOCKED
     job.completed_at = None
     job.blocked_reason = "expanding missing provides"
@@ -1409,6 +1523,7 @@ async def try_autofix_layer_missing_provides(
 
     async def _restore_failed() -> None:
         job.status = BuildStatus.FAILED if prior_status == BuildStatus.FAILED else prior_status
+        job.completed_at = prior_completed
         if job.status != BuildStatus.BLOCKED:
             job.blocked_reason = (reason or job.blocked_reason or "")[:500] or job.blocked_reason
         await db.flush()
@@ -1461,8 +1576,9 @@ async def try_autofix_layer_missing_provides(
     sources: set[str] = set()
     unresolved: set[str] = set()
     for miss in sorted(misses):
-        if cap_index.satisfies_requirement(miss):
-            continue
+        # mock already said this cap is missing in the real install root.
+        # never trust cap_index.satisfies here (stale unions / weak EVR matching
+        # have skipped rust-anstream/nom7/etc and left the layer dead).
         srcs = _provider_sources_for_miss(
             miss,
             pkg=pkg_name,
@@ -1470,6 +1586,16 @@ async def try_autofix_layer_missing_provides(
             package_names=package_names,
             cap_index=cap_index,
         )
+        if not srcs:
+            # version filter may have dropped every compat pkg; still try plain
+            # rust-<crate> / indexed providers without EVR gate for autofix.
+            srcs = _provider_sources_for_miss_unfiltered(
+                miss,
+                pkg=pkg_name,
+                provider_map=provider_map,
+                package_names=package_names,
+                cap_index=cap_index,
+            )
         if srcs:
             sources |= srcs
         else:
@@ -1478,6 +1604,12 @@ async def try_autofix_layer_missing_provides(
                 unresolved.add(hint)
 
     if not sources:
+        logger.info(
+            "layer_plan_id=%s job_id=%s autofix found misses=%s but no distgit providers",
+            job.layer_plan_id,
+            job.id,
+            sorted(misses)[:8],
+        )
         await _restore_failed()
         return False
 
@@ -1500,8 +1632,15 @@ async def try_autofix_layer_missing_provides(
         arches=arches,
         cap_index=cap_index,
         force_build=True,
+        package_names=package_names,
     )
     if not attached:
+        logger.info(
+            "layer_plan_id=%s job_id=%s autofix providers=%s but spawn attached nothing",
+            plan.id,
+            job.id,
+            sorted(sources)[:12],
+        )
         await _restore_failed()
         return False
 
