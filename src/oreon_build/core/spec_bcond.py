@@ -500,10 +500,12 @@ def parse_spec_bconds(
         if not active():
             continue
 
-        if s.upper().startswith("NAME:"):
-            val = (s.split(":", 1)[1] or "").strip()
+        tag = s.split(":", 1)[0].strip().upper() if ":" in s else ""
+        if tag in {"NAME", "VERSION", "RELEASE", "EPOCH"}:
+            raw_val = (s.split(":", 1)[1] or "").strip()
+            val = _expand_br_macros(raw_val, macros)
             if val and "%" not in val:
-                macros["name"] = val
+                macros[tag.lower()] = val
             continue
         br_m = _RE_BR_LINE.match(s)
         req_m = _RE_REQ_LINE.match(s)
