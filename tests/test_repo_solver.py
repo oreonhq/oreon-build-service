@@ -37,6 +37,15 @@ def test_parse_no_match_argument() -> None:
     )
 
 
+def test_parse_no_matching_package_to_install() -> None:
+    from oreon_build.services.repo_solver import parse_depsolve_missing
+
+    assert parse_depsolve_missing(
+        "No matching package to install: 'python3-matplotlib'\n"
+        "Not all dependencies satisfied\n"
+    ) == {"python3-matplotlib"}
+
+
 def test_multiarch_exclusive_ok_when_present_on_some_arch() -> None:
     from oreon_build.services.repo_solver import (
         MultiArchRepoSolver,

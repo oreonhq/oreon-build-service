@@ -12,6 +12,7 @@ from oreon_build.models import (
     LayerPlan,
     LayerPlanStatus,
     Package,
+    Release,
 )
 from oreon_build.services.distgit_order import _SpecParseResult
 from oreon_build.services.layer_engine import (
@@ -20,6 +21,7 @@ from oreon_build.services.layer_engine import (
     _filter_build_set,
     _recheck_job_ready,
     _revive_upstream_cancelled_dependents,
+    _spawn_layer_dep_sources,
     _static_close_dependencies,
     break_dep_cycles,
     cascade_fail_dependents,
@@ -28,6 +30,7 @@ from oreon_build.services.layer_engine import (
     initial_job_status,
     on_package_published,
     parse_missing_provides_from_text,
+    prune_unneeded_layer_sources,
     resolve_layer_blocker_cycles,
     try_autofix_layer_missing_provides,
 )
@@ -177,6 +180,18 @@ Problem 2: nothing provides requested (crate(rayon/default) >= 1.10.0 with crate
     assert any("rayon" in c for c in got)
 
 
+def test_parse_missing_provides_no_matching_package_to_install():
+    text = """
+No matches found for the following disable plugin patterns: local, spacewalk, versionlock
+Last metadata expiration check: 0:00:28 ago on Sat Aug  8 18:02:43 2026.
+No matching package to install: 'python3-matplotlib'
+Not all dependencies satisfied
+Error: Some packages could not be found.
+"""
+    got = parse_missing_provides_from_text(text)
+    assert got == {"python3-matplotlib"}
+
+
 @pytest.mark.asyncio
 async def test_static_close_skips_evr_current_transitive_provider():
     """Repo already has provider at >= distgit EVR: do not enqueue rebuild."""
@@ -286,8 +301,8 @@ async def test_static_close_skips_runtime_requires_already_in_repo():
 
 
 @pytest.mark.asyncio
-async def test_static_close_expands_missing_runtime_requires():
-    """Missing runtime Requires expand the provider so install-time still works."""
+async def test_static_close_does_not_expand_missing_runtime_requires():
+    """Runtime Requires do not pull new packages into the build set."""
     parsed = {
         "or11-backgrounds": _SpecParseResult(
             source_name="or11-backgrounds",
@@ -334,10 +349,172 @@ async def test_static_close_expands_missing_runtime_requires():
             **_close_kwargs(),
         )
 
-    assert known == {"or11-backgrounds", "xfdesktop"}
-    assert deps.get("or11-backgrounds") == {"xfdesktop"}
+    assert known == {"or11-backgrounds"}
+    assert "xfdesktop" not in known
+    assert deps.get("or11-backgrounds", set()) == set()
     assert errors == []
-    assert unresolved.get("or11-backgrounds", set()) == set()
+
+
+@pytest.mark.asyncio
+async def test_static_close_orders_runtime_requires_inside_build_set():
+    """Runtime Requires only order packages already selected for build."""
+    parsed = {
+        "or11-backgrounds": _SpecParseResult(
+            source_name="or11-backgrounds",
+            build_requires=["make"],
+            provided_binary_names={"or11-backgrounds"},
+            build_requires_raw=["make"],
+            requires=["oreon-wallpapers"],
+            requires_raw=["oreon-wallpapers"],
+        ),
+        "oreon-wallpapers": _SpecParseResult(
+            source_name="oreon-wallpapers",
+            build_requires=[],
+            provided_binary_names={"oreon-wallpapers"},
+            build_requires_raw=[],
+        ),
+    }
+    cap_index = _index_with(provides={"make"}, source_names=set())
+
+    with patch(
+        "oreon_build.services.layer_engine.get_distgit_provides_index_cached",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "oreon_build.services.layer_engine.expand_chain_spec_closure_sparse",
+        new=AsyncMock(return_value=({"or11-backgrounds": "a", "oreon-wallpapers": "b"}, parsed, [])),
+    ), patch(
+        "oreon_build.services.layer_engine.providers_for_requirement",
+        return_value={"oreon-wallpapers"},
+    ), patch(
+        "oreon_build.services.layer_engine.get_repo_solver",
+        return_value=_ok_solver(),
+    ):
+        deps, known, errors, unresolved = await _static_close_dependencies(
+            ["or11-backgrounds", "oreon-wallpapers"],
+            cap_index=cap_index,
+            **_close_kwargs(),
+        )
+
+    assert known == {"or11-backgrounds", "oreon-wallpapers"}
+    assert deps.get("or11-backgrounds") == {"oreon-wallpapers"}
+    assert errors == []
+
+
+@pytest.mark.asyncio
+async def test_static_close_pulls_versioned_unsatisfied_br_provider():
+    parsed = {
+        "kf6-baloo": _SpecParseResult(
+            source_name="kf6-baloo",
+            build_requires=["extra-cmake-modules >= 6.28.0"],
+            provided_binary_names={"kf6-baloo"},
+            build_requires_raw=["extra-cmake-modules >= 6.28.0"],
+            version="6.28.0",
+            release="1",
+        ),
+        "extra-cmake-modules": _SpecParseResult(
+            source_name="extra-cmake-modules",
+            build_requires=[],
+            provided_binary_names={"extra-cmake-modules"},
+            build_requires_raw=[],
+            version="6.28.0",
+            release="1",
+        ),
+    }
+    cap_index = RepoCapabilityIndex(
+        source_names={"extra-cmake-modules"},
+        binary_names={"extra-cmake-modules"},
+        provides={"extra-cmake-modules"},
+        capability_evrs={"extra-cmake-modules": [("0", "6.27.0", "1.or11")]},
+        binary_source={"extra-cmake-modules": "extra-cmake-modules"},
+    )
+    cap_index.finalize_lookups()
+
+    with patch(
+        "oreon_build.services.layer_engine.get_distgit_provides_index_cached",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "oreon_build.services.layer_engine.expand_chain_spec_closure_sparse",
+        new=AsyncMock(return_value=({"kf6-baloo": "a", "extra-cmake-modules": "b"}, parsed, [])),
+    ), patch(
+        "oreon_build.services.layer_engine.providers_for_requirement",
+        return_value={"extra-cmake-modules"},
+    ), patch(
+        "oreon_build.services.layer_engine.get_repo_solver",
+        return_value=_ok_solver(),
+    ):
+        deps, known, errors, unresolved = await _static_close_dependencies(
+            ["kf6-baloo"],
+            cap_index=cap_index,
+            **_close_kwargs(),
+        )
+
+    assert "extra-cmake-modules" in known
+    assert deps.get("kf6-baloo") == {"extra-cmake-modules"}
+    assert errors == []
+
+
+def test_leaf_br_edges_prefer_repo_for_satisfied_gcc():
+    from oreon_build.services.layer_engine import _add_leaf_br_edges
+
+    parsed = _SpecParseResult(
+        source_name="kf6-kauth",
+        build_requires=["gcc-c++", "extra-cmake-modules >= 6.28.0"],
+        provided_binary_names={"kf6-kauth"},
+        build_requires_raw=["gcc-c++", "extra-cmake-modules >= 6.28.0"],
+        version="6.28.0",
+        release="1",
+    )
+    gcc = _SpecParseResult(
+        source_name="gcc",
+        build_requires=[],
+        provided_binary_names={"gcc", "gcc-c++"},
+        version="16.1.1",
+        release="2",
+    )
+    ecm = _SpecParseResult(
+        source_name="extra-cmake-modules",
+        build_requires=[],
+        provided_binary_names={"extra-cmake-modules"},
+        version="6.28.0",
+        release="1",
+    )
+    cap_index = RepoCapabilityIndex(
+        source_names={"gcc", "extra-cmake-modules"},
+        binary_names={"gcc", "gcc-c++", "extra-cmake-modules"},
+        provides={"gcc", "gcc-c++", "extra-cmake-modules"},
+        capability_providers={
+            "gcc": {"gcc"},
+            "gcc-c++": {"gcc"},
+            "extra-cmake-modules": {"extra-cmake-modules"},
+        },
+        capability_evrs={
+            "gcc": [("0", "16.1.0", "1.or11")],
+            "gcc-c++": [("0", "16.1.0", "1.or11")],
+            "extra-cmake-modules": [("0", "6.27.0", "1.or11")],
+        },
+        binary_source={
+            "gcc": "gcc",
+            "gcc-c++": "gcc",
+            "extra-cmake-modules": "extra-cmake-modules",
+        },
+    )
+    cap_index.finalize_lookups()
+    deps: dict[str, set[str]] = {}
+    _add_leaf_br_edges(
+        deps,
+        "kf6-kauth",
+        parsed,
+        provider_map={
+            "gcc": {"gcc"},
+            "gcc-c++": {"gcc"},
+            "extra-cmake-modules": {"extra-cmake-modules"},
+        },
+        package_names={"gcc", "extra-cmake-modules", "kf6-kauth"},
+        cap_index=cap_index,
+        parsed_by_source={"kf6-kauth": parsed, "gcc": gcc, "extra-cmake-modules": ecm},
+    )
+    assert "gcc" not in deps.get("kf6-kauth", set())
+    assert deps.get("kf6-kauth") == {"extra-cmake-modules"}
 
 
 def test_filter_build_set_keeps_root_drops_evr_current():
@@ -522,9 +699,17 @@ async def test_autofix_still_expands_when_cap_index_lies_about_satisfied():
             return_value={"rust-askalono"},
         ),
         patch(
+            "oreon_build.services.layer_engine._planned_source_names",
+            new=AsyncMock(return_value={"rust-askalono", "rust-askalono-cli"}),
+        ),
+        patch(
             "oreon_build.services.layer_engine._spawn_layer_dep_sources",
             new=AsyncMock(return_value={"rust-askalono"}),
         ) as spawn,
+        patch(
+            "oreon_build.services.layer_engine._source_statuses_in_plan",
+            new=AsyncMock(return_value={"rust-askalono": [BuildStatus.QUEUED]}),
+        ),
         patch(
             "oreon_build.services.layer_engine.resolve_layer_blocker_cycles",
             new=AsyncMock(return_value=0),
@@ -532,6 +717,10 @@ async def test_autofix_still_expands_when_cap_index_lies_about_satisfied():
         patch(
             "oreon_build.services.layer_engine._revive_upstream_cancelled_dependents",
             new=AsyncMock(return_value=0),
+        ),
+        patch(
+            "oreon_build.services.layer_engine.prune_unneeded_layer_sources",
+            new=AsyncMock(return_value=set()),
         ),
     ):
         ok = await try_autofix_layer_missing_provides(
@@ -629,9 +818,13 @@ async def test_autofix_uses_job_arch_not_plan_arch_intersection():
             return_value=set(),
         ),
         patch(
-            "oreon_build.services.layer_engine._spawn_layer_dep_sources",
+            "oreon_build.services.layer_engine._planned_source_names",
             new=AsyncMock(return_value=set()),
-        ) as spawn,
+        ) as planned,
+        patch(
+            "oreon_build.services.layer_engine._link_planned_dep_sources",
+            new=AsyncMock(return_value=set()),
+        ) as link,
     ):
         ok = await try_autofix_layer_missing_provides(
             _DB(),
@@ -640,7 +833,8 @@ async def test_autofix_uses_job_arch_not_plan_arch_intersection():
             package_name="rust-askalono-cli",
         )
     assert ok is False
-    spawn.assert_not_called()
+    planned.assert_not_called()
+    link.assert_not_called()
     assert load_idx.call_args.args[2] == ["x86_64"]
 
 
@@ -773,6 +967,10 @@ async def test_recheck_job_ready_queues_when_all_deps_resolved():
             "oreon_build.services.layer_engine._resolve_install_holes",
             return_value=(set(), set()),
         ),
+        patch(
+            "oreon_build.services.layer_engine.prune_unneeded_layer_sources",
+            new=AsyncMock(return_value=set()),
+        ),
     ):
         await _recheck_job_ready(
             db,
@@ -817,8 +1015,24 @@ async def test_recheck_job_ready_stays_blocked_on_static_hole():
             return_value=(set(), set()),
         ),
         patch(
-            "oreon_build.services.layer_engine._spawn_layer_dep_sources",
+            "oreon_build.services.layer_engine._planned_source_names",
+            new=AsyncMock(return_value={"libbar", "topapp"}),
+        ),
+        patch(
+            "oreon_build.services.layer_engine._link_planned_dep_sources",
             new=AsyncMock(return_value={"libbar"}),
+        ),
+        patch(
+            "oreon_build.services.layer_engine._source_statuses_in_plan",
+            new=AsyncMock(return_value={"libbar": [BuildStatus.QUEUED]}),
+        ),
+        patch(
+            "oreon_build.services.layer_engine.resolve_layer_blocker_cycles",
+            new=AsyncMock(return_value=0),
+        ),
+        patch(
+            "oreon_build.services.layer_engine.prune_unneeded_layer_sources",
+            new=AsyncMock(return_value=set()),
         ),
     ):
         await _recheck_job_ready(
@@ -867,10 +1081,7 @@ async def test_on_package_published_noop_when_no_blockers_registered():
 
         return _Ctx()
 
-    with (
-        patch("oreon_build.services.layer_engine.clear_repo_capability_cache"),
-        patch("oreon_build.db.session.async_session_maker", side_effect=_session_cm),
-    ):
+    with patch("oreon_build.db.session.async_session_maker", side_effect=_session_cm):
         await on_package_published("libbar", "oreon-11")
 
 
@@ -910,12 +1121,12 @@ async def test_cheap_unblock_does_not_cancel_when_blocker_only_failed():
             sql = str(stmt).lower()
             if "blocking_source" in sql and "layer_job_blockers" in sql:
                 result.all.return_value = [("rust-askalono",)]
-                # some dialects return rows as tuples from .all on selected columns
-                if "build_job_id" not in sql:
-                    result.all.return_value = [("rust-askalono",)]
                 result.scalars.return_value.all.return_value = []
                 return result
-            # status lookup for blocker package
+            if "packages.name" in sql or "package.name" in sql or "name" in sql:
+                result.all.return_value = [("rust-askalono", BuildStatus.FAILED)]
+                result.scalars.return_value.all.return_value = []
+                return result
             result.all.return_value = [(BuildStatus.FAILED,)]
             result.scalars.return_value.all.return_value = []
             return result
@@ -941,6 +1152,176 @@ async def test_cheap_unblock_does_not_cancel_when_blocker_only_failed():
     assert changed is False
     assert job.status == BuildStatus.BLOCKED
     cascade.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cheap_unblock_stops_missing_provides_thrash():
+    job = MagicMock()
+    job.id = 55
+    job.package_id = 20
+    job.status = BuildStatus.BLOCKED
+    job.blocked_reason = "waiting on: rust-smawk"
+    job.completed_at = None
+    deleted: list[Any] = []
+
+    class _DB:
+        async def execute(self, stmt):
+            result = MagicMock()
+            sql = str(stmt).lower()
+            if "blocking_source" in sql and "layer_job_blockers" in sql:
+                result.all.return_value = [("rust-smawk",)]
+                result.scalars.return_value.all.return_value = [MagicMock()]
+                return result
+            if "error_message" in sql or "build_attempts" in sql:
+                miss = "No matching package to install: 'crate(smawk)'"
+                result.all.return_value = [
+                    (miss, BuildStatus.FAILED),
+                    (miss, BuildStatus.FAILED),
+                    (miss, BuildStatus.FAILED),
+                ]
+                return result
+            result.all.return_value = [("rust-smawk", BuildStatus.SUCCESS)]
+            result.scalars.return_value.all.return_value = []
+            return result
+
+        async def delete(self, obj):
+            deleted.append(obj)
+
+        async def flush(self):
+            return None
+
+    changed = await _cheap_unblock_if_blockers_done(_DB(), job, 1122)
+    assert changed is True
+    assert job.status == BuildStatus.FAILED
+    assert "still missing after providers built" in (job.blocked_reason or "")
+    assert deleted
+
+
+@pytest.mark.asyncio
+async def test_autofix_hard_fails_when_providers_already_built():
+    job = MagicMock()
+    job.id = 77
+    job.layer_plan_id = 1122
+    job.release_id = 1
+    job.package_id = 9
+    job.branch = "plasma-6.7.4"
+    job.status = BuildStatus.FAILED
+    job.completed_at = None
+    job.blocked_reason = None
+    job.target_id = None
+
+    plan = MagicMock()
+    plan.id = 1122
+    plan.status = LayerPlanStatus.RUNNING
+    plan.plan_options = {
+        "distgit_url": "https://github.com/oreonhq/rpm-specfiles.git",
+        "distgit_branch": "testing/post-beta",
+        "architectures": ["x86_64"],
+    }
+    plan.root_packages = []
+    plan.triggered_by_id = None
+
+    release = MagicMock()
+    release.id = 1
+    release.releasename = "oreon-11-rp1"
+
+    class _DB:
+        async def get(self, model, ident, **kw):
+            if model is LayerPlan:
+                return plan
+            if model is Release:
+                return release
+            if model is Package:
+                return Package(name="rust-textwrap")
+            return None
+
+        async def execute(self, stmt):
+            result = MagicMock()
+            sql = str(stmt).lower()
+            if "layer_job_blockers" in sql:
+                result.scalars.return_value.all.return_value = []
+                result.all.return_value = []
+                return result
+            if "packages.name" in sql or ("name" in sql and "status" in sql):
+                result.all.return_value = [("rust-smawk", BuildStatus.SUCCESS)]
+                return result
+            result.scalars.return_value.all.return_value = []
+            result.all.return_value = []
+            return result
+
+        async def delete(self, obj):
+            return None
+
+        async def flush(self):
+            return None
+
+        def add(self, obj):
+            return None
+
+    with (
+        patch(
+            "oreon_build.services.layer_engine.parse_missing_provides_from_text",
+            return_value={"crate(smawk)"},
+        ),
+        patch(
+            "oreon_build.services.layer_engine._misses_from_job_build_log",
+            new=AsyncMock(return_value=set()),
+        ),
+        patch(
+            "oreon_build.services.layer_engine._github_headers",
+            return_value={},
+        ),
+        patch(
+            "oreon_build.services.layer_engine.get_distgit_provides_index_cached",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "oreon_build.services.layer_engine.load_repo_capability_index",
+            return_value=_index_with(),
+        ),
+        patch(
+            "oreon_build.services.layer_engine._provider_sources_for_miss",
+            return_value={"rust-smawk"},
+        ),
+        patch(
+            "oreon_build.services.layer_engine._provider_sources_for_miss_unfiltered",
+            return_value={"rust-smawk"},
+        ),
+        patch(
+            "oreon_build.services.layer_engine._planned_source_names",
+            new=AsyncMock(return_value={"rust-smawk", "rust-textwrap"}),
+        ),
+        patch(
+            "oreon_build.services.layer_engine._spawn_layer_dep_sources",
+            new=AsyncMock(return_value={"rust-smawk"}),
+        ),
+        patch(
+            "oreon_build.services.layer_engine._source_statuses_in_plan",
+            new=AsyncMock(return_value={"rust-smawk": [BuildStatus.SUCCESS]}),
+        ),
+        patch(
+            "oreon_build.services.layer_engine.resolve_layer_blocker_cycles",
+            new=AsyncMock(return_value=0),
+        ),
+        patch(
+            "oreon_build.services.layer_engine._revive_upstream_cancelled_dependents",
+            new=AsyncMock(),
+        ),
+        patch(
+            "oreon_build.services.layer_engine.prune_unneeded_layer_sources",
+            new=AsyncMock(return_value=set()),
+        ),
+    ):
+        handled = await try_autofix_layer_missing_provides(
+            _DB(),
+            job,
+            "No matching package to install: 'crate(smawk)'",
+            package_name="rust-textwrap",
+        )
+
+    assert handled is False
+    assert job.status == BuildStatus.FAILED
+    assert "still missing after providers built" in (job.blocked_reason or "")
 
 
 @pytest.mark.asyncio
@@ -1392,6 +1773,10 @@ async def test_settle_keeps_running_after_cycle_break_queues_work():
             "oreon_build.services.layer_engine.finalize_blocked_on_dead_upstreams",
             new=AsyncMock(return_value=0),
         ),
+        patch(
+            "oreon_build.services.layer_engine.finalize_idle_blocked_jobs",
+            new=AsyncMock(return_value=0),
+        ),
         patch("oreon_build.services.layer_plan.notify_layer_plan_terminal") as notify,
     ):
         from oreon_build.services.layer_plan import maybe_settle_layer_plan
@@ -1456,6 +1841,10 @@ async def test_settle_finalizes_blocked_on_failed_then_fails_plan():
             "oreon_build.services.layer_engine.finalize_blocked_on_dead_upstreams",
             new=AsyncMock(return_value=1),
         ),
+        patch(
+            "oreon_build.services.layer_engine.finalize_idle_blocked_jobs",
+            new=AsyncMock(return_value=0),
+        ),
         patch("oreon_build.services.layer_plan.notify_layer_plan_terminal") as notify,
     ):
         from oreon_build.services.layer_plan import maybe_settle_layer_plan
@@ -1465,6 +1854,61 @@ async def test_settle_finalizes_blocked_on_failed_then_fails_plan():
     assert plan.status == LayerPlanStatus.FAILED
     assert "Primary: rust-winnow" in (plan.error_message or "")
     notify.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_finalize_idle_blocked_fails_cannot_resolve_and_cancels_waiters():
+    from oreon_build.services.layer_engine import finalize_idle_blocked_jobs
+
+    leaf = MagicMock()
+    leaf.id = 1
+    leaf.status = BuildStatus.BLOCKED
+    leaf.blocked_reason = "cannot resolve: cmake3 (import into distgit)"
+    leaf.completed_at = None
+
+    waiter = MagicMock()
+    waiter.id = 2
+    waiter.status = BuildStatus.BLOCKED
+    waiter.blocked_reason = "waiting on: kf5-kcoreaddons"
+    waiter.completed_at = None
+
+    class _DB:
+        async def scalar(self, stmt):
+            return 0
+
+        async def execute(self, stmt):
+            result = MagicMock()
+            sql = str(stmt).lower()
+            if "layer_job_blockers" in sql:
+                result.all.return_value = []
+                result.scalars.return_value.all.return_value = []
+                return result
+            still = [j for j in (leaf, waiter) if j.status == BuildStatus.BLOCKED]
+            result.scalars.return_value.all.return_value = still
+            return result
+
+        async def flush(self):
+            return None
+
+        async def delete(self, obj):
+            return None
+
+    with (
+        patch(
+            "oreon_build.services.layer_engine._cheap_unblock_if_blockers_done",
+            new=AsyncMock(return_value=False),
+        ),
+        patch(
+            "oreon_build.services.layer_engine.finalize_blocked_on_dead_upstreams",
+            new=AsyncMock(return_value=0),
+        ),
+    ):
+        n = await finalize_idle_blocked_jobs(_DB(), 1126)
+
+    assert n >= 2
+    assert leaf.status == BuildStatus.FAILED
+    assert waiter.status == BuildStatus.CANCELLED
+    assert "layer idle" in (waiter.blocked_reason or "")
 
 
 @pytest.mark.asyncio
@@ -1527,7 +1971,6 @@ async def test_autofix_missing_provides_reblocks_instead_of_halt():
             return None
 
     db = _DB()
-    new_job = MagicMock(id=99)
 
     with (
         patch("oreon_build.services.layer_engine.get_distgit_provides_index_cached", new=AsyncMock(return_value=None)),
@@ -1538,19 +1981,34 @@ async def test_autofix_missing_provides_reblocks_instead_of_halt():
             return_value={"rust-askalono"},
         ),
         patch(
-            "oreon_build.services.layer_engine._refetch_spec_text",
-            new=AsyncMock(return_value="Name: rust-askalono\nVersion: 0.5.0\nRelease: 1\n"),
+            "oreon_build.services.layer_engine._planned_source_names",
+            new=AsyncMock(return_value={"rust-askalono", "rust-askalono-cli"}),
         ),
         patch(
-            "oreon_build.services.layer_engine._create_job_for_package",
-            new=AsyncMock(return_value=[new_job]),
+            "oreon_build.services.layer_engine._spawn_layer_dep_sources",
+            new=AsyncMock(return_value={"rust-askalono"}),
+        ),
+        patch(
+            "oreon_build.services.layer_engine._source_statuses_in_plan",
+            new=AsyncMock(return_value={"rust-askalono": [BuildStatus.QUEUED]}),
+        ),
+        patch(
+            "oreon_build.services.layer_engine.resolve_layer_blocker_cycles",
+            new=AsyncMock(return_value=0),
+        ),
+        patch(
+            "oreon_build.services.layer_engine._revive_upstream_cancelled_dependents",
+            new=AsyncMock(return_value=0),
         ),
         patch(
             "oreon_build.services.layer_engine.release_distgit_branch",
             return_value="main",
         ),
+        patch(
+            "oreon_build.services.layer_engine.prune_unneeded_layer_sources",
+            new=AsyncMock(return_value=set()),
+        ),
     ):
-        # Release model lookup uses oreon_build.models.Release
         from oreon_build.models import Release as ReleaseModel
 
         async def _get(model, ident, **kw):
@@ -1645,7 +2103,6 @@ async def test_autofix_reads_r2_log_when_error_message_was_head_truncated():
         "## mock fluff\n" * 200
         + "Problem 1: nothing provides requested (crate(askalono/default) >= 0.5.0 with crate(askalono/default) < 0.6.0~)\n"
     ).encode()
-    new_job = MagicMock(id=100)
 
     with (
         patch("oreon_build.services.layer_engine.get_distgit_provides_index_cached", new=AsyncMock(return_value=None)),
@@ -1656,14 +2113,30 @@ async def test_autofix_reads_r2_log_when_error_message_was_head_truncated():
             return_value={"rust-askalono"},
         ),
         patch(
-            "oreon_build.services.layer_engine._refetch_spec_text",
-            new=AsyncMock(return_value="Name: rust-askalono\n"),
+            "oreon_build.services.layer_engine._planned_source_names",
+            new=AsyncMock(return_value={"rust-askalono", "rust-askalono-cli"}),
         ),
         patch(
-            "oreon_build.services.layer_engine._create_job_for_package",
-            new=AsyncMock(return_value=[new_job]),
+            "oreon_build.services.layer_engine._spawn_layer_dep_sources",
+            new=AsyncMock(return_value={"rust-askalono"}),
+        ),
+        patch(
+            "oreon_build.services.layer_engine._source_statuses_in_plan",
+            new=AsyncMock(return_value={"rust-askalono": [BuildStatus.QUEUED]}),
+        ),
+        patch(
+            "oreon_build.services.layer_engine.resolve_layer_blocker_cycles",
+            new=AsyncMock(return_value=0),
+        ),
+        patch(
+            "oreon_build.services.layer_engine._revive_upstream_cancelled_dependents",
+            new=AsyncMock(return_value=0),
         ),
         patch("oreon_build.services.layer_engine.release_distgit_branch", return_value="main"),
+        patch(
+            "oreon_build.services.layer_engine.prune_unneeded_layer_sources",
+            new=AsyncMock(return_value=set()),
+        ),
         patch("oreon_build.services.r2.get_r2_client") as r2_cls,
     ):
         r2_cls.return_value.get_object.return_value = log
@@ -1678,3 +2151,524 @@ async def test_autofix_reads_r2_log_when_error_message_was_head_truncated():
     assert job.status == BuildStatus.BLOCKED
     assert job.completed_at is None
     assert "rust-askalono" in (job.blocked_reason or "")
+
+
+def test_filter_providers_drops_mingw_for_native_consumer():
+    from oreon_build.services.dep_plan.providers import (
+        filter_providers_for_consumer,
+        is_toolchainish_source,
+        narrow_alternate_providers,
+    )
+
+    got = filter_providers_for_consumer(
+        "extra-cmake-modules",
+        {"qt6-qtbase", "mingw-qt6-qtbase"},
+    )
+    assert got == {"qt6-qtbase"}
+    mingw = filter_providers_for_consumer(
+        "mingw-qt6-qtdeclarative",
+        {"qt6-qtbase", "mingw-qt6-qtbase"},
+    )
+    assert mingw == {"mingw-qt6-qtbase"}
+    assert narrow_alternate_providers(
+        "ghc",
+        {"ghc", "ghc8.10", "ghc9.0", "ghc9.4", "ghc9.6"},
+    ) == {"ghc"}
+    assert is_toolchainish_source("ghc")
+    assert is_toolchainish_source("ghc-base")
+    assert is_toolchainish_source("ghc9.4")
+    assert not is_toolchainish_source("qt6-qtbase")
+
+
+def test_toolchain_any_arch_skips_ghc_libs():
+    from oreon_build.services.layer_engine import (
+        _source_needs_build,
+        _toolchain_any_arch_satisfied,
+    )
+
+    idx = RepoCapabilityIndex()
+    idx.source_names_any.add("ghc-base")
+    idx.binary_names_any.add("ghc-base-devel")
+    idx.capability_providers["ghc-base-devel"] = {"ghc-base"}
+    idx.finalize_lookups()
+    assert _toolchain_any_arch_satisfied(
+        idx, "ghc-base-devel", {"ghc-base"}
+    )
+    assert not _source_needs_build(
+        "ghc-base",
+        cap_index=idx,
+        require_evr=True,
+    )
+
+
+def test_should_seed_blocks_foreign_compiler_stacks():
+    from oreon_build.services.dep_plan.providers import (
+        filter_providers_for_consumer,
+        should_seed_providers,
+    )
+
+    assert not should_seed_providers("yt-dlp", "pandoc", {"pandoc-cli"})
+    assert not should_seed_providers("openjpeg", "mingw32-lcms2", {"mingw-lcms2"})
+    assert should_seed_providers("pandoc-cli", "ghc-base-devel", {"ghc-base"})
+    assert should_seed_providers("mingw-openjpeg", "mingw32-lcms2", {"mingw-lcms2"})
+    assert should_seed_providers("kf6-kconfig", "cmake(Qt6Core)", {"qt6-qtbase"})
+    assert should_seed_providers("plasma-workspace", "cln-devel", {"cln"})
+    assert filter_providers_for_consumer(
+        "fast_float",
+        {"doctest", "ghc-doctest"},
+    ) == {"doctest"}
+
+
+def test_provider_sources_for_miss_filters_mingw():
+    from oreon_build.services.layer_engine import _provider_sources_for_miss
+
+    idx = RepoCapabilityIndex()
+    idx.finalize_lookups()
+    pm = {
+        "cmake(Qt6Core)": {"qt6-qtbase", "mingw-qt6-qtbase"},
+        "__lower__": {"cmake(qt6core)": {"qt6-qtbase", "mingw-qt6-qtbase"}},
+    }
+    got = _provider_sources_for_miss(
+        "cmake(Qt6Core)",
+        pkg="extra-cmake-modules",
+        provider_map=pm,
+        package_names={"qt6-qtbase", "mingw-qt6-qtbase", "extra-cmake-modules"},
+        cap_index=idx,
+    )
+    assert got == {"qt6-qtbase"}
+
+
+@pytest.mark.asyncio
+async def test_autofix_spawns_provider_not_in_layer():
+    job = MagicMock()
+    job.id = 88
+    job.layer_plan_id = 1124
+    job.release_id = 1
+    job.package_id = 9
+    job.branch = "plasma-6.7.4"
+    job.status = BuildStatus.FAILED
+    job.completed_at = None
+    job.blocked_reason = None
+    job.target_id = None
+    job.layer_index = 3
+
+    plan = MagicMock()
+    plan.id = 1124
+    plan.status = LayerPlanStatus.RUNNING
+    plan.plan_options = {
+        "distgit_url": "https://github.com/oreonhq/rpm-specfiles.git",
+        "distgit_branch": "testing/post-beta",
+        "architectures": ["x86_64"],
+    }
+    plan.root_packages = ["plasma-workspace"]
+    plan.triggered_by_id = None
+    release = MagicMock()
+    release.id = 1
+    release.releasename = "oreon-11-rp1"
+
+    class _DB:
+        async def get(self, model, ident, **kw):
+            if model is LayerPlan:
+                return plan
+            if model is Release:
+                return release
+            if model is Package:
+                return Package(name="plasma-workspace")
+            return None
+
+        async def execute(self, stmt):
+            result = MagicMock()
+            result.scalars.return_value.all.return_value = []
+            result.all.return_value = []
+            return result
+
+        async def flush(self):
+            return None
+
+        def add(self, obj):
+            return None
+
+    with (
+        patch(
+            "oreon_build.services.layer_engine.parse_missing_provides_from_text",
+            return_value={"cln-devel"},
+        ),
+        patch(
+            "oreon_build.services.layer_engine._misses_from_job_build_log",
+            new=AsyncMock(return_value=set()),
+        ),
+        patch("oreon_build.services.layer_engine._github_headers", return_value={}),
+        patch(
+            "oreon_build.services.layer_engine.get_distgit_provides_index_cached",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "oreon_build.services.layer_engine.load_repo_capability_index",
+            return_value=_index_with(),
+        ),
+        patch(
+            "oreon_build.services.layer_engine._provider_sources_for_miss",
+            return_value={"cln"},
+        ),
+        patch(
+            "oreon_build.services.layer_engine._capability_arches_for_job",
+            new=AsyncMock(return_value=["x86_64"]),
+        ),
+        patch(
+            "oreon_build.services.layer_engine._planned_source_names",
+            new=AsyncMock(return_value={"plasma-workspace"}),
+        ),
+        patch(
+            "oreon_build.services.layer_engine._spawn_layer_dep_sources",
+            new=AsyncMock(return_value={"cln"}),
+        ) as spawn,
+        patch(
+            "oreon_build.services.layer_engine._source_statuses_in_plan",
+            new=AsyncMock(return_value={"cln": [BuildStatus.QUEUED]}),
+        ),
+        patch(
+            "oreon_build.services.layer_engine.resolve_layer_blocker_cycles",
+            new=AsyncMock(return_value=0),
+        ),
+        patch(
+            "oreon_build.services.layer_engine._revive_upstream_cancelled_dependents",
+            new=AsyncMock(return_value=0),
+        ),
+    ):
+        handled = await try_autofix_layer_missing_provides(
+            _DB(),
+            job,
+            "nothing provides cln-devel needed by libqalculate-devel",
+            package_name="plasma-workspace",
+        )
+
+    assert handled is True
+    assert job.status == BuildStatus.BLOCKED
+    assert "cln" in (job.blocked_reason or "")
+    spawn.assert_awaited_once()
+    assert spawn.await_args.kwargs.get("arches") == ["x86_64"]
+    assert spawn.await_args.kwargs.get("sources") == {"cln"}
+    assert spawn.await_args.kwargs.get("force_build") is False
+
+
+def test_soft_retryable_blocker_reason_ignores_mock_logs():
+    from oreon_build.services.layer_engine import _soft_retryable_blocker_reason
+
+    assert _soft_retryable_blocker_reason("waiting on: cln") is True
+    assert _soft_retryable_blocker_reason("expanding missing provides") is True
+    assert (
+        _soft_retryable_blocker_reason(
+            "nothing provides mingw32-libcharset needed by freexl-devel"
+        )
+        is False
+    )
+    assert _soft_retryable_blocker_reason("## mock additional repos\nnothing provides foo") is False
+
+
+@pytest.mark.asyncio
+async def test_autofix_thrash_stop_skips_expand():
+    job = MagicMock()
+    job.id = 50644
+    job.layer_plan_id = 1124
+    job.release_id = 1
+    job.package_id = 9
+    job.branch = "plasma-6.7.4"
+    job.status = BuildStatus.FAILED
+    job.completed_at = None
+    job.blocked_reason = None
+
+    class _DB:
+        async def get(self, model, ident, **kw):
+            return None
+
+        async def execute(self, stmt):
+            result = MagicMock()
+            miss = "No matching package to install: 'python3-pytest-xdist'"
+            result.all.return_value = [
+                (miss, BuildStatus.FAILED),
+                (miss, BuildStatus.FAILED),
+                (miss, BuildStatus.FAILED),
+            ]
+            result.scalars.return_value.all.return_value = []
+            return result
+
+        async def flush(self):
+            return None
+
+        def add(self, obj):
+            return None
+
+        async def delete(self, obj):
+            return None
+
+    with (
+        patch(
+            "oreon_build.services.layer_engine.parse_missing_provides_from_text",
+            return_value={"python3-pytest-xdist"},
+        ),
+        patch(
+            "oreon_build.services.layer_engine._misses_from_job_build_log",
+            new=AsyncMock(return_value=set()),
+        ),
+    ):
+        handled = await try_autofix_layer_missing_provides(
+            _DB(),
+            job,
+            "nothing provides python3-pytest-xdist",
+            package_name="linkchecker",
+        )
+
+    assert handled is False
+    assert job.status == BuildStatus.FAILED
+    assert "thrash stop" in (job.blocked_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_spawn_fills_missing_plan_arches():
+    job = MagicMock()
+    job.id = 51097
+    job.layer_plan_id = 1124
+    job.branch = "plasma-6.7.4"
+    job.layer_index = 3
+
+    plan = MagicMock()
+    plan.id = 1124
+    plan.root_packages = ["plasma-workspace"]
+    plan.plan_options = {
+        "distgit_url": "https://github.com/oreonhq/rpm-specfiles.git",
+        "preferred_mock_environment_id": None,
+        "priority": 0,
+    }
+    plan.triggered_by_id = None
+    plan.side_tag_id = 1
+
+    release = MagicMock()
+    release.id = 1
+    release.releasename = "oreon-11-rp1"
+    release.default_mock_environment_id = None
+
+    existing = MagicMock()
+    existing.id = 51168
+    existing.target_id = 10
+    existing.status = BuildStatus.RUNNING
+    existing.blocked_reason = None
+
+    x86 = MagicMock()
+    x86.architecture = "x86_64"
+    created: list[list[str]] = []
+    added: list[Any] = []
+
+    class _DB:
+        async def get(self, model, ident, **kw):
+            if model is BuildTarget and ident == 10:
+                return x86
+            return None
+
+        async def execute(self, stmt):
+            result = MagicMock()
+            result.scalars.return_value.all.return_value = [existing]
+            result.all.return_value = []
+            return result
+
+        async def flush(self):
+            return None
+
+        def add(self, obj):
+            added.append(obj)
+
+    async def _create(*args, **kwargs):
+        created.append(list(kwargs.get("architectures") or []))
+        nj = MagicMock()
+        nj.id = 999
+        return [nj]
+
+    with (
+        patch(
+            "oreon_build.services.layer_engine._refetch_spec_text",
+            new=AsyncMock(return_value="Name: cln\n"),
+        ),
+        patch(
+            "oreon_build.services.layer_engine._create_job_for_package",
+            new=_create,
+        ),
+        patch(
+            "oreon_build.services.distgit_order._spec_parse_fn",
+            return_value=lambda text, name: _SpecParseResult(
+                name="cln", epoch=0, version="1.3", release="1.or11"
+            ),
+        ),
+    ):
+        attached = await _spawn_layer_dep_sources(
+            _DB(),
+            job,
+            plan=plan,
+            release=release,
+            sources={"cln"},
+            owner="oreonhq",
+            repo="rpm-specfiles",
+            distgit_branch="testing/post-beta",
+            releasename="oreon-11-rp1",
+            headers={},
+            arches=["x86_64", "aarch64"],
+            force_build=True,
+            package_names={"cln"},
+        )
+
+    assert attached == {"cln"}
+    assert created == [["aarch64"]]
+    assert any(isinstance(x, LayerJobBlocker) for x in added)
+
+
+@pytest.mark.asyncio
+async def test_prune_unneeded_drops_orphan_non_root():
+    plan = MagicMock()
+    plan.id = 1126
+    plan.root_packages = ["plasma-workspace"]
+
+    root = MagicMock()
+    root.id = 1
+    root.status = BuildStatus.BLOCKED
+    root.blocked_reason = "waiting on: kf6-kconfig"
+    root.package = Package(name="plasma-workspace")
+    root.completed_at = None
+
+    orphan = MagicMock()
+    orphan.id = 2
+    orphan.status = BuildStatus.PENDING
+    orphan.blocked_reason = None
+    orphan.package = Package(name="kactivities")
+    orphan.completed_at = None
+
+    kept_dep = MagicMock()
+    kept_dep.id = 3
+    kept_dep.status = BuildStatus.QUEUED
+    kept_dep.blocked_reason = None
+    kept_dep.package = Package(name="kf6-kconfig")
+    kept_dep.completed_at = None
+
+    jobs = [root, orphan, kept_dep]
+    blockers = [LayerJobBlocker(build_job_id=1, blocking_source="kf6-kconfig")]
+
+    class _DB:
+        async def execute(self, stmt):
+            result = MagicMock()
+            sql = str(stmt).lower()
+            if "layer_job_blockers" in sql:
+                result.all.return_value = [("kf6-kconfig",)]
+                result.scalars.return_value.all.return_value = []
+                return result
+            # open job ids
+            if "build_jobs.id" in sql or sql.strip().startswith("select build_jobs.id"):
+                result.scalars.return_value.all.return_value = [1, 3]
+                return result
+            # jobs for a package name
+            result.scalars.return_value.all.return_value = [
+                j for j in jobs if j.status != BuildStatus.SKIPPED or j is root
+            ]
+            # better: return by matching package from remaining
+            if "kactivities" in sql or True:
+                # return whatever still matches candidates query - filter in python
+                pass
+            return result
+
+        async def flush(self):
+            return None
+
+        async def delete(self, obj):
+            if obj in blockers:
+                blockers.remove(obj)
+
+    async def _exec(self, stmt):
+        return await _DB.execute(self, stmt)
+
+    class _DB2(_DB):
+        async def execute(self, stmt):
+            result = MagicMock()
+            sql = str(stmt).lower()
+            if "layer_job_blockers" in sql and "blocking_source" in sql:
+                result.all.return_value = [("kf6-kconfig",)]
+                result.scalars.return_value.all.return_value = []
+                return result
+            if "layer_job_blockers" in sql:
+                result.scalars.return_value.all.return_value = []
+                result.all.return_value = []
+                return result
+            # open ids query
+            if ".id" in sql and "status" in sql and "package" not in sql:
+                result.scalars.return_value.all.return_value = [
+                    j.id for j in (root, orphan, kept_dep) if j.status in (
+                        BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.BLOCKED, BuildStatus.RUNNING
+                    )
+                ]
+                return result
+            # package jobs query
+            result.scalars.return_value.all.return_value = [
+                j for j in (root, orphan, kept_dep)
+                if j.package and (
+                    ("kactivities" in sql and j.package.name == "kactivities")
+                    or ("kf6-kconfig" in sql and j.package.name == "kf6-kconfig")
+                    or j.package.name in sql
+                )
+            ]
+            # fallback: sqlalchemy params often hide name; return both candidates' jobs
+            if not result.scalars.return_value.all.return_value:
+                # called per candidate name via join - can't see bind param easily
+                # return based on call order via side effect below
+                pass
+            return result
+
+    calls = {"n": 0}
+
+    class _DB3:
+        async def execute(self, stmt):
+            result = MagicMock()
+            sql = str(stmt).lower()
+            if "layer_job_blockers" in sql and "blocking_source" in sql and "build_job_id" in sql:
+                result.all.return_value = [("kf6-kconfig",)]
+                result.scalars.return_value.all.return_value = []
+                return result
+            if "layer_job_blockers" in sql:
+                result.scalars.return_value.all.return_value = []
+                result.all.return_value = []
+                return result
+            if "package.name" in sql or "packages.name" in sql:
+                calls["n"] += 1
+                # first candidate alphabetically is kactivities, then kf6-kconfig
+                result.scalars.return_value.all.return_value = (
+                    [orphan] if calls["n"] == 1 else [kept_dep]
+                )
+                return result
+            # open ids
+            result.scalars.return_value.all.return_value = [1, 2, 3]
+            return result
+
+        async def flush(self):
+            return None
+
+        async def delete(self, obj):
+            if obj in blockers:
+                blockers.remove(obj)
+
+    with patch(
+        "oreon_build.services.layer_plan._cancel_job_and_running_attempts",
+        new=AsyncMock(),
+    ) as cancel:
+        pruned = await prune_unneeded_layer_sources(
+            _DB3(), plan, candidates={"kactivities", "kf6-kconfig"}
+        )
+
+    assert pruned == {"kactivities"}
+    assert orphan.status == BuildStatus.SKIPPED
+    assert "pruned:" in (orphan.blocked_reason or "")
+    assert root.status == BuildStatus.BLOCKED
+    assert kept_dep.status == BuildStatus.QUEUED
+    cancel.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_prune_noop_without_candidates():
+    plan = MagicMock()
+    plan.id = 1
+    plan.root_packages = ["root"]
+    assert await prune_unneeded_layer_sources(MagicMock(), plan) == set()
+    assert await prune_unneeded_layer_sources(MagicMock(), plan, candidates=set()) == set()

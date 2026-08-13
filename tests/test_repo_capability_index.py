@@ -244,6 +244,40 @@ def test_ingest_filelists_adds_path_provides() -> None:
     assert "python3" in idx.capability_providers["/usr/bin/python3"]
 
 
+def test_load_arch_metadata_skips_filelists_by_default(monkeypatch) -> None:
+    from oreon_build.services import repo_capability_index as rci
+
+    calls: list[str] = []
+
+    class _R2:
+        def get_object(self, key):
+            if key.endswith("repomd.xml"):
+                return b"<repomd/>"
+            return None
+
+    monkeypatch.setattr(rci, "get_r2_client", lambda: _R2())
+    monkeypatch.setattr(rci, "_resolve_repodata_key", lambda *a, **k: "primary.xml.gz")
+    monkeypatch.setattr(
+        rci,
+        "_fetch_repodata_blob",
+        lambda *a, **k: calls.append("fetch") or b"<metadata/>",
+    )
+    monkeypatch.setattr(rci, "_decompress_if_needed", lambda raw, key: raw)
+    monkeypatch.setattr(
+        rci,
+        "_ingest_primary_xml",
+        lambda idx, xml: idx.provides.add("pkgconfig(foo)"),
+    )
+
+    def _boom(*a, **k):
+        raise AssertionError("filelists must not be ingested by default")
+
+    monkeypatch.setattr(rci, "_ingest_filelists_xml", _boom)
+    monkeypatch.setattr(rci, "_INCLUDE_FILELISTS", False)
+    idx = rci._load_arch_metadata("oreon-11-rp1", "testing", "x86_64")
+    assert "pkgconfig(foo)" in idx.provides
+
+
 def test_collect_ignores_satisfied_caps() -> None:
     from oreon_build.services.distgit_order import _collect_repo_transitive_candidates, _parse_spec_text
 

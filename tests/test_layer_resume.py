@@ -86,7 +86,7 @@ async def test_resume_reopens_failed_and_reblocks_waiters():
     req = MagicMock()
 
     with patch("oreon_build.services.layer_plan.log_audit", new=AsyncMock()):
-        out = await resume_layer_plan_by_user(db, req, user, layer_plan_id=42)
+        out, reopen_ids = await resume_layer_plan_by_user(db, req, user, layer_plan_id=42)
 
     assert out.status == LayerPlanStatus.RUNNING
     assert out.error_message is None
@@ -97,6 +97,7 @@ async def test_resume_reopens_failed_and_reblocks_waiters():
     assert "libfail" in (wait_job.blocked_reason or "")
     assert ok_job.status == BuildStatus.SUCCESS
     assert any(getattr(a, "blocking_source", None) == "libfail" for a in db.added)
+    assert set(reopen_ids) == {2, 3}
 
 
 @pytest.mark.asyncio

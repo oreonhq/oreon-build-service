@@ -457,6 +457,21 @@ Name: mingw-hunspell
     assert "mingw64(libhunspell-1.7-0.dll)" in provided
 
 
+def test_lightweight_mingw_sysroot_does_not_emit_host_cmake_or_pkgconfig() -> None:
+    mingw = """
+Name: mingw-qt6-qtbase
+Version: 6.7.4
+%files -n mingw64-qt6-qtbase
+%{mingw64_libdir}/cmake/Qt6Core/Qt6CoreConfig.cmake
+%{mingw64_libdir}/pkgconfig/Qt6Core.pc
+%{mingw64_bindir}/libQt6Core.dll
+"""
+    provided = _lightweight_provides_from_spec_text("mingw-qt6-qtbase", mingw)
+    assert "cmake(Qt6Core)" not in provided
+    assert "pkgconfig(Qt6Core)" not in provided
+    assert "mingw64(libQt6Core.dll)" in provided
+
+
 def test_perl_metacpan_dist_maps_unprefixed_dpkg() -> None:
     from oreon_build.services.perl_resolve import distgit_sources_for_perl_module
 

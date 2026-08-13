@@ -389,3 +389,19 @@ BuildRequires: udisks2-devel
     assert "hal-devel" in active_build_brs(info, {})
     assert "hal-devel" not in active_build_brs(info, {"hal": "0"})
     assert "udisks2-devel" in active_build_brs(info, {})
+
+
+def test_version_macro_expands_in_buildrequires() -> None:
+    spec = """
+%global framework baloo
+Name: kf6-%{framework}
+Version: 6.28.0
+Release: 1
+BuildRequires: extra-cmake-modules >= %{version}
+BuildRequires: cmake(KF6Config)
+"""
+    info = parse_spec_bconds(spec)
+    assert info.macros.get("version") == "6.28.0"
+    assert info.macros.get("name") == "kf6-baloo"
+    assert "extra-cmake-modules >= 6.28.0" in info.unconditional_brs
+    assert "extra-cmake-modules >= %{version}" not in info.unconditional_brs
