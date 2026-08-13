@@ -522,39 +522,38 @@ async def list_layer_plans(
 async def _layer_plan_to_status_response(db: DbSession, plan) -> LayerPlanStatusResponse:
     await db.refresh(plan)
     rel = await db.get(Release, plan.release_id)
-    from oreon_build.models import LayerJobBlocker, SideTag
+    from oreon_build.models import SideTag
+    from sqlalchemy import func
+
+    counts_r = await db.execute(
+        select(BuildJob.status, func.count(BuildJob.id))
+        .where(BuildJob.layer_plan_id == plan.id)
+        .group_by(BuildJob.status)
+    )
+    counts: dict[str, int] = {st.value: int(n) for st, n in counts_r.all()}
 
     jobs_r = await db.execute(
         select(BuildJob)
         .options(selectinload(BuildJob.package), selectinload(BuildJob.build_target))
-        .where(BuildJob.layer_plan_id == plan.id)
+        .where(
+            BuildJob.layer_plan_id == plan.id,
+            BuildJob.status == BuildStatus.FAILED,
+        )
         .order_by(BuildJob.layer_index.asc().nulls_last(), BuildJob.id.asc())
     )
     jobs = list(jobs_r.scalars().all())
-    blockers_r = await db.execute(
-        select(LayerJobBlocker.build_job_id, LayerJobBlocker.blocking_source).where(
-            LayerJobBlocker.build_job_id.in_([j.id for j in jobs])
-        )
-    )
-    blocked_on: dict[int, list[str]] = {}
-    for job_id, src in blockers_r.all():
-        blocked_on.setdefault(int(job_id), []).append(str(src))
-
     rows = [
         LayerJobRow(
             job_id=j.id,
             package_name=j.package.name if j.package else "?",
             status=j.status.value,
             layer_index=j.layer_index,
-            blocked_reason=j.blocked_reason,
+            blocked_reason=None,
             architecture=j.build_target.architecture if j.build_target else None,
-            blocked_on=sorted(set(blocked_on.get(j.id, []))),
+            blocked_on=[],
         )
         for j in jobs
     ]
-    counts: dict[str, int] = {}
-    for j in jobs:
-        counts[j.status.value] = counts.get(j.status.value, 0) + 1
 
     side_tag = await db.get(SideTag, plan.side_tag_id) if plan.side_tag_id else None
     return LayerPlanStatusResponse(
@@ -600,10 +599,14 @@ async def resume_layer_build_endpoint(
     db: DbSession,
     user: CurrentUser,
 ):
+    from oreon_build.services.build_trigger_bg import schedule_layer_resume_refresh
     from oreon_build.services.layer_plan import resume_layer_plan_by_user
 
-    plan = await resume_layer_plan_by_user(db, request, user, layer_plan_id=layer_plan_id)
+    plan, reopen_ids = await resume_layer_plan_by_user(
+        db, request, user, layer_plan_id=layer_plan_id
+    )
     await db.commit()
+    schedule_layer_resume_refresh(int(plan.id), reopen_ids)
     return await _layer_plan_to_status_response(db, plan)
 
 
