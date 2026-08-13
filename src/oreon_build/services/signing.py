@@ -219,6 +219,43 @@ def should_apply_pesign_to_rpm(rpm_path: Path, settings: Optional[PesignConfig] 
     arch = (parts[1].strip() if len(parts) > 1 else "") or "noarch"
     return resolve_pesign_nickname(name, arch, s) is not None
 
+def secureboot_uki_cer_filename(arch: str) -> str:
+    return f"secureboot-uki-{_norm_arch(arch)}.cer"
+
+
+def package_wants_secureboot_uki_cer(package_name: str) -> bool:
+    n = (package_name or "").strip().lower()
+    return n == "kernel" or n.startswith("kernel-")
+
+
+def export_nss_cert_der(nss_dir: str, nickname: str, dest: Path) -> None:
+    nss = (nss_dir or "").strip()
+    nick = (nickname or "").strip()
+    if not nss or not nick:
+        raise PesignRepackError("nss dir and certificate nickname required to export UKI cer")
+    if not shutil.which("certutil"):
+        raise PesignRepackError("certutil not found on PATH; install nss-tools to export UKI cer")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env.setdefault("LC_ALL", "C.UTF-8")
+    env["NSS_DEFAULT_DB_TYPE"] = "sql"
+    result = subprocess.run(
+        ["certutil", "-L", "-d", f"sql:{nss}", "-n", nick, "-r"],
+        capture_output=True,
+        env=env,
+    )
+    if result.returncode != 0:
+        err = (result.stderr or b"").decode("utf-8", "replace").strip()
+        raise PesignRepackError(
+            f"certutil export failed for nick={nick!r} nss={nss!r}: {err or '(no output)'}"
+        )
+    der = result.stdout or b""
+    if len(der) < 32:
+        raise PesignRepackError(f"certutil export for nick={nick!r} produced empty/short DER")
+    dest.write_bytes(der)
+    dest.chmod(0o600)
+
+
 _PESIGN_TREE_SCRIPT = r"""#!/usr/bin/env bash
 set -euo pipefail
 NSS_DEFAULT_DB_TYPE="${NSS_DEFAULT_DB_TYPE:-sql}"
@@ -244,9 +281,36 @@ _pesign_one() {
   pesign "${args[@]}"
   mv -f "$tmp" "$f"
 }
+_inject_uki_cer() {
+  [[ -n "${OREON_SECUREBOOT_UKI_CER:-}" ]] || return 0
+  [[ -f "${OREON_SECUREBOOT_UKI_CER}" ]] || {
+    echo "OREON_SECUREBOOT_UKI_CER missing: ${OREON_SECUREBOOT_UKI_CER}" >&2
+    return 1
+  }
+  local arch="${OREON_SECUREBOOT_UKI_ARCH:-}"
+  [[ -n "$arch" ]] || {
+    echo "OREON_SECUREBOOT_UKI_ARCH unset" >&2
+    return 1
+  }
+  local dest_name="secureboot-uki-${arch}.cer"
+  local found=0
+  local d
+  shopt -s nullglob
+  for d in usr/share/doc/kernel-keys/*/ ./usr/share/doc/kernel-keys/*/; do
+    [[ -d "$d" ]] || continue
+    found=1
+    cp -f -- "${OREON_SECUREBOOT_UKI_CER}" "${d}${dest_name}"
+    chmod 0644 "${d}${dest_name}"
+  done
+  shopt -u nullglob
+  if [[ "$found" -eq 0 ]]; then
+    echo "no usr/share/doc/kernel-keys/* to install ${dest_name}" >&2
+  fi
+}
 while IFS= read -r -d '' f; do
   _pesign_one "$f"
 done < <(find . -type f -print0)
+_inject_uki_cer
 """
 
 def pesign_rpm_if_configured(rpm_path: Path, settings: Optional[PesignConfig] = None) -> bool:
@@ -279,6 +343,7 @@ def pesign_rpm_if_configured(rpm_path: Path, settings: Optional[PesignConfig] = 
     setarch_wrapper = Path(tmp_root) / "setarch"
     out_dir = Path(tmp_root) / "out"
     rb_tmp = Path(tmp_root) / "rpmrebuild"
+    uki_cer_path = Path(tmp_root) / secureboot_uki_cer_filename(pkg_arch)
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
         rb_tmp.mkdir(parents=True, exist_ok=True)
@@ -294,6 +359,16 @@ def pesign_rpm_if_configured(rpm_path: Path, settings: Optional[PesignConfig] = 
             env["PESIGN_TOKEN"] = s.pesign_token
         env["RPMREBUILD_TMPDIR"] = str(rb_tmp)
         env["RPM_BUILD_ARCH"] = pkg_arch
+        if package_wants_secureboot_uki_cer(pkg_name):
+            try:
+                export_nss_cert_der(s.pesign_nss_dir, cert_nick, uki_cer_path)
+            except PesignRepackError as exc:
+                logger.error("secureboot UKI cer export failed for %s: %s", rpm_path.name, exc)
+                if s.pesign_strict or cross_aarch64:
+                    raise
+                return False
+            env["OREON_SECUREBOOT_UKI_CER"] = str(uki_cer_path)
+            env["OREON_SECUREBOOT_UKI_ARCH"] = pkg_arch
         real_setarch = shutil.which("setarch") or "/usr/bin/setarch"
         setarch_wrapper.write_text(
             "\n".join(
@@ -407,11 +482,19 @@ def pesign_rpm_if_configured(rpm_path: Path, settings: Optional[PesignConfig] = 
                 built[0].name,
             )
         shutil.copyfile(built[0], rpm_path)
-        logger.info(
-            "pesign payload signing (rpmrebuild) completed for %s (cert=%s)",
-            rpm_path.name,
-            cert_nick,
-        )
+        if env.get("OREON_SECUREBOOT_UKI_CER"):
+            logger.info(
+                "pesign payload signing (rpmrebuild) completed for %s (cert=%s, uki_cer=%s)",
+                rpm_path.name,
+                cert_nick,
+                secureboot_uki_cer_filename(pkg_arch),
+            )
+        else:
+            logger.info(
+                "pesign payload signing (rpmrebuild) completed for %s (cert=%s)",
+                rpm_path.name,
+                cert_nick,
+            )
         return True
     except PesignRepackError:
         raise

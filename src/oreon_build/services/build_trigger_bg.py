@@ -157,3 +157,32 @@ async def run_layer_seed(plan_id: int) -> None:
                     logger.exception(
                         "background layer seed cleanup failed layer_plan_id=%s", plan_id
                     )
+
+
+async def run_layer_resume_refresh(plan_id: int, job_ids: list[int]) -> None:
+    """Re-parse resumed blocked jobs then prune deps the specs no longer need."""
+    from oreon_build.models import LayerPlan, LayerPlanStatus
+    from oreon_build.services.layer_engine import refresh_blocked_jobs_for_prune
+
+    async with async_session_maker() as db:
+        try:
+            plan = await db.get(LayerPlan, int(plan_id))
+            if plan is None or plan.status != LayerPlanStatus.RUNNING:
+                return
+            n = await refresh_blocked_jobs_for_prune(db, plan, job_ids=list(job_ids or []))
+            # recheck already prunes sources dropped from blockers
+            await db.commit()
+            logger.info(
+                "background layer resume refresh layer_plan_id=%s refreshed=%s",
+                plan_id,
+                n,
+            )
+        except Exception:
+            await db.rollback()
+            logger.exception(
+                "background layer resume refresh failed layer_plan_id=%s", plan_id
+            )
+
+
+def schedule_layer_resume_refresh(plan_id: int, job_ids: list[int]) -> None:
+    spawn(run_layer_resume_refresh(int(plan_id), list(job_ids or [])))

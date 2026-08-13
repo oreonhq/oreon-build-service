@@ -37,16 +37,24 @@ from oreon_build.models import (
     Worker,
 )
 from oreon_build.services.build_pass import apply_plan_to_job_options
+from oreon_build.core.rpm_requires import (
+    is_chain_plan_requirement,
+)
 from oreon_build.services.build_target_util import get_or_create_build_target, resolve_mock_environment_id
 from oreon_build.services.dep_plan.install_oracle import InstallOracle, overlay_from_nodes
 from oreon_build.services.dep_plan.order import topo_layers
-from oreon_build.services.dep_plan.providers import providers_for_requirement
+from oreon_build.services.dep_plan.providers import (
+    filter_providers_for_consumer,
+    is_toolchainish_source,
+    narrow_alternate_providers,
+    should_seed_providers,
+    providers_for_requirement,
+)
 from oreon_build.services.distgit_order import (
     _fetch_distgit_specs_batch,
     _github_owner_repo_from_git_url,
     _spec_parse_fn,
     build_dependency_capabilities,
-    dependency_capabilities,
     distgit_providers_dict,
     expand_chain_spec_closure_sparse,
     get_distgit_provides_index_cached,
@@ -55,7 +63,6 @@ from oreon_build.services.distgit_order import (
 from oreon_build.services.layer_plan import get_or_create_package
 from oreon_build.services.repo_capability_index import (
     RepoCapabilityIndex,
-    clear_repo_capability_cache,
     default_capability_extra_branches,
     load_repo_capability_index,
 )
@@ -76,14 +83,27 @@ _RE_NOTHING_PROVIDES = re.compile(
     r"nothing provides\s+(?P<cap>.+?)(?:\s+needed by\s|\s*$)",
     re.IGNORECASE,
 )
+_RE_NO_MATCHING_PACKAGE = re.compile(
+    r"No matching package to install:\s*['\"]?(?P<cap>[^'\"\n]+?)['\"]?\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_RE_NO_MATCH_FOR_ARGUMENT = re.compile(
+    r"No match for argument:\s*(?P<cap>.+)$",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 def parse_missing_provides_from_text(text: str) -> set[str]:
     out: set[str] = set()
     raw = text or ""
-    for cre in (_RE_NOTHING_PROVIDES_REQUESTED, _RE_NOTHING_PROVIDES):
+    for cre in (
+        _RE_NOTHING_PROVIDES_REQUESTED,
+        _RE_NOTHING_PROVIDES,
+        _RE_NO_MATCHING_PACKAGE,
+        _RE_NO_MATCH_FOR_ARGUMENT,
+    ):
         for m in cre.finditer(raw):
-            cap = (m.group("cap") or "").strip()
+            cap = (m.group("cap") or "").strip().rstrip(".")
             if cap and "%" not in cap:
                 out.add(cap)
     return out
@@ -233,7 +253,9 @@ def _provider_sources_for_miss(
     srcs = providers_for_requirement(
         miss, provider_map=provider_map, repo_index=cap_index, package_names=package_names
     )
-    return {s for s in srcs if s and s != pkg}
+    srcs = {s for s in srcs if s and s != pkg}
+    srcs = filter_providers_for_consumer(pkg, srcs)
+    return narrow_alternate_providers(miss, srcs)
 
 
 def _provider_sources_for_miss_unfiltered(
@@ -274,10 +296,7 @@ def _provider_sources_for_miss_unfiltered(
             package_names=package_names,
             cap_index=cap_index,
         )
-    # also ask providers without going through version filter path
     if not out:
-        # temporary: providers_for_requirement always filters when constraints present.
-        # pull map hits from crate() leaves only.
         import re as _re
 
         for m in _re.finditer(r"crate\(([^)]+)\)", raw):
@@ -291,7 +310,8 @@ def _provider_sources_for_miss_unfiltered(
                         out.add(src)
                 if cap in package_names and cap != pkg:
                     out.add(cap)
-    return out
+    out = filter_providers_for_consumer(pkg, out)
+    return narrow_alternate_providers(miss, out)
 
 
 def _miss_is_self_provided(
@@ -331,12 +351,18 @@ def _source_needs_build(
 
     require_evr=True for unmet-capability providers: only skip when distgit EVR is
     known and repo is already >= that EVR. Presence alone is not enough (arch holes).
+    Toolchain/haskell stacks use any-arch presence so dual-arch ExclusiveArch holes
+    do not rebuild the whole compiler universe into a shared build set.
     """
     n = (name or "").strip()
     if not n:
         return False
     if always_build and n in always_build:
         return True
+    if is_toolchainish_source(n) and getattr(
+        cap_index, "source_present_in_repo", lambda _n: False
+    )(n):
+        return False
     parsed = (parsed_by_source or {}).get(n)
     if parsed is not None:
         epoch, version, release = _parsed_evr(parsed)
@@ -367,8 +393,8 @@ def _add_leaf_br_edges(
     parsed_by_source: dict[str, Any] | None = None,
     always_build: set[str] | None = None,
 ) -> None:
-    for req in dependency_capabilities(parsed):
-        if cap_index.satisfies_requirement(req):
+    for req in build_dependency_capabilities(parsed):
+        if not is_chain_plan_requirement(req):
             continue
         if _miss_is_self_provided(
             req, pkg=pkg, provider_map=provider_map, package_names=package_names, cap_index=cap_index
@@ -377,6 +403,14 @@ def _add_leaf_br_edges(
         srcs = _provider_sources_for_miss(
             req, pkg=pkg, provider_map=provider_map, package_names=package_names, cap_index=cap_index
         )
+        if not should_seed_providers(pkg, req, srcs):
+            continue
+        if cap_index.satisfies_requirement(req):
+            continue
+        elif not srcs:
+            continue
+        elif _toolchain_any_arch_satisfied(cap_index, req, srcs):
+            continue
         for s in srcs:
             if not _source_needs_build(
                 s,
@@ -387,6 +421,55 @@ def _add_leaf_br_edges(
             ):
                 continue
             deps.setdefault(pkg, set()).add(s)
+
+
+def _toolchain_any_arch_satisfied(
+    cap_index: RepoCapabilityIndex, req: str, srcs: set[str]
+) -> bool:
+    """Dual-arch ExclusiveArch toolchains: present on some arch, do not rebuild all."""
+    from oreon_build.core.rpm_requires import requirement_check_capabilities
+
+    if not srcs:
+        return False
+    if not all(is_toolchainish_source(s) for s in srcs):
+        return False
+    for cap in requirement_check_capabilities(req):
+        if getattr(cap_index, "has_capability_any_arch", lambda _c: False)(cap):
+            return True
+    for s in srcs:
+        if getattr(cap_index, "source_present_in_repo", lambda _n: False)(s):
+            return True
+    return False
+
+
+def _add_runtime_order_edges(
+    deps: dict[str, set[str]],
+    build_set: set[str],
+    parsed_by_source: dict[str, Any],
+    *,
+    provider_map: dict[str, set[str]],
+    package_names: set[str],
+    cap_index: RepoCapabilityIndex,
+) -> None:
+    for pkg in list(build_set):
+        parsed = parsed_by_source.get(pkg)
+        if parsed is None:
+            continue
+        for req in runtime_dependency_capabilities(parsed):
+            if not is_chain_plan_requirement(req):
+                continue
+            if cap_index.satisfies_requirement(req):
+                continue
+            if _miss_is_self_provided(
+                req, pkg=pkg, provider_map=provider_map, package_names=package_names, cap_index=cap_index
+            ):
+                continue
+            srcs = _provider_sources_for_miss(
+                req, pkg=pkg, provider_map=provider_map, package_names=package_names, cap_index=cap_index
+            )
+            for s in srcs:
+                if s in build_set and s != pkg:
+                    deps.setdefault(pkg, set()).add(s)
 
 
 def _overlay_nodes_for_parsed(
@@ -560,6 +643,8 @@ async def _static_close_dependencies(
         def _fold_misses(pkg: str, misses: set[str], to_fetch: set[str]) -> set[str]:
             pkg_unres: set[str] = set()
             for miss in sorted(misses):
+                if not is_chain_plan_requirement(miss):
+                    continue
                 if cap_index.satisfies_requirement(miss):
                     continue
                 if _miss_is_self_provided(
@@ -577,6 +662,13 @@ async def _static_close_dependencies(
                     package_names=package_names,
                     cap_index=cap_index,
                 )
+                if not should_seed_providers(pkg, miss, srcs):
+                    hint = _unresolved_hint(miss)
+                    if hint:
+                        pkg_unres.add(hint)
+                    continue
+                if _toolchain_any_arch_satisfied(cap_index, miss, srcs):
+                    continue
                 kept: set[str] = set()
                 for s in srcs:
                     if not _source_needs_build(
@@ -660,6 +752,14 @@ async def _static_close_dependencies(
 
     deps, build_set, unresolved = _filter_build_set(
         roots, deps, parsed_by_source, unresolved, cap_index
+    )
+    _add_runtime_order_edges(
+        deps,
+        build_set,
+        parsed_by_source,
+        provider_map=provider_map,
+        package_names=package_names,
+        cap_index=cap_index,
     )
     return deps, build_set, errors, unresolved
 
@@ -1128,8 +1228,13 @@ async def _recheck_job_ready(
     releasename: str,
     headers: dict[str, str],
     target_arches: set[str] | None,
+    prune: bool = True,
 ) -> None:
-    """Re-verify one blocked job against the fresh repo state."""
+    """Re-verify one blocked job against the fresh repo state.
+
+    prune=False for bulk resume refresh. Requeueing hundreds of waiters then
+    pruning "nobody waits on this" cascades and nukes the whole mid-layer stack.
+    """
     from oreon_build.core.rpm_requires import merge_provider_maps
 
     pkg = await db.get(Package, job.package_id)
@@ -1166,7 +1271,7 @@ async def _recheck_job_ready(
     leaf_ok: list[str] = []
 
     for req in build_dependency_capabilities(parsed):
-        if not req or "%" in req:
+        if not req or "%" in req or not is_chain_plan_requirement(req):
             continue
         if cap_index.satisfies_requirement(req):
             leaf_ok.append(req)
@@ -1179,33 +1284,6 @@ async def _recheck_job_ready(
             cap_index=cap_index,
         ):
             leaf_ok.append(req)
-            continue
-        srcs = _provider_sources_for_miss(
-            req,
-            pkg=pkg_name,
-            provider_map=provider_map,
-            package_names=package_names,
-            cap_index=cap_index,
-        )
-        if srcs:
-            still_missing |= srcs
-        else:
-            hint = _unresolved_hint(req)
-            if hint:
-                unresolved_caps.add(hint)
-
-    for req in runtime_dependency_capabilities(parsed):
-        if not req or "%" in req:
-            continue
-        if cap_index.satisfies_requirement(req):
-            continue
-        if _miss_is_self_provided(
-            req,
-            pkg=pkg_name,
-            provider_map=provider_map,
-            package_names=package_names,
-            cap_index=cap_index,
-        ):
             continue
         srcs = _provider_sources_for_miss(
             req,
@@ -1234,6 +1312,8 @@ async def _recheck_job_ready(
     )
     still_missing |= {s for s in install_srcs if s and s != pkg_name}
     for g in install_gaps:
+        if not is_chain_plan_requirement(g):
+            continue
         if cap_index.satisfies_requirement(g):
             continue
         if _miss_is_self_provided(
@@ -1259,40 +1339,57 @@ async def _recheck_job_ready(
                 unresolved_caps.add(hint)
 
     old_r = await db.execute(select(LayerJobBlocker).where(LayerJobBlocker.build_job_id == job.id))
-    for row in old_r.scalars().all():
+    old_rows = list(old_r.scalars().all())
+    old_blockers = {
+        (row.blocking_source or "").strip()
+        for row in old_rows
+        if (row.blocking_source or "").strip()
+    }
+    for row in old_rows:
         await db.delete(row)
     await db.flush()
 
+    attached_final: set[str] = set()
     if still_missing:
-        attached = await _spawn_layer_dep_sources(
-            db,
-            job,
-            plan=plan,
-            release=release,
-            sources=still_missing,
-            owner=owner,
-            repo=repo,
-            distgit_branch=distgit_branch,
-            releasename=releasename,
-            headers=headers,
-            arches=arches,
-            cap_index=cap_index,
-            force_build=True,
-            package_names=package_names,
+        planned = await _planned_source_names(db, int(plan.id))
+        in_plan = {s for s in still_missing if s in planned}
+        outside = still_missing - in_plan
+        attached = await _link_planned_dep_sources(
+            db, job, plan=plan, sources=in_plan
         )
-        leftover = still_missing - attached
         if attached:
-            job.status = BuildStatus.BLOCKED
-            bits = [f"waiting on: {', '.join(sorted(attached)[:8])}"]
-            if leftover:
-                bits.append(f"cannot resolve: {', '.join(sorted(leftover)[:4])}")
-            job.blocked_reason = "; ".join(bits)[:500]
-            await db.flush()
-            await resolve_layer_blocker_cycles(
-                db, int(plan.id), cap_index=cap_index
-            )
-            return
-        unresolved_caps |= {_unresolved_hint(x) for x in leftover}
+            statuses = await _source_statuses_in_plan(db, int(plan.id), attached)
+            waiting = {
+                s
+                for s in attached
+                if any(st not in _OK_BLOCKER_STATUSES for st in (statuses.get(s) or []))
+                or not (statuses.get(s) or [])
+            }
+            if waiting:
+                old_r = await db.execute(
+                    select(LayerJobBlocker).where(LayerJobBlocker.build_job_id == job.id)
+                )
+                for row in old_r.scalars().all():
+                    src = (row.blocking_source or "").strip()
+                    if src and src not in waiting:
+                        await db.delete(row)
+                job.status = BuildStatus.BLOCKED
+                bits = [f"waiting on: {', '.join(sorted(waiting)[:8])}"]
+                if outside:
+                    bits.append(f"cannot resolve: {', '.join(sorted(outside)[:4])}")
+                job.blocked_reason = "; ".join(bits)[:500]
+                await db.flush()
+                await resolve_layer_blocker_cycles(db, int(plan.id), cap_index=cap_index)
+                if prune:
+                    await prune_unneeded_layer_sources(
+                        db, plan, candidates=old_blockers - waiting
+                    )
+                return
+            attached_final = set(attached)
+        unresolved_caps |= {_unresolved_hint(x) for x in outside}
+        unresolved_caps |= {
+            _unresolved_hint(x) for x in (still_missing - attached) if _unresolved_hint(x)
+        }
 
     if unresolved_caps:
         job.status = BuildStatus.BLOCKED
@@ -1300,11 +1397,220 @@ async def _recheck_job_ready(
             f"cannot resolve: {', '.join(sorted(unresolved_caps)[:8])} (import into distgit)"
         )
         await db.flush()
+        if prune:
+            await prune_unneeded_layer_sources(db, plan, candidates=old_blockers)
         return
 
     job.status = BuildStatus.QUEUED
     job.blocked_reason = None
     await db.flush()
+    if prune:
+        await prune_unneeded_layer_sources(
+            db, plan, candidates=old_blockers - attached_final
+        )
+
+async def _planned_source_names(db: Any, plan_id: int) -> set[str]:
+    rows = await db.execute(
+        select(Package.name)
+        .join(BuildJob, BuildJob.package_id == Package.id)
+        .where(BuildJob.layer_plan_id == plan_id)
+    )
+    return {str(n) for (n,) in rows.all() if n}
+
+
+_OPEN_LAYER_STATUSES = (
+    BuildStatus.PENDING,
+    BuildStatus.QUEUED,
+    BuildStatus.BLOCKED,
+    BuildStatus.RUNNING,
+)
+_PRUNE_NOTE = "pruned: no longer required by layer"
+
+
+async def prune_unneeded_layer_sources(
+    db: Any,
+    plan: LayerPlan,
+    *,
+    candidates: set[str] | None = None,
+) -> set[str]:
+    """Drop packages explicitly removed from a consumer's deps.
+
+    candidates must be sources a recheck/autofix just dropped from blockers.
+    A global "nothing waits on this" sweep is wrong: queued mid-layer packages
+    often have no reverse blockers while still required by the layer.
+    """
+    if plan.id is None or not candidates:
+        return set()
+    roots = {(r or "").strip() for r in (plan.root_packages or []) if (r or "").strip()}
+    want = {(c or "").strip() for c in candidates if (c or "").strip()} - roots
+    if not want:
+        return set()
+
+    open_ids_r = await db.execute(
+        select(BuildJob.id).where(
+            BuildJob.layer_plan_id == plan.id,
+            BuildJob.status.in_(_OPEN_LAYER_STATUSES),
+        )
+    )
+    open_ids = [int(x) for x in open_ids_r.scalars().all()]
+    still_needed: set[str] = set()
+    if open_ids:
+        bl_r = await db.execute(
+            select(LayerJobBlocker.blocking_source).where(
+                LayerJobBlocker.build_job_id.in_(open_ids),
+                LayerJobBlocker.blocking_source.in_(sorted(want)),
+            )
+        )
+        still_needed = {(s or "").strip() for (s,) in bl_r.all() if s}
+
+    pruned: set[str] = set()
+    for name in sorted(want - still_needed):
+        jobs_r = await db.execute(
+            select(BuildJob)
+            .options(selectinload(BuildJob.package))
+            .join(Package, Package.id == BuildJob.package_id)
+            .where(BuildJob.layer_plan_id == plan.id, Package.name == name)
+        )
+        jobs = list(jobs_r.scalars().all())
+        if not jobs:
+            continue
+        for j in jobs:
+            if j.status == BuildStatus.SKIPPED and (j.blocked_reason or "").startswith("pruned:"):
+                continue
+            if j.status not in _OPEN_LAYER_STATUSES:
+                continue
+            old_r = await db.execute(
+                select(LayerJobBlocker).where(LayerJobBlocker.build_job_id == j.id)
+            )
+            for row in old_r.scalars().all():
+                await db.delete(row)
+            from oreon_build.services.layer_plan import _cancel_job_and_running_attempts
+
+            await _cancel_job_and_running_attempts(db, j, _PRUNE_NOTE)
+            j.status = BuildStatus.SKIPPED
+            j.completed_at = None
+            j.blocked_reason = _PRUNE_NOTE
+            pruned.add(name)
+        stale_r = await db.execute(
+            select(LayerJobBlocker).where(LayerJobBlocker.blocking_source == name)
+        )
+        for row in stale_r.scalars().all():
+            await db.delete(row)
+    if pruned:
+        await db.flush()
+        logger.info(
+            "layer_plan_id=%s pruned unneeded sources=%s",
+            plan.id,
+            ",".join(sorted(pruned)[:20]),
+        )
+    return pruned
+
+
+async def refresh_blocked_jobs_for_prune(
+    db: Any,
+    plan: LayerPlan,
+    *,
+    job_ids: list[int] | None = None,
+) -> int:
+    """Re-parse specs for blocked jobs so dropped BRs leave the blocker set."""
+    q = select(BuildJob).where(
+        BuildJob.layer_plan_id == plan.id,
+        BuildJob.status == BuildStatus.BLOCKED,
+    )
+    if job_ids is not None:
+        if not job_ids:
+            return 0
+        q = q.where(BuildJob.id.in_(job_ids))
+    jobs_r = await db.execute(q)
+    blocked = list(jobs_r.scalars().all())
+    if not blocked:
+        return 0
+
+    first = blocked[0]
+    release = await db.get(Release, first.release_id)
+    if release is None:
+        return 0
+    opt = _plan_options(plan)
+    dg_url = str(opt.get("distgit_url") or "https://github.com/oreonhq/rpm-specfiles.git").strip()
+    gr = _github_owner_repo_from_git_url(dg_url)
+    if not gr:
+        return 0
+    owner, distgit_repo = gr
+    dg_branch = str(opt.get("distgit_branch") or release_distgit_branch(release)).strip()
+    plan_arches = [str(a) for a in (opt.get("architectures") or DEFAULT_ARCH) if a] or list(
+        DEFAULT_ARCH
+    )
+    releasename = (release.releasename or "").strip()
+    headers = _github_headers()
+    cap_index = await asyncio.to_thread(
+        load_repo_capability_index,
+        releasename,
+        first.branch,
+        plan_arches[:1] or list(DEFAULT_ARCH[:1]),
+        extra_branches=default_capability_extra_branches(first.branch),
+    )
+    target_arches = {a.lower() for a in plan_arches if a} or None
+    n = 0
+    for job in blocked:
+        try:
+            await _recheck_job_ready(
+                db,
+                job,
+                plan=plan,
+                release=release,
+                cap_index=cap_index,
+                owner=owner,
+                repo=distgit_repo,
+                distgit_branch=dg_branch,
+                releasename=releasename,
+                headers=headers,
+                target_arches=target_arches,
+                prune=False,
+            )
+            n += 1
+        except Exception:
+            logger.exception(
+                "layer_plan_id=%s refresh blockers failed job_id=%s",
+                plan.id,
+                job.id,
+            )
+    return n
+
+
+async def _link_planned_dep_sources(
+    db: Any,
+    job: BuildJob,
+    *,
+    plan: LayerPlan,
+    sources: set[str],
+) -> set[str]:
+    """Attach blockers only for sources already in this layer. Never create jobs."""
+    attached: set[str] = set()
+    for src in sorted(sources):
+        existing_r = await db.execute(
+            select(BuildJob)
+            .join(Package, Package.id == BuildJob.package_id)
+            .where(Package.name == src, BuildJob.layer_plan_id == plan.id)
+        )
+        existing = list(existing_r.scalars().all())
+        if not existing:
+            continue
+        db.add(LayerJobBlocker(build_job_id=job.id, blocking_source=src))
+        attached.add(src)
+        for ej in existing:
+            if ej.id == job.id:
+                continue
+            reason = (ej.blocked_reason or "").strip()
+            if ej.status == BuildStatus.CANCELLED:
+                ej.status = BuildStatus.QUEUED
+                ej.completed_at = None
+                ej.blocked_reason = None
+            elif ej.status == BuildStatus.FAILED and _soft_retryable_blocker_reason(reason):
+                ej.status = BuildStatus.QUEUED
+                ej.completed_at = None
+                ej.blocked_reason = None
+        await db.flush()
+    return attached
 
 
 async def _spawn_layer_dep_sources(
@@ -1326,8 +1632,11 @@ async def _spawn_layer_dep_sources(
 ) -> set[str]:
     """Create/link blocker sources for a job. Returns sources that were attached.
 
-    force_build=True means the capability is already known unsatisfied so never
-    skip a distgit provider just because the index thinks the EVR looks current.
+    Prefer repo/side-tag copies. Skip spawning when the provider is already
+    present at >= distgit EVR unless force_build=True.
+
+    Used at seed and by autofix for clear missing providers. Publish recheck stays
+    planned-only via _link_planned_dep_sources.
     """
     from oreon_build.services.distgit_order import _spec_parse_fn
 
@@ -1335,6 +1644,19 @@ async def _spawn_layer_dep_sources(
     known_pkgs = set(package_names or ())
     roots = {(r or "").strip() for r in (plan.root_packages or []) if (r or "").strip()}
     parse_fn = _spec_parse_fn(releasename, target_arches={a.lower() for a in arches if a} or None)
+    want_arches = [normalize_machine_arch(a) for a in arches if a] or list(DEFAULT_ARCH)
+
+    async def _existing_arches(jobs: list[BuildJob]) -> set[str]:
+        out: set[str] = set()
+        for ej in jobs:
+            tid = getattr(ej, "target_id", None)
+            if tid is None:
+                continue
+            target = await db.get(BuildTarget, tid)
+            if target is not None and target.architecture:
+                out.add(normalize_machine_arch(str(target.architecture)))
+        return out
+
     for src in sorted(sources):
         existing_r = await db.execute(
             select(BuildJob)
@@ -1342,9 +1664,9 @@ async def _spawn_layer_dep_sources(
             .where(Package.name == src, BuildJob.layer_plan_id == plan.id)
         )
         existing = list(existing_r.scalars().all())
+        have = await _existing_arches(existing) if existing else set()
+        missing_arches = [a for a in want_arches if a not in have]
         if existing:
-            db.add(LayerJobBlocker(build_job_id=job.id, blocking_source=src))
-            attached.add(src)
             for ej in existing:
                 if ej.id == job.id:
                     continue
@@ -1353,16 +1675,19 @@ async def _spawn_layer_dep_sources(
                     ej.status = BuildStatus.QUEUED
                     ej.completed_at = None
                     ej.blocked_reason = None
-                elif ej.status == BuildStatus.FAILED and (
-                    parse_missing_provides_from_text(reason)
-                    or reason.startswith("expanding missing provides")
-                    or reason.startswith("waiting on:")
-                ):
+                elif ej.status == BuildStatus.FAILED and _soft_retryable_blocker_reason(reason):
                     ej.status = BuildStatus.QUEUED
                     ej.completed_at = None
                     ej.blocked_reason = None
             await db.flush()
-            continue
+            if not missing_arches:
+                db.add(LayerJobBlocker(build_job_id=job.id, blocking_source=src))
+                attached.add(src)
+                await db.flush()
+                continue
+        else:
+            missing_arches = list(want_arches)
+
         spec_check = await _refetch_spec_text(
             src, owner=owner, repo=repo, distgit_branch=distgit_branch, releasename=releasename, headers=headers
         )
@@ -1380,12 +1705,17 @@ async def _spawn_layer_dep_sources(
                     src,
                     releasename,
                 )
+                if existing:
+                    db.add(LayerJobBlocker(build_job_id=job.id, blocking_source=src))
+                    attached.add(src)
+                    await db.flush()
                 continue
         if (
             spec_check
             and not force_build
             and cap_index is not None
             and src not in roots
+            and not existing
         ):
             try:
                 parsed = await asyncio.to_thread(parse_fn, spec_check, f"{src}.spec")
@@ -1406,8 +1736,8 @@ async def _spawn_layer_dep_sources(
             plan,
             src,
             release=release,
-            workers_by_arch={normalize_machine_arch(a): True for a in arches},
-            architectures=arches,
+            workers_by_arch={normalize_machine_arch(a): True for a in missing_arches},
+            architectures=missing_arches,
             distgit_url=_plan_options(plan).get("distgit_url") or "https://github.com/oreonhq/rpm-specfiles.git",
             distgit_branch=distgit_branch,
             preferred_mock_environment_id=_plan_options(plan).get("preferred_mock_environment_id"),
@@ -1420,16 +1750,17 @@ async def _spawn_layer_dep_sources(
             initial_status=BuildStatus.QUEUED,
             blocked_reason=None,
         )
-        if not new_jobs:
+        if not new_jobs and not existing:
             logger.warning(
                 "layer_plan_id=%s spawn %s create returned no jobs arches=%s",
                 plan.id,
                 src,
-                arches,
+                missing_arches,
             )
             continue
         db.add(LayerJobBlocker(build_job_id=job.id, blocking_source=src))
         attached.add(src)
+        await db.flush()
     return attached
 
 
@@ -1508,6 +1839,32 @@ async def try_autofix_layer_missing_provides(
     misses = parse_missing_provides_from_text(reason)
     misses |= await _misses_from_job_build_log(db, job)
     if not misses:
+        return False
+    thrash_n = await _recent_missing_provides_fail_count(db, int(job.id))
+    if thrash_n >= _AUTOFIX_THRASH_FAIL_LIMIT:
+        from datetime import datetime, timezone
+
+        old_r = await db.execute(
+            select(LayerJobBlocker).where(LayerJobBlocker.build_job_id == job.id)
+        )
+        for row in old_r.scalars().all():
+            await db.delete(row)
+        job.status = BuildStatus.FAILED
+        job.completed_at = datetime.now(timezone.utc)
+        job.blocked_reason = (
+            "autofix thrash stop after "
+            + str(thrash_n)
+            + " missing-provides fails: "
+            + ", ".join(sorted(misses)[:8])
+        )[:500]
+        await db.flush()
+        logger.info(
+            "layer_plan_id=%s job_id=%s autofix thrash stop after %s fails misses=%s",
+            job.layer_plan_id,
+            job.id,
+            thrash_n,
+            sorted(misses)[:8],
+        )
         return False
     plan = await db.get(LayerPlan, job.layer_plan_id, with_for_update=True)
     if plan is None or plan.status not in (LayerPlanStatus.PENDING, LayerPlanStatus.RUNNING):
@@ -1596,6 +1953,11 @@ async def try_autofix_layer_missing_provides(
                 package_names=package_names,
                 cap_index=cap_index,
             )
+        if not should_seed_providers(pkg_name, miss, srcs):
+            hint = _unresolved_hint(miss)
+            if hint:
+                unresolved.add(hint)
+            continue
         if srcs:
             sources |= srcs
         else:
@@ -1613,49 +1975,116 @@ async def try_autofix_layer_missing_provides(
         await _restore_failed()
         return False
 
+    planned = await _planned_source_names(db, int(plan.id))
+    in_plan = {s for s in sources if s in planned}
+    to_spawn = {s for s in sources if s not in planned}
+    # one-hop only, keep foreign-stack fanout from reappearing mid-run
+    if len(to_spawn) > 8:
+        logger.info(
+            "layer_plan_id=%s job_id=%s autofix spawn capped %s -> %s",
+            plan.id,
+            job.id,
+            len(to_spawn),
+            sorted(to_spawn)[:8],
+        )
+        to_spawn = set(sorted(to_spawn)[:8])
+    # spawn also fills missing plan arches for sources already in the layer
+    spawn_set = in_plan | to_spawn
+
     old_r = await db.execute(select(LayerJobBlocker).where(LayerJobBlocker.build_job_id == job.id))
-    for row in old_r.scalars().all():
+    old_rows = list(old_r.scalars().all())
+    old_blockers = {
+        (row.blocking_source or "").strip()
+        for row in old_rows
+        if (row.blocking_source or "").strip()
+    }
+    for row in old_rows:
         await db.delete(row)
     await db.flush()
 
-    attached = await _spawn_layer_dep_sources(
-        db,
-        job,
-        plan=plan,
-        release=release,
-        sources=sources,
-        owner=owner,
-        repo=distgit_repo,
-        distgit_branch=dg_branch,
-        releasename=releasename,
-        headers=headers,
-        arches=arches,
-        cap_index=cap_index,
-        force_build=True,
-        package_names=package_names,
-    )
-    if not attached:
-        logger.info(
-            "layer_plan_id=%s job_id=%s autofix providers=%s but spawn attached nothing",
-            plan.id,
-            job.id,
-            sorted(sources)[:12],
+    attached: set[str] = set()
+    if spawn_set:
+        spawned = await _spawn_layer_dep_sources(
+            db,
+            job,
+            plan=plan,
+            release=release,
+            sources=spawn_set,
+            owner=owner,
+            repo=distgit_repo,
+            distgit_branch=dg_branch,
+            releasename=releasename,
+            headers=headers,
+            arches=plan_arches,
+            cap_index=cap_index,
+            force_build=False,
+            package_names=package_names,
         )
+        attached |= spawned
+        if spawned:
+            logger.info(
+                "layer_plan_id=%s job_id=%s autofix spawned %s",
+                plan.id,
+                job.id,
+                ",".join(sorted(spawned)[:12]),
+            )
+    if not attached:
         await _restore_failed()
         return False
 
-    attached_list = sorted(attached)
+    statuses_by_src = await _source_statuses_in_plan(db, int(plan.id), set(attached))
+    waiting = {
+        src
+        for src in attached
+        if any(s not in _OK_BLOCKER_STATUSES for s in (statuses_by_src.get(src) or []))
+        or not (statuses_by_src.get(src) or [])
+    }
+    if not waiting:
+        old_r = await db.execute(
+            select(LayerJobBlocker).where(LayerJobBlocker.build_job_id == job.id)
+        )
+        for row in old_r.scalars().all():
+            await db.delete(row)
+        from datetime import datetime, timezone
+
+        job.status = BuildStatus.FAILED
+        job.completed_at = datetime.now(timezone.utc)
+        job.blocked_reason = (
+            "still missing after providers built: " + ", ".join(sorted(attached)[:8])
+        )[:500]
+        await db.flush()
+        logger.info(
+            "layer_plan_id=%s job_id=%s autofix providers already built, hard-fail misses=%s providers=%s",
+            plan.id,
+            job.id,
+            sorted(misses)[:8],
+            sorted(attached)[:8],
+        )
+        return False
+
+    old_r = await db.execute(select(LayerJobBlocker).where(LayerJobBlocker.build_job_id == job.id))
+    for row in old_r.scalars().all():
+        src = (row.blocking_source or "").strip()
+        if src and src not in waiting:
+            await db.delete(row)
+    await db.flush()
+
+    attached_list = sorted(waiting)
     job.status = BuildStatus.BLOCKED
     job.completed_at = None
     reason_bits = [f"waiting on: {', '.join(attached_list[:8])}"]
     if unresolved:
         reason_bits.append(f"cannot resolve: {', '.join(sorted(unresolved)[:4])}")
+    leftover = sources - attached
+    if leftover:
+        reason_bits.append(f"unresolved providers: {', '.join(sorted(leftover)[:4])}")
     job.blocked_reason = "; ".join(reason_bits)[:500]
     await db.flush()
     await resolve_layer_blocker_cycles(db, int(plan.id), cap_index=cap_index)
     await _revive_upstream_cancelled_dependents(
         db, plan_id=int(plan.id), source_name=pkg_name
     )
+    await prune_unneeded_layer_sources(db, plan, candidates=old_blockers - set(waiting))
     logger.info(
         "layer_plan_id=%s job_id=%s autofix missing provides -> blocked on %s",
         plan.id,
@@ -1677,20 +2106,54 @@ async def on_package_published(source_name: str, releasename: str) -> None:
         job_ids = [int(x) for x in blocker_r.scalars().all()]
     if not job_ids:
         return
-    clear_repo_capability_cache()
 
+    # Prefer cheap unblock. Full solv/cap recheck only when a job is stuck with no
+    # remaining blockers. Per-publish full recheck was OOM-killing the API.
+    work: list[dict[str, Any]] = []
+    cheap_n = 0
     async with async_session_maker() as db:
         jobs_r = await db.execute(
             select(BuildJob).where(BuildJob.id.in_(job_ids), BuildJob.status == BuildStatus.BLOCKED)
         )
         jobs = list(jobs_r.scalars().all())
-        work: list[dict[str, Any]] = []
         for job in jobs:
             if job.layer_plan_id is None:
                 continue
             plan = await db.get(LayerPlan, job.layer_plan_id)
             if plan is None or plan.status not in (LayerPlanStatus.PENDING, LayerPlanStatus.RUNNING):
                 continue
+            try:
+                job = await db.get(BuildJob, int(job.id), with_for_update=True)
+                if job is None or job.status != BuildStatus.BLOCKED or job.layer_plan_id is None:
+                    continue
+                if await _cheap_unblock_if_blockers_done(db, job, int(job.layer_plan_id)):
+                    cheap_n += 1
+                    await db.commit()
+                    logger.info(
+                        "layer unblock after publish source=%s job_id=%s -> %s (cheap)",
+                        source_name,
+                        job.id,
+                        job.status.value,
+                    )
+                    continue
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                logger.exception(
+                    "layer_engine: cheap publish unblock failed job_id=%s source=%s",
+                    getattr(job, "id", None),
+                    source_name,
+                )
+                continue
+
+            bl_r = await db.execute(
+                select(LayerJobBlocker.blocking_source).where(
+                    LayerJobBlocker.build_job_id == int(job.id)
+                )
+            )
+            if any(x[0] for x in bl_r.all() if x):
+                continue
+
             release = await db.get(Release, job.release_id)
             if release is None:
                 continue
@@ -1701,7 +2164,9 @@ async def on_package_published(source_name: str, releasename: str) -> None:
                 continue
             owner, distgit_repo = gr
             dg_branch = str(opt.get("distgit_branch") or release_distgit_branch(release)).strip()
-            plan_arches = [str(a) for a in (opt.get("architectures") or DEFAULT_ARCH) if a] or list(DEFAULT_ARCH)
+            plan_arches = [str(a) for a in (opt.get("architectures") or DEFAULT_ARCH) if a] or list(
+                DEFAULT_ARCH
+            )
             arches = await _capability_arches_for_job(db, job, plan_arches)
             work.append(
                 {
@@ -1717,10 +2182,11 @@ async def on_package_published(source_name: str, releasename: str) -> None:
                 }
             )
 
+    if cheap_n and not work:
+        return
     if not work:
         return
 
-    # load cap indexes outside any DB txn (can take minutes)
     cap_by_key: dict[tuple[str, str, tuple[str, ...]], Any] = {}
     for item in work:
         key = (releasename, str(item["branch"] or ""), tuple(item["arches"]))
@@ -1866,7 +2332,16 @@ _ACTIVE_BLOCKER_STATUSES = (
     BuildStatus.RUNNING,
 )
 _DEAD_BLOCKER_STATUSES = (BuildStatus.FAILED, BuildStatus.CANCELLED)
-_OK_BLOCKER_STATUSES = (BuildStatus.SUCCESS, BuildStatus.SKIPPED)
+_OK_BLOCKER_STATUSES = frozenset({BuildStatus.SUCCESS, BuildStatus.SKIPPED})
+_AUTOFIX_THRASH_FAIL_LIMIT = 3
+
+
+def _soft_retryable_blocker_reason(reason: str | None) -> bool:
+    """Only soft wait states. Mock logs contain 'nothing provides' and must stay failed."""
+    r = (reason or "").strip()
+    if not r:
+        return False
+    return r.startswith("expanding missing provides") or r.startswith("waiting on:")
 
 
 async def finalize_blocked_on_dead_upstreams(db: Any, plan_id: int) -> int:
@@ -1934,6 +2409,130 @@ async def finalize_blocked_on_dead_upstreams(db: Any, plan_id: int) -> int:
         changed += round_n
         if not round_n:
             break
+    return changed
+
+
+async def finalize_idle_blocked_jobs(db: Any, plan_id: int) -> int:
+    """Close blocked jobs when the layer has nothing left that can run.
+
+    cannot-resolve / stuck expanding leave jobs BLOCKED forever, and waiters on
+    those stay BLOCKED too, so settle never halts the plan. When idle, fail the
+    leaves then cancel whatever is still blocked.
+    """
+    from datetime import datetime, timezone
+
+    from sqlalchemy import func
+
+    active_n = await db.scalar(
+        select(func.count())
+        .select_from(BuildJob)
+        .where(
+            BuildJob.layer_plan_id == plan_id,
+            BuildJob.status.in_(
+                (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.RUNNING)
+            ),
+        )
+    )
+    if int(active_n or 0) > 0:
+        return 0
+
+    jobs_r = await db.execute(
+        select(BuildJob).where(
+            BuildJob.layer_plan_id == plan_id,
+            BuildJob.status == BuildStatus.BLOCKED,
+        )
+    )
+    blocked = list(jobs_r.scalars().all())
+    if not blocked:
+        return 0
+
+    changed = 0
+    queued_any = False
+    for job in blocked:
+        if await _cheap_unblock_if_blockers_done(db, job, plan_id):
+            changed += 1
+            if job.status == BuildStatus.QUEUED:
+                queued_any = True
+    if queued_any:
+        return changed
+
+    jobs_r = await db.execute(
+        select(BuildJob).where(
+            BuildJob.layer_plan_id == plan_id,
+            BuildJob.status == BuildStatus.BLOCKED,
+        )
+    )
+    blocked = list(jobs_r.scalars().all())
+    now = datetime.now(timezone.utc)
+    for job in blocked:
+        reason = (job.blocked_reason or "").strip()
+        bl_r = await db.execute(
+            select(LayerJobBlocker.blocking_source).where(
+                LayerJobBlocker.build_job_id == job.id
+            )
+        )
+        blockers = [str(x[0]) for x in bl_r.all() if x and x[0]]
+        if reason.startswith("cannot resolve:"):
+            old_r = await db.execute(
+                select(LayerJobBlocker).where(LayerJobBlocker.build_job_id == job.id)
+            )
+            for row in old_r.scalars().all():
+                await db.delete(row)
+            job.status = BuildStatus.FAILED
+            job.completed_at = now
+            changed += 1
+        elif reason.startswith("expanding missing provides") and not blockers:
+            job.status = BuildStatus.FAILED
+            job.completed_at = now
+            job.blocked_reason = "stuck expanding missing provides with no providers"[:500]
+            changed += 1
+    if changed:
+        await db.flush()
+        changed += await finalize_blocked_on_dead_upstreams(db, plan_id)
+
+    active_n = await db.scalar(
+        select(func.count())
+        .select_from(BuildJob)
+        .where(
+            BuildJob.layer_plan_id == plan_id,
+            BuildJob.status.in_(
+                (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.RUNNING)
+            ),
+        )
+    )
+    if int(active_n or 0) > 0:
+        return changed
+
+    jobs_r = await db.execute(
+        select(BuildJob).where(
+            BuildJob.layer_plan_id == plan_id,
+            BuildJob.status == BuildStatus.BLOCKED,
+        )
+    )
+    still = list(jobs_r.scalars().all())
+    if not still:
+        return changed
+
+    for job in still:
+        prior = (job.blocked_reason or "").strip()
+        old_r = await db.execute(
+            select(LayerJobBlocker).where(LayerJobBlocker.build_job_id == job.id)
+        )
+        for row in old_r.scalars().all():
+            await db.delete(row)
+        job.status = BuildStatus.CANCELLED
+        job.completed_at = now
+        job.blocked_reason = (
+            "layer idle: blocked with no runnable work"
+            + (f" ({prior[:180]})" if prior else "")
+        )[:500]
+        changed += 1
+    await db.flush()
+    logger.info(
+        "layer_plan_id=%s finalized %s idle blocked job(s)",
+        plan_id,
+        changed,
+    )
     return changed
 
 
@@ -2258,6 +2857,28 @@ async def resolve_layer_blocker_cycles(
                         waiter_name,
                         blocker_name,
                     )
+                    if job.status == BuildStatus.QUEUED:
+                        thrash_n = await _recent_missing_provides_fail_count(db, int(job.id))
+                        if thrash_n >= _AUTOFIX_THRASH_FAIL_LIMIT:
+                            from datetime import datetime, timezone
+
+                            job.status = BuildStatus.FAILED
+                            job.completed_at = datetime.now(timezone.utc)
+                            job.blocked_reason = (
+                                "cycle break thrash stop after "
+                                + str(thrash_n)
+                                + " missing-provides fails (dropped "
+                                + blocker_name
+                                + ")"
+                            )[:500]
+                            await db.flush()
+                            logger.info(
+                                "layer_plan_id=%s job_id=%s cycle order-break thrash stop after %s fails dropped=%s",
+                                plan_id,
+                                jid,
+                                thrash_n,
+                                blocker_name,
+                            )
             if order_changed:
                 break
         if not order_changed:
@@ -2276,12 +2897,61 @@ async def cancel_layer_blocker_cycles(
     return await resolve_layer_blocker_cycles(db, plan_id, cap_index=cap_index)
 
 
+async def _source_statuses_in_plan(
+    db: Any, plan_id: int, sources: set[str]
+) -> dict[str, list[BuildStatus]]:
+    out: dict[str, list[BuildStatus]] = {s: [] for s in sources if s}
+    if not out:
+        return out
+    st_r = await db.execute(
+        select(Package.name, BuildJob.status)
+        .join(Package, Package.id == BuildJob.package_id)
+        .where(BuildJob.layer_plan_id == plan_id, Package.name.in_(list(out.keys())))
+    )
+    for name, st in st_r.all():
+        if name in out and st is not None:
+            out[name].append(st)
+    return out
+
+
+def _sources_all_ok(statuses_by_src: dict[str, list[BuildStatus]]) -> bool:
+    if not statuses_by_src:
+        return False
+    for statuses in statuses_by_src.values():
+        if not statuses:
+            return False
+        if any(s not in _OK_BLOCKER_STATUSES for s in statuses):
+            return False
+    return True
+
+
+async def _recent_missing_provides_fail_count(db: Any, job_id: int, *, limit: int = 5) -> int:
+    rows_r = await db.execute(
+        select(BuildAttempt.error_message, BuildAttempt.status)
+        .where(BuildAttempt.build_job_id == job_id)
+        .order_by(BuildAttempt.id.desc())
+        .limit(limit)
+    )
+    n = 0
+    for err, st in rows_r.all():
+        if st != BuildStatus.FAILED:
+            break
+        if parse_missing_provides_from_text(err or ""):
+            n += 1
+        else:
+            break
+    return n
+
+
 async def _cheap_unblock_if_blockers_done(db: Any, job: BuildJob, plan_id: int) -> bool:
     """Queue when blockers succeeded. Soft-cancel only if every blocker was CANCELLED.
 
     FAILED is not dead here. Autofix may still flip FAILED -> BLOCKED for missing
     provides. Real hard-fail waiters close via finalize_blocked_on_dead_upstreams
     from maybe_settle once nothing is active.
+
+    If blockers are already success/skipped but this job has been failing the same
+    missing-provides loop, stop requeueing (autofix thrash).
     """
     bl_r = await db.execute(
         select(LayerJobBlocker.blocking_source).where(LayerJobBlocker.build_job_id == job.id)
@@ -2290,22 +2960,18 @@ async def _cheap_unblock_if_blockers_done(db: Any, job: BuildJob, plan_id: int) 
     if not blockers:
         return False
 
+    statuses_by_src = await _source_statuses_in_plan(db, plan_id, set(blockers))
     dead: list[str] = []
     pending = False
     for src in blockers:
-        st_r = await db.execute(
-            select(BuildJob.status)
-            .join(Package, Package.id == BuildJob.package_id)
-            .where(BuildJob.layer_plan_id == plan_id, Package.name == src)
-        )
-        statuses = [s for (s,) in st_r.all()]
+        statuses = statuses_by_src.get(src) or []
         if not statuses:
             pending = True
             continue
         if all(s == BuildStatus.CANCELLED for s in statuses):
             dead.append(src)
             continue
-        if any(s != BuildStatus.SUCCESS for s in statuses):
+        if any(s not in _OK_BLOCKER_STATUSES for s in statuses):
             pending = True
 
     if dead:
@@ -2320,9 +2986,28 @@ async def _cheap_unblock_if_blockers_done(db: Any, job: BuildJob, plan_id: int) 
     if pending:
         return False
 
+    thrash_n = await _recent_missing_provides_fail_count(db, int(job.id))
     old_r = await db.execute(select(LayerJobBlocker).where(LayerJobBlocker.build_job_id == job.id))
     for row in old_r.scalars().all():
         await db.delete(row)
+    if thrash_n >= _AUTOFIX_THRASH_FAIL_LIMIT:
+        from datetime import datetime, timezone
+
+        job.status = BuildStatus.FAILED
+        job.completed_at = datetime.now(timezone.utc)
+        job.blocked_reason = (
+            "still missing after providers built: " + ", ".join(sorted(blockers)[:8])
+        )[:500]
+        await db.flush()
+        logger.info(
+            "layer_plan_id=%s job_id=%s cheap-unblock thrash stop after %s fails blockers=%s",
+            plan_id,
+            job.id,
+            thrash_n,
+            sorted(blockers)[:8],
+        )
+        return True
+
     job.status = BuildStatus.QUEUED
     job.blocked_reason = None
     await db.flush()
@@ -2350,7 +3035,6 @@ async def reconcile_stuck_layer_blockers() -> None:
     now = _time.monotonic()
     for plan_id in plan_ids:
         need_full: list[int] = []
-        cycle_cap: RepoCapabilityIndex | None = None
         owner = ""
         distgit_repo = ""
         dg_branch = ""
@@ -2383,53 +3067,6 @@ async def reconcile_stuck_layer_blockers() -> None:
             arches = [str(a) for a in (opt.get("architectures") or DEFAULT_ARCH) if a] or list(DEFAULT_ARCH)
             releasename = (release.releasename or "").strip()
             branch = blocked[0].branch
-
-            try:
-                # single-arch index for cycle repo-break + stuck recheck (multi-arch OOMs)
-                recheck_arches = [arches[0]] if arches else list(DEFAULT_ARCH[:1])
-                cycle_cap = await asyncio.to_thread(
-                    load_repo_capability_index,
-                    releasename,
-                    branch,
-                    recheck_arches,
-                    extra_branches=default_capability_extra_branches(branch),
-                )
-                n_broke = await resolve_layer_blocker_cycles(db, plan_id, cap_index=cycle_cap)
-                if n_broke:
-                    await db.commit()
-                    from oreon_build.services.layer_plan import maybe_settle_layer_plan
-
-                    await maybe_settle_layer_plan(db, plan_id)
-                    await db.commit()
-                    plan = await db.get(LayerPlan, plan_id)
-                    if plan is None or plan.status != LayerPlanStatus.RUNNING:
-                        continue
-                    jobs_r = await db.execute(
-                        select(BuildJob).where(
-                            BuildJob.layer_plan_id == plan_id,
-                            BuildJob.status == BuildStatus.BLOCKED,
-                        )
-                    )
-                    blocked = list(jobs_r.scalars().all())
-                    if not blocked:
-                        continue
-            except Exception:
-                await db.rollback()
-                logger.exception(
-                    "layer_engine: cycle resolve failed plan_id=%s", plan_id
-                )
-                plan = await db.get(LayerPlan, plan_id)
-                if plan is None or plan.status != LayerPlanStatus.RUNNING:
-                    continue
-                jobs_r = await db.execute(
-                    select(BuildJob).where(
-                        BuildJob.layer_plan_id == plan_id,
-                        BuildJob.status == BuildStatus.BLOCKED,
-                    )
-                )
-                blocked = list(jobs_r.scalars().all())
-                if not blocked:
-                    continue
 
             for j in blocked:
                 jid = int(j.id)
@@ -2489,17 +3126,26 @@ async def reconcile_stuck_layer_blockers() -> None:
             continue
         need_full = need_full[:_FULL_RECHECK_PER_SWEEP]
 
-        if cycle_cap is not None:
-            cap_index = cycle_cap
-        else:
-            recheck_arches = [arches[0]] if arches else list(DEFAULT_ARCH[:1])
-            cap_index = await asyncio.to_thread(
-                load_repo_capability_index,
-                releasename,
-                branch,
-                recheck_arches,
-                extra_branches=default_capability_extra_branches(branch),
-            )
+        recheck_arches = [arches[0]] if arches else list(DEFAULT_ARCH[:1])
+        cap_index = await asyncio.to_thread(
+            load_repo_capability_index,
+            releasename,
+            branch,
+            recheck_arches,
+            extra_branches=default_capability_extra_branches(branch),
+        )
+        try:
+            async with async_session_maker() as db:
+                n_broke = await resolve_layer_blocker_cycles(db, plan_id, cap_index=cap_index)
+                if n_broke:
+                    await db.commit()
+                    from oreon_build.services.layer_plan import maybe_settle_layer_plan
+
+                    await maybe_settle_layer_plan(db, plan_id)
+                    await db.commit()
+        except Exception:
+            logger.exception("layer_engine: cycle resolve failed plan_id=%s", plan_id)
+
         headers: dict[str, str] = {}
         target_arches = {a.lower() for a in arches if a} or None
         for jid in need_full:

@@ -21,6 +21,10 @@ _RE_NO_MATCH = re.compile(
     r"No match for argument:\s*(?P<cap>.+)$",
     re.IGNORECASE | re.MULTILINE,
 )
+_RE_NO_MATCHING_PACKAGE = re.compile(
+    r"No matching package to install:\s*['\"]?(?P<cap>[^'\"\n]+?)['\"]?\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 _RE_PACKAGE_REQUIRES = re.compile(
     r"package\s+\S+(?:\s+from\s+\S+)?\s+requires\s+(?P<cap>.+?),\s+but none of the providers can be installed",
     re.IGNORECASE,
@@ -58,7 +62,8 @@ def nevra_to_name(nevra: str) -> str:
 
 _SOLVER_CACHE: dict[tuple[Any, ...], tuple[float, "OreonRepoSolver"]] = {}
 _SOLVER_CACHE_TTL_SEC = 900.0
-_SOLVER_CACHE_MAX = 1
+# keep both arches warm so dual-arch layers do not thrash-evict each other
+_SOLVER_CACHE_MAX = 4
 
 
 def _overlay_cap_ok(cap: str) -> bool:
@@ -156,7 +161,12 @@ class SolveResult:
 def parse_depsolve_missing(text: str) -> set[str]:
     out: set[str] = set()
     blob = text or ""
-    for rx in (_RE_NOTHING_PROVIDES, _RE_NO_MATCH, _RE_PACKAGE_REQUIRES):
+    for rx in (
+        _RE_NOTHING_PROVIDES,
+        _RE_NO_MATCH,
+        _RE_NO_MATCHING_PACKAGE,
+        _RE_PACKAGE_REQUIRES,
+    ):
         for m in rx.finditer(blob):
             cap = (m.group("cap") or "").strip().rstrip(".")
             if cap:
@@ -537,6 +547,7 @@ def get_repo_solver(
     now = time.monotonic()
     hit = _SOLVER_CACHE.get(key)
     if hit and now - hit[0] < _SOLVER_CACHE_TTL_SEC:
+        _SOLVER_CACHE[key] = (now, hit[1])
         return hit[1]
 
     def _close_solver(sol: MultiArchRepoSolver) -> None:
@@ -545,23 +556,23 @@ def get_repo_solver(
         except Exception:
             pass
 
-    # drop expired solvers (warmup recreates every ~10m; old pools were leaked)
     for k, (ts, sol) in list(_SOLVER_CACHE.items()):
         if now - ts >= _SOLVER_CACHE_TTL_SEC or k == key:
             _SOLVER_CACHE.pop(k, None)
             _close_solver(sol)
-    # solv pools are multi-GB. keep at most one warm solver.
     while len(_SOLVER_CACHE) >= _SOLVER_CACHE_MAX:
         oldest_k = min(_SOLVER_CACHE.items(), key=lambda kv: kv[1][0])[0]
         _ts, sol = _SOLVER_CACHE.pop(oldest_k)
         _close_solver(sol)
+    import gc
+
+    gc.collect()
 
     solvers = [
         OreonRepoSolver(releasename=releasename, branches=branches, arch=a)
         for a in arches
     ]
     multi = MultiArchRepoSolver(solvers)
-    # fail closed on warm so bad metadata surfaces at get time
     multi.warm()
     _SOLVER_CACHE[key] = (now, multi)
     return multi
@@ -574,4 +585,7 @@ def clear_repo_solver_cache() -> None:
         except Exception:
             pass
     _SOLVER_CACHE.clear()
+    import gc
+
+    gc.collect()
 

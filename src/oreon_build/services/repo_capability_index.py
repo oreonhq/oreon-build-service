@@ -31,9 +31,16 @@ from oreon_build.services.r2 import get_r2_client
 logger = logging.getLogger(__name__)
 
 _CACHE_TTL_SEC = 1800.0
-_CACHE_MAX = 1
+# primary-only indexes are ~hundreds of MB, not multi-GB filelist maps
+_CACHE_MAX = 4
 _cache: dict[tuple[str, str, str], tuple[float, RepoCapabilityIndex]] = {}
 _cache_lock = threading.Lock()
+# filelists belong in libsolv. putting every path into this Python index OOMs the API.
+_INCLUDE_FILELISTS = os.environ.get("OREON_CAP_INCLUDE_FILELISTS", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 _RE_REPO_CHANNEL = re.compile(
     r"/(?P<rel>[^/]+)/(?P<channel>dev|testing|stable)/(?:\$basearch|\$arch|x86_64|aarch64|noarch|src)(?:/|$)",
@@ -825,7 +832,13 @@ def _fetch_repodata_blob(
     return raw
 
 
-def _load_arch_metadata(releasename: str, branch: str, arch: str) -> RepoCapabilityIndex:
+def _load_arch_metadata(
+    releasename: str,
+    branch: str,
+    arch: str,
+    *,
+    include_filelists: bool | None = None,
+) -> RepoCapabilityIndex:
     partial = RepoCapabilityIndex()
     r2 = get_r2_client()
     repo_prefix = f"{releasename}/{branch}/{arch}"
@@ -843,20 +856,22 @@ def _load_arch_metadata(releasename: str, branch: str, arch: str) -> RepoCapabil
     if primary_raw and primary_key:
         _ingest_primary_xml(partial, _decompress_if_needed(primary_raw, primary_key))
 
-    filelists_key = _resolve_repodata_key(repo_prefix, repomd, "filelists")
-    filelists_raw = _fetch_repodata_blob(
-        r2,
-        filelists_key,
-        cache_path=_meta_blob_path(releasename, branch, arch, "filelists", digest),
-    )
-    if filelists_raw and filelists_key:
-        _ingest_filelists_xml(partial, _decompress_if_needed(filelists_raw, filelists_key))
+    want_fl = _INCLUDE_FILELISTS if include_filelists is None else include_filelists
+    if want_fl:
+        filelists_key = _resolve_repodata_key(repo_prefix, repomd, "filelists")
+        filelists_raw = _fetch_repodata_blob(
+            r2,
+            filelists_key,
+            cache_path=_meta_blob_path(releasename, branch, arch, "filelists", digest),
+        )
+        if filelists_raw and filelists_key:
+            _ingest_filelists_xml(partial, _decompress_if_needed(filelists_raw, filelists_key))
 
     return partial
 
 
 def _load_arch_primary(releasename: str, branch: str, arch: str) -> RepoCapabilityIndex:
-    return _load_arch_metadata(releasename, branch, arch)
+    return _load_arch_metadata(releasename, branch, arch, include_filelists=False)
 
 
 def _copy_index_fields(dst: RepoCapabilityIndex, src: RepoCapabilityIndex) -> None:
@@ -989,17 +1004,19 @@ def load_repo_capability_index(
                 _cache.pop(k, None)
         hit = _cache.get(cache_key)
         if hit and now - hit[0] < _CACHE_TTL_SEC:
+            _cache[cache_key] = (now, hit[1])
             return hit[1]
 
-        # drop any other key first so peak stays ~1 index (these are multi-GB)
-        _cache.clear()
-        import gc
-
-        gc.collect()
+        while len(_cache) >= _CACHE_MAX:
+            oldest_k = min(_cache.items(), key=lambda kv: kv[1][0])[0]
+            _cache.pop(oldest_k, None)
 
         parts: list[RepoCapabilityIndex] = []
         for a in arches:
-            per_branch = [_load_arch_metadata(rel, b, a) for b in branches]
+            per_branch = [
+                _load_arch_metadata(rel, b, a, include_filelists=_INCLUDE_FILELISTS)
+                for b in branches
+            ]
             parts.append(
                 _union_indexes(per_branch)
                 if len(per_branch) > 1
@@ -1008,13 +1025,14 @@ def load_repo_capability_index(
         index = _merge_arch_indexes(parts)
         _cache[cache_key] = (now, index)
         logger.info(
-            "repo capability index %s/%s arches=%s sources=%s binaries=%s provides=%s",
+            "repo capability index %s/%s arches=%s sources=%s binaries=%s provides=%s filelists=%s",
             rel,
             branch_key,
             arch_key or "(none)",
             len(index.source_names),
             len(index.binary_names),
             len(index.provides),
+            _INCLUDE_FILELISTS,
         )
         return index
 
@@ -1022,3 +1040,6 @@ def load_repo_capability_index(
 def clear_repo_capability_cache() -> None:
     with _cache_lock:
         _cache.clear()
+    import gc
+
+    gc.collect()

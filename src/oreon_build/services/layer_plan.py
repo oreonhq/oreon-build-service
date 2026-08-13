@@ -5,7 +5,7 @@ import re
 from typing import TYPE_CHECKING, Any
 
 from fastapi import HTTPException, Request, status
-from sqlalchemy import select
+from sqlalchemy import case, func, select, update
 from sqlalchemy.orm import selectinload
 
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
@@ -251,17 +251,44 @@ async def fail_layer_plan(
     open_job_status = (
         BuildStatus.CANCELLED if terminal == LayerPlanStatus.CANCELLED else BuildStatus.FAILED
     )
-    jres = await db.execute(
-        select(BuildJob).where(
+    note = ("Layer plan stopped: " + (message or terminal.value))[:500]
+    open_states = (
+        BuildStatus.PENDING,
+        BuildStatus.QUEUED,
+        BuildStatus.BLOCKED,
+        BuildStatus.RUNNING,
+    )
+    await db.execute(
+        update(BuildJob)
+        .where(
             BuildJob.layer_plan_id == plan.id,
-            BuildJob.status.in_(
-                (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.BLOCKED, BuildStatus.RUNNING),
+            BuildJob.status.in_(open_states),
+        )
+        .values(status=open_job_status, blocked_reason=note)
+    )
+    att_status = (
+        BuildStatus.CANCELLED if terminal == LayerPlanStatus.CANCELLED else BuildStatus.FAILED
+    )
+    open_job_ids = select(BuildJob.id).where(BuildJob.layer_plan_id == plan.id)
+    await db.execute(
+        update(BuildAttempt)
+        .where(
+            BuildAttempt.build_job_id.in_(open_job_ids),
+            BuildAttempt.status.in_(open_states),
+        )
+        .values(
+            status=att_status,
+            error_message=case(
+                (
+                    (BuildAttempt.error_message.is_(None))
+                    | (func.trim(BuildAttempt.error_message) == ""),
+                    note,
+                ),
+                else_=BuildAttempt.error_message,
             ),
         )
     )
-    note = "Layer plan stopped: " + (message or terminal.value)
-    for j in jres.scalars().all():
-        await _stop_job_and_running_attempts(db, j, note, as_status=open_job_status)
+    await db.flush()
     notify_layer_plan_terminal(plan.id, terminal.value, plan.error_message)
 
 
@@ -392,7 +419,12 @@ async def resume_layer_plan_by_user(
     user: "Account",
     *,
     layer_plan_id: int,
-) -> LayerPlan:
+) -> tuple[LayerPlan, list[int]]:
+    """Reopen failed/cancelled jobs. Returns (plan, reopened_job_ids).
+
+    Spec refresh + deep prune is scheduled by the caller after commit so the
+    HTTP request stays fast.
+    """
     result = await db.execute(select(LayerPlan).where(LayerPlan.id == layer_plan_id).with_for_update())
     plan = result.scalar_one_or_none()
     if not plan:
@@ -461,6 +493,7 @@ async def resume_layer_plan_by_user(
             await _replace_job_blockers(db, int(job.id), [])
 
     await db.flush()
+
     await log_audit(
         db,
         "build.layer_resume",
@@ -471,7 +504,7 @@ async def resume_layer_plan_by_user(
         ip_address=get_client_ip(request),
         user_agent=get_user_agent(request),
     )
-    return plan
+    return plan, [int(j.id) for j in reopen]
 
 
 async def maybe_settle_layer_plan(db: Any, layer_plan_id: int) -> None:
@@ -495,12 +528,14 @@ async def maybe_settle_layer_plan(db: Any, layer_plan_id: int) -> None:
     ):
         from oreon_build.services.layer_engine import (
             finalize_blocked_on_dead_upstreams,
+            finalize_idle_blocked_jobs,
             resolve_layer_blocker_cycles,
         )
 
         broke = await resolve_layer_blocker_cycles(db, plan.id)
         finalized = await finalize_blocked_on_dead_upstreams(db, plan.id)
-        if broke or finalized:
+        idle_n = await finalize_idle_blocked_jobs(db, plan.id)
+        if broke or finalized or idle_n:
             jobs_r = await db.execute(
                 select(BuildJob)
                 .options(selectinload(BuildJob.package))
@@ -510,7 +545,9 @@ async def maybe_settle_layer_plan(db: Any, layer_plan_id: int) -> None:
             if any(j.status == BuildStatus.BLOCKED for j in jobs) and not any(
                 j.status in active_states for j in jobs
             ):
-                if await finalize_blocked_on_dead_upstreams(db, plan.id):
+                more = await finalize_blocked_on_dead_upstreams(db, plan.id)
+                more += await finalize_idle_blocked_jobs(db, plan.id)
+                if more:
                     jobs_r = await db.execute(
                         select(BuildJob)
                         .options(selectinload(BuildJob.package))

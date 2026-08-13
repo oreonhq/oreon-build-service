@@ -36,6 +36,10 @@ _RE_NO_MATCH = re.compile(
     r"No match for argument:\s*(?P<cap>.+)$",
     re.IGNORECASE | re.MULTILINE,
 )
+_RE_NO_MATCHING_PACKAGE = re.compile(
+    r"No matching package to install:\s*['\"]?(?P<cap>[^'\"\n]+?)['\"]?\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 _REPOMD_NS = {"r": "http://linux.duke.edu/metadata/repo"}
 
 
@@ -187,7 +191,7 @@ def _parse_missing_from_problems(texts: Iterable[str]) -> set[str]:
         cap = (m.group("cap") or "").strip().rstrip(".")
         if cap:
             out.add(cap)
-    for rx in (_RE_NO_MATCH, _RE_NOTHING_PROVIDES):
+    for rx in (_RE_NO_MATCH, _RE_NO_MATCHING_PACKAGE, _RE_NOTHING_PROVIDES):
         for m in rx.finditer(blob):
             cap = (m.group("cap") or "").strip().rstrip(".")
             if not cap:
@@ -324,10 +328,13 @@ class SolvArchEngine:
         self._loaded = False
 
     def close(self) -> None:
+        pool = self._pool
         self._pool = None
         self._overlay_repo = None
         self._loaded = False
         self._resolve_cache.clear()
+        self._overlay_pkgs.clear()
+        del pool
 
     def load(self) -> None:
         if self._loaded and self._pool is not None:

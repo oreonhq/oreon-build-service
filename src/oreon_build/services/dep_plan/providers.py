@@ -19,13 +19,119 @@ from oreon_build.services.repo_capability_index import is_rich_dependency, is_rp
 __all__ = [
     "actionable_caps",
     "filter_plan_brs",
+    "filter_providers_for_consumer",
+    "is_mingw_requirement",
+    "is_mingw_source",
+    "is_toolchainish_source",
     "merge_maps",
+    "narrow_alternate_providers",
     "providers_for_requirement",
+    "should_seed_providers",
 ]
 
 _RE_CRATE_VER_LEAF = re.compile(
     r"crate\((?P<inner>[^)]+)\)\s*(?P<op>>=|<=|>|<|=|==)\s*(?P<ver>[^\s,)]+)"
 )
+_RE_GHC_ALT = re.compile(r"^ghc\d", re.IGNORECASE)
+_RE_VERSION_SUFFIX = re.compile(r"\d")
+_RE_MINGW_REQ = re.compile(
+    r"(?i)(?:^|[\s,(])mingw(?:32|64)(?:-|\()|^mingw(?:32|64)-"
+)
+_TOOLCHAINISH_EXTRA = frozenset(
+    {"alex", "happy", "shake", "pandoc", "pandoc-cli", "cabal-install"}
+)
+
+
+def is_mingw_source(name: str) -> bool:
+    n = (name or "").strip().lower()
+    return n.startswith("mingw-") or n.startswith("mingw32-") or n.startswith("mingw64-")
+
+
+def is_mingw_requirement(req: str) -> bool:
+    """True for mingw32/mingw64 package or dll provides."""
+    r = (req or "").strip()
+    if not r:
+        return False
+    low = r.lower()
+    if low.startswith("mingw32-") or low.startswith("mingw64-") or low.startswith("mingw-"):
+        return True
+    return bool(_RE_MINGW_REQ.search(r))
+
+
+def filter_providers_for_consumer(consumer: str, srcs: set[str]) -> set[str]:
+    """Prefer same-family providers. Native never picks mingw/haskell when a native exists."""
+    out = {s for s in srcs if s}
+    if not out:
+        return out
+    if is_mingw_source(consumer):
+        mingw = {s for s in out if is_mingw_source(s)}
+        return mingw or out
+    if is_toolchainish_source(consumer):
+        tools = {s for s in out if is_toolchainish_source(s)}
+        return tools or out
+    preferred = {
+        s for s in out if not is_mingw_source(s) and not is_toolchainish_source(s)
+    }
+    if preferred:
+        return preferred
+    native = {s for s in out if not is_mingw_source(s)}
+    return native or out
+
+
+def _is_ghc_alternate_compiler(name: str) -> bool:
+    n = (name or "").strip()
+    if not n:
+        return False
+    if n == "ghc":
+        return True
+    return bool(_RE_GHC_ALT.match(n))
+
+
+def is_toolchainish_source(name: str) -> bool:
+    """ExclusiveArch / dual-arch compiler stacks. Prefer any-arch repo presence."""
+    n = (name or "").strip()
+    if not n:
+        return False
+    if _is_ghc_alternate_compiler(n) or n in _TOOLCHAINISH_EXTRA:
+        return True
+    low = n.lower()
+    return low.startswith("ghc-")
+
+
+def should_seed_providers(consumer: str, req: str, srcs: set[str]) -> bool:
+    """False when seed must not pull foreign compiler/cross stacks into a native graph."""
+    if not srcs:
+        return False
+    if is_mingw_requirement(req) and not is_mingw_source(consumer):
+        return False
+    if all(is_toolchainish_source(s) for s in srcs) and not is_toolchainish_source(consumer):
+        return False
+    return True
+
+
+def narrow_alternate_providers(requirement: str, srcs: set[str]) -> set[str]:
+    """Collapse overloaded alternate-compiler sets (ghc + ghc9.*) to the primary."""
+    out = {s for s in srcs if s}
+    if len(out) <= 1:
+        return out
+    ghc_alts = {s for s in out if _is_ghc_alternate_compiler(s)}
+    if len(ghc_alts) >= 2 and ghc_alts == out:
+        if "ghc" in ghc_alts:
+            return {"ghc"}
+        return {sorted(ghc_alts, key=lambda s: (len(s), s))[0]}
+    if len(ghc_alts) >= 2 and "ghc" in ghc_alts:
+        return (out - ghc_alts) | {"ghc"}
+    primary = (requirement or "").strip()
+    if primary and primary in out:
+        # cap name equals a source and other hits look like versioned alts of it
+        alts = {
+            s
+            for s in out
+            if s != primary and s.startswith(primary) and _RE_VERSION_SUFFIX.search(s[len(primary) :])
+        }
+        if alts and alts | {primary} == out:
+            return {primary}
+    return out
 
 
 def merge_maps(*maps: dict[str, set[str]] | None) -> dict[str, set[str]]:
@@ -155,8 +261,16 @@ def providers_for_requirement(
     package_names: set[str] | None = None,
 ) -> set[str]:
     """Sources that Provide this cap (or rich-dep leaves). Map lookup only."""
+    from oreon_build.core.rpm_requires import is_chain_plan_requirement
+
     raw = (requirement or "").strip()
     if not raw or is_rpmlib_requirement(raw):
+        return set()
+    if raw.startswith("(") and raw.endswith(")"):
+        leaves = [c for c in requirement_check_capabilities(raw) if is_chain_plan_requirement(c)]
+        if not leaves:
+            return set()
+    elif not is_chain_plan_requirement(raw):
         return set()
     out: set[str] = set()
     known = package_names or set()
@@ -170,6 +284,8 @@ def providers_for_requirement(
         }
     else:
         for cap in requirement_check_capabilities(raw):
+            if not is_chain_plan_requirement(cap):
+                continue
             for src in _map_sources(provider_map, cap):
                 if is_distgit_source_name(src):
                     out.add(src)
@@ -179,6 +295,8 @@ def providers_for_requirement(
                     if is_distgit_source_name(src):
                         out.add(src)
     for cap in requirement_check_capabilities(raw):
+        if not is_chain_plan_requirement(cap):
+            continue
         if cap in known and is_distgit_source_name(cap):
             out.add(cap)
         for src in _map_sources(provider_map, cap):

@@ -740,6 +740,17 @@ def _cmake_module_from_file_path(path: str) -> str | None:
     return f"cmake({name})"
 
 
+def _is_mingw_sysroot_path(path: str) -> bool:
+    p = (path or "").lower()
+    if not p:
+        return False
+    if "w64-mingw32/sys-root/" in p:
+        return True
+    if "/usr/i686-w64-mingw32/" in p or "/usr/x86_64-w64-mingw32/" in p:
+        return True
+    return False
+
+
 _RE_MINGW_DLL_FILE = re.compile(
     r"/(?:usr/)?(?P<arch>i686|x86_64)-w64-mingw32/sys-root/mingw/bin/"
     r"(?P<dll>lib[A-Za-z0-9_+.-]+\.dll)\b",
@@ -884,7 +895,7 @@ _PROVIDES_INDEX_CACHE: dict[tuple[str, str, str, str, str], tuple[float, Distgit
 _provides_index_tasks: dict[tuple[str, str, str, str, str], asyncio.Task[DistgitProvidesIndex | None]] = {}
 _PACKAGE_NAMES_CACHE: dict[tuple[str, str, str, str], tuple[float, frozenset[str]]] = {}
 _PACKAGE_NAMES_CACHE_TTL_SEC = 1800.0
-_PROVIDES_INDEX_DISK_VERSION = "v13"
+_PROVIDES_INDEX_DISK_VERSION = "v14"
 
 
 def _so_file_provides(libstem: str) -> set[str]:
@@ -1018,16 +1029,16 @@ def _lightweight_provides_from_spec_text(pkg: str, spec_text: str) -> set[str]:
         if not in_files:
             continue
         expanded = _expand_rpm_macros(s, macros)
-        if ".pc" in expanded:
+        mingw_path = _is_mingw_sysroot_path(expanded)
+        if ".pc" in expanded and not mingw_path:
             m = _RE_PC_FILE.search(expanded)
             if m and "%" not in m.group(1) and "*" not in m.group(1):
                 provided.add(f"pkgconfig({m.group(1)})")
             elif "*" in expanded and "/pkgconfig/" in expanded:
-                # Fcitx5*.pc → at least pkgconfig(Fcitx5) prefix for map hits
                 gm = re.search(r"/pkgconfig/([A-Za-z0-9_+.-]+)\*\.pc\b", expanded)
                 if gm and gm.group(1):
                     provided.add(f"pkgconfig({gm.group(1)})")
-        if ".so" in expanded:
+        if ".so" in expanded and not mingw_path:
             m = _RE_SO_FILE.search(expanded)
             if m and "%" not in m.group(1):
                 provided.update(_so_file_provides(m.group(1)))
@@ -1043,14 +1054,14 @@ def _lightweight_provides_from_spec_text(pkg: str, spec_text: str) -> set[str]:
             perl_cap = _perl_module_from_file_path(expanded)
             if perl_cap:
                 provided.add(perl_cap)
-        if "/cmake/" in expanded:
+        if "/cmake/" in expanded and not mingw_path:
             cmake_cap = _cmake_module_from_file_path(expanded)
             if cmake_cap:
                 provided.add(cmake_cap)
         if ".dll" in expanded.lower() or "mingw" in expanded.lower():
             provided.update(_mingw_dll_provides_from_path(expanded))
             provided.update(_mingw_dll_provides_from_path(s))
-        if "%" not in expanded:
+        if "%" not in expanded and not mingw_path:
             path = expanded.split()[0] if expanded.split() else ""
             if path.startswith("/") and "*" not in path and "?" not in path and "[" not in path:
                 provided.add(path)
@@ -1741,27 +1752,68 @@ async def expand_chain_spec_closure_sparse(
                     )
                 ):
                     continue
-                for dep in dependency_capabilities(parsed):
-                    if repo_index is not None and repo_index.satisfies_requirement(dep):
+                from oreon_build.core.rpm_requires import (
+                    is_chain_plan_requirement,
+                    parse_versioned_requirement,
+                )
+
+                def _enqueue_prov(prov: str) -> None:
+                    if prov in parsed_by_source or prov == pkg:
+                        return
+                    if not is_distgit_source_name(prov):
+                        return
+                    if prov not in needed:
+                        needed.add(prov)
+                        queue.append(prov)
+
+                from oreon_build.services.dep_plan.providers import (
+                    filter_providers_for_consumer,
+                    is_toolchainish_source,
+                    narrow_alternate_providers,
+                    should_seed_providers,
+                )
+
+                for dep in build_dependency_capabilities(parsed):
+                    if not is_chain_plan_requirement(dep):
                         continue
+                    satisfied = bool(
+                        repo_index is not None and repo_index.satisfies_requirement(dep)
+                    )
+                    name, op, ver = parse_versioned_requirement(dep)
+                    versioned = bool(name and op and ver)
+                    if satisfied and versioned:
+                        continue
+                    provs: set[str] = set()
                     for cap in requirement_check_capabilities(dep):
                         for prov in _providers_from_maps(cap, [provider_map]):
-                            if prov in parsed_by_source or prov == pkg:
-                                continue
-                            if not is_distgit_source_name(prov):
-                                continue
-                            if prov not in needed:
-                                needed.add(prov)
-                                queue.append(prov)
+                            if is_distgit_source_name(prov):
+                                provs.add(prov)
                         if repo_index is not None:
                             for src in repo_index.distgit_sources_for_capability(cap):
-                                if src in parsed_by_source or src == pkg:
-                                    continue
-                                if not is_distgit_source_name(src):
-                                    continue
-                                if src not in needed:
-                                    needed.add(src)
-                                    queue.append(src)
+                                if is_distgit_source_name(src):
+                                    provs.add(src)
+                    provs = filter_providers_for_consumer(pkg, provs)
+                    provs = narrow_alternate_providers(dep, provs)
+                    if not should_seed_providers(pkg, dep, provs):
+                        continue
+                    if not satisfied and repo_index is not None and provs:
+                        toolchainish = all(is_toolchainish_source(s) for s in provs)
+                        if toolchainish and (
+                            any(
+                                getattr(repo_index, "has_capability_any_arch", lambda _c: False)(c)
+                                for c in requirement_check_capabilities(dep)
+                            )
+                            or any(
+                                getattr(repo_index, "source_present_in_repo", lambda _n: False)(s)
+                                for s in provs
+                            )
+                        ):
+                            continue
+                    # Prefer repo/side-tag. Only pull providers for unsatisfied deps.
+                    if satisfied:
+                        continue
+                    for prov in provs:
+                        _enqueue_prov(prov)
 
     if len(needed) > max_parse:
         err.append(
