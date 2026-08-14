@@ -13,16 +13,6 @@
     <nav></nav>
   </header>
   <main class="main">
-    <section class="card">
-      <h2>Dashboard</h2>
-      <p id="dashboard-hint">Oreon build system. View-only for guests; login to trigger builds, create releases/packages, enroll workers, and manage mock environments.</p>
-      <div class="stats">
-        <div class="stat"><span id="stat-builds">-</span> Builds</div>
-        <div class="stat"><span id="stat-packages">-</span> Packages</div>
-        <div class="stat"><span id="stat-releases">-</span> Releases</div>
-        <div class="stat"><span id="stat-workers">-</span> Workers</div>
-      </div>
-    </section>
     <section class="card" id="dashboard-builds-card">
       <h2>Recent builds</h2>
       <p style="color:var(--text-muted); font-size:0.9rem; margin-top:0.25rem;">Latest jobs across all releases and packages.</p>
@@ -39,18 +29,6 @@
   <script>
     (function() {
       const api = window.oreonApi || {};
-      function updateHint() {
-        var el = document.getElementById('dashboard-hint');
-        if (el && api.token) el.textContent = 'Oreon build system. You can trigger builds, create releases/packages, enroll workers, and manage mock environments from the pages above.';
-        else if (el) el.textContent = 'Oreon build system. View-only for guests; login to trigger builds, create releases/packages, enroll workers, and manage mock environments.';
-      }
-      updateHint();
-      window.addEventListener('auth-change', updateHint);
-      function count(data) {
-        if (Array.isArray(data)) return data.length;
-        if (data && Array.isArray(data.items)) return data.items.length;
-        return 0;
-      }
       async function loadStats() {
         try {
           const [buildsResp, packagesResp, releasesResp, workersResp] = await Promise.all([
@@ -63,12 +41,7 @@
           const packages = (packagesResp && packagesResp.items) ? packagesResp.items : [];
           const releases = (releasesResp && releasesResp.items) ? releasesResp.items : [];
           const workers = (workersResp && workersResp.items) ? workersResp.items : [];
-          document.getElementById('stat-builds').textContent = (buildsResp && typeof buildsResp.total === 'number') ? buildsResp.total : builds.length;
-          document.getElementById('stat-packages').textContent = (packagesResp && typeof packagesResp.total === 'number') ? packagesResp.total : packages.length;
-          document.getElementById('stat-releases').textContent = (releasesResp && typeof releasesResp.total === 'number') ? releasesResp.total : releases.length;
-          document.getElementById('stat-workers').textContent = (workersResp && typeof workersResp.total === 'number') ? workersResp.total : workers.length;
 
-          // Recent builds table
           var buildsHost = document.getElementById('dashboard-builds');
           function statusBadge(s) {
             if (s === 'success' || s === 'skipped') return '<span class="badge success">' + s + '</span>';
@@ -90,10 +63,10 @@
                 var relName = (b.release_name || '').trim() || (rel && (rel.releasename || '').trim()) || '';
                 var pkgLabel = pkgName ? (pkgName + ' (' + b.package_id + ')') : ('#' + b.package_id);
                 var relLabel = relName ? (relName + ' (' + b.release_id + ')') : ('#' + b.release_id);
-                var arch = b.architecture || '—';
+                var arch = b.architecture || '-';
                 var created = (b.created_at || '').slice(0, 19);
                 var sd = jobDisplayStatus(b);
-                var signCell = window.oreonSigningKeyHtml ? window.oreonSigningKeyHtml(b.signing_status) : '—';
+                var signCell = window.oreonSigningKeyHtml ? window.oreonSigningKeyHtml(b.signing_status) : '-';
                 return '<tr>'
                   + '<td><a href="/build.html?job_id=' + b.id + '">#' + b.id + '</a></td>'
                   + '<td>' + pkgLabel + '</td>'
@@ -110,7 +83,6 @@
             }
           }
 
-          // Releases + worker summary
           var relHost = document.getElementById('dashboard-releases');
           if (relHost) {
             if (!releases.length) {
@@ -120,7 +92,6 @@
               workers.forEach(function(w) {
                 if ((w.state || '') === 'offline') return;
                 var arch = (w.architecture || 'x86_64');
-                // Workers are global; just count by architecture
                 byRelease['_all'] = byRelease['_all'] || {};
                 byRelease['_all'][arch] = (byRelease['_all'][arch] || 0) + 1;
               });
@@ -135,7 +106,7 @@
                   }).join(', ');
                 } else {
                   var parts = Object.keys(archCounts).map(function(a) { return a + ': ' + archCounts[a]; });
-                  workerSummary = parts.join(', ') || '—';
+                  workerSummary = parts.join(', ') || '-';
                 }
                 return '<tr>'
                   + '<td>' + r.id + '</td>'
@@ -151,10 +122,7 @@
                 + '</tr></thead><tbody>' + rows + '</tbody></table>';
             }
           }
-        } catch (e) {
-          var el = document.getElementById('stat-builds');
-          if (el) el.textContent = '?';
-        }
+        } catch (e) {}
       }
       loadStats();
     })();
