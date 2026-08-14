@@ -504,7 +504,9 @@
           stopLayerPoll();
           return;
         }
-        if (st === 'pending' && !(data.jobs && data.jobs.length)) {
+        var jobCount = 0;
+        Object.keys(counts).forEach(function(k) { jobCount += Number(counts[k] || 0) || 0; });
+        if (st === 'pending' && jobCount === 0) {
           showLayerAlert('info', 'Layer ' + data.layer_plan_id + ': seeding',
             '<p>Walking static deps and queuing jobs. This page will update when seeding finishes.</p>',
             { showCancel: true, layerId: data.layer_plan_id });
