@@ -9,7 +9,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 
 import click
 import httpx
@@ -147,6 +147,135 @@ def parse_package_names(args: tuple[str, ...]) -> list[str]:
         return []
     parts = re.split(r"[\s,]+", joined)
     return [p for p in parts if p]
+
+def parse_package_blob(text: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in re.split(r"[\s,]+", (text or "").strip()):
+        if not part or part in seen:
+            continue
+        seen.add(part)
+        out.append(part)
+    return out
+
+_RE_SPEC_VERSION = re.compile(r"(?im)^(?P<pre>\s*Version\s*:\s*)(?P<val>\S+)(?P<post>.*)$")
+_RE_SPEC_RELEASE = re.compile(r"(?im)^(?P<pre>\s*Release\s*:\s*)(?P<num>\d+)(?P<rest>.*)$")
+_RE_SPEC_DEFINE_VER = re.compile(
+    r"(?im)^(?P<pre>\s*%(?:global|define)\s+version\s+)(?P<val>\S+)(?P<post>.*)$"
+)
+
+def _split_spec_changelog(text: str) -> tuple[str, str]:
+    m = re.search(r"(?im)^%changelog\b", text)
+    if not m:
+        return text, ""
+    return text[: m.start()], text[m.start() :]
+
+def _spec_literal_version(preamble: str) -> tuple[str, str] | None:
+    vm = _RE_SPEC_VERSION.search(preamble)
+    if not vm:
+        return None
+    val = vm.group("val").strip()
+    if not val:
+        return None
+    if re.fullmatch(r"%\{version\}", val, re.I):
+        dm = _RE_SPEC_DEFINE_VER.search(preamble)
+        if not dm:
+            return None
+        dval = dm.group("val").strip()
+        if not dval or "%" in dval:
+            return None
+        return dval, "define"
+    if "%" in val:
+        return None
+    return val, "tag"
+
+def _replace_version_token(text: str, old: str, new: str) -> str:
+    if old == new:
+        return text
+    if len(old) < 3 and "." not in old:
+        return text
+    rx = re.compile(r"(?<![0-9A-Za-z.])" + re.escape(old) + r"(?!(?:[0-9A-Za-z]|\.\d))")
+    return rx.sub(new, text)
+
+def bump_spec_to_version(text: str, latest: str) -> tuple[str, str, str] | None:
+    latest = (latest or "").strip()
+    if not latest or "%" in latest:
+        return None
+    pre, log = _split_spec_changelog(text)
+    found = _spec_literal_version(pre)
+    if not found:
+        return None
+    old, kind = found
+    if old == latest:
+        return text, old, latest
+    if kind == "define":
+        pre = _RE_SPEC_DEFINE_VER.sub(lambda m: m.group("pre") + latest + m.group("post"), pre, count=1)
+    else:
+        pre = _RE_SPEC_VERSION.sub(lambda m: m.group("pre") + latest + m.group("post"), pre, count=1)
+    pre = _RE_SPEC_RELEASE.sub(lambda m: m.group("pre") + "1" + m.group("rest"), pre, count=1)
+    pre = _replace_version_token(pre, old, latest)
+    return pre + log, old, latest
+
+def find_pkg_specs(root: Path, pkg: str) -> list[Path]:
+    root = root.expanduser().resolve()
+    direct = root / pkg / f"{pkg}.spec"
+    if direct.is_file():
+        return [direct]
+    hits: list[Path] = []
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return []
+    for child in children:
+        if not child.is_dir():
+            continue
+        p = child / pkg / f"{pkg}.spec"
+        if p.is_file():
+            hits.append(p)
+    return hits
+
+def _prompt_packages() -> list[str]:
+    click.echo("packages")
+    try:
+        first = input()
+    except EOFError:
+        return []
+    names = parse_package_blob(first)
+    if len(names) > 1:
+        return names
+    lines = [first]
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        if not line.strip():
+            break
+        lines.append(line)
+    return parse_package_blob("\n".join(lines))
+
+def _watchdog_latest(wd: str, token: str | None, name: str, cached: dict[str, str]) -> str | None:
+    hit = cached.get(name)
+    if hit:
+        return hit
+    r = http_request_raw(
+        "GET",
+        wd,
+        "/api/release-monitoring/latest/%s" % quote(name, safe=".-_"),
+        token=token,
+        timeout=60.0,
+    )
+    if r.status_code != 200:
+        detail = ""
+        try:
+            detail = str(r.json().get("detail") or "")
+        except Exception:
+            detail = r.text[:200]
+        click.echo("%s  watchdog latest failed (%s) %s" % (name, r.status_code, detail), err=True)
+        return None
+    data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+    ver = str((data or {}).get("latest_version") or "").strip()
+    return ver or None
 
 def _nevra_to_name(nevra: str) -> str:
     s = nevra.strip()
@@ -299,6 +428,107 @@ def cmd_whoami() -> None:
     token = require_auth(get_token())
     p = _jwt_payload_unverified(token)
     click.echo("user: %s\nrole: %s" % (p.get("sub", "?"), p.get("role", "?")))
+
+@cli.command("spec-bump")
+@click.option(
+    "-p",
+    "--packages",
+    "packages_blob",
+    default=None,
+    help="Package list (spaces, commas, or newlines). Skip the packages prompt.",
+)
+@click.option(
+    "-d",
+    "--spec-root",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="rpm-specfiles tree. Skip the directory prompt.",
+)
+def cmd_spec_bump(packages_blob: str | None, spec_root: Path | None) -> None:
+    token = get_token()
+    wd = get_watchdog_url()
+    if packages_blob is None:
+        if not sys.stdin.isatty():
+            click.echo("pass -p/--packages when stdin is not a tty", err=True)
+            sys.exit(2)
+        names = _prompt_packages()
+    else:
+        names = parse_package_blob(packages_blob)
+    if not names:
+        click.echo("no packages given", err=True)
+        sys.exit(2)
+    if spec_root is None:
+        if not sys.stdin.isatty():
+            click.echo("pass -d/--spec-root when stdin is not a tty", err=True)
+            sys.exit(2)
+        raw = click.prompt("rpm-specfiles directory")
+        spec_root = Path(raw)
+    root = spec_root.expanduser()
+    if not root.is_dir():
+        click.echo("not a directory  %s" % root, err=True)
+        sys.exit(2)
+
+    cached: dict[str, str] = {}
+    rr = http_request_raw("GET", wd, "/api/release-monitoring/results", token=token, timeout=60.0)
+    if rr.status_code == 200:
+        try:
+            payload = rr.json()
+        except Exception:
+            payload = {}
+        for item in payload.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            n = str(item.get("package_name") or "").strip()
+            v = str(item.get("latest_version") or "").strip()
+            if n and v:
+                cached[n] = v
+
+    ok = 0
+    skip = 0
+    fail = 0
+    for pkg in names:
+        specs = find_pkg_specs(root, pkg)
+        if not specs:
+            click.echo("%s  no spec under %s" % (pkg, root), err=True)
+            fail += 1
+            continue
+        if len(specs) > 1:
+            click.echo("%s  multiple specs, pick a tighter directory" % pkg, err=True)
+            for p in specs:
+                click.echo("    %s" % p, err=True)
+            fail += 1
+            continue
+        spec_path = specs[0]
+        latest = _watchdog_latest(wd, token, pkg, cached)
+        if not latest:
+            fail += 1
+            continue
+        try:
+            text = spec_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            click.echo("%s  cannot read %s (%s)" % (pkg, spec_path, exc), err=True)
+            fail += 1
+            continue
+        bumped = bump_spec_to_version(text, latest)
+        if bumped is None:
+            click.echo("%s  cannot find a literal Version in %s" % (pkg, spec_path), err=True)
+            fail += 1
+            continue
+        new_text, old, new = bumped
+        if old == new:
+            click.echo("%s  already %s" % (pkg, old))
+            skip += 1
+            continue
+        if new_text == text:
+            click.echo("%s  %s -> %s but spec text unchanged" % (pkg, old, new), err=True)
+            fail += 1
+            continue
+        spec_path.write_text(new_text, encoding="utf-8")
+        click.echo("%s  %s -> %s  %s" % (pkg, old, new, spec_path))
+        ok += 1
+    click.echo("bumped=%s already=%s failed=%s" % (ok, skip, fail))
+    if fail:
+        sys.exit(1)
 
 @cli.command("iso-dnf-log")
 @click.argument(

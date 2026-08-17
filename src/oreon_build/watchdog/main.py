@@ -331,6 +331,52 @@ def create_app() -> FastAPI:
                 }
             )
 
+    @app.get("/api/release-monitoring/latest/{package_name}")
+    async def release_monitoring_latest(package_name: str):
+        import httpx
+        from sqlalchemy import select as sa_select
+        from oreon_build.services.release_monitor import _anitya_latest
+
+        name = (package_name or "").strip()
+        if not name or len(name) > 256:
+            return JSONResponse(content={"detail": "invalid package name"}, status_code=400)
+
+        async with async_session_maker() as db:
+            row = (
+                await db.execute(
+                    sa_select(ReleaseMonitorOutdated)
+                    .join(ReleaseMonitorScan, ReleaseMonitorOutdated.scan_id == ReleaseMonitorScan.id)
+                    .where(
+                        ReleaseMonitorScan.status == "done",
+                        ReleaseMonitorOutdated.package_name == name,
+                    )
+                    .order_by(ReleaseMonitorScan.started_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if row is not None:
+                return JSONResponse(
+                    content={
+                        "package_name": name,
+                        "latest_version": row.latest_version,
+                        "current_version": row.current_version,
+                        "project": row.project,
+                        "ecosystem": row.ecosystem,
+                        "source": "scan",
+                    }
+                )
+
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            hit = await _anitya_latest(client, name)
+        if not hit:
+            return JSONResponse(
+                content={"detail": "no version mapping for %s" % name},
+                status_code=404,
+            )
+        return JSONResponse(
+            content={"package_name": name, "source": "anitya", **hit}
+        )
+
     @app.get("/api/release-monitoring/status")
     async def release_monitoring_status(release_id: int | None = Query(None)):
         from sqlalchemy import select
