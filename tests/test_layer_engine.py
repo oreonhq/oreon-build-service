@@ -1696,6 +1696,9 @@ async def test_resolve_layer_blocker_cycles_queues_after_order_break():
             ]
             return result
 
+        async def flush(self):
+            return None
+
     async def _drop(db, job, sources):
         jid = int(job.id)
         before = list(live_blockers.get(jid, []))
@@ -1725,6 +1728,19 @@ async def test_resolve_layer_blocker_cycles_queues_after_order_break():
     assert jobs[3].status == BuildStatus.BLOCKED
     assert "golist" in (jobs[3].blocked_reason or "")
     assert any(j.status == BuildStatus.QUEUED for j in jobs[:2])
+
+    # the member we let through must build with tests off, otherwise it still
+    # BuildRequires the edge we just dropped and dies on a missing provide
+    from oreon_build.services.build_pass import bootstrap_dropped_sources, job_options_dict
+
+    freed = [j for j in jobs[:2] if j.status == BuildStatus.QUEUED]
+    assert freed
+    for j in freed:
+        opts = job_options_dict(j)
+        assert opts.get("build_profile") == "bootstrap"
+        assert opts.get("rpmbuild_defines") == {"with_check": "0"}
+        assert opts.get("next_profile") == "full"
+        assert bootstrap_dropped_sources(j)
 
 
 @pytest.mark.asyncio
@@ -2191,14 +2207,24 @@ def test_toolchain_any_arch_skips_ghc_libs():
     idx.binary_names_any.add("ghc-base-devel")
     idx.capability_providers["ghc-base-devel"] = {"ghc-base"}
     idx.finalize_lookups()
+
+    class _Restricted:
+        exclusive_arches = {"x86_64"}
+
+    restricted = {"ghc-base": _Restricted()}
+    # ExclusiveArch toolchain: present on one arch is the honest answer
     assert _toolchain_any_arch_satisfied(
-        idx, "ghc-base-devel", {"ghc-base"}
+        idx, "ghc-base-devel", {"ghc-base"}, restricted
     )
     assert not _source_needs_build(
         "ghc-base",
         cap_index=idx,
+        parsed_by_source=restricted,
         require_evr=True,
     )
+    # same repo state with no ExclusiveArch is a real arch hole, so build it
+    assert not _toolchain_any_arch_satisfied(idx, "ghc-base-devel", {"ghc-base"})
+    assert _source_needs_build("ghc-base", cap_index=idx, require_evr=True)
 
 
 def test_should_seed_blocks_foreign_compiler_stacks():
@@ -2207,9 +2233,13 @@ def test_should_seed_blocks_foreign_compiler_stacks():
         should_seed_providers,
     )
 
-    assert not should_seed_providers("yt-dlp", "pandoc", {"pandoc-cli"})
+    # a non-ghc cap whose only provider is a haskell package must not drag the
+    # ghc stack into a native graph
+    assert not should_seed_providers("fast_float", "doctest", {"ghc-doctest"})
     assert not should_seed_providers("openjpeg", "mingw32-lcms2", {"mingw-lcms2"})
-    assert should_seed_providers("pandoc-cli", "ghc-base-devel", {"ghc-base"})
+    # asking for a ghc-namespace cap means you want the haskell stack
+    assert should_seed_providers("shake", "ghc-base", {"ghc"})
+    assert should_seed_providers("ghc-aeson", "ghc-base-devel", {"ghc-base"})
     assert should_seed_providers("mingw-openjpeg", "mingw32-lcms2", {"mingw-lcms2"})
     assert should_seed_providers("kf6-kconfig", "cmake(Qt6Core)", {"qt6-qtbase"})
     assert should_seed_providers("plasma-workspace", "cln-devel", {"cln"})
@@ -2520,6 +2550,117 @@ async def test_spawn_fills_missing_plan_arches():
 
 
 @pytest.mark.asyncio
+async def test_force_build_sources_rebuilds_repo_current_provider():
+    """autofix must rebuild a cap-gap provider even when repo EVR looks current.
+
+    mock is authoritative that the capability is missing from the real root, so the
+    repo-current EVR gate must not skip that specific provider.
+    """
+    job = MagicMock()
+    job.id = 58503
+    job.layer_plan_id = 1136
+    job.branch = "testing/post-beta"
+    job.layer_index = 2
+
+    plan = MagicMock()
+    plan.id = 1136
+    plan.root_packages = ["perl-ExtUtils-MakeMaker-CPANfile"]
+    plan.plan_options = {
+        "distgit_url": "https://github.com/oreonhq/rpm-specfiles.git",
+        "preferred_mock_environment_id": None,
+        "priority": 0,
+    }
+    plan.triggered_by_id = None
+    plan.side_tag_id = None
+
+    release = MagicMock()
+    release.id = 1
+    release.releasename = "oreon-11-rp1"
+    release.default_mock_environment_id = None
+
+    class _DB:
+        async def get(self, model, ident, **kw):
+            return None
+
+        async def execute(self, stmt):
+            result = MagicMock()
+            result.scalars.return_value.all.return_value = []
+            result.all.return_value = []
+            return result
+
+        async def flush(self):
+            return None
+
+        def add(self, obj):
+            pass
+
+    created: list[str] = []
+
+    async def _create(*args, **kwargs):
+        created.append(args[2] if len(args) > 2 else kwargs.get("pkg_name"))
+        nj = MagicMock()
+        nj.id = 4242
+        return [nj]
+
+    cap_index = MagicMock()
+
+    async def _run(force_sources):
+        created.clear()
+        with (
+            patch(
+                "oreon_build.services.layer_engine._refetch_spec_text",
+                new=AsyncMock(return_value="Name: perl-CPAN-Meta-Requirements\n"),
+            ),
+            patch(
+                "oreon_build.services.layer_engine._create_job_for_package",
+                new=_create,
+            ),
+            patch(
+                "oreon_build.services.layer_engine._source_needs_build",
+                return_value=False,
+            ),
+            patch(
+                "oreon_build.services.distgit_order._spec_parse_fn",
+                return_value=lambda text, name: _SpecParseResult(
+                    source_name="perl-CPAN-Meta-Requirements",
+                    build_requires=[],
+                    provided_binary_names=set(),
+                    epoch=0,
+                    version="2.140",
+                    release="524.or11",
+                ),
+            ),
+        ):
+            return await _spawn_layer_dep_sources(
+                _DB(),
+                job,
+                plan=plan,
+                release=release,
+                sources={"perl-CPAN-Meta-Requirements"},
+                owner="oreonhq",
+                repo="rpm-specfiles",
+                distgit_branch="testing/post-beta",
+                releasename="oreon-11-rp1",
+                headers={},
+                arches=["x86_64", "aarch64"],
+                cap_index=cap_index,
+                force_build=False,
+                force_build_sources=force_sources,
+                package_names={"perl-CPAN-Meta-Requirements"},
+            )
+
+    # repo-current provider with no force -> EVR gate skips it, autofix would die
+    attached_skip = await _run(set())
+    assert attached_skip == set()
+    assert created == []
+
+    # same provider marked cap-gap -> force rebuild despite repo-current EVR
+    attached_force = await _run({"perl-CPAN-Meta-Requirements"})
+    assert attached_force == {"perl-CPAN-Meta-Requirements"}
+    assert created == ["perl-CPAN-Meta-Requirements"]
+
+
+@pytest.mark.asyncio
 async def test_prune_unneeded_drops_orphan_non_root():
     plan = MagicMock()
     plan.id = 1126
@@ -2672,3 +2813,178 @@ async def test_prune_noop_without_candidates():
     plan.root_packages = ["root"]
     assert await prune_unneeded_layer_sources(MagicMock(), plan) == set()
     assert await prune_unneeded_layer_sources(MagicMock(), plan, candidates=set()) == set()
+
+
+def test_bcond_defines_use_rpm_bcond_macros():
+    from oreon_build.worker.main import _mock_rpmbuild_define_args
+
+    # %{?with_check} tests definedness, so "with_check 0" would switch tests ON
+    flat = " ".join(_mock_rpmbuild_define_args({"with_check": "0"}))
+    assert "_without_check --without-check" in flat
+    assert "with_check 0" not in flat
+    flat = " ".join(_mock_rpmbuild_define_args({"with_check": "1"}))
+    assert "_with_check --with-check" in flat
+    # plain macros are untouched
+    assert "dist .or11" in " ".join(_mock_rpmbuild_define_args({"dist": ".or11"}))
+
+
+def test_shell_macro_never_splits_into_phantom_caps():
+    from oreon_build.core.rpm_requires import requirement_check_capabilities
+
+    # %global majmin_ver %(echo %{version} | cut -d. -f1,2)
+    caps = requirement_check_capabilities(
+        "libkeduvocdocument-devel >= %(echo 26.4.3 | cut -d. -f1,2)"
+    )
+    assert "2)" not in caps
+    assert not any(c.startswith("(echo") for c in caps)
+
+
+def test_bootstrap_pass_round_trip():
+    import asyncio
+
+    from oreon_build.models import BuildStatus
+    from oreon_build.services.build_pass import (
+        bootstrap_dropped_sources,
+        job_options_dict,
+        poll_payload_from_job,
+        schedule_next_pass_after_publish,
+    )
+    from oreon_build.services.layer_engine import _start_bootstrap_pass
+
+    class _Job:
+        def __init__(self):
+            self.job_options = {}
+            self.status = BuildStatus.QUEUED
+            self.completed_at = "x"
+
+    class _Db:
+        async def flush(self):
+            return None
+
+    job = _Job()
+    assert asyncio.run(_start_bootstrap_pass(_Db(), job, {"rust-quickcheck"}))
+    opts = job_options_dict(job)
+    assert opts["build_profile"] == "bootstrap"
+    assert opts["rpmbuild_defines"] == {"with_check": "0"}
+    assert bootstrap_dropped_sources(job) == ["rust-quickcheck"]
+    # the worker gets tests turned off for the bootstrap pass
+    assert poll_payload_from_job(job)["rpmbuild_defines"] == {"with_check": "0"}
+
+    # second pass clears the defines so the rebuild actually runs its tests
+    assert schedule_next_pass_after_publish(job)
+    opts = job_options_dict(job)
+    assert opts["build_profile"] == "full"
+    assert opts["rpmbuild_defines"] == {}
+    assert "next_profile" not in opts
+    assert job.status == BuildStatus.PENDING
+    assert poll_payload_from_job(job)["rpmbuild_defines"] == {}
+    # and it does not loop back into another bootstrap
+    assert not schedule_next_pass_after_publish(job)
+
+
+@pytest.mark.asyncio
+async def test_second_pass_waits_for_the_dep_its_bootstrap_skipped():
+    from contextlib import asynccontextmanager
+
+    from oreon_build.models import BuildStatus
+    from oreon_build.services import layer_engine as le
+
+    added: list = []
+
+    class _Job:
+        id = 5
+        layer_plan_id = 77
+        status = BuildStatus.PENDING
+        blocked_reason = None
+        job_options = {"build_profile": "full", "bootstrap_dropped": ["rust-quickcheck"]}
+
+    job = _Job()
+
+    class _DB:
+        async def get(self, model, ident, **kw):
+            return job
+
+        async def execute(self, stmt):
+            result = MagicMock()
+            result.scalars.return_value.all.return_value = []
+            return result
+
+        def add(self, row):
+            added.append(row)
+
+        async def flush(self):
+            return None
+
+        async def commit(self):
+            return None
+
+    @asynccontextmanager
+    async def _maker():
+        yield _DB()
+
+    def _session_maker():
+        return _maker()
+
+    with (
+        patch("oreon_build.db.session.async_session_maker", _session_maker),
+        patch.object(
+            le,
+            "_source_statuses_in_plan",
+            new=AsyncMock(return_value={"rust-quickcheck": [BuildStatus.CANCELLED]}),
+        ),
+    ):
+        await le.reblock_second_pass_if_needed(5)
+
+    assert job.status == BuildStatus.BLOCKED
+    assert "rust-quickcheck" in (job.blocked_reason or "")
+    assert [r.blocking_source for r in added] == ["rust-quickcheck"]
+    assert "bootstrap_dropped" not in job.job_options
+
+    # once the dep really is built the full pass is free to run
+    job.status = BuildStatus.PENDING
+    job.job_options = {"build_profile": "full", "bootstrap_dropped": ["rust-quickcheck"]}
+    added.clear()
+    with (
+        patch("oreon_build.db.session.async_session_maker", _session_maker),
+        patch.object(
+            le,
+            "_source_statuses_in_plan",
+            new=AsyncMock(return_value={"rust-quickcheck": [BuildStatus.SUCCESS]}),
+        ),
+    ):
+        await le.reblock_second_pass_if_needed(5)
+
+    assert job.status == BuildStatus.PENDING
+    assert added == []
+
+
+def test_ghc_lib_subpackage_provides_real_package_names():
+    from oreon_build.services.distgit_order import (
+        _ghc_subpackage_libname,
+        _lightweight_provides_from_spec_text,
+    )
+
+    assert _ghc_subpackage_libname("base-4.20.0.0") == "base"
+    # version tail is still a macro, the name is what matters
+    assert _ghc_subpackage_libname("Cabal-%{Cabal_ver}") == "Cabal"
+    # -c takes a dep list, never a library name
+    assert _ghc_subpackage_libname("gmp-devel,libffi-devel") == ""
+
+    spec = "\n".join(
+        [
+            "Name: ghc",
+            "Version: 9.10.1",
+            "%ghc_lib_subpackage -d -l BSD-3-Clause Cabal-%{Cabal_ver}",
+            "%ghc_lib_subpackage -d -l BSD -c gmp-devel,libffi-devel base-4.20.0.0",
+            "%ghc_lib_subpackage -l BSD array-0.5.8.0",
+        ]
+    )
+    prov = _lightweight_provides_from_spec_text("ghc", spec)
+    assert "ghc-base" in prov
+    assert "ghc-base-devel" in prov
+    assert "ghc-Cabal" in prov
+    assert "ghc-Cabal-devel" in prov
+    assert "ghc-array" in prov
+    # no -d on array, and the -c value never becomes a package
+    assert "ghc-array-devel" not in prov
+    assert not [p for p in prov if "," in p]

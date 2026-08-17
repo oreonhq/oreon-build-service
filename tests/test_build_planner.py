@@ -246,12 +246,25 @@ def test_classify_mono_xbuild_fetches_not_imports() -> None:
         nodes={"sbctl": PackageNode(name="sbctl", action="block", br_complete=True)},
         solve=SolveResult(ok=False, missing_provides={"mono(xbuild)"}),
         brs=["mono(xbuild)"],
-        provider_map={},
+        provider_map={"mono(xbuild)": {"mono"}},
         repo_index=RepoCapabilityIndex(),
         package_names={"sbctl", "mono"},
     )
     assert "mono(xbuild)" not in imps
     assert "mono" in fetch
+
+
+def test_classify_mono_xbuild_undeclared_is_not_guessed() -> None:
+    pe, imps, fetch = classify_misses(
+        root="sbctl",
+        nodes={"sbctl": PackageNode(name="sbctl", action="block", br_complete=True)},
+        solve=SolveResult(ok=False, missing_provides={"mono(xbuild)"}),
+        brs=["mono(xbuild)"],
+        provider_map={},
+        repo_index=RepoCapabilityIndex(),
+        package_names={"sbctl", "mono"},
+    )
+    assert "mono" not in fetch
 
 
 def test_classify_spurious_version_miss_ignored() -> None:
@@ -260,7 +273,7 @@ def test_classify_spurious_version_miss_ignored() -> None:
         nodes={"sbctl": PackageNode(name="sbctl", action="block", br_complete=True)},
         solve=SolveResult(ok=False, missing_provides={"4-0-2", "mono(xbuild)"}),
         brs=["mono(xbuild)"],
-        provider_map={},
+        provider_map={"mono(xbuild)": {"mono"}},
         repo_index=RepoCapabilityIndex(),
         package_names={"sbctl", "mono"},
     )
