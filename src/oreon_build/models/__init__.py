@@ -19,6 +19,7 @@ from .publish_task import PublishTask
 from .rpm_complete_lock import RpmCompleteLock
 from .security_advisory import SecurityAdvisory, SecurityAdvisoryRelease
 from .side_tag import SideTag, SideTagCreatedFrom, SideTagMember
+from .release_monitor import ReleaseMonitorScan, ReleaseMonitorOutdated
 
 __all__ = [
     "Account",
@@ -61,4 +62,6 @@ __all__ = [
     "SideTag",
     "SideTagCreatedFrom",
     "SideTagMember",
+    "ReleaseMonitorScan",
+    "ReleaseMonitorOutdated",
 ]
