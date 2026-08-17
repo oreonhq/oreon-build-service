@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import io
 import json
 import logging
 import os
 import subprocess
 import time
-import tarfile
 import tempfile
 import threading
 from datetime import datetime, timedelta, timezone
@@ -16,9 +14,8 @@ from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Depends, File, Header, HTTPException, Query, UploadFile, status
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import Response
 from pydantic import BaseModel
-from starlette.background import BackgroundTask
 from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -55,7 +52,12 @@ from oreon_build.models import (
     WorkerState,
 )
 from oreon_build.services.r2 import get_r2_client, log_r2_key, repo_r2_prefix, repo_rpms_key, src_r2_key
-from oreon_build.services.signing import sign_rpm
+from oreon_build.services.signing import (
+    PesignRepackError,
+    pesign_rpm_if_configured,
+    resolve_pesign_nickname,
+    sign_rpm,
+)
 from oreon_build.services.worker_artifact_access import source_r2_keys_for_attempt
 from oreon_build.services.worker_state_sync import sync_worker_state_after_attempt_finished
 
@@ -74,19 +76,18 @@ def _cancel_cache_ttl_seconds() -> float:
 
 _MAX_BUILD_LOG_BYTES = 64 * 1024 * 1024
 
-def _pesign_material_configured(settings) -> bool:
-    nss = Path((settings.pesign_nss_dir or "").strip()).expanduser()
-    try:
-        resolved = nss.resolve()
-    except OSError:
+def _pesign_expected_for_filename(fname: str) -> bool:
+    name = Path((fname or "").strip()).name
+    if not name.endswith(".rpm") or name.endswith(".src.rpm"):
         return False
-    if not resolved.is_dir():
+    stem = name[: -len(".rpm")]
+    if "." not in stem:
         return False
-    if (settings.pesign_rules_json or "").strip():
-        return True
-    if (settings.pesign_certificate_nickname or "").strip():
-        return True
-    return False
+    nvr, arch = stem.rsplit(".", 1)
+    parts = nvr.rsplit("-", 2)
+    if len(parts) != 3:
+        return False
+    return resolve_pesign_nickname(parts[0], arch, get_settings()) is not None
 
 async def _maybe_stop_burst_vm(
     db: Any,
@@ -136,14 +137,6 @@ def _worker_declared_max_parallel_attempts(worker: Worker) -> int:
     except Exception:
         return fallback
     return max(1, min(n, 64))
-
-def _build_pesign_bundle_file(dest: Path, nss_dir: Path, manifest: dict) -> None:
-    raw = json.dumps(manifest, indent=2).encode("utf-8")
-    with tarfile.open(dest, "w:gz") as tf:
-        info = tarfile.TarInfo("manifest.json")
-        info.size = len(raw)
-        tf.addfile(info, io.BytesIO(raw))
-        tf.add(str(nss_dir.resolve()), arcname="nss")
 
 async def get_worker(
     db: DbSession,
@@ -756,10 +749,10 @@ async def upload_worker_rpm_complete(
     head_polls = int((os.environ.get("OREON_RPM_COMPLETE_HEAD_POLLS") or "48").strip())
     head_polls = max(8, min(head_polls, 160))
 
-    def _finalize() -> tuple[bool, str, int, str]:
+    def _finalize() -> tuple[bool, bool, str, int, str]:
         fname = Path(body.filename.strip()).name
 
-        def _one_attempt() -> tuple[bool, str, int, str]:
+        def _one_attempt() -> tuple[bool, bool, str, int, str]:
             fd, tmp_path = tempfile.mkstemp(suffix=".rpm")
             os.close(fd)
             path = Path(tmp_path)
@@ -803,6 +796,9 @@ async def upload_worker_rpm_complete(
                 actual_sha = h.hexdigest()
 
                 if actual_size == sz and actual_sha == want_sha:
+                    pesigned = False
+                    if not fname.endswith(".src.rpm"):
+                        pesigned = pesign_rpm_if_configured(path)
                     signed = sign_rpm(path)
                     signed_size = path.stat().st_size
                     h2 = hashlib.sha256()
@@ -815,7 +811,7 @@ async def upload_worker_rpm_complete(
                     signed_sha = h2.hexdigest()
                     with open(path, "rb") as fh2:
                         r2.upload_fileobj(r2_key, fh2, content_type=_RPM_UPLOAD_CONTENT_TYPE)
-                    return signed, r2_key, signed_size, signed_sha
+                    return signed, pesigned, r2_key, signed_size, signed_sha
 
                 if _presigned_rpm_already_finalized_on_retry(path, fname):
                     logger.warning(
@@ -823,7 +819,7 @@ async def upload_worker_rpm_complete(
                         fname,
                         attempt_id,
                     )
-                    return True, r2_key, actual_size, actual_sha
+                    return True, _pesign_expected_for_filename(fname), r2_key, actual_size, actual_sha
 
                 raise ValueError(
                     "Upload verify failed (R2 size=%s sha256=%s; worker size=%s sha256=%s). "
@@ -929,11 +925,16 @@ async def upload_worker_rpm_complete(
             await asyncio.sleep(2)
 
         try:
-            signed, rk, signed_size, signed_sha = await asyncio.to_thread(_finalize)
+            signed, pesigned, rk, signed_size, signed_sha = await asyncio.to_thread(_finalize)
         except FileNotFoundError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
         except ValueError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+        except PesignRepackError as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"pesign failed on controller: {e}",
+            ) from e
     finally:
         if lock_acquired:
             try:
@@ -972,7 +973,7 @@ async def upload_worker_rpm_complete(
         "filename": fname,
         "r2_key": rk,
         "signed": signed,
-        "pesign_applied": False,
+        "pesign_applied": pesigned,
         "size_bytes": signed_size,
         "checksum_sha256": digest,
     }
@@ -1005,7 +1006,7 @@ async def upload_worker_rpm_status(
         "filename": fname,
         "r2_key": row.r2_key,
         "signed": bool(row.is_signed),
-        "pesign_applied": False,
+        "pesign_applied": _pesign_expected_for_filename(fname),
         "size_bytes": int(row.size_bytes or 0),
         "checksum_sha256": (row.checksum_sha256 or "").strip(),
     }
@@ -1410,72 +1411,8 @@ async def worker_download_pesign_bundle(
     db: DbSession,
     worker: Annotated[Worker, Depends(_require_worker)],
 ):
-    settings = get_settings()
-    ar = await db.execute(
-        select(BuildAttempt).where(
-            BuildAttempt.id == attempt_id,
-            BuildAttempt.worker_id == worker.id,
-        )
-    )
-    attempt = ar.scalar_one_or_none()
-    if not attempt:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attempt not found")
-    if attempt.status != BuildStatus.RUNNING:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Pesign bundle only while attempt is running",
-        )
-    if not _pesign_material_configured(settings):
-        return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-    nss_dir = Path(settings.pesign_nss_dir).expanduser().resolve()
-    manifest = {
-        "version": 1,
-        "pesign_rules_json": settings.pesign_rules_json,
-        "pesign_certificate_nickname": settings.pesign_certificate_nickname,
-        "pesign_package_name_regex": settings.pesign_package_name_regex,
-        "pesign_token": settings.pesign_token,
-        "pesign_strict": settings.pesign_strict,
-        "pesign_aarch64_qemu_prefix": settings.pesign_aarch64_qemu_prefix,
-        "pesign_aarch64_guest_shell": settings.pesign_aarch64_guest_shell,
-        "nss_subdir": "nss",
-    }
-    fd, tmp = tempfile.mkstemp(suffix=".tar.gz")
-    os.close(fd)
-    out_path = Path(tmp)
-
-    def _build() -> None:
-        _build_pesign_bundle_file(out_path, nss_dir, manifest)
-
-    try:
-        await asyncio.to_thread(_build)
-    except Exception:
-        out_path.unlink(missing_ok=True)
-        raise
-
-    await log_audit(
-        db,
-        action="worker.pesign_bundle_download",
-        resource_type="build_attempt",
-        resource_id=str(attempt_id),
-        details=f"worker_id={worker.id}",
-        emit_discord=False,
-    )
-
-    out_str = str(out_path)
-
-    def _cleanup() -> None:
-        try:
-            os.unlink(out_str)
-        except OSError:
-            pass
-
-    return FileResponse(
-        path=out_str,
-        filename=f"pesign-bundle-{attempt_id}.tar.gz",
-        media_type="application/gzip",
-        background=BackgroundTask(_cleanup),
-    )
+    # pesign now happens on the controller at rpm finalize, workers get nothing
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 @router.post("/upload-rpm/{attempt_id}")
 async def upload_worker_rpm(
@@ -1498,8 +1435,8 @@ async def upload_worker_rpm(
     path = Path(tmp_path)
     raw: bytes = b""
     signed = False
+    pesigned = False
     digest = ""
-    r2_key = ""
     try:
         total = 0
         with open(path, "wb") as out:
@@ -1515,6 +1452,8 @@ async def upload_worker_rpm(
                     )
                 out.write(chunk)
 
+        if not fname.endswith(".src.rpm"):
+            pesigned = await asyncio.to_thread(pesign_rpm_if_configured, path)
         signed = await asyncio.to_thread(sign_rpm, path)
         raw = await asyncio.to_thread(path.read_bytes)
         digest = hashlib.sha256(raw).hexdigest()
@@ -1522,6 +1461,12 @@ async def upload_worker_rpm(
         await asyncio.to_thread(_put_rpm_bytes_to_r2, r2_key, raw)
     except HTTPException:
         raise
+    except PesignRepackError as exc:
+        logger.exception("controller pesign failed attempt_id=%s file=%s", attempt_id, fname)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"pesign failed on controller: {exc}",
+        ) from exc
     except Exception as exc:
         logger.exception("upload-rpm failed attempt_id=%s", attempt_id)
         raise HTTPException(
@@ -1548,7 +1493,7 @@ async def upload_worker_rpm(
         "filename": fname,
         "r2_key": r2_key,
         "signed": signed,
-        "pesign_applied": False,
+        "pesign_applied": pesigned,
         "size_bytes": len(raw),
         "checksum_sha256": digest,
     }
@@ -1766,29 +1711,28 @@ async def report_result(
         attempt.error_message = err_msg
     if payload.log_r2_key:
         attempt.log_r2_key = payload.log_r2_key
-    from oreon_build.services.build_pass import job_options_dict
+    from oreon_build.services.build_pass import schedule_next_pass_after_publish
 
-    job_opts = job_options_dict(job)
-    has_next = bool(str(job_opts.get("next_profile") or "").strip())
-    if terminal_st == "success" and has_next:
-        job.status = BuildStatus.PENDING
-        job.completed_at = None
-    else:
+    # schedule_next_pass swaps the profile and clears the bootstrap defines. Only
+    # flipping status here would rerun the same pass with tests still off forever.
+    queued_next_pass = terminal_st == "success" and schedule_next_pass_after_publish(job)
+    if not queued_next_pass:
         job.status = BuildStatus(terminal_st)
         job.completed_at = attempt.finished_at
     await db.flush()
     await sync_worker_state_after_attempt_finished(db, worker)
     await db.commit()
 
+    if queued_next_pass:
+        try:
+            from oreon_build.services.layer_engine import reblock_second_pass_if_needed
+
+            await reblock_second_pass_if_needed(int(job.id))
+        except Exception:
+            logger.exception("second pass re-block failed job_id=%s", job.id)
+
     await _burst_vm_stop_check()
 
-    if st_l in ("failed", "cancelled"):
-        try:
-            from oreon_build.services.layer_plan import notify_layer_job_terminal_after_result
-
-            await notify_layer_job_terminal_after_result(job.id, st_l, err_msg)
-        except Exception:
-            logger.exception("layer notify after terminal job result job_id=%s", job.id)
     for a in payload.artifacts:
         stmt = (
             pg_insert(Artifact.__table__)
@@ -1910,6 +1854,14 @@ async def report_result(
         ip_address=None,
         user_agent="worker",
     )
+    await db.commit()
+
+    # layer autofix locks the plan row and can run for minutes, keep it off the
+    # request so the worker post cant time out and lose the result
+    if st_l in ("failed", "cancelled"):
+        from oreon_build.services.build_trigger_bg import schedule_layer_terminal_notify
+
+        schedule_layer_terminal_notify(job.id, st_l, err_msg)
 
     return {"status": "ok"}
 
