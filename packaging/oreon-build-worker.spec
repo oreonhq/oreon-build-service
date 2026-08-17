@@ -38,7 +38,6 @@ Requires:       rpmdevtools
 Requires:       pigz
 Requires:       rpmrebuild
 Requires:       pesign
-Requires:       nss-tools
 Requires:       git
 Requires:       kf6-rpm-macros
 
