@@ -17,7 +17,11 @@ logger = logging.getLogger(__name__)
 _plan_lock = asyncio.Lock()
 
 
+_running: set[asyncio.Task] = set()
+
+
 def _log_task_result(task: asyncio.Task[None]) -> None:
+    _running.discard(task)
     try:
         exc = task.exception()
     except asyncio.CancelledError:
@@ -28,6 +32,7 @@ def _log_task_result(task: asyncio.Task[None]) -> None:
 
 def spawn(coro) -> None:
     task = asyncio.create_task(coro)
+    _running.add(task)
     task.add_done_callback(_log_task_result)
 
 
@@ -186,3 +191,20 @@ async def run_layer_resume_refresh(plan_id: int, job_ids: list[int]) -> None:
 
 def schedule_layer_resume_refresh(plan_id: int, job_ids: list[int]) -> None:
     spawn(run_layer_resume_refresh(int(plan_id), list(job_ids or [])))
+
+
+async def run_layer_terminal_notify(job_id: int, status_str: str, error_message: str | None) -> None:
+    """Layer autofix/settle for a terminal job. Serializes on the plan row, so it
+    must never run inside the worker result request."""
+    from oreon_build.services.layer_plan import notify_layer_job_terminal_after_result
+
+    try:
+        await notify_layer_job_terminal_after_result(int(job_id), status_str, error_message)
+    except Exception:
+        logger.exception("background layer terminal notify failed job_id=%s", job_id)
+
+
+def schedule_layer_terminal_notify(
+    job_id: int, status_str: str, error_message: str | None
+) -> None:
+    spawn(run_layer_terminal_notify(int(job_id), status_str, error_message))

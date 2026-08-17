@@ -351,6 +351,29 @@ def _add_capability_tokens(target: set[str], raw: str, macros: dict[str, str]) -
             target.add(tok)
 
 
+_RE_GHC_LIB_TOKEN = re.compile(
+    r"^([A-Za-z][A-Za-z0-9_]*(?:-[A-Za-z][A-Za-z0-9_]*)*)"
+    r"(?:-(?:\d[\w.]*|%\{[^}]+\}))?$"
+)
+
+
+def _ghc_subpackage_libname(token: str) -> str:
+    """Library name out of a %ghc_lib_subpackage arg.
+
+    Args look like base-4.20.0.0 or Cabal-%{Cabal_ver}. The version tail is
+    whatever ghc happens to ship, so a leftover macro there must not throw the
+    whole subpackage away or ghc-base and friends stay invisible to the planner.
+    """
+    t = (token or "").strip()
+    if not t:
+        return ""
+    m = _RE_GHC_LIB_TOKEN.match(t)
+    if not m:
+        return ""
+    name = m.group(1)
+    return name if "%" not in name else ""
+
+
 def _extract_pkg_name_from_package_options(opts: str, source_name: str) -> str | None:
     raw = (opts or "").strip()
     if not raw:
@@ -895,7 +918,7 @@ _PROVIDES_INDEX_CACHE: dict[tuple[str, str, str, str, str], tuple[float, Distgit
 _provides_index_tasks: dict[tuple[str, str, str, str, str], asyncio.Task[DistgitProvidesIndex | None]] = {}
 _PACKAGE_NAMES_CACHE: dict[tuple[str, str, str, str], tuple[float, frozenset[str]]] = {}
 _PACKAGE_NAMES_CACHE_TTL_SEC = 1800.0
-_PROVIDES_INDEX_DISK_VERSION = "v14"
+_PROVIDES_INDEX_DISK_VERSION = "v15"
 
 
 def _so_file_provides(libstem: str) -> set[str]:
@@ -1001,18 +1024,26 @@ def _lightweight_provides_from_spec_text(pkg: str, spec_text: str) -> set[str]:
             rest = _expand_rpm_macros(rest, macros)
             tokens = rest.split()
             i = 0
+            devel = False
             while i < len(tokens):
                 tok = tokens[i]
-                if tok == "-l":
+                # -l takes a license, -c takes a dep list. both eat their value
+                if tok in ("-l", "-c"):
                     i += 2
+                    continue
+                if tok == "-d":
+                    devel = True
+                    i += 1
                     continue
                 if tok.startswith("-"):
                     i += 1
                     continue
-                if "%" not in tok:
-                    lm = re.match(r"^([A-Za-z0-9_]+(?:-[A-Za-z0-9_]+)*)-\d[\w.]*$", tok)
-                    libname = lm.group(1) if lm else tok
+                libname = _ghc_subpackage_libname(tok)
+                if libname:
                     provided.add(f"ghc-libhs({libname})")
+                    provided.add(f"ghc-{libname}")
+                    if devel:
+                        provided.add(f"ghc-{libname}-devel")
                 i += 1
             continue
         if low.startswith("%py_provides") or low.startswith("%py3_provides"):

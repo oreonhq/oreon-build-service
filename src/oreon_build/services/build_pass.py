@@ -48,6 +48,14 @@ def counts_for_chain_publish(job: BuildJob) -> bool:
     return profile == "full"
 
 
+def bootstrap_dropped_sources(job: BuildJob) -> list[str]:
+    """Blockers a bootstrap pass was allowed to skip, needed again for the full pass."""
+    raw = job_options_dict(job).get("bootstrap_dropped")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(x) for x in raw if str(x).strip()]
+
+
 def schedule_next_pass_after_publish(job: BuildJob) -> bool:
     opts = job_options_dict(job)
     nxt = str(opts.get("next_profile") or "").strip().lower()

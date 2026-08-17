@@ -532,6 +532,18 @@ class RepoCapabilityIndex:
             return True
         return any(src == n for src in self.binary_source.values())
 
+    def source_present_for_arches(self, name: str) -> bool:
+        """Present on every arch this index covers, not merely somewhere.
+
+        source_present_in_repo folds in the any-arch union. A compiler built only
+        on x86_64 then reads as present, so an aarch64 build never gets one and
+        every consumer on that arch dies with nothing to link against.
+        """
+        n = (name or "").strip()
+        if not n:
+            return False
+        return n in self.source_names or n in self.binary_names
+
     def _source_repo_evrs(self, name: str) -> list[tuple[str, str, str]]:
         n = (name or "").strip()
         if not n:

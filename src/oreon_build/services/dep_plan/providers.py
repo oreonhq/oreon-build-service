@@ -37,9 +37,6 @@ _RE_VERSION_SUFFIX = re.compile(r"\d")
 _RE_MINGW_REQ = re.compile(
     r"(?i)(?:^|[\s,(])mingw(?:32|64)(?:-|\()|^mingw(?:32|64)-"
 )
-_TOOLCHAINISH_EXTRA = frozenset(
-    {"alex", "happy", "shake", "pandoc", "pandoc-cli", "cabal-install"}
-)
 
 
 def is_mingw_source(name: str) -> bool:
@@ -88,14 +85,37 @@ def _is_ghc_alternate_compiler(name: str) -> bool:
 
 
 def is_toolchainish_source(name: str) -> bool:
-    """ExclusiveArch / dual-arch compiler stacks. Prefer any-arch repo presence."""
+    """ghc alternate-compiler namespace (ghc, ghcNN, ghc-*). Prefer any-arch repo presence."""
     n = (name or "").strip()
     if not n:
         return False
-    if _is_ghc_alternate_compiler(n) or n in _TOOLCHAINISH_EXTRA:
+    if _is_ghc_alternate_compiler(n):
         return True
-    low = n.lower()
-    return low.startswith("ghc-")
+    return n.lower().startswith("ghc-")
+
+
+def is_ghc_requirement(req: str) -> bool:
+    """The cap itself sits in the ghc namespace, so a ghc source is its real owner.
+
+    ghc ships base/Cabal/bytestring as subpackages. A package asking for those by
+    name wants the haskell stack, whoever it is, so pulling ghc is the answer and
+    not a foreign stack leaking into a native graph.
+    """
+    raw = (req or "").strip()
+    if not raw:
+        return False
+    from oreon_build.core.rpm_requires import requirement_check_capabilities
+
+    for cap in requirement_check_capabilities(raw) or [raw]:
+        c = (cap or "").strip()
+        if not c:
+            continue
+        if c.startswith("libHS"):
+            return True
+        low = c.lower()
+        if low == "ghc" or low.startswith("ghc-"):
+            return True
+    return False
 
 
 def should_seed_providers(consumer: str, req: str, srcs: set[str]) -> bool:
@@ -104,7 +124,11 @@ def should_seed_providers(consumer: str, req: str, srcs: set[str]) -> bool:
         return False
     if is_mingw_requirement(req) and not is_mingw_source(consumer):
         return False
-    if all(is_toolchainish_source(s) for s in srcs) and not is_toolchainish_source(consumer):
+    if (
+        all(is_toolchainish_source(s) for s in srcs)
+        and not is_toolchainish_source(consumer)
+        and not is_ghc_requirement(req)
+    ):
         return False
     return True
 

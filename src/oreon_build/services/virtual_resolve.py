@@ -1,5 +1,15 @@
 """Map virtual RPM caps to distgit source package names.
 
+Resolution is driven by provider data only. A cap is decomposed into rich-dep
+leaves, normalized to its equivalent authoritative forms, then looked up in the
+distgit provides map. On top of that sit decoders for capability namespaces that
+encode their owner in a fixed format (ghc sonames, ghc-devel/prof, mvn coords,
+go import paths, crate compat series, tex style files).
+
+No alias tables, no fuzzy name matching, no guessing a source from a cap that
+does not declare it. Guessing invents providers that do not exist and spawns
+junk rebuilds.
+
 Discovery only. Never used as installability proof.
 """
 
@@ -13,9 +23,6 @@ _RE_PKGCONFIG = re.compile(r"^pkgconfig\((.+)\)$", re.IGNORECASE)
 _RE_PYTHON3DIST = re.compile(r"^python3(?:\.\d+)?dist\((.+)\)$", re.IGNORECASE)
 _RE_TEX = re.compile(r"^tex\((.+)\)$", re.IGNORECASE)
 _RE_MVN = re.compile(r"^mvn\(([^)]+)\)$", re.IGNORECASE)
-_RE_MINGW_DLL = re.compile(
-    r"^mingw(32|64)\((lib[A-Za-z0-9_+.-]+\.dll)\)$", re.IGNORECASE
-)
 _RE_GHC_DEVEL = re.compile(r"^ghc-devel\((.+)\)$", re.IGNORECASE)
 _RE_GHC_PROF = re.compile(r"^ghc-prof\((.+)\)$", re.IGNORECASE)
 _RE_MONO = re.compile(r"^mono\((.+)\)$", re.IGNORECASE)
@@ -27,48 +34,6 @@ _RE_PY_EXTRA = re.compile(r"\[([^\]]*)\]\s*$")
 _RE_BIN_PLUS = re.compile(r"^(.+)\+([A-Za-z0-9_.+-]+)$")
 _RE_CRATE = re.compile(r"^crate\(([^)/]+)(?:/[^)]+)?\)$")
 
-# mingw DLL stem → mingw source leaf (mingw-<leaf> / mingw32-<leaf>)
-_MINGW_LIB_TO_SRC = {
-    "libintl": "gettext",
-    "libgmp": "gmp",
-    "libtasn1": "libtasn1",
-    "libgcc_s_seh": "gcc",
-    "libgcc_s_dw2": "gcc",
-    "libstdc++": "gcc",
-    "libwinpthread": "winpthreads",
-    "libssp": "gcc",
-    "libffi": "libffi",
-    "libiconv": "win-iconv",
-    "zlib1": "zlib",
-    "libz": "zlib",
-    "libssl": "openssl",
-    "libcrypto": "openssl",
-}
-
-# common pypi name → rpm leaf (without python- prefix)
-_PYTHON_DIST_ALIASES = {
-    "pywavelets": ("pywt", "pywavelets"),
-    "wxpython": ("wxpython4", "wxpython"),
-    "python-snappy": ("snappy", "python-snappy"),
-    "pyyaml": ("yaml", "pyyaml"),
-    "beautifulsoup4": ("beautifulsoup4", "bs4"),
-    "pillow": ("pillow", "pil"),
-    "msgpack": ("msgpack", "msgpack-python"),
-    "protobuf": ("protobuf", "proto-plus"),
-}
-
-_PC_NAME_SUFFIXES = (
-    "Core",
-    "Module",
-    "Modules",
-    "Utils",
-    "Config",
-    "Client",
-    "Server",
-    "Widgets",
-    "Gui",
-    "UI",
-)
 _RE_GHC_LIBHS = re.compile(
     r"^libHS(.+)-(\d[\w.]*)-[A-Za-z0-9]+-ghc[\d.]+\.so(?:\(\)\(64bit\))?$"
 )
@@ -83,60 +48,27 @@ def _hit(known: set[str], *cands: str) -> set[str]:
     return out
 
 
-def _norm_alnum(s: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
-
-
 def font_binary_to_sources(name: str, package_names: set[str]) -> set[str]:
-    """liberation-mono-fonts → liberation-fonts; amiri-quran-fonts → amiri-fonts."""
+    """A font binary resolves only when it is itself a known source."""
     n = (name or "").strip()
-    known = package_names or set()
     if not n:
         return set()
-    if n in known:
-        return {n}
-    if not n.endswith("-fonts"):
-        return set()
-    base = n[: -len("-fonts")]
-    parts = [p for p in base.split("-") if p]
-    out: set[str] = set()
-    for i in range(len(parts) - 1, 0, -1):
-        cand = "-".join(parts[:i]) + "-fonts"
-        if cand in known:
-            out.add(cand)
-    return out
+    return _hit(package_names or set(), n)
 
 
 def font_cap_to_sources(cap: str, package_names: set[str], provider_map: dict) -> set[str]:
-    """font(wenquanyizenhei) → wqy-zenhei-fonts."""
+    """font(foo) resolves off the declared font() provide, nothing else.
+
+    Font cap tokens are squashed upstream names that do not track the rpm name,
+    so substring matching them against every *-fonts package invents providers.
+    """
     m = _RE_FONT.match((cap or "").strip())
     if not m:
         return set()
     inner = (m.group(1) or "").strip()
     if not inner or "%" in inner:
         return set()
-    known = package_names or set()
-    out = _pmap_sources(provider_map, f"font({inner})", cap)
-    token = _norm_alnum(inner)
-    if not token:
-        return out
-    for pkg in known:
-        if not pkg.endswith("-fonts"):
-            continue
-        body = pkg[: -len("-fonts")]
-        norm = _norm_alnum(body)
-        if not norm:
-            continue
-        if norm == token or norm in token or token in norm:
-            out.add(pkg)
-            continue
-        # wqyzenhei ⊂ wenquanyizenhei via last component zenhei
-        last = body.split("-")[-1].lower()
-        if len(last) >= 4 and last in token and any(
-            p and p[0].lower() in token for p in body.split("-")[:-1]
-        ):
-            out.add(pkg)
-    return {s for s in out if s}
+    return _pmap_sources(provider_map, f"font({inner})", cap)
 
 
 def pkgconfig_to_sources(cap: str, package_names: set[str], provider_map: dict) -> set[str]:
@@ -160,47 +92,26 @@ def pkgconfig_to_sources(cap: str, package_names: set[str], provider_map: dict) 
                     out.add(src)
 
     add_from_map(f"pkgconfig({inner})")
-    # liborcus-0.20 → liborcus-0.21 may exist; also strip version
+    # a .pc name carries its api version (liborcus-0.20), the packaged one may sit
+    # at another revision, so match any declared pkgconfig(base-*) provide.
     base = inner
     vm = _RE_PC_VER.match(inner)
     if vm:
         base, ver = vm.group(1), vm.group(2)
         add_from_map(f"pkgconfig({base})")
-        # any pkgconfig(base-*) in map
         prefix = f"pkgconfig({base}-"
         for key, srcs in provider_map.items():
             if key == "__lower__" or not isinstance(srcs, (set, frozenset, list, tuple)):
                 continue
             if key.startswith(prefix) and key.endswith(")"):
                 out.update(s for s in srcs if s)
-        # mozjs-140 → mozjs140 / mozjs140-devel (version baked into the name)
+        # mozjs-140 ships as mozjs140, the version folds into the name
         major = ver.split(".", 1)[0]
         nodots = ver.replace(".", "")
         for concat in (f"{base}{ver}", f"{base}{major}", f"{base}{nodots}"):
-            out |= _hit(known, concat, f"{concat}-devel")
             add_from_map(f"pkgconfig({concat})")
-    # Fcitx5Core → try Fcitx5 prefix in map + fcitx5 source
-    stripped = inner
-    for suf in _PC_NAME_SUFFIXES:
-        if stripped.endswith(suf) and len(stripped) > len(suf):
-            stripped = stripped[: -len(suf)]
-            add_from_map(f"pkgconfig({stripped})")
-            break
-    low = stripped.lower()
-    out |= _hit(
-        known,
-        base,
-        f"{base}-devel",
-        base[3:] if base.startswith("lib") else "",
-        f"{base[3:]}-devel" if base.startswith("lib") else "",
-        low,
-        f"{low}-devel",
-        stripped,
-        f"{stripped}-devel",
-    )
-    # tcmalloc lives in gperftools
-    if "tcmalloc" in inner.lower() or "profiler" in inner.lower():
-        out |= _hit(known, "gperftools", "gperftools-devel")
+            out |= _hit(known, concat, f"{concat}-devel")
+    out |= _hit(known, inner, base)
     return {s for s in out if s}
 
 
@@ -217,6 +128,8 @@ def python3dist_to_sources(cap: str, package_names: set[str], provider_map: dict
         return set()
     known = package_names or set()
     out: set[str] = set()
+    # pep503 treats -/_/case as the same dist, so these are equivalent spellings
+    # of one name, not guesses at a different package.
     variants = {
         inner,
         inner.lower(),
@@ -225,21 +138,6 @@ def python3dist_to_sources(cap: str, package_names: set[str], provider_map: dict
         inner.lower().replace("_", "-"),
         inner.lower().replace("-", "_"),
     }
-    # python-snappy dist name → also snappy
-    if inner.lower().startswith("python-"):
-        rest = inner[7:]
-        variants.update(
-            {
-                rest,
-                rest.lower(),
-                rest.replace("_", "-"),
-                rest.replace("-", "_"),
-            }
-        )
-    for alias in _PYTHON_DIST_ALIASES.get(inner.lower(), ()):
-        variants.add(alias)
-        variants.add(alias.replace("_", "-"))
-        variants.add(alias.replace("-", "_"))
     for v in variants:
         key = f"python3dist({v})"
         for src in provider_map.get(key, set()) | provider_map.get(key.lower(), set()):
@@ -258,7 +156,7 @@ def python3dist_to_sources(cap: str, package_names: set[str], provider_map: dict
             f"python3-{v.lower()}",
         )
         out |= py_hits
-        # bare name only when no python-* source (jupyterlab)
+        # some pypi packages ship under their dist name with no python- prefix
         if not py_hits:
             out |= _hit(known, v, v.lower())
     # case-insensitive scan of provider map keys
@@ -330,54 +228,10 @@ def mvn_to_sources(cap: str, package_names: set[str], provider_map: dict) -> set
         out |= _pmap_sources(provider_map, f"mvn({group}:{artifact})")
     if not artifact:
         return {s for s in out if s}
-    cands: list[str] = [artifact, artifact.replace(".", "-"), artifact.replace(".", "_")]
-    if artifact.endswith("-plugin"):
-        cands.append(artifact[: -len("-plugin")])
-        cands.append(artifact.replace("-plugin", ""))
-    if artifact.startswith("javax."):
-        rest = artifact[len("javax.") :].replace(".", "-")
-        cands += [f"jakarta-{rest}", f"jakarta-{rest}1.0", rest]
-    if group.startswith("javax."):
-        rest = group[len("javax.") :].replace(".", "-")
-        cands += [f"jakarta-{rest}", f"jakarta-{rest}1.0"]
-    if "surefire" in artifact:
-        cands += ["maven-surefire", "maven-surefire-plugin"]
+    # the artifact id is the rpm name for jpackage-style specs, dots become dashes
+    cands = [artifact, artifact.replace(".", "-"), artifact.replace(".", "_")]
     out |= _hit(known, *cands)
     return {s for s in out if s}
-
-
-def _strip_dll_versions(stem: str) -> str:
-    s = stem or ""
-    # libhunspell-1.7-0 → libhunspell
-    while True:
-        nxt = re.sub(r"[-._]\d+$", "", s)
-        if nxt == s:
-            break
-        s = nxt
-    return s
-
-
-def mingw_dll_to_sources(cap: str, package_names: set[str]) -> set[str]:
-    m = _RE_MINGW_DLL.match((cap or "").strip())
-    if not m:
-        return set()
-    known = package_names or set()
-    arch = m.group(1)
-    dll = m.group(2)
-    stem = dll[:-4] if dll.lower().endswith(".dll") else dll
-    stem = _strip_dll_versions(stem)
-    leaf = _MINGW_LIB_TO_SRC.get(stem.lower())
-    if not leaf and stem.lower().startswith("lib"):
-        leaf = _MINGW_LIB_TO_SRC.get(stem.lower()) or stem[3:]
-    if not leaf:
-        leaf = stem[3:] if stem.lower().startswith("lib") else stem
-    return _hit(
-        known,
-        f"mingw-{leaf}",
-        f"mingw{arch}-{leaf}",
-        f"mingw-{stem}",
-        f"mingw{arch}-{stem}",
-    )
 
 
 def ghc_devel_to_sources(cap: str, package_names: set[str], provider_map: dict) -> set[str]:
@@ -446,6 +300,15 @@ def cmake_to_sources(cap: str, package_names: set[str], provider_map: dict) -> s
     if vm:
         base = vm.group(1)
         out |= _pmap_sources(provider_map, f"cmake({base})")
+    # the config module usually ships in a lib<base>/<base>-devel subpackage; walk
+    # those provide/binary names back to their source through the provider map.
+    out |= _pmap_sources(
+        provider_map,
+        base,
+        f"lib{base}",
+        f"{base}-devel",
+        f"lib{base}-devel",
+    )
     out |= _hit(
         known,
         base,
@@ -453,10 +316,37 @@ def cmake_to_sources(cap: str, package_names: set[str], provider_map: dict) -> s
         f"lib{base}",
         f"lib{base}-devel",
     )
-    # bson-1.0 / bson → mongo-c-driver (ships libbson)
-    if base.lower() in {"bson", "mongoc", "libbson", "libmongoc"}:
-        out |= _hit(known, "mongo-c-driver", "libbson", "libmongoc")
+    # config modules often carry the soname version in the provide
+    # (cmake(bson-2.3.1)) while consumers ask for the bare cmake(bson).
+    if not out:
+        out |= _cmake_module_provides(provider_map, base)
     return {s for s in out if s}
+
+
+_RE_CMAKE_MODULE_VER_TAIL = re.compile(r"^-?\d[\w.]*$")
+
+
+def _cmake_module_provides(provider_map: dict, base: str) -> set[str]:
+    """Sources providing cmake(<base>), cmake(<base>-<ver>) or cmake(<base><ver>)."""
+    low = (base or "").strip().lower()
+    if not low:
+        return set()
+    out: set[str] = set()
+    for key, srcs in (provider_map or {}).items():
+        if not isinstance(key, str):
+            continue
+        kl = key.lower()
+        if not kl.startswith("cmake(") or not kl.endswith(")"):
+            continue
+        module = kl[len("cmake("):-1]
+        if not module.startswith(low):
+            continue
+        tail = module[len(low):]
+        if tail and not _RE_CMAKE_MODULE_VER_TAIL.match(tail):
+            continue
+        if isinstance(srcs, (set, frozenset, list, tuple)):
+            out |= {s for s in srcs if s}
+    return out
 
 
 def ghc_libhs_to_sources(cap: str, package_names: set[str], provider_map: dict) -> set[str]:
@@ -495,6 +385,21 @@ def golang_path_to_sources(cap: str, provider_map: dict) -> set[str]:
     return best
 
 
+def _glob_is_selective(pattern: str) -> bool:
+    """Reject %files globs that own a whole directory.
+
+    A spec shipping %{_bindir}/* or %{_bindir}/[a-wyz]* registers a pattern that
+    matches every binary anyone asks for. Those patterns name a directory, not a
+    file, so they say nothing about who provides a given path. Strip wildcards
+    and character classes, then require real literal text in the basename.
+    """
+    base = (pattern or "").rsplit("/", 1)[-1]
+    # drop character classes before counting so [a-wyz]* is empty, not "awyz"
+    no_classes = re.sub(r"\[[^\]]*\]", "", base)
+    literal = re.sub(r"[*?]", "", no_classes)
+    return sum(1 for ch in literal if ch.isalnum()) >= 3
+
+
 def _glob_provided_sources(path: str, provider_map: dict) -> set[str]:
     if not path.startswith("/"):
         return set()
@@ -503,6 +408,8 @@ def _glob_provided_sources(path: str, provider_map: dict) -> set[str]:
         if key == "__lower__" or not isinstance(key, str) or not key.startswith("__glob__"):
             continue
         pattern = key[len("__glob__") :]
+        if not _glob_is_selective(pattern):
+            continue
         if fnmatch.fnmatchcase(path, pattern):
             if isinstance(srcs, (set, frozenset, list, tuple)):
                 out.update(s for s in srcs if s)
@@ -535,106 +442,77 @@ def crate_to_sources(cap: str, package_names: set[str], provider_map: dict) -> s
     return {s for s in out if s}
 
 
-_RUNTIME_PACKAGE_STEMS = frozenset(
-    {
-        "rust",
-        "go",
-        "golang",
-        "python",
-        "python2",
-        "python3",
-        "perl",
-        "ruby",
-        "node",
-        "nodejs",
-        "php",
-        "lua",
-        "ghc",
-        "java",
-        "javac",
-        "ocaml",
-        "R",
-        "r",
-    }
-)
-
-
 def path_or_binary_to_sources(
     cap: str, package_names: set[str], provider_map: dict
 ) -> set[str]:
-    """/usr/bin/sphinx-build / sphinx-build → python-sphinx."""
-    from oreon_build.services.distgit_order import _rust_crate_name_from_package
+    """Resolve a file path or binary name off declared file provides.
 
+    Chopping a binary name into stems and prepending python-/lib- guesses at a
+    source that never claimed the file. The distgit index already maps every
+    subpackage and shipped path back to its source, so look it up instead.
+    """
     primary = (cap or "").strip()
     if not primary or "(" in primary:
         return set()
     known = package_names or set()
     out = _pmap_sources(provider_map, primary)
     out |= _glob_provided_sources(primary, provider_map)
-    base = primary
-    if primary.startswith("/usr/bin/") or primary.startswith("/usr/sbin/"):
+    if primary.startswith("/"):
         base = primary.rsplit("/", 1)[-1]
-        out |= _pmap_sources(provider_map, base, f"/usr/bin/{base}", f"/usr/sbin/{base}")
-    elif "/" in primary:
+        if primary.startswith(("/usr/bin/", "/usr/sbin/")):
+            out |= _pmap_sources(
+                provider_map, base, f"/usr/bin/{base}", f"/usr/sbin/{base}"
+            )
         return {s for s in out if s}
-    if base.startswith("rust-") and base != "rust":
-        out |= _hit(known, base)
-        crate = _rust_crate_name_from_package(base)
-        if crate:
-            out |= crate_to_sources(f"crate({crate})", known, provider_map)
-        return {s for s in out if s}
-    if base.startswith(("python3-", "python-")) and base not in _RUNTIME_PACKAGE_STEMS:
-        out |= _hit(known, base)
-        if base.startswith("python3-"):
-            rest = base[len("python3-") :]
-            out |= _hit(known, f"python-{rest}", f"python3-{rest}")
-            if rest:
-                out |= python3dist_to_sources(f"python3dist({rest})", known, provider_map)
-                out |= python3dist_to_sources(
-                    f"python3dist({rest.replace('-', '_')})", known, provider_map
-                )
-        else:
-            rest = base[len("python-") :]
-            out |= _hit(known, f"python-{rest}", f"python3-{rest}")
-            if rest:
-                out |= python3dist_to_sources(f"python3dist({rest})", known, provider_map)
-                out |= python3dist_to_sources(
-                    f"python3dist({rest.replace('-', '_')})", known, provider_map
-                )
-        return {s for s in out if s}
-    if base.startswith(("golang-", "perl-", "rubygem-", "nodejs-", "ghc-", "php-")):
-        out |= _hit(known, base)
-        return {s for s in out if s}
-    # python3-pytest-xdist+psutil
-    plus = _RE_BIN_PLUS.match(base)
+    # rpm spells an extras subpackage as name+extra, the base owns the files
+    plus = _RE_BIN_PLUS.match(primary)
     if plus:
-        base = plus.group(1)
-        out |= _pmap_sources(provider_map, base)
-    out |= devel_subpkg_to_sources(base, known)
-    out |= _hit(known, base)
-    # sphinx-build → python-sphinx (not the unrelated sphinx search package)
-    parts = [p for p in base.split("-") if p]
-    for i in range(len(parts), 0, -1):
-        stem = "-".join(parts[:i])
-        if stem in _RUNTIME_PACKAGE_STEMS or stem.lower() in _RUNTIME_PACKAGE_STEMS:
-            continue
-        py_hits = _hit(known, f"python-{stem}", f"python3-{stem}")
-        out |= py_hits
-        out |= _pmap_sources(
-            provider_map,
-            f"python3-{stem}",
-            f"python-{stem}",
-            f"/usr/bin/{stem}",
-            stem,
-        )
-        if py_hits:
-            break
-        bare = _hit(known, f"{stem}-cli")
-        # bare stem only when no python-* exists for this token
-        if not _hit(known, f"python-{stem}", f"python3-{stem}"):
-            bare |= _hit(known, stem)
-        out |= bare
+        out |= _pmap_sources(provider_map, plus.group(1))
+        out |= _hit(known, plus.group(1))
+    out |= _pmap_sources(provider_map, f"/usr/bin/{primary}", f"/usr/sbin/{primary}")
+    out |= _hit(known, primary)
     return {s for s in out if s}
+
+
+_SUBPKG_SUFFIXES = (
+    "-devel",
+    "-static",
+    "-libs",
+    "-headers",
+)
+
+
+def subpkg_to_sources(cap: str, package_names: set[str], provider_map: dict) -> set[str]:
+    """A -devel/-libs subpackage belongs to whoever declares its base name.
+
+    rpm splits one source into name and name-devel, and a spec that renamed itself
+    keeps the old name as a plain Provides. wxGTK declares wxGTK3, so wxGTK3-devel
+    is wxGTK. Only a declared provide counts here. Taking the bare stem as a source
+    name would invent an owner for every foo-devel nobody ships.
+
+    Suffixes are limited to the ones rpm only ever uses for a split subpackage.
+    -doc and -tools show up as whole package names (yelp-tools, qt5-doc), so
+    stripping them hands the cap to the wrong source.
+
+    An ambiguous base is dropped. clang-devel strips to clang, which half a dozen
+    versioned compiler specs declare, and picking among them spawns junk rebuilds.
+    """
+    primary = (cap or "").strip()
+    if not primary or "(" in primary or primary.startswith("/"):
+        return set()
+    # the full name already resolves, so it names a package rather than a split
+    if primary in (package_names or set()) or _pmap_sources(provider_map, primary):
+        return set()
+    low = primary.lower()
+    out: set[str] = set()
+    for suf in _SUBPKG_SUFFIXES:
+        if not low.endswith(suf):
+            continue
+        base = primary[: -len(suf)].strip()
+        if base:
+            out |= _pmap_sources(provider_map, base)
+    out = {s for s in out if s}
+    return out if len(out) == 1 else set()
 
 
 def _pmap_sources(provider_map: dict, *keys: str) -> set[str]:
@@ -652,54 +530,26 @@ def mono_to_sources(cap: str, package_names: set[str], provider_map: dict) -> se
     m = _RE_MONO.match((cap or "").strip())
     if not m:
         return set()
-    known = package_names or set()
     out = _pmap_sources(provider_map, cap, cap.lower())
-    if "mono" in known:
-        out.add("mono")
     return {s for s in out if s}
 
 
-def devel_subpkg_to_sources(cap: str, package_names: set[str]) -> set[str]:
-    """Map binary subpackages like llvm15-static back to distgit source llvm15."""
-    n = (cap or "").strip()
-    known = package_names or set()
-    if not n or n in known:
-        return _hit(known, n) if n else set()
-    # python3-foo+extra → python-foo
-    plus = _RE_BIN_PLUS.match(n)
-    if plus:
-        n = plus.group(1)
-        if n in known:
-            return {n}
-    # longer suffixes first so cmake-utils beats utils
-    for suffix in (
-        "-cmake-utils",
-        "-debugsource",
-        "-debuginfo",
-        "-devel",
-        "-static",
-        "-libs",
-        "-docs",
-        "-doc",
-        "-tests",
-        "-test",
-        "-common",
-        "-tools",
-        "-utils",
-        "-prof",
-    ):
-        if n.endswith(suffix):
-            base = n[: -len(suffix)]
-            hit = _hit(known, base)
-            if hit:
-                return hit
-    if n.startswith("python3-"):
-        rest = n[len("python3-") :]
-        # dont map python3-subunit → subunit (C bindings). only python-* sources.
-        hit = _hit(known, f"python-{rest}", f"python3-{rest}")
-        if hit:
-            return hit
-    return set()
+def _normalized_cap_forms(cap: str) -> list[str]:
+    """Equivalent spellings of one cap, not candidate other packages.
+
+    python3.14dist(x) and python3dist(x) are the same provide written for a
+    specific interpreter, so a lookup has to try both.
+    """
+    c = (cap or "").strip()
+    if not c:
+        return []
+    forms = [c]
+    m = _RE_PYTHON3DIST.match(c)
+    if m:
+        generic = f"python3dist({m.group(1).strip()})"
+        if generic != c:
+            forms.append(generic)
+    return forms
 
 
 def _virtual_cap_leaves(requirement: str) -> list[str]:
@@ -739,25 +589,26 @@ def distgit_sources_for_virtual_cap(
     known = package_names or set()
     pmap = provider_map or {}
     out: set[str] = set()
-    for primary in _virtual_cap_leaves(requirement):
-        if primary in known:
-            out.add(primary)
-        out |= font_binary_to_sources(primary, known)
-        out |= font_cap_to_sources(primary, known, pmap)
-        out |= pkgconfig_to_sources(primary, known, pmap)
-        out |= python3dist_to_sources(primary, known, pmap)
-        out |= tex_to_sources(primary, known, pmap)
-        out |= mvn_to_sources(primary, known, pmap)
-        out |= mingw_dll_to_sources(primary, known)
-        out |= ghc_devel_to_sources(primary, known, pmap)
-        out |= ghc_prof_to_sources(primary, known, pmap)
-        out |= ghc_libhs_to_sources(primary, known, pmap)
-        out |= cmake_to_sources(primary, known, pmap)
-        out |= mono_to_sources(primary, known, pmap)
-        out |= golang_path_to_sources(primary, pmap)
-        out |= crate_to_sources(primary, known, pmap)
-        out |= devel_subpkg_to_sources(primary, known)
-        out |= path_or_binary_to_sources(primary, known, pmap)
+    for leaf in _virtual_cap_leaves(requirement):
+        for primary in _normalized_cap_forms(leaf):
+            if primary in known:
+                out.add(primary)
+            out |= _pmap_sources(pmap, primary)
+            out |= font_binary_to_sources(primary, known)
+            out |= font_cap_to_sources(primary, known, pmap)
+            out |= pkgconfig_to_sources(primary, known, pmap)
+            out |= python3dist_to_sources(primary, known, pmap)
+            out |= tex_to_sources(primary, known, pmap)
+            out |= mvn_to_sources(primary, known, pmap)
+            out |= ghc_devel_to_sources(primary, known, pmap)
+            out |= ghc_prof_to_sources(primary, known, pmap)
+            out |= ghc_libhs_to_sources(primary, known, pmap)
+            out |= cmake_to_sources(primary, known, pmap)
+            out |= mono_to_sources(primary, known, pmap)
+            out |= golang_path_to_sources(primary, pmap)
+            out |= crate_to_sources(primary, known, pmap)
+            out |= subpkg_to_sources(primary, known, pmap)
+            out |= path_or_binary_to_sources(primary, known, pmap)
     return {s for s in out if s}
 
 

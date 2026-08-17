@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from urllib.parse import urlparse
@@ -11,6 +12,7 @@ from oreon_build.config import get_settings
 logger = logging.getLogger(__name__)
 
 _DISCORD_TIMEOUT = httpx.Timeout(30.0, connect=20.0)
+_DISCORD_MAX_ATTEMPTS = 3
 
 async def _post(payload: dict, webhook_url: str | None = None) -> None:
     settings = get_settings()
@@ -19,13 +21,37 @@ async def _post(payload: dict, webhook_url: str | None = None) -> None:
         return
     try:
         async with httpx.AsyncClient(timeout=_DISCORD_TIMEOUT) as client:
-            await client.post(url, json=payload)
+            for attempt in range(_DISCORD_MAX_ATTEMPTS):
+                r = await client.post(url, json=payload)
+                if r.status_code < 300:
+                    return
+                if r.status_code == 429 and attempt + 1 < _DISCORD_MAX_ATTEMPTS:
+                    await asyncio.sleep(_retry_after_seconds(r))
+                    continue
+                logger.warning(
+                    "Discord webhook rejected payload with HTTP %s: %s",
+                    r.status_code,
+                    (r.text or "")[:200],
+                )
+                return
     except httpx.RequestError as e:
         logger.warning("Discord webhook request failed (%s)", e)
-    except httpx.HTTPStatusError as e:
-        logger.warning("Discord webhook HTTP error %s", e.response.status_code)
     except Exception:
         logger.exception("Discord webhook unexpected error")
+
+
+def _retry_after_seconds(response: httpx.Response) -> float:
+    raw = response.headers.get("Retry-After")
+    if raw is None:
+        try:
+            raw = str((response.json() or {}).get("retry_after") or "")
+        except Exception:
+            raw = ""
+    try:
+        wait = float(raw)
+    except (TypeError, ValueError):
+        wait = 1.0
+    return max(0.5, min(wait, 15.0))
 
 async def send_discord_message(text: str) -> None:
     if not text:

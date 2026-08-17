@@ -36,7 +36,12 @@ from oreon_build.models import (
     Release,
     Worker,
 )
-from oreon_build.services.build_pass import apply_plan_to_job_options
+from oreon_build.services.build_pass import (
+    apply_plan_to_job_options,
+    bootstrap_dropped_sources,
+    job_options_dict,
+    schedule_next_pass_after_publish,
+)
 from oreon_build.core.rpm_requires import (
     is_chain_plan_requirement,
 )
@@ -336,6 +341,31 @@ def _parsed_evr(parsed: Any) -> tuple[int, str, str]:
     return epoch, str(getattr(parsed, "version", "") or ""), str(getattr(parsed, "release", "") or "")
 
 
+def _source_is_arch_restricted(name: str, parsed_by_source: dict[str, Any] | None) -> bool:
+    parsed = (parsed_by_source or {}).get((name or "").strip())
+    return bool(getattr(parsed, "exclusive_arches", None))
+
+
+def _toolchain_presence_counts(
+    name: str,
+    *,
+    cap_index: RepoCapabilityIndex,
+    parsed_by_source: dict[str, Any] | None,
+) -> bool:
+    """Does an existing toolchain build cover the arches this plan targets.
+
+    An ExclusiveArch compiler legitimately exists on a subset of arches, so any-arch
+    presence is the honest answer there. Everything else has to be present on the
+    arches being built or it needs a build.
+    """
+    n = (name or "").strip()
+    if not n:
+        return False
+    if _source_is_arch_restricted(n, parsed_by_source):
+        return bool(getattr(cap_index, "source_present_in_repo", lambda _n: False)(n))
+    return bool(getattr(cap_index, "source_present_for_arches", lambda _n: False)(n))
+
+
 def _source_needs_build(
     name: str,
     *,
@@ -351,17 +381,18 @@ def _source_needs_build(
 
     require_evr=True for unmet-capability providers: only skip when distgit EVR is
     known and repo is already >= that EVR. Presence alone is not enough (arch holes).
-    Toolchain/haskell stacks use any-arch presence so dual-arch ExclusiveArch holes
-    do not rebuild the whole compiler universe into a shared build set.
+    Toolchain/haskell stacks skip on any-arch presence only when the spec really is
+    ExclusiveArch. Otherwise a compiler built on one arch would suppress the rebuild
+    the other arch needs.
     """
     n = (name or "").strip()
     if not n:
         return False
     if always_build and n in always_build:
         return True
-    if is_toolchainish_source(n) and getattr(
-        cap_index, "source_present_in_repo", lambda _n: False
-    )(n):
+    if is_toolchainish_source(n) and _toolchain_presence_counts(
+        n, cap_index=cap_index, parsed_by_source=parsed_by_source
+    ):
         return False
     parsed = (parsed_by_source or {}).get(n)
     if parsed is not None:
@@ -409,7 +440,7 @@ def _add_leaf_br_edges(
             continue
         elif not srcs:
             continue
-        elif _toolchain_any_arch_satisfied(cap_index, req, srcs):
+        elif _toolchain_any_arch_satisfied(cap_index, req, srcs, parsed_by_source):
             continue
         for s in srcs:
             if not _source_needs_build(
@@ -424,14 +455,24 @@ def _add_leaf_br_edges(
 
 
 def _toolchain_any_arch_satisfied(
-    cap_index: RepoCapabilityIndex, req: str, srcs: set[str]
+    cap_index: RepoCapabilityIndex,
+    req: str,
+    srcs: set[str],
+    parsed_by_source: dict[str, Any] | None = None,
 ) -> bool:
-    """Dual-arch ExclusiveArch toolchains: present on some arch, do not rebuild all."""
+    """ExclusiveArch toolchains: present on some arch, do not rebuild all.
+
+    Only an arch-restricted spec gets the any-arch pass. A compiler that simply was
+    never built on one arch is a real hole, and calling it satisfied leaves every
+    consumer on that arch unable to resolve.
+    """
     from oreon_build.core.rpm_requires import requirement_check_capabilities
 
     if not srcs:
         return False
     if not all(is_toolchainish_source(s) for s in srcs):
+        return False
+    if not all(_source_is_arch_restricted(s, parsed_by_source) for s in srcs):
         return False
     for cap in requirement_check_capabilities(req):
         if getattr(cap_index, "has_capability_any_arch", lambda _c: False)(cap):
@@ -667,7 +708,7 @@ async def _static_close_dependencies(
                     if hint:
                         pkg_unres.add(hint)
                     continue
-                if _toolchain_any_arch_satisfied(cap_index, miss, srcs):
+                if _toolchain_any_arch_satisfied(cap_index, miss, srcs, parsed_by_source):
                     continue
                 kept: set[str] = set()
                 for s in srcs:
@@ -1628,12 +1669,18 @@ async def _spawn_layer_dep_sources(
     arches: list[str],
     cap_index: RepoCapabilityIndex | None = None,
     force_build: bool = False,
+    force_build_sources: set[str] | None = None,
     package_names: set[str] | None = None,
 ) -> set[str]:
     """Create/link blocker sources for a job. Returns sources that were attached.
 
     Prefer repo/side-tag copies. Skip spawning when the provider is already
     present at >= distgit EVR unless force_build=True.
+
+    force_build_sources marks specific providers that must be rebuilt even when the
+    repo copy looks EVR-current. Autofix uses this because mock already proved the
+    capability is missing from the real install root, so the repo copy is stale and
+    the EVR union cannot be trusted for those sources.
 
     Used at seed and by autofix for clear missing providers. Publish recheck stays
     planned-only via _link_planned_dep_sources.
@@ -1642,6 +1689,7 @@ async def _spawn_layer_dep_sources(
 
     attached: set[str] = set()
     known_pkgs = set(package_names or ())
+    force_srcs = {(s or "").strip() for s in (force_build_sources or set()) if (s or "").strip()}
     roots = {(r or "").strip() for r in (plan.root_packages or []) if (r or "").strip()}
     parse_fn = _spec_parse_fn(releasename, target_arches={a.lower() for a in arches if a} or None)
     want_arches = [normalize_machine_arch(a) for a in arches if a] or list(DEFAULT_ARCH)
@@ -1688,11 +1736,13 @@ async def _spawn_layer_dep_sources(
         else:
             missing_arches = list(want_arches)
 
+        force_this = force_build or src in force_srcs
+
         spec_check = await _refetch_spec_text(
             src, owner=owner, repo=repo, distgit_branch=distgit_branch, releasename=releasename, headers=headers
         )
         if not spec_check:
-            if force_build and src in known_pkgs:
+            if force_this and src in known_pkgs:
                 logger.info(
                     "layer_plan_id=%s spawn %s refetch missed but package is indexed, creating anyway",
                     plan.id,
@@ -1712,7 +1762,7 @@ async def _spawn_layer_dep_sources(
                 continue
         if (
             spec_check
-            and not force_build
+            and not force_this
             and cap_index is not None
             and src not in roots
             and not existing
@@ -2018,6 +2068,7 @@ async def try_autofix_layer_missing_provides(
             arches=plan_arches,
             cap_index=cap_index,
             force_build=False,
+            force_build_sources=spawn_set,
             package_names=package_names,
         )
         attached |= spawned
@@ -2733,6 +2784,93 @@ async def _drop_blocker_sources(db: Any, job: BuildJob, sources: set[str]) -> in
     return dropped
 
 
+_BOOTSTRAP_DEFINES = {"with_check": "0"}
+
+
+async def _start_bootstrap_pass(db: Any, job: BuildJob, dropped: set[str]) -> bool:
+    """Rebuild a cycle member with tests off so it stops needing its test-only dep.
+
+    Dropping the blocker edge on its own only moves the failure. The spec still
+    BuildRequires the thing we removed, so the build dies on a missing provide and
+    the cycle survives. Turning checks off drops the requirement, and next_profile
+    brings the package back for a real build once the other half exists.
+    """
+    drop = {s for s in dropped if s}
+    if not drop:
+        return False
+    opts = job_options_dict(job)
+    if str(opts.get("build_profile") or "full").strip().lower() != "full":
+        # already bootstrapping, just remember the extra edge
+        merged = sorted(set(bootstrap_dropped_sources(job)) | drop)
+        opts["bootstrap_dropped"] = merged
+        job.job_options = opts
+        await db.flush()
+        return False
+    apply_plan_to_job_options(
+        job,
+        {
+            "build_profile": "bootstrap",
+            "rpmbuild_defines": dict(_BOOTSTRAP_DEFINES),
+            "next_profile": "full",
+        },
+    )
+    opts = job_options_dict(job)
+    opts["bootstrap_dropped"] = sorted(drop)
+    job.job_options = opts
+    await db.flush()
+    return True
+
+
+async def reblock_second_pass_if_needed(job_id: int) -> None:
+    """Hold a full rebuild until the deps its bootstrap pass skipped actually exist.
+
+    The bootstrap only skipped them to break the cycle. Letting the full pass run
+    straight away just reruns the same failing build.
+    """
+    from oreon_build.db.session import async_session_maker
+
+    async with async_session_maker() as db:
+        job = await db.get(BuildJob, int(job_id), with_for_update=True)
+        if job is None or job.layer_plan_id is None:
+            return
+        if job.status != BuildStatus.PENDING:
+            return
+        wanted = [s for s in bootstrap_dropped_sources(job) if s]
+        if not wanted:
+            return
+        statuses = await _source_statuses_in_plan(db, int(job.layer_plan_id), set(wanted))
+        pending = {
+            src
+            for src in wanted
+            if not statuses.get(src)
+            or not any(st in _OK_BLOCKER_STATUSES for st in statuses.get(src) or [])
+        }
+        opts = job_options_dict(job)
+        opts.pop("bootstrap_dropped", None)
+        job.job_options = opts
+        if not pending:
+            await db.commit()
+            return
+        have_r = await db.execute(
+            select(LayerJobBlocker.blocking_source).where(
+                LayerJobBlocker.build_job_id == int(job.id)
+            )
+        )
+        have = {str(x) for x in have_r.scalars().all() if x}
+        for src in sorted(pending - have):
+            db.add(LayerJobBlocker(build_job_id=int(job.id), blocking_source=src))
+        await db.flush()
+        job.status = BuildStatus.BLOCKED
+        job.blocked_reason = ("waiting on: " + ", ".join(sorted(pending)))[:500]
+        await db.commit()
+        logger.info(
+            "layer_plan_id=%s job_id=%s second pass re-blocked on %s",
+            job.layer_plan_id,
+            job.id,
+            sorted(pending)[:8],
+        )
+
+
 async def resolve_layer_blocker_cycles(
     db: Any,
     plan_id: int,
@@ -2850,12 +2988,14 @@ async def resolve_layer_blocker_cycles(
                     blockers[jid] = [s for s in blockers.get(jid, []) if s != blocker_name]
                     touched += 1
                     order_changed = True
+                    boot = await _start_bootstrap_pass(db, job, {blocker_name})
                     logger.info(
-                        "layer_plan_id=%s job_id=%s cycle order-break dropped %s -> %s",
+                        "layer_plan_id=%s job_id=%s cycle order-break dropped %s -> %s bootstrap=%s",
                         plan_id,
                         jid,
                         waiter_name,
                         blocker_name,
+                        boot,
                     )
                     if job.status == BuildStatus.QUEUED:
                         thrash_n = await _recent_missing_provides_fail_count(db, int(job.id))
