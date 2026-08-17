@@ -1172,6 +1172,28 @@ def _mock_rpmbuild_smp_define_args() -> list[str]:
         f"_smp_build_ncpus {n}",
     ]
 
+def _bcond_define(key: str, value: str) -> str:
+    """Turn with_foo/without_foo into the bcond macro rpm actually reads.
+
+    %{?with_foo} tests whether the macro exists, not what it holds, so
+    --define "with_foo 0" switches the condition on when the caller wanted it
+    off. Tests then run during a bootstrap build and the cycle never breaks.
+    """
+    if key.startswith("with_"):
+        name = key[len("with_") :]
+        on = value == "1"
+    elif key.startswith("without_"):
+        name = key[len("without_") :]
+        on = value != "1"
+    else:
+        return ""
+    if not name:
+        return ""
+    if on:
+        return f"_with_{name} --with-{name}"
+    return f"_without_{name} --without-{name}"
+
+
 def _mock_rpmbuild_define_args(rpmbuild_defines: dict | None) -> list[str]:
     out: list[str] = []
     if not isinstance(rpmbuild_defines, dict):
@@ -1181,7 +1203,8 @@ def _mock_rpmbuild_define_args(rpmbuild_defines: dict | None) -> list[str]:
         if not k:
             continue
         v = str(rpmbuild_defines.get(key) or "").strip()
-        out += ["--define", f"{k} {v}"]
+        bcond = _bcond_define(k, v)
+        out += ["--define", bcond or f"{k} {v}"]
     return out
 
 
