@@ -454,9 +454,43 @@ def rpm_requirement_capabilities(requirement: str) -> list[str]:
     return out
 
 
+def _neutralize_shell_macros(value: str) -> str:
+    """Collapse %(...) to a single token. rpm runs it through a shell, we cannot.
+
+    Left as-is, %(echo %{version} | cut -d. -f1,2) gets split on its own comma and
+    hands back "2)" as a requirement. Nothing ever provides that, so the package
+    fails to resolve and never gets a build attempt.
+    """
+    text = value or ""
+    if "%(" not in text:
+        return text
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] == "%" and i + 1 < n and text[i + 1] == "(":
+            depth = 0
+            j = i + 1
+            while j < n:
+                if text[j] == "(":
+                    depth += 1
+                elif text[j] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        j += 1
+                        break
+                j += 1
+            out.append("%__expr__")
+            i = j
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
 def _requirement_chunks(value: str) -> list[str]:
     chunks: list[str] = []
-    for part in re.split(r"[,;\n]", value or ""):
+    for part in re.split(r"[,;\n]", _neutralize_shell_macros(value or "")):
         part = part.strip()
         if not part:
             continue
