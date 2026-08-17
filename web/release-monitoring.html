@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Oreon Watchdog - Release Monitoring</title>
+  <link rel="stylesheet" href="/static/style.css?v=5">
+  <style>
+    .errata-shell { max-width: 1100px; margin: 0 auto; }
+    .errata-lead { color: var(--text-muted); font-size: 0.92rem; line-height: 1.45; margin: 0 0 1rem; }
+    .wd-subnav { display: flex; gap: 0.5rem; margin: 0 0 1rem; flex-wrap: wrap; }
+    .wd-subnav a { text-decoration: none; padding: 0.35rem 0.75rem; border: 1px solid var(--border); border-radius: 4px; color: var(--text); font-size: 0.9rem; background: #fff; }
+    .wd-subnav a.active { background: var(--primary, #2563eb); color: #fff; border-color: var(--primary, #2563eb); }
+    .errata-filters { display: flex; flex-wrap: wrap; gap: 0.75rem 1rem; align-items: flex-end; margin-bottom: 1rem; padding: 0.75rem 0; border-bottom: 1px solid var(--border); }
+    .errata-filters .form-group { margin-bottom: 0; min-width: 10rem; }
+    .errata-table-wrap { border: 1px solid var(--border); border-radius: 4px; background: #fff; overflow: auto; }
+    .errata-table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+    .errata-table th { text-align: left; font-weight: 600; padding: 0.55rem 0.65rem; border-bottom: 1px solid var(--border); background: #fafafa; color: var(--text); }
+    .errata-table td { padding: 0.5rem 0.65rem; border-bottom: 1px solid #e8e8e8; vertical-align: middle; }
+    .errata-table tbody tr:hover { background: #f9fafb; }
+    .errata-table .pkg-name { font-family: ui-monospace, monospace; }
+    .ver-old { color: var(--danger, #b91c1c); font-family: ui-monospace, monospace; }
+    .ver-new { color: var(--success, #16a34a); font-weight: 600; font-family: ui-monospace, monospace; }
+    .rm-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin: 0.25rem 0 0.75rem; }
+    .rm-progress { color: var(--text-muted); font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+  <header class="header" data-oreon-nav-skip="1">
+    <a href="/" class="header-logo-link">
+      <img src="/static/owdlogo.png" alt="Oreon Watchdog" class="header-logo" style="height:32px; max-height:32px;">
+    </a>
+    <nav>
+      <span id="auth-section">
+        <span id="user-info"></span>
+        <button id="btn-login" type="button">Login</button>
+        <button id="btn-logout" type="button" style="display:none">Logout</button>
+      </span>
+    </nav>
+  </header>
+  <main class="main errata-shell">
+    <section class="card">
+      <div class="wd-subnav">
+        <a href="/">Security advisories</a>
+        <a href="/release-monitoring" class="active">Release Monitoring</a>
+      </div>
+      <h1 style="margin:0 0 0.35rem; font-size:1.35rem;">Release Monitoring</h1>
+      <p class="errata-lead">
+        Checks our published package versions in R2 against the latest upstream stable on
+        release-monitoring.org (Anitya). Only outdated packages are listed. Rescan after updating and
+        the ones you fixed drop off.
+      </p>
+
+      <div class="errata-filters">
+        <div class="form-group">
+          <label for="rm-release-id">Release</label>
+          <select id="rm-release-id" class="form-control"></select>
+        </div>
+      </div>
+
+      <div class="rm-actions" id="rm-authed-actions" style="display:none;">
+        <button type="button" class="btn primary" id="btn-rm-scan">Run scan</button>
+        <button type="button" class="btn" id="btn-rm-clear">Clear results</button>
+      </div>
+      <div class="rm-progress" id="rm-progress"></div>
+    </section>
+
+    <section class="card">
+      <h2 style="margin-top:0;">Outdated packages</h2>
+      <div id="rm-status" style="color:var(--text-muted); font-size:0.9rem; margin-bottom:0.75rem;">Loading...</div>
+      <div class="errata-table-wrap">
+        <table class="errata-table">
+          <thead>
+            <tr>
+              <th>Package</th>
+              <th>Our version</th>
+              <th>Latest upstream</th>
+              <th>Project</th>
+            </tr>
+          </thead>
+          <tbody id="rm-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js?v=18"></script>
+  <script src="/static/watchdog-release-checkboxes.js?v=1"></script>
+  <script>
+    (function() {
+      const api = window.oreonApi || {};
+      const statusEl = document.getElementById('rm-status');
+      const tbody = document.getElementById('rm-tbody');
+      const progressEl = document.getElementById('rm-progress');
+      var pollTimer = null;
+
+      function esc(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; }
+      function urlEncode(v) { return encodeURIComponent((v || '').toString()); }
+
+      function decodeJwt(token) {
+        try {
+          var payload = token.split('.')[1];
+          payload = payload.replace(/-/g, '+').replace(/_/g, '/');
+          while (payload.length % 4) payload += '=';
+          return JSON.parse(atob(payload));
+        } catch (e) { return null; }
+      }
+      function canManage() {
+        if (!api.token) return false;
+        var p = decodeJwt(api.token);
+        return !!(p && (p.role === 'admin' || p.role === 'maintainer'));
+      }
+
+      function currentReleaseId() {
+        var sel = document.getElementById('rm-release-id');
+        return sel && sel.value ? sel.value : '';
+      }
+
+      function loadReleases() {
+        return api.get('/security/releases').then(function(res) {
+          var sel = document.getElementById('rm-release-id');
+          if (!sel) return;
+          var prev = sel.value;
+          var deduped = window.oreonReleaseCheckboxes.dedupeReleases((res && res.items) ? res.items : []);
+          sel.innerHTML = '';
+          deduped.forEach(function(r) { sel.appendChild(new Option(r.releasename, r.id)); });
+          if (prev) {
+            for (var j = 0; j < sel.options.length; j++) {
+              if (sel.options[j].value === prev) { sel.value = prev; break; }
+            }
+          }
+        }).catch(function() {});
+      }
+
+      function fmtWhen(iso) {
+        if (!iso) return '';
+        try { return new Date(iso).toLocaleString(); } catch (e) { return iso; }
+      }
+
+      function renderProgress(latest, active) {
+        if (active) {
+          var total = active.total_packages || 0;
+          var checked = active.checked_packages || 0;
+          var frac = total ? (' ' + checked + ' / ' + total) : '';
+          progressEl.textContent = 'Scanning against Anitya...' + frac + ' (' + (active.matched_packages || 0) + ' tracked upstream)';
+          return;
+        }
+        if (latest) {
+          var when = fmtWhen(latest.finished_at || latest.started_at);
+          var bits = 'Last scan ' + (when ? ('on ' + when) : '') +
+            ': checked ' + (latest.total_packages || 0) + ', ' +
+            (latest.matched_packages || 0) + ' tracked upstream, ' +
+            (latest.outdated_count || 0) + ' outdated.';
+          progressEl.textContent = bits;
+          return;
+        }
+        progressEl.textContent = 'No scan has run yet.';
+      }
+
+      function renderTable(items) {
+        if (!items || !items.length) {
+          tbody.innerHTML = '<tr><td colspan="4" style="color:var(--text-muted);">No outdated packages. Everything matches the latest upstream, or no scan has completed.</td></tr>';
+          return;
+        }
+        tbody.innerHTML = items.map(function(it) {
+          var proj = it.project || '';
+          var eco = it.ecosystem || '';
+          var projCell = esc(proj);
+          if (eco && /^https?:\/\//.test(eco)) {
+            projCell = '<a href="' + esc(eco) + '" target="_blank" rel="noopener">' + esc(proj || eco) + '</a>';
+          }
+          return '<tr>'
+            + '<td class="pkg-name">' + esc(it.package_name) + '</td>'
+            + '<td class="ver-old">' + esc(it.current_version) + '</td>'
+            + '<td class="ver-new">' + esc(it.latest_version) + '</td>'
+            + '<td>' + projCell + '</td>'
+            + '</tr>';
+        }).join('');
+      }
+
+      function stopPolling() {
+        if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+      }
+
+      function schedulePoll() {
+        stopPolling();
+        pollTimer = setTimeout(loadResults, 3000);
+      }
+
+      function loadResults() {
+        var rid = currentReleaseId();
+        var path = '/release-monitoring/results';
+        if (rid) path += '?release_id=' + urlEncode(rid);
+        api.get(path).then(function(res) {
+          var items = (res && res.items) ? res.items : [];
+          var latest = res ? res.latest_scan : null;
+          var active = res ? res.active_scan : null;
+          renderProgress(latest, active);
+          renderTable(items);
+          if (active) {
+            statusEl.textContent = 'Scan in progress...';
+            schedulePoll();
+          } else {
+            stopPolling();
+            statusEl.textContent = items.length
+              ? (items.length + ' outdated package' + (items.length === 1 ? '' : 's'))
+              : '0 outdated packages';
+          }
+          refreshActionState(!!active);
+        }).catch(function(e) {
+          statusEl.textContent = 'Failed to load: ' + (e.message || e);
+          tbody.innerHTML = '';
+        });
+      }
+
+      function refreshActionState(scanning) {
+        var actions = document.getElementById('rm-authed-actions');
+        if (actions) actions.style.display = canManage() ? 'flex' : 'none';
+        var scanBtn = document.getElementById('btn-rm-scan');
+        var clearBtn = document.getElementById('btn-rm-clear');
+        if (scanBtn) {
+          scanBtn.disabled = !!scanning;
+          scanBtn.textContent = scanning ? 'Scanning...' : 'Run scan';
+        }
+        if (clearBtn) clearBtn.disabled = !!scanning;
+      }
+
+      var scanBtn = document.getElementById('btn-rm-scan');
+      if (scanBtn) {
+        scanBtn.addEventListener('click', function() {
+          if (!canManage()) return;
+          var rid = currentReleaseId();
+          scanBtn.disabled = true;
+          scanBtn.textContent = 'Starting...';
+          api.post('/release-monitoring/scan', rid ? { release_id: parseInt(rid, 10) } : {}).then(function() {
+            loadResults();
+          }).catch(function(e) {
+            statusEl.textContent = 'Scan failed to start: ' + (e.message || e);
+            refreshActionState(false);
+          });
+        });
+      }
+
+      var clearBtn = document.getElementById('btn-rm-clear');
+      if (clearBtn) {
+        clearBtn.addEventListener('click', function() {
+          if (!canManage()) return;
+          if (!window.confirm('Clear all release monitoring results?')) return;
+          clearBtn.disabled = true;
+          api.post('/release-monitoring/clear', {}).then(function() {
+            loadResults();
+          }).catch(function(e) {
+            statusEl.textContent = 'Clear failed: ' + (e.message || e);
+            clearBtn.disabled = false;
+          });
+        });
+      }
+
+      var relSel = document.getElementById('rm-release-id');
+      if (relSel) {
+        relSel.addEventListener('change', function() { loadResults(); });
+      }
+
+      loadReleases().then(loadResults);
+      refreshActionState(false);
+      window.addEventListener('auth-change', function() {
+        refreshActionState(false);
+        loadReleases().then(loadResults);
+      });
+    })();
+  </script>
+</body>
+</html>
