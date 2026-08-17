@@ -612,13 +612,53 @@ def _wait_job_and_maybe_log(api_base: str, token: str, job_id: int, log_dir: Pat
     if log_dir and attempt_id:
         _fetch_attempt_log(api_base, attempt_id, log_dir / f"build-{job_id}.log")
 
-def _fetch_attempt_log(api_base: str, attempt_id: int, dest: Path) -> None:
-    r = http_request_raw("GET", api_base, f"/api/logs/attempts/{attempt_id}", token=None)
+def _fetch_attempt_log(api_base: str, attempt_id: int, dest: Path) -> bool:
+    r = http_request_raw("GET", api_base, f"/api/logs/attempts/{attempt_id}", token=None, timeout=300.0)
     if r.status_code != 200:
         click.echo("log not available for attempt %s (HTTP %s)" % (attempt_id, r.status_code), err=True)
-        return
+        return False
+    dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(r.content)
     click.echo("wrote %s" % dest)
+    return True
+
+
+def _list_all_layer_jobs(
+    api_base: str,
+    token: str | None,
+    layer_id: int,
+    status: str,
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    offset = 0
+    limit = 1000
+    while True:
+        out = http_json(
+            "GET",
+            api_base,
+            "/api/builds",
+            token=token,
+            params={
+                "layer_plan_id": layer_id,
+                "status": status,
+                "limit": limit,
+                "offset": offset,
+            },
+        )
+        page = out.get("items") or []
+        if not isinstance(page, list):
+            break
+        items.extend(j for j in page if isinstance(j, dict))
+        total = int(out.get("total") or 0)
+        offset += len(page)
+        if not page or offset >= total:
+            break
+    return items
+
+
+def _safe_log_name(value: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9._+-]+", "_", (value or "").strip())
+    return s.strip("._") or "unknown"
 
 @cli.group("builds")
 def grp_builds() -> None:
@@ -959,6 +999,52 @@ def logs_view(attempt_id: int, out: str | None, tail: int | None) -> None:
         click.echo("wrote %s" % out)
     else:
         click.echo(r.text, nl=False)
+
+@grp_logs.command("layer-fail")
+@click.argument("layer_id", type=int)
+@click.option(
+    "--out",
+    "out_dir",
+    type=click.Path(),
+    default=None,
+    help="Directory to write logs into (default ./layer-<id>-failed-logs)",
+)
+def logs_layer_fail(layer_id: int, out_dir: str | None) -> None:
+    token = get_token()
+    api_base = get_api_url()
+    dest = Path(out_dir) if out_dir else Path("layer-%s-failed-logs" % layer_id)
+    dest.mkdir(parents=True, exist_ok=True)
+    jobs = _list_all_layer_jobs(api_base, token, layer_id, "failed")
+    if not jobs:
+        click.echo("no failed jobs in layer %s" % layer_id)
+        return
+    wrote = 0
+    missing = 0
+    for job in jobs:
+        jid = int(job["id"])
+        pkg = _safe_log_name(str(job.get("package_name") or "pkg-%s" % (job.get("package_id") or jid)))
+        arch = _safe_log_name(str(job.get("architecture") or "noarch"))
+        attempts = http_json("GET", api_base, f"/api/builds/jobs/{jid}/attempts", token=token)
+        if not isinstance(attempts, list) or not attempts:
+            click.echo("job %s %s %s has no attempts" % (jid, pkg, arch), err=True)
+            missing += 1
+            continue
+        for att in attempts:
+            if not isinstance(att, dict):
+                continue
+            aid = int(att["id"])
+            name = "%s-%s-job%s-attempt%s.log" % (pkg, arch, jid, aid)
+            if _fetch_attempt_log(api_base, aid, dest / name):
+                wrote += 1
+            else:
+                missing += 1
+    click.echo("layer %s failed jobs=%s logs written=%s missing=%s dir=%s" % (
+        layer_id,
+        len(jobs),
+        wrote,
+        missing,
+        dest,
+    ))
 
 @cli.command("promote")
 @click.argument("from_channel")
