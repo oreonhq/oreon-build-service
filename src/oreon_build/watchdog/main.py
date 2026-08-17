@@ -18,6 +18,8 @@ from oreon_build.models import (
     CveMatch,
     CveMatchRelease,
     Release,
+    ReleaseMonitorOutdated,
+    ReleaseMonitorScan,
     SecurityAdvisory,
     SecurityAdvisoryRelease,
     TrackedRpm,
@@ -229,6 +231,12 @@ async def _discord_notify_advisory_resolved(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _configure_watchdog_logging()
+    try:
+        from oreon_build.services.release_monitor import mark_stale_scans_failed
+
+        await mark_stale_scans_failed()
+    except Exception:
+        logger.exception("failed to reconcile stale release-monitor scans on startup")
     yield
 
 def create_app() -> FastAPI:
@@ -259,6 +267,154 @@ def create_app() -> FastAPI:
     @app.get("/advisories/{advisory_id}")
     async def _advisory_detail(advisory_id: int):
         return FileResponse(web_dir / "advisory-custom.html")
+
+    @app.get("/release-monitoring")
+    async def _release_monitoring():
+        return FileResponse(web_dir / "release-monitoring.html")
+
+    def _scan_meta(scan: ReleaseMonitorScan) -> dict:
+        return {
+            "id": int(scan.id),
+            "release_id": scan.release_id,
+            "branches": scan.branches or "",
+            "status": scan.status,
+            "total_packages": int(scan.total_packages or 0),
+            "checked_packages": int(scan.checked_packages or 0),
+            "matched_packages": int(scan.matched_packages or 0),
+            "outdated_count": int(scan.outdated_count or 0),
+            "error": scan.error,
+            "started_at": _dt_to_iso(scan.started_at),
+            "finished_at": _dt_to_iso(scan.finished_at),
+        }
+
+    @app.get("/api/release-monitoring/results")
+    async def release_monitoring_results(release_id: int | None = Query(None)):
+        from sqlalchemy import select
+
+        async with async_session_maker() as db:
+            done_q = select(ReleaseMonitorScan).where(ReleaseMonitorScan.status == "done")
+            active_q = select(ReleaseMonitorScan).where(ReleaseMonitorScan.status == "running")
+            if release_id is not None:
+                done_q = done_q.where(ReleaseMonitorScan.release_id == release_id)
+                active_q = active_q.where(ReleaseMonitorScan.release_id == release_id)
+            done_q = done_q.order_by(ReleaseMonitorScan.started_at.desc()).limit(1)
+            active_q = active_q.order_by(ReleaseMonitorScan.started_at.desc()).limit(1)
+
+            latest = (await db.execute(done_q)).scalar_one_or_none()
+            active = (await db.execute(active_q)).scalar_one_or_none()
+
+            items: list[dict] = []
+            if latest is not None:
+                rows = (
+                    await db.execute(
+                        select(ReleaseMonitorOutdated)
+                        .where(ReleaseMonitorOutdated.scan_id == latest.id)
+                        .order_by(ReleaseMonitorOutdated.package_name)
+                    )
+                ).scalars().all()
+                items = [
+                    {
+                        "package_name": r.package_name,
+                        "current_version": r.current_version,
+                        "latest_version": r.latest_version,
+                        "project": r.project,
+                        "ecosystem": r.ecosystem,
+                    }
+                    for r in rows
+                ]
+
+            return JSONResponse(
+                content={
+                    "latest_scan": _scan_meta(latest) if latest else None,
+                    "active_scan": _scan_meta(active) if active else None,
+                    "items": items,
+                }
+            )
+
+    @app.get("/api/release-monitoring/status")
+    async def release_monitoring_status(release_id: int | None = Query(None)):
+        from sqlalchemy import select
+
+        async with async_session_maker() as db:
+            q = select(ReleaseMonitorScan)
+            if release_id is not None:
+                q = q.where(ReleaseMonitorScan.release_id == release_id)
+            q = q.order_by(ReleaseMonitorScan.started_at.desc()).limit(1)
+            scan = (await db.execute(q)).scalar_one_or_none()
+            return JSONResponse(content={"scan": _scan_meta(scan) if scan else None})
+
+    @app.post("/api/release-monitoring/scan")
+    async def release_monitoring_scan(
+        payload: dict = Body(default={}),
+        actor=Depends(require_maintainer_or_admin),
+    ):
+        from sqlalchemy import select
+        from oreon_build.core.repo_branch import PRIMARY_REPO_BRANCHES
+        from oreon_build.services.release_monitor import schedule_scan
+
+        release_id = payload.get("release_id")
+        try:
+            release_id = int(release_id) if release_id not in (None, "") else None
+        except (TypeError, ValueError):
+            return JSONResponse(content={"detail": "invalid release_id"}, status_code=400)
+
+        async with async_session_maker() as db:
+            running = (
+                await db.execute(
+                    select(ReleaseMonitorScan).where(ReleaseMonitorScan.status == "running")
+                )
+            ).scalars().first()
+            if running is not None:
+                return JSONResponse(
+                    content={"detail": "A scan is already running", "scan_id": int(running.id)},
+                    status_code=409,
+                )
+
+            release = None
+            if release_id is not None:
+                release = await db.get(Release, release_id)
+                if release is None:
+                    return JSONResponse(content={"detail": "release not found"}, status_code=404)
+            else:
+                release = (
+                    await db.execute(select(Release).order_by(Release.releasename).limit(1))
+                ).scalar_one_or_none()
+                if release is None:
+                    return JSONResponse(content={"detail": "no releases configured"}, status_code=400)
+
+            branches = ",".join(PRIMARY_REPO_BRANCHES)
+            scan = ReleaseMonitorScan(
+                release_id=release.id,
+                branches=branches,
+                status="running",
+                created_by_account_id=actor.id,
+            )
+            db.add(scan)
+            await db.commit()
+            await db.refresh(scan)
+            scan_id = int(scan.id)
+
+        schedule_scan(scan_id)
+        return JSONResponse(content={"ok": True, "scan_id": scan_id})
+
+    @app.post("/api/release-monitoring/clear")
+    async def release_monitoring_clear(_actor=Depends(require_maintainer_or_admin)):
+        from sqlalchemy import delete, select
+
+        async with async_session_maker() as db:
+            running = (
+                await db.execute(
+                    select(ReleaseMonitorScan).where(ReleaseMonitorScan.status == "running")
+                )
+            ).scalars().first()
+            if running is not None:
+                return JSONResponse(
+                    content={"detail": "Cannot clear while a scan is running"}, status_code=409
+                )
+            await db.execute(delete(ReleaseMonitorOutdated))
+            await db.execute(delete(ReleaseMonitorScan))
+            await db.commit()
+        return JSONResponse(content={"ok": True})
 
     @app.get("/api/security/advisories")
     async def list_advisories(
