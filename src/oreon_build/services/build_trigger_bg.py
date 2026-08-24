@@ -10,6 +10,7 @@ from oreon_build.db.session import async_session_maker
 from oreon_build.models import Account, Release
 from oreon_build.services.build_trigger_exec import execute_build_trigger
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,10 @@ def spawn(coro) -> None:
 async def run_distgit_batch(payload: dict[str, Any], user_id: int, ip: str | None, ua: str) -> None:
     data = DistgitBatchTrigger.model_validate(payload)
     async with async_session_maker() as db:
-        user = await db.get(Account, user_id)
+        user_result = await db.execute(
+            select(Account).options(selectinload(Account.role)).where(Account.id == user_id)
+        )
+        user = user_result.scalar_one_or_none()
         if user is None:
             logger.error("distgit batch: user_id=%s not found", user_id)
             return
@@ -100,6 +104,13 @@ async def run_distgit_batch(payload: dict[str, Any], user_id: int, ip: str | Non
                     pkg_name,
                     data.release_id,
                 )
+                user_result = await db.execute(
+                    select(Account).options(selectinload(Account.role)).where(Account.id == user_id)
+                )
+                user = user_result.scalar_one_or_none()
+                if user is None:
+                    logger.error("distgit batch: user_id=%s disappeared after rollback", user_id)
+                    break
         if queued or skipped or failed:
             logger.info(
                 "distgit batch release_id=%s queued=%s skipped=%s failed=%s",
@@ -165,28 +176,7 @@ async def run_layer_seed(plan_id: int) -> None:
 
 
 async def run_layer_resume_refresh(plan_id: int, job_ids: list[int]) -> None:
-    """Re-parse resumed blocked jobs then prune deps the specs no longer need."""
-    from oreon_build.models import LayerPlan, LayerPlanStatus
-    from oreon_build.services.layer_engine import refresh_blocked_jobs_for_prune
-
-    async with async_session_maker() as db:
-        try:
-            plan = await db.get(LayerPlan, int(plan_id))
-            if plan is None or plan.status != LayerPlanStatus.RUNNING:
-                return
-            n = await refresh_blocked_jobs_for_prune(db, plan, job_ids=list(job_ids or []))
-            # recheck already prunes sources dropped from blockers
-            await db.commit()
-            logger.info(
-                "background layer resume refresh layer_plan_id=%s refreshed=%s",
-                plan_id,
-                n,
-            )
-        except Exception:
-            await db.rollback()
-            logger.exception(
-                "background layer resume refresh failed layer_plan_id=%s", plan_id
-            )
+    return
 
 
 def schedule_layer_resume_refresh(plan_id: int, job_ids: list[int]) -> None:

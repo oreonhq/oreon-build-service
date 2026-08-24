@@ -60,7 +60,8 @@ class InstallOracle:
         self._solver.set_overlay(packages)
         fp = "|".join(
             f"{k}={getattr(v, 'epoch', 0)}:{getattr(v, 'version', '0')}-"
-            f"{getattr(v, 'release', '0')}+{','.join(sorted(getattr(v, 'provides', ()) or ()))}"
+            f"{getattr(v, 'release', '0')}+{','.join(sorted(getattr(v, 'provides', ()) or ())) }"
+            f"|req={','.join(sorted(getattr(v, 'requires', ()) or ())) }"
             for k, v in sorted(packages.items())
         )
         if fp != self._overlay_fp:
@@ -131,6 +132,11 @@ def overlay_from_nodes(
             continue
         caps = set(by_src.get(name, set()))
         caps.add(name)
+        requires = {
+            str(req).strip()
+            for req in (getattr(node, "runtime_requires", None) or ())
+            if str(req).strip() and "%" not in str(req)
+        }
         provides = getattr(node, "provides", None) or set()
         caps |= {c for c in provides if c}
         for b in getattr(node, "binaries", None) or ():
@@ -165,6 +171,7 @@ def overlay_from_nodes(
         out[name] = OverlayPackage(
             source_name=name,
             provides=frozenset(clean),
+            requires=frozenset(requires),
             epoch=epoch,
             version=ver,
             release=rel,

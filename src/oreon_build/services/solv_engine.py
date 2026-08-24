@@ -28,18 +28,6 @@ _RE_REQUESTED = re.compile(
     r"nothing provides requested\s+(?P<cap>.+?)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
-_RE_NOTHING_PROVIDES = re.compile(
-    r"nothing provides\s+(?P<cap>.+?)(?:\s+needed by\s|\s*$)",
-    re.IGNORECASE,
-)
-_RE_NO_MATCH = re.compile(
-    r"No match for argument:\s*(?P<cap>.+)$",
-    re.IGNORECASE | re.MULTILINE,
-)
-_RE_NO_MATCHING_PACKAGE = re.compile(
-    r"No matching package to install:\s*['\"]?(?P<cap>[^'\"\n]+?)['\"]?\s*$",
-    re.IGNORECASE | re.MULTILINE,
-)
 _REPOMD_NS = {"r": "http://linux.duke.edu/metadata/repo"}
 
 
@@ -191,14 +179,6 @@ def _parse_missing_from_problems(texts: Iterable[str]) -> set[str]:
         cap = (m.group("cap") or "").strip().rstrip(".")
         if cap:
             out.add(cap)
-    for rx in (_RE_NO_MATCH, _RE_NO_MATCHING_PACKAGE, _RE_NOTHING_PROVIDES):
-        for m in rx.finditer(blob):
-            cap = (m.group("cap") or "").strip().rstrip(".")
-            if not cap:
-                continue
-            if cap.lower().startswith("requested "):
-                cap = cap[10:].strip()
-            out.add(cap)
     return out
 
 
@@ -243,18 +223,15 @@ def _missing_from_solver_problems(problems: Iterable[Any], solv: Any) -> set[str
                 info = None
             if info is None:
                 continue
+            try:
+                problem_text = info.problemstr() or ""
+            except Exception:
+                problem_text = str(info)
             rtype = getattr(info, "type", None)
             if rtype is None:
                 rtype = getattr(rule, "type", None)
-            if rtype not in interesting:
-                # still take dep when problemstr says nothing provides
-                pstr = ""
-                try:
-                    pstr = (info.problemstr() or "").lower()
-                except Exception:
-                    pstr = str(info).lower()
-                if "nothing provides" not in pstr and "no match" not in pstr:
-                    continue
+            if rtype not in interesting and "nothing provides" not in problem_text.lower():
+                continue
             cap = _dep_to_cap(getattr(info, "dep", None))
             if cap:
                 out.add(cap)
@@ -298,6 +275,7 @@ class _RepoMetaFiles:
 class OverlaySolvable:
     source_name: str
     provides: frozenset[str]
+    requires: frozenset[str] = frozenset()
     epoch: int = 0
     version: str = "0"
     release: str = "0"
@@ -452,6 +430,23 @@ class SolvArchEngine:
         pool = self._pool
         index = RepoCapabilityIndex()
         overlay_name = "oreon-plan-overlay"
+
+        def add_evr(cap: str, evr: str) -> None:
+            name = (cap or "").strip()
+            raw = (evr or "").strip()
+            if not name or not raw:
+                return
+            epoch = "0"
+            if ":" in raw:
+                epoch, raw = raw.split(":", 1)
+            version, sep, release = raw.rpartition("-")
+            if not sep or not version:
+                version, release = raw, ""
+            bucket = index.capability_evrs.setdefault(name, [])
+            item = (epoch or "0", version, release)
+            if item not in bucket:
+                bucket.append(item)
+
         for sol in pool.solvables_iter():
             try:
                 repo = sol.repo
@@ -464,17 +459,23 @@ class SolvArchEngine:
             if not name:
                 continue
             src = _source_name_from_solvable(sol, solv) or name
+            try:
+                evr = sol.lookup_str(solv.SOLVABLE_EVR) or ""
+            except Exception:
+                evr = ""
             index.binary_names.add(name)
             index.source_names.add(src)
             index.binary_source[name] = src
             index.provides.add(name)
             index.capability_providers.setdefault(name, set()).add(src)
+            add_evr(name, evr)
             for dep in sol.lookup_deparray(solv.SOLVABLE_PROVIDES) or ():
                 cap = _dep_to_cap(dep)
                 if not cap:
                     continue
                 index.provides.add(cap)
                 index.capability_providers.setdefault(cap, set()).add(src)
+                add_evr(cap, evr)
             reqs: set[str] = set()
             for dep in sol.lookup_deparray(solv.SOLVABLE_REQUIRES) or ():
                 cap = _dep_to_cap(dep)
@@ -608,6 +609,10 @@ class SolvArchEngine:
                         solv.REL_EQ,
                     ),
                 )
+            for req in sorted(pkg.requires):
+                dep_id = _req_to_dep_id(pool, solv, req)
+                if dep_id is not None:
+                    s.add_deparray(solv.SOLVABLE_REQUIRES, dep_id)
         pool.createwhatprovides()
 
     def _ensure_branch_meta(self, branch: str) -> _RepoMetaFiles:

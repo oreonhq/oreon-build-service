@@ -13,7 +13,7 @@ from oreon_build.config import get_settings
 from oreon_build.core.repo_branch import job_publish_branch
 from oreon_build.db.session import async_session_maker
 from oreon_build.models import Artifact, BuildAttempt, BuildJob, BuildTarget, PublishTask, Release
-from oreon_build.services.publisher import prefix_publish_lock, update_repodata_at_prefix
+from oreon_build.services.publisher import prefix_publish_lock, rpm_publish_locks, update_repodata_at_prefix
 from oreon_build.services.r2 import get_r2_client, repo_r2_prefix, repo_rpms_key, src_r2_key
 
 logger = logging.getLogger(__name__)
@@ -67,7 +67,8 @@ def process_repo_publish_sync(
     from oreon_build.api.worker_api import _prune_superseded_repo_objects
 
     prefix = repo_r2_prefix(releasename, branch, arch)
-    with prefix_publish_lock(prefix):
+    filenames = [getattr(artifact, "filename", "") for artifact in payload_artifacts]
+    with prefix_publish_lock(prefix), rpm_publish_locks(prefix, filenames):
         r2 = get_r2_client()
         from oreon_build.services.publisher import (
             _ensure_stage_sidecar,
@@ -278,24 +279,27 @@ async def _mark_publish_tasks_failed(task_ids: list[int], attempt_ids: list[int]
         _publish_completed_attempts.add(attempt_id)
     _cleanup_old_locks()
 
-async def _source_and_release_for_attempt(attempt_id: int) -> tuple[str, str] | None:
+async def _source_and_release_for_attempt(
+    attempt_id: int,
+) -> tuple[str, str, str | None] | None:
     from sqlalchemy import select as _select
 
     from oreon_build.models import BuildAttempt, BuildJob, Package, Release
 
     async with async_session_maker() as db:
         row = await db.execute(
-            _select(Package.name, Release.releasename)
+            _select(Package.name, Release.releasename, BuildTarget.architecture)
             .join(BuildJob, BuildJob.package_id == Package.id)
             .join(BuildAttempt, BuildAttempt.build_job_id == BuildJob.id)
             .join(Release, Release.id == BuildJob.release_id)
+            .join(BuildTarget, BuildTarget.id == BuildJob.target_id, isouter=True)
             .where(BuildAttempt.id == attempt_id)
             .limit(1)
         )
         hit = row.first()
         if not hit:
             return None
-        return str(hit[0]), str(hit[1] or "")
+        return str(hit[0]), str(hit[1] or ""), str(hit[2] or "") or None
 
 
 async def _notify_publish_success(attempt_ids: list[int]) -> None:
@@ -306,7 +310,7 @@ async def _notify_publish_success(attempt_ids: list[int]) -> None:
         try:
             info = await _source_and_release_for_attempt(attempt_id)
             if info:
-                await on_package_published(info[0], info[1])
+                await on_package_published(info[0], info[1], info[2])
         except Exception:
             logger.exception("layer engine unblock after publish attempt_id=%s", attempt_id)
         try:

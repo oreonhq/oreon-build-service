@@ -17,9 +17,11 @@ from oreon_build.services.dep_plan.br_filter import filter_plan_brs
 from oreon_build.services.repo_capability_index import is_rich_dependency, is_rpmlib_requirement
 
 __all__ = [
+    "BASE_SYSTEM_PACKAGES",
     "actionable_caps",
     "filter_plan_brs",
     "filter_providers_for_consumer",
+    "is_base_system_package",
     "is_mingw_requirement",
     "is_mingw_source",
     "is_toolchainish_source",
@@ -34,6 +36,81 @@ _RE_CRATE_VER_LEAF = re.compile(
 )
 _RE_GHC_ALT = re.compile(r"^ghc\d", re.IGNORECASE)
 _RE_VERSION_SUFFIX = re.compile(r"\d")
+
+
+# Packages assumed present in the build environment (buildsys-build group).
+# These are fundamental build tools that should never be pulled in from
+# distgit source as a chain-plan build dependency.
+BASE_SYSTEM_PACKAGES: frozenset[str] = frozenset(
+    {
+        "bash",
+        "binutils",
+        "bison",
+        "bzip2",
+        "coreutils",
+        "cpio",
+        "diffutils",
+        "expat",
+        "file",
+        "findutils",
+        "gawk",
+        "gcc",
+        "gcc-c++",
+        "gdb",
+        "gettext",
+        "glibc",
+        "glibc-common",
+        "glibc-devel",
+        "glibc-minimal-langpacks",
+        "gmp",
+        "grep",
+        "groff-base",
+        "gzip",
+        "info",
+        "iptables",
+        "libacl",
+        "libattr",
+        "libcap",
+        "libffi",
+        "libgcc",
+        "libgomp",
+        "libselinux",
+        "libsepol",
+        "libstdc++",
+        "libstdc++-devel",
+        "libtool",
+        "libxcrypt",
+        "make",
+        "patch",
+        "perl",
+        "pkgconf",
+        "pkgconf-m4",
+        "pkgconf-pkg-config",
+        "redhat-rpm-config",
+        "rpm",
+        "rpm-build",
+        "rpm-build-libs",
+        "sed",
+        "setup",
+        "shadow-utils",
+        "tar",
+        "tbb",
+        "unzip",
+        "util-linux",
+        "which",
+        "xz",
+        "zlib",
+        "binutils-devel",
+    }
+)
+
+
+def is_base_system_package(name: str) -> bool:
+    """True when *name* is a base-system build tool assumed present in mock."""
+    n = (name or "").strip().lower()
+    return n in BASE_SYSTEM_PACKAGES
+
+
 _RE_MINGW_REQ = re.compile(
     r"(?i)(?:^|[\s,(])mingw(?:32|64)(?:-|\()|^mingw(?:32|64)-"
 )
@@ -119,7 +196,11 @@ def is_ghc_requirement(req: str) -> bool:
 
 
 def should_seed_providers(consumer: str, req: str, srcs: set[str]) -> bool:
-    """False when seed must not pull foreign compiler/cross stacks into a native graph."""
+    """False when seed must not pull foreign compiler/cross stacks into a native graph.
+
+    Also False when the only providers are base-system build tools (gcc, make, etc.)
+    that are assumed present in the build environment.
+    """
     if not srcs:
         return False
     if is_mingw_requirement(req) and not is_mingw_source(consumer):
@@ -130,7 +211,27 @@ def should_seed_providers(consumer: str, req: str, srcs: set[str]) -> bool:
         and not is_ghc_requirement(req)
     ):
         return False
+    consumer_low = (consumer or "").strip().lower()
+    if consumer_low and is_base_system_package(consumer_low):
+        return True
+    if all(is_base_system_package(s) for s in srcs):
+        req_name = _requirement_name(req)
+        if req_name and is_base_system_package(req_name):
+            return False
     return True
+
+
+def _requirement_name(req: str) -> str | None:
+    """Extract the bare capability name from a requirement like 'gcc >= 13'."""
+    from oreon_build.core.rpm_requires import parse_versioned_requirement
+
+    name, _op, _ver = parse_versioned_requirement((req or "").strip())
+    if name:
+        return name.strip()
+    cap = (req or "").strip()
+    if cap.startswith("(") and cap.endswith(")"):
+        return None
+    return cap or None
 
 
 def narrow_alternate_providers(requirement: str, srcs: set[str]) -> set[str]:
@@ -162,10 +263,51 @@ def merge_maps(*maps: dict[str, set[str]] | None) -> dict[str, set[str]]:
     return merge_provider_maps(*[m for m in maps if m])
 
 
+_CASEFOLD_INDEX_CACHE: dict[int, dict[str, set[str]]] = {}
+
+
+def _build_casefolded_index(provider_map: dict) -> dict[str, set[str]]:
+    if not provider_map:
+        return {}
+    cached = _CASEFOLD_INDEX_CACHE.get(id(provider_map))
+    if cached is not None:
+        return cached
+    lower_key = provider_map.get("__lower__")
+    if isinstance(lower_key, dict):
+        idx = lower_key
+    else:
+        idx = {}
+        for key, sources in provider_map.items():
+            if not isinstance(key, str) or key == "__lower__":
+                continue
+            folded = key.casefold()
+            bucket = idx.get(folded)
+            if bucket is None:
+                bucket = set()
+                idx[folded] = bucket
+            if isinstance(sources, (set, frozenset)):
+                bucket.update(s for s in sources if s)
+            elif isinstance(sources, (list, tuple)):
+                bucket.update(s for s in sources if s)
+    _CASEFOLD_INDEX_CACHE[id(provider_map)] = idx
+    return idx
+
+
 def _map_sources(provider_map: dict, cap: str) -> set[str]:
     from oreon_build.services.virtual_resolve import _pmap_sources
 
-    return _pmap_sources(provider_map, cap, (cap or "").lower())
+    result = _pmap_sources(provider_map, cap, (cap or "").lower())
+    if result:
+        return result
+    folded = (cap or "").casefold()
+    if not folded:
+        return result
+    idx = _build_casefolded_index(provider_map)
+    if idx:
+        cached = idx.get(folded)
+        if cached:
+            result.update(cached)
+    return result
 
 
 def _rust_compat_series_from_package(pkg: str) -> str | None:
@@ -236,24 +378,28 @@ def _source_may_satisfy_crate_versions(src: str, requirement: str) -> bool:
     Compat dirs name a series range [series, next), not a single version.
     rust-structmeta0.1 can satisfy >= 0.1.4 with < 0.2 even though the
     series token pads to 0.1.0. Unsuffixed rust-foo is always kept.
+    rust-similar2 is similar series 2, not a crate named similar2.
     """
     constraints = _crate_version_constraints(requirement)
     if not constraints:
         return True
-    from oreon_build.services.distgit_order import _rust_crate_name_from_package
-
-    src_crate = _rust_crate_name_from_package(src)
-    series = _rust_compat_series_from_package(src)
-    if series is None:
-        return True
-    nxt = _series_next(series)
-    if nxt is None:
-        return True
-    floor = split_requirement_evr(_series_as_provide_ver(series))
-    ceiling = split_requirement_evr(_series_as_provide_ver(nxt))
+    n = (src or "").strip()
     for crate, op, ver in constraints:
-        if src_crate and src_crate != crate:
+        prefix = f"rust-{crate}"
+        if n == prefix:
             continue
+        if not n.startswith(prefix):
+            continue
+        series = n[len(prefix) :]
+        if not (
+            re.fullmatch(r"0\.\d+(?:\.\d+)*", series) or re.fullmatch(r"\d+", series)
+        ):
+            continue
+        nxt = _series_next(series)
+        if nxt is None:
+            continue
+        floor = split_requirement_evr(_series_as_provide_ver(series))
+        ceiling = split_requirement_evr(_series_as_provide_ver(nxt))
         need = split_requirement_evr(ver)
         if op == ">=":
             if not evr_satisfies("<", need, ceiling):
@@ -372,7 +518,66 @@ def providers_for_requirement(
                 out.add(raw)
     if "crate(" in raw and _crate_version_constraints(raw):
         out = {s for s in out if _source_may_satisfy_crate_versions(s, raw)}
+    else:
+        out = _prefer_current_crate_sources(raw, out)
+    if perl_mods:
+        out = _prefer_specific_perl_sources(out)
     return out
+
+
+def _prefer_specific_perl_sources(srcs: set[str]) -> set[str]:
+    """Drop the interpreter and shorter perl-* prefixes when a longer owner exists.
+
+    perl.spec Provides: perl(CPAN::Meta::...) for dual-life noise. DNF still
+    installs perl-CPAN-Meta-Requirements for that module.
+    """
+    perl_like = {s for s in srcs if s == "perl" or s.startswith("perl-")}
+    if not perl_like:
+        return srcs
+    rest = srcs - perl_like
+    if "perl" in perl_like and any(s.startswith("perl-") for s in perl_like):
+        perl_like.discard("perl")
+    drop: set[str] = set()
+    for a in perl_like:
+        for b in perl_like:
+            if a != b and b.startswith(a + "-"):
+                drop.add(a)
+    return rest | (perl_like - drop)
+
+
+def _crate_names_in_requirement(requirement: str) -> list[str]:
+    raw = (requirement or "").strip()
+    if "crate(" not in raw:
+        return []
+    names: list[str] = []
+    seen: set[str] = set()
+    for m in re.finditer(r"crate\(([^)/]+)(?:/[^)]*)?\)", raw):
+        crate = (m.group(1) or "").strip()
+        if crate and crate not in seen:
+            seen.add(crate)
+            names.append(crate)
+    return names
+
+
+def _prefer_current_crate_sources(requirement: str, srcs: set[str]) -> set[str]:
+    """Unversioned crate(foo) → rust-foo, not every rust-foo0.N compat dir."""
+    if not srcs or not _crate_names_in_requirement(requirement):
+        return srcs
+    drop: set[str] = set()
+    for crate in _crate_names_in_requirement(requirement):
+        current = f"rust-{crate}"
+        if current not in srcs:
+            continue
+        prefix = current
+        for s in srcs:
+            if s == prefix:
+                continue
+            if not s.startswith(prefix):
+                continue
+            series = s[len(prefix) :]
+            if re.fullmatch(r"0\.\d+(?:\.\d+)*", series) or re.fullmatch(r"\d+", series):
+                drop.add(s)
+    return srcs - drop
 
 
 def actionable_caps(requirement: str) -> list[str]:

@@ -26,6 +26,7 @@ _ANITYA_ATTEMPTS = 5
 _MAX_PACKAGES = 20000
 
 _running: set[asyncio.Task] = set()
+_periodic_task: asyncio.Task | None = None
 
 
 def _parse_srpm_name_version(filename: str) -> tuple[str, str, str] | None:
@@ -256,3 +257,56 @@ def schedule_scan(scan_id: int) -> None:
     task = asyncio.create_task(run_release_monitor_scan(scan_id))
     _running.add(task)
     task.add_done_callback(lambda t: _running.discard(t))
+
+
+async def run_automatic_release_monitor_scan() -> None:
+    async with async_session_maker() as db:
+        active_releases = (
+            await db.execute(select(Release).where(Release.is_active.is_(True)).order_by(Release.id))
+        ).scalars().all()
+        running = (
+            await db.execute(select(ReleaseMonitorScan.release_id).where(ReleaseMonitorScan.status == "running"))
+        ).scalars().all()
+        running_ids = {int(value) for value in running if value is not None}
+        scan_ids: list[int] = []
+        branches = ",".join(PRIMARY_REPO_BRANCHES)
+        for release in active_releases:
+            if release.id in running_ids:
+                continue
+            scan = ReleaseMonitorScan(
+                release_id=release.id,
+                branches=branches,
+                status="running",
+            )
+            db.add(scan)
+            await db.flush()
+            scan_ids.append(int(scan.id))
+        await db.commit()
+    for scan_id in scan_ids:
+        schedule_scan(scan_id)
+
+
+def start_periodic_release_monitor(interval_seconds: int = 18000) -> asyncio.Task:
+    global _periodic_task
+    if _periodic_task is not None and not _periodic_task.done():
+        return _periodic_task
+
+    async def loop() -> None:
+        while True:
+            try:
+                await run_automatic_release_monitor_scan()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("automatic release monitor scan failed")
+            await asyncio.sleep(interval_seconds)
+
+    _periodic_task = asyncio.create_task(loop())
+    return _periodic_task
+
+
+def stop_periodic_release_monitor() -> None:
+    global _periodic_task
+    if _periodic_task is not None:
+        _periodic_task.cancel()
+        _periodic_task = None

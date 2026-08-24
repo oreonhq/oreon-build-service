@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -61,9 +62,10 @@ def nevra_to_name(nevra: str) -> str:
     return s
 
 _SOLVER_CACHE: dict[tuple[Any, ...], tuple[float, "OreonRepoSolver"]] = {}
-_SOLVER_CACHE_TTL_SEC = 900.0
+_SOLVER_CACHE_TTL_SEC = 300.0
 # keep both arches warm so dual-arch layers do not thrash-evict each other
-_SOLVER_CACHE_MAX = 4
+_SOLVER_CACHE_MAX = 1
+_SOLV_LOCK = threading.RLock()
 
 
 def _overlay_cap_ok(cap: str) -> bool:
@@ -190,6 +192,7 @@ def parse_depsolve_broken_binaries(text: str) -> set[str]:
 class OverlayPackage:
     source_name: str
     provides: frozenset[str]
+    requires: frozenset[str] = frozenset()
     epoch: int = 0
     version: str = "0"
     release: str = "0"
@@ -224,14 +227,15 @@ class OreonRepoSolver:
         self._solv_engine: Any | None = None
 
     def close(self) -> None:
-        if self._solv_engine is not None:
-            try:
-                self._solv_engine.close()
-            except Exception:
-                pass
-            self._solv_engine = None
-        if self._owned_td and self._td and os.path.isdir(self._td):
-            shutil.rmtree(self._td, ignore_errors=True)
+        with _SOLV_LOCK:
+            if self._solv_engine is not None:
+                try:
+                    self._solv_engine.close()
+                except Exception:
+                    pass
+                self._solv_engine = None
+            if self._owned_td and self._td and os.path.isdir(self._td):
+                shutil.rmtree(self._td, ignore_errors=True)
 
     def __del__(self) -> None:
         try:
@@ -262,6 +266,7 @@ class OreonRepoSolver:
             name: OverlaySolvable(
                 source_name=pkg.source_name,
                 provides=pkg.provides,
+                requires=pkg.requires,
                 epoch=pkg.epoch,
                 version=pkg.version,
                 release=pkg.release,
@@ -271,15 +276,37 @@ class OreonRepoSolver:
         }
 
     def set_overlay(self, packages: dict[str, Iterable[str] | OverlayPackage]) -> None:
-        new: dict[str, OverlayPackage] = {}
-        for name, provides in packages.items():
-            src = (name or "").strip()
-            if not src:
-                continue
-            if isinstance(provides, OverlayPackage):
+        with _SOLV_LOCK:
+            new: dict[str, OverlayPackage] = {}
+            for name, provides in packages.items():
+                src = (name or "").strip()
+                if not src:
+                    continue
+                if isinstance(provides, OverlayPackage):
+                    caps = frozenset(
+                        p.strip()
+                        for p in provides.provides
+                        if p
+                        and str(p).strip()
+                        and "%" not in str(p)
+                        and not str(p).strip().startswith("bundled(")
+                        and _overlay_cap_ok(str(p).strip())
+                    )
+                    if not caps:
+                        continue
+                    new[src] = OverlayPackage(
+                        source_name=src,
+                        provides=caps,
+                        requires=frozenset(),
+                        epoch=int(provides.epoch or 0),
+                        version=(provides.version or "0").strip() or "0",
+                        release=(provides.release or "0").strip() or "0",
+                        arch=(provides.arch or "noarch").strip() or "noarch",
+                    )
+                    continue
                 caps = frozenset(
                     p.strip()
-                    for p in provides.provides
+                    for p in provides
                     if p
                     and str(p).strip()
                     and "%" not in str(p)
@@ -288,51 +315,36 @@ class OreonRepoSolver:
                 )
                 if not caps:
                     continue
-                new[src] = OverlayPackage(
-                    source_name=src,
-                    provides=caps,
-                    epoch=int(provides.epoch or 0),
-                    version=(provides.version or "0").strip() or "0",
-                    release=(provides.release or "0").strip() or "0",
-                    arch=(provides.arch or "noarch").strip() or "noarch",
-                )
-                continue
-            caps = frozenset(
-                p.strip()
-                for p in provides
-                if p
-                and str(p).strip()
-                and "%" not in str(p)
-                and not str(p).strip().startswith("bundled(")
-                and _overlay_cap_ok(str(p).strip())
-            )
-            if not caps:
-                continue
-            new[src] = OverlayPackage(source_name=src, provides=caps)
-        fp = hashlib.sha256(
-            repr(
-                sorted(
-                    (
-                        k,
-                        tuple(sorted(v.provides)),
-                        v.epoch,
-                        v.version,
-                        v.release,
-                        v.arch,
+                new[src] = OverlayPackage(source_name=src, provides=caps)
+            fp = hashlib.sha256(
+                repr(
+                    sorted(
+                        (
+                            k,
+                            tuple(sorted(v.provides)),
+                            tuple(sorted(v.requires)),
+                            v.epoch,
+                            v.version,
+                            v.release,
+                            v.arch,
+                        )
+                        for k, v in new.items()
                     )
-                    for k, v in new.items()
-                )
-            ).encode()
-        ).hexdigest()
-        eng = self._get_solv_engine()
-        if fp == self._overlay_fp:
-            return
-        self._overlay_pkgs = new
-        self._overlay_fp = fp
-        self._resolve_cache.clear()
-        eng.set_overlay(self._overlay_to_solvables())
+                ).encode()
+            ).hexdigest()
+            eng = self._get_solv_engine()
+            if fp == self._overlay_fp:
+                return
+            self._overlay_pkgs = new
+            self._overlay_fp = fp
+            self._resolve_cache.clear()
+            eng.set_overlay(self._overlay_to_solvables())
 
     def reuse_overlay_from(self, other: "OreonRepoSolver") -> None:
+        with _SOLV_LOCK:
+            self._reuse_overlay_from(other)
+
+    def _reuse_overlay_from(self, other: "OreonRepoSolver") -> None:
         """Reuse another arch solver's overlay (libsolv copy)."""
         if self is other:
             return
@@ -350,11 +362,16 @@ class OreonRepoSolver:
         eng.set_overlay(self._overlay_to_solvables())
 
     def _get_base(self) -> Any:
-        eng = self._get_solv_engine()
-        eng.warm()
+        with _SOLV_LOCK:
+            eng = self._get_solv_engine()
+            eng.warm()
         return eng
 
     def resolve(self, requirements: Iterable[str]) -> SolveResult:
+        with _SOLV_LOCK:
+            return self._resolve_locked(requirements)
+
+    def _resolve_locked(self, requirements: Iterable[str]) -> SolveResult:
         reqs = sorted(
             {
                 (r or "").strip()
@@ -377,13 +394,16 @@ class OreonRepoSolver:
         return result
 
     def has_provider(self, requirement: str) -> bool:
-        return bool(self._get_solv_engine().has_provider(requirement))
+        with _SOLV_LOCK:
+            return bool(self._get_solv_engine().has_provider(requirement))
 
     def sources_providing(self, requirement: str) -> set[str]:
-        return set(self._get_solv_engine().sources_providing(requirement))
+        with _SOLV_LOCK:
+            return set(self._get_solv_engine().sources_providing(requirement))
 
     def capability_index(self) -> Any:
-        return self._get_solv_engine().capability_index()
+        with _SOLV_LOCK:
+            return self._get_solv_engine().capability_index()
 
     def can_install(self, requirements: Iterable[str]) -> bool:
         return self.resolve(requirements).ok
@@ -393,23 +413,6 @@ class OreonRepoSolver:
 
 
 def is_arch_unavailable_failure(result: SolveResult) -> bool:
-    """True when arch has no package (ExclusiveArch / missing), not a depsolve hole."""
-    if result.ok:
-        return False
-    text = (result.problems or "").lower()
-    if "nothing provides" in text and "needed by" in text:
-        return False
-    if "problem:" in text and "needed by" in text:
-        return False
-    if "none of the providers can be installed" in text:
-        return False
-    if "no match for argument" in text:
-        return True
-    if "no matching package to install" in text and "problem:" not in text:
-        return True
-    # job-level nothing provides requested X with no providers at all
-    if "nothing provides requested" in text and "needed by" not in text:
-        return True
     return False
 
 
@@ -424,20 +427,18 @@ class MultiArchRepoSolver:
             s.close()
 
     def warm(self) -> None:
-        from concurrent.futures import ThreadPoolExecutor
-
-        if not self.solvers:
-            return
-        with ThreadPoolExecutor(max_workers=len(self.solvers)) as pool:
-            list(pool.map(lambda s: s._get_base(), self.solvers))
+        with _SOLV_LOCK:
+            for solver in self.solvers:
+                solver._get_base()
 
     def set_overlay(self, packages: dict[str, Iterable[str]]) -> None:
-        if not self.solvers:
-            return
-        primary = self.solvers[0]
-        primary.set_overlay(packages)
-        for s in self.solvers[1:]:
-            s.reuse_overlay_from(primary)
+        with _SOLV_LOCK:
+            if not self.solvers:
+                return
+            primary = self.solvers[0]
+            primary.set_overlay(packages)
+            for solver in self.solvers[1:]:
+                solver.reuse_overlay_from(primary)
 
     def has_provider(self, requirement: str) -> bool:
         return any(s.has_provider(requirement) for s in self.solvers)
@@ -468,19 +469,15 @@ class MultiArchRepoSolver:
         if len(self.solvers) == 1:
             return self.solvers[0].resolve(reqs)
 
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
         missing: set[str] = set()
         broken: set[str] = set()
         problems: list[str] = []
         ok_count = 0
         hard_fail = False
         soft_fail = False
-        with ThreadPoolExecutor(max_workers=len(self.solvers)) as pool:
-            futs = {pool.submit(s.resolve, reqs): s for s in self.solvers}
-            for fut in as_completed(futs):
-                s = futs[fut]
-                r = fut.result()
+        with _SOLV_LOCK:
+            for solver in self.solvers:
+                r = solver.resolve(reqs)
                 if r.ok:
                     ok_count += 1
                     continue
@@ -488,29 +485,22 @@ class MultiArchRepoSolver:
                     soft_fail = True
                     missing |= set(r.missing_provides or ())
                     if r.problems:
-                        problems.append(f"[{s.arch}] {r.problems}")
+                        problems.append(f"[{solver.arch}] {r.problems}")
                     continue
                 hard_fail = True
                 missing |= set(r.missing_provides or ())
                 broken |= set(r.broken_binaries or ())
                 if r.problems:
-                    problems.append(f"[{s.arch}] {r.problems}")
+                    problems.append(f"[{solver.arch}] {r.problems}")
 
-        # ExclusiveArch: package exists on some arches, absent on others → ok
-        if not hard_fail and ok_count > 0:
+        if not hard_fail and not soft_fail and ok_count == len(self.solvers):
             return SolveResult(ok=True)
-        if not hard_fail and soft_fail and ok_count == 0:
-            return SolveResult(
-                ok=False,
-                missing_provides=set(missing),
-                problems="\n".join(problems)
-                or "No match for argument on any target arch",
-            )
         return SolveResult(
-            ok=not hard_fail and ok_count > 0,
+            ok=False,
             missing_provides=missing,
             broken_binaries=broken,
-            problems="\n".join(problems),
+            problems="\n".join(problems)
+            or "Build requirements are unavailable on one or more target architectures",
         )
 
     def can_install(self, requirements: Iterable[str]) -> bool:

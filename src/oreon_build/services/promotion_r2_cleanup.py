@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Optional
 
-from oreon_build.services.publisher import update_repodata_at_prefix
+from oreon_build.services.publisher import prefix_publish_lock, rpm_publish_locks, update_repodata_at_prefix
 from oreon_build.services.r2 import R2Client, get_r2_client, repo_r2_prefix, repo_rpms_key, src_r2_key
 
 logger = logging.getLogger(__name__)
@@ -219,22 +219,29 @@ def whole_tree_promote_branch(
         filenames = sorted(src_bin | src_src)
         if not filenames:
             continue
-        _dest_keys, copied = copy_branch_to_branch(
-            rel, src_b, dest_b, arch, filenames, r2=client
-        )
-        copied_total += len(copied)
-        run_batched_promotion_r2_maintenance(
-            releasename=rel,
-            from_branch=src_b,
-            dest_channel=dest_b,
-            arch=arch,
-            artifact_filenames=filenames,
-            copied_filenames=copied if empty_source else [],
-            newly_copied_filenames=copied,
-        )
-        if not empty_source and copied:
-            # still refresh dest; leave source objects
-            update_repodata_at_prefix(repo_r2_prefix(rel, dest_b, arch), r2_client=client, force_full=True)
+        src_prefix = repo_r2_prefix(rel, src_b, arch)
+        dest_prefix = repo_r2_prefix(rel, dest_b, arch)
+        lock_prefixes = sorted((src_prefix, dest_prefix))
+        with prefix_publish_lock(lock_prefixes[0]), prefix_publish_lock(lock_prefixes[1]), rpm_publish_locks(dest_prefix, filenames):
+            _dest_keys, copied = copy_branch_to_branch(
+                rel, src_b, dest_b, arch, filenames, r2=client
+            )
+            copied_total += len(copied)
+            run_batched_promotion_r2_maintenance(
+                releasename=rel,
+                from_branch=src_b,
+                dest_channel=dest_b,
+                arch=arch,
+                artifact_filenames=filenames,
+                copied_filenames=copied if empty_source else [],
+                newly_copied_filenames=copied,
+            )
+            if not empty_source and copied:
+                update_repodata_at_prefix(
+                    repo_r2_prefix(rel, dest_b, arch),
+                    r2_client=client,
+                    force_full=True,
+                )
 
     # any leftover keys under source prefix (repodata etc)
     if delete_source_prefix:

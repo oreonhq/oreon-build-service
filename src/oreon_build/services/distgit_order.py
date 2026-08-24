@@ -1398,7 +1398,7 @@ def _read_specs_from_tarball(
 
 
 def _chain_distgit_max_parse() -> int:
-    raw = (os.getenv("OREON_CHAIN_DISTGIT_MAX_PARSE") or "4096").strip()
+    raw = (os.getenv("OREON_CHAIN_DISTGIT_MAX_PARSE") or "512").strip()
     try:
         n = int(raw)
     except ValueError:
@@ -1407,7 +1407,7 @@ def _chain_distgit_max_parse() -> int:
 
 
 def _chain_distgit_parse_wave_size() -> int:
-    raw = (os.getenv("OREON_CHAIN_DISTGIT_PARSE_WAVE") or "96").strip()
+    raw = (os.getenv("OREON_CHAIN_DISTGIT_PARSE_WAVE") or "128").strip()
     try:
         n = int(raw)
     except ValueError:
@@ -1438,17 +1438,50 @@ async def _fetch_distgit_specs_batch(
     if not packages:
         return {}
 
-    async def one(pkg: str) -> tuple[str, str | None]:
+    async def one_with_retry(pkg: str) -> tuple[str, str | None]:
         url = _distgit_spec_raw_url(owner, repo, distgit_branch, releasename, pkg)
-        try:
-            r = await client.get(url)
-        except httpx.HTTPError:
+        max_retries = 3
+        base_delay = 0.5
+        for attempt in range(max_retries + 1):
+            try:
+                r = await client.get(url)
+            except httpx.HTTPError as exc:
+                logger.warning(
+                    "distgit spec fetch retry pkg=%s attempt=%s/%s exc=%s",
+                    pkg,
+                    attempt,
+                    max_retries,
+                    exc,
+                )
+                if attempt < max_retries:
+                    await asyncio.sleep(base_delay * (2 ** attempt))
+                    continue
+                return pkg, None
+            if r.status_code == 200:
+                return pkg, r.text
+            if r.status_code in (500, 502, 503, 504, 403, 429):
+                logger.warning(
+                    "distgit spec fetch retry pkg=%s attempt=%s/%s status=%s",
+                    pkg,
+                    attempt,
+                    max_retries,
+                    r.status_code,
+                )
+                if attempt < max_retries:
+                    await asyncio.sleep(base_delay * (2 ** attempt))
+                    continue
+                return pkg, None
+            # For 404/other, assume the package really doesn't exist (no retry)
+            logger.warning(
+                "distgit spec fetch failed pkg=%s status=%s url=%s",
+                pkg,
+                r.status_code,
+                url,
+            )
             return pkg, None
-        if r.status_code != 200:
-            return pkg, None
-        return pkg, r.text
+        return pkg, None
 
-    results = await asyncio.gather(*(one(pkg) for pkg in packages))
+    results = await asyncio.gather(*(one_with_retry(pkg) for pkg in packages))
     return {pkg: text for pkg, text in results if text}
 
 
@@ -1664,12 +1697,15 @@ async def enrich_specs_buildrequires_with_rpm(
         for pkg, text, parsed, run_gen in jobs
     }
     try:
-        for fut in as_completed(futs):
-            pkg = futs[fut]
-            try:
-                parsed_by_source[pkg] = fut.result()
-            except Exception:
-                logger.warning("BR enrich worker failed for %s", pkg, exc_info=True)
+        results = await asyncio.gather(
+            *(asyncio.wrap_future(fut) for fut in futs),
+            return_exceptions=True,
+        )
+        for (fut, pkg), result in zip(futs.items(), results, strict=True):
+            if isinstance(result, Exception):
+                logger.warning("BR enrich worker failed for %s: %s", pkg, result)
+                continue
+            parsed_by_source[pkg] = result
     finally:
         if tmp_root is not None:
             tmp_root.cleanup()
@@ -1766,6 +1802,25 @@ async def expand_chain_spec_closure_sparse(
                     )
                 specs[pkg] = batch_specs[pkg]
                 parsed_by_source[pkg] = parsed
+
+            await enrich_specs_buildrequires_with_rpm(
+                batch_specs,
+                parsed_by_source,
+                releasename=releasename,
+                scope_packages=set(batch_specs),
+                generate_packages={
+                    pkg
+                    for pkg in batch_specs
+                    if getattr(parsed_by_source.get(pkg), "has_generate_buildrequires", False)
+                },
+                owner=owner,
+                repo=repo,
+                distgit_branch=distgit_branch,
+                headers=headers,
+            )
+
+            for pkg in batch_specs:
+                parsed = parsed_by_source[pkg]
                 for cap, srcs in _provider_map_from_specs({pkg: parsed}).items():
                     if cap == "__lower__":
                         continue
@@ -1799,12 +1854,16 @@ async def expand_chain_spec_closure_sparse(
 
                 from oreon_build.services.dep_plan.providers import (
                     filter_providers_for_consumer,
+                    is_base_system_package,
                     is_toolchainish_source,
                     narrow_alternate_providers,
                     should_seed_providers,
                 )
 
-                for dep in build_dependency_capabilities(parsed):
+                for dep in (
+                    build_dependency_capabilities(parsed)
+                    + runtime_dependency_capabilities(parsed)
+                ):
                     if not is_chain_plan_requirement(dep):
                         continue
                     satisfied = bool(
@@ -1812,6 +1871,8 @@ async def expand_chain_spec_closure_sparse(
                     )
                     name, op, ver = parse_versioned_requirement(dep)
                     versioned = bool(name and op and ver)
+                    if not satisfied and name and is_base_system_package(name):
+                        satisfied = True
                     if satisfied and versioned:
                         continue
                     provs: set[str] = set()
@@ -2027,11 +2088,19 @@ def _expand_chain_spec_closure(
                     continue
                 add_capability_providers(provider_map, cap, srcs)
             for dep in dependency_capabilities(parsed):
+                from oreon_build.core.rpm_requires import parse_versioned_requirement
+                from oreon_build.services.dep_plan.providers import is_base_system_package
+
+                name, _op, _ver = parse_versioned_requirement(dep)
+                if name and is_base_system_package(name):
+                    continue
                 provs = set(_providers_from_maps(dep, [provider_map]))
                 if dep in names_set:
                     provs.add(dep)
                 for prov in provs:
                     if prov not in names_set or prov == pkg:
+                        continue
+                    if is_base_system_package(prov):
                         continue
                     if prov not in needed:
                         needed.add(prov)

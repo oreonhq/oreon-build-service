@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import fnmatch
 import re
-from typing import Iterable
+from typing import Any, Iterable
 
 _RE_PKGCONFIG = re.compile(r"^pkgconfig\((.+)\)$", re.IGNORECASE)
 _RE_PYTHON3DIST = re.compile(r"^python3(?:\.\d+)?dist\((.+)\)$", re.IGNORECASE)
@@ -251,12 +251,26 @@ def ghc_devel_to_sources(cap: str, package_names: set[str], provider_map: dict) 
     hm = _RE_GHC_INNER.match(inner)
     if hm:
         name = hm.group(1)
+    hyphen = name.replace("_", "-")
+    dedicated = [f"ghc-{name}", f"ghc-{hyphen}"]
+    for d in dedicated:
+        if d in known:
+            return {d}
     out |= _hit(
         known,
         f"ghc-{name}",
         f"ghc-{name}-devel",
-        f"ghc-{name.replace('_', '-')}",
-        f"ghc-{name.replace('_', '-')}-devel",
+        f"ghc-{hyphen}",
+        f"ghc-{hyphen}-devel",
+    )
+    out |= _pmap_sources(
+        provider_map,
+        f"ghc-{name}",
+        f"ghc-{name}-devel",
+        f"ghc-{hyphen}",
+        f"ghc-{hyphen}-devel",
+        f"ghc-libhs({name})",
+        f"ghc-libhs({hyphen})",
     )
     return {s for s in out if s}
 
@@ -416,6 +430,111 @@ def _glob_provided_sources(path: str, provider_map: dict) -> set[str]:
     return out
 
 
+def _path_prefix_is_specific(path: str) -> bool:
+    """True when a %files path is a real tree, not /usr/bin or /usr/share."""
+    p = (path or "").rstrip("/")
+    if not p.startswith("/usr"):
+        return False
+    return p.count("/") >= 3
+
+
+def _path_in_declared_tree(missing: str, declared: str) -> bool:
+    m = (missing or "").rstrip("/")
+    d = (declared or "").rstrip("/")
+    if not m or not d:
+        return False
+    if m == d:
+        return True
+    if m.startswith(d + "/") and _path_prefix_is_specific(d):
+        return True
+    if d.startswith(m + "/") and _path_prefix_is_specific(m):
+        return True
+    return False
+
+
+def _glob_literal_prefix(pattern: str) -> str:
+    return re.split(r"[*?[]", pattern or "", maxsplit=1)[0].rstrip("/")
+
+
+def file_path_to_sources(path: str, provider_map: dict, repo_index: Any | None = None) -> set[str]:
+    """Who ships this path, from declared %files / globs / repo file provides only."""
+    missing = (path or "").strip().rstrip("/")
+    if not missing.startswith("/"):
+        return set()
+    out: set[str] = set()
+    best = -1
+    best_srcs: set[str] = set()
+
+    def _consider(declared: str, srcs: set[str]) -> None:
+        nonlocal best, best_srcs
+        if not srcs or not _path_in_declared_tree(missing, declared):
+            return
+        score = len(declared.rstrip("/"))
+        if score > best:
+            best = score
+            best_srcs = set(srcs)
+        elif score == best:
+            best_srcs |= set(srcs)
+
+    pmap = provider_map or {}
+    out |= _pmap_sources(pmap, missing)
+    walk = missing
+    while walk.startswith("/usr"):
+        out |= _pmap_sources(pmap, walk)
+        if "/" not in walk[1:]:
+            break
+        walk = walk.rsplit("/", 1)[0]
+
+    for key, srcs in pmap.items():
+        if key == "__lower__" or not isinstance(key, str):
+            continue
+        if not isinstance(srcs, (set, frozenset, list, tuple)):
+            continue
+        owned = {s for s in srcs if s}
+        if not owned:
+            continue
+        if key.startswith("__glob__"):
+            pattern = key[len("__glob__") :]
+            lit = _glob_literal_prefix(pattern)
+            matched = False
+            if _glob_is_selective(pattern) and fnmatch.fnmatchcase(missing, pattern):
+                matched = True
+            elif _path_prefix_is_specific(lit) and (
+                _path_in_declared_tree(missing, lit) or fnmatch.fnmatchcase(missing, pattern)
+            ):
+                matched = True
+            if matched:
+                _consider(lit or pattern, owned)
+            continue
+        if key.startswith("/"):
+            _consider(key, owned)
+
+    if repo_index is not None:
+        from oreon_build.core.rpm_requires import is_distgit_source_name
+
+        providers = getattr(repo_index, "capability_providers", None) or {}
+        binary_source = getattr(repo_index, "binary_source", None) or {}
+        walk = missing
+        while walk.startswith("/usr"):
+            pkgs = providers.get(walk) or set()
+            srcs = set()
+            for pkg in pkgs:
+                src = binary_source.get(pkg)
+                if src:
+                    srcs.add(src)
+                elif is_distgit_source_name(pkg):
+                    srcs.add(pkg)
+            _consider(walk, srcs)
+            out |= srcs
+            if "/" not in walk[1:]:
+                break
+            walk = walk.rsplit("/", 1)[0]
+
+    if best_srcs:
+        return {s for s in best_srcs if s}
+    return {s for s in out if s}
+
+
 def crate_to_sources(cap: str, package_names: set[str], provider_map: dict) -> set[str]:
     """crate(foo/default) / crate(foo) → rust-foo (+ compat rust-foo0.37)."""
     from oreon_build.services.distgit_order import _rust_crate_name_from_package
@@ -433,7 +552,10 @@ def crate_to_sources(cap: str, package_names: set[str], provider_map: dict) -> s
         f"crate({crate}/default)",
         cap,
     )
-    out |= _hit(known, f"rust-{crate}")
+    current = f"rust-{crate}"
+    out |= _hit(known, current)
+    if current in known:
+        return {s for s in out if s} | {current}
     for pkg in known:
         if not pkg.startswith("rust-"):
             continue
@@ -452,8 +574,13 @@ def path_or_binary_to_sources(
     subpackage and shipped path back to its source, so look it up instead.
     """
     primary = (cap or "").strip()
-    if not primary or "(" in primary:
+    if not primary:
         return set()
+    if "(" in primary:
+        stem = primary.split("(", 1)[0].strip()
+        if ".so" not in stem:
+            return set()
+        return {s for s in _pmap_sources(provider_map, primary, stem) if s}
     known = package_names or set()
     out = _pmap_sources(provider_map, primary)
     out |= _glob_provided_sources(primary, provider_map)

@@ -30,9 +30,9 @@ from oreon_build.services.r2 import get_r2_client
 
 logger = logging.getLogger(__name__)
 
-_CACHE_TTL_SEC = 1800.0
+_CACHE_TTL_SEC = 600.0
 # primary-only indexes are ~hundreds of MB, not multi-GB filelist maps
-_CACHE_MAX = 4
+_CACHE_MAX = 2
 _cache: dict[tuple[str, str, str], tuple[float, RepoCapabilityIndex]] = {}
 _cache_lock = threading.Lock()
 # filelists belong in libsolv. putting every path into this Python index OOMs the API.
@@ -113,6 +113,7 @@ class RepoCapabilityIndex:
     _caps_lower: set[str] = field(default_factory=set, repr=False)
     _providers_by_lower: dict[str, set[str]] = field(default_factory=dict, repr=False)
     _unsatisfied_cache: dict[str, frozenset[str]] = field(default_factory=dict, repr=False)
+    _source_evrs: dict[str, tuple[tuple[str, str, str], ...]] = field(default_factory=dict, repr=False)
     _all_caps: set[str] | None = field(default=None, repr=False)
 
     def finalize_lookups(self) -> None:
@@ -122,6 +123,19 @@ class RepoCapabilityIndex:
         for cap, pkgs in self.capability_providers.items():
             merged.setdefault(cap.lower(), set()).update(pkgs)
         self._providers_by_lower = merged
+        source_evrs: dict[str, set[tuple[str, str, str]]] = {}
+        for source in self.source_names | self.source_names_any:
+            evrs = self.capability_evrs.get(source) or ()
+            if evrs:
+                source_evrs.setdefault(source, set()).update(evrs)
+        for binary, source in self.binary_source.items():
+            evrs = self.capability_evrs.get(binary) or ()
+            if evrs:
+                source_evrs.setdefault(source, set()).update(evrs)
+        self._source_evrs = {
+            source: tuple(evrs)
+            for source, evrs in source_evrs.items()
+        }
         self._unsatisfied_cache.clear()
 
     @property
@@ -548,20 +562,9 @@ class RepoCapabilityIndex:
         n = (name or "").strip()
         if not n:
             return []
-        out: list[tuple[str, str, str]] = []
-        seen: set[tuple[str, str, str]] = set()
-        for evr in self.capability_evrs.get(n) or []:
-            if evr not in seen:
-                seen.add(evr)
-                out.append(evr)
-        for bin_name, src in self.binary_source.items():
-            if src != n:
-                continue
-            for evr in self.capability_evrs.get(bin_name) or []:
-                if evr not in seen:
-                    seen.add(evr)
-                    out.append(evr)
-        return out
+        if not self._source_evrs:
+            self.finalize_lookups()
+        return list(self._source_evrs.get(n) or ())
 
     def source_is_repo_current(
         self,

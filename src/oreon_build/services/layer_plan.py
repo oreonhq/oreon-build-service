@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from fastapi import HTTPException, Request, status
@@ -13,7 +14,6 @@ from oreon_build.models import (
     BuildAttempt,
     BuildJob,
     BuildStatus,
-    LayerJobBlocker,
     LayerPlan,
     LayerPlanStatus,
     Package,
@@ -25,7 +25,6 @@ from oreon_build.services.ci_callback import notify_layer_plan_terminal
 
 _RE_UPSTREAM_FAILED = re.compile(r"^upstream\s+(\S+)\s+failed\b", re.IGNORECASE)
 _RE_WAITING_TRAIL = re.compile(r"\s*\([^)]*\)\s*$")
-
 if TYPE_CHECKING:
     from oreon_build.models import Account
 
@@ -147,6 +146,7 @@ async def get_or_create_package(
     triggered_by_id: int | None,
     request: Request | None,
     layer_plan_ids: list[int] | None = None,
+    skip_audit: bool = False,
 ) -> tuple[int, int | None]:
     """Returns (package_id, package_version_id)."""
     from oreon_build.services.build_target_util import resolve_package_by_name
@@ -184,25 +184,24 @@ async def get_or_create_package(
         github_html_url=gh_url,
     )
     db.add(pkg)
+    pv = PackageVersion(package=pkg, version=npd["version"] or "0.0.1")
+    db.add(pv)
+    if npd.get("source_url"):
+        db.add(Source(package_version=pv, kind="distgit", url=npd["source_url"]))
     await db.flush()
     package_id = pkg.id
-    pv = PackageVersion(package_id=pkg.id, version=npd["version"] or "0.0.1")
-    db.add(pv)
-    await db.flush()
     package_version_id = pv.id
-    if npd.get("source_url"):
-        db.add(Source(package_version_id=pv.id, kind="distgit", url=npd["source_url"]))
-    await db.flush()
-    if triggered_by_id is not None:
+    if triggered_by_id is not None and not skip_audit:
         await log_audit(
             db,
             "package.create",
             account_id=triggered_by_id,
             resource_type="package",
-            resource_id=str(pkg.id),
+            resource_id="pending",
             details=pkg.name,
             ip_address=get_client_ip(request) if request is not None else None,
             user_agent=get_user_agent(request) if request is not None else "layer-build",
+            emit_discord=False,
         )
     return package_id, package_version_id
 
@@ -299,56 +298,22 @@ async def on_build_job_failed_for_layer(
     *,
     package_name: str | None = None,
 ) -> None:
-    """Missing-provides expands. Hard fails soft-block waiters then settle if stuck."""
     if job.layer_plan_id is None:
         return
-    from oreon_build.services.layer_engine import (
-        cascade_fail_dependents,
-        parse_missing_provides_from_text,
-        try_autofix_layer_missing_provides,
-    )
+    plan = await db.get(LayerPlan, job.layer_plan_id)
+    if plan is None or plan.status in (LayerPlanStatus.SUCCESS, LayerPlanStatus.FAILED, LayerPlanStatus.CANCELLED):
+        return
+    job.status = BuildStatus.FAILED
+    job.completed_at = datetime.now(timezone.utc)
+    job.blocked_reason = None
+    job.error_message = (reason or "Build failed")[:8000]
+    await db.flush()
+    await maybe_settle_layer_plan(db, int(plan.id))
 
-    try:
-        if await try_autofix_layer_missing_provides(
-            db, job, reason or "", package_name=package_name
-        ):
-            return
-    except Exception:
-        logger.exception(
-            "layer autofix crashed job_id=%s layer_plan_id=%s",
-            job.id,
-            job.layer_plan_id,
-        )
-        if parse_missing_provides_from_text(reason or ""):
-            await maybe_settle_layer_plan(db, job.layer_plan_id)
-            return
-    plan = await db.get(LayerPlan, job.layer_plan_id, with_for_update=True)
-    if plan is None:
-        return
-    if plan.status in (LayerPlanStatus.SUCCESS, LayerPlanStatus.FAILED, LayerPlanStatus.CANCELLED):
-        return
-    if job.status == BuildStatus.FAILED:
-        job.blocked_reason = (reason or job.blocked_reason or "build failed")[:500]
-    pkg = package_name
-    if not pkg and job.package is not None:
-        pkg = job.package.name
-    if not pkg:
-        pkg_row = await db.get(Package, job.package_id)
-        pkg = pkg_row.name if pkg_row else "package"
-    short = (reason or "build failed").strip() or "build failed"
-    if len(short) > 240:
-        short = short[:237] + "..."
-    await cascade_fail_dependents(db, job, pkg, short)
-    await maybe_settle_layer_plan(db, job.layer_plan_id)
 
 
 async def on_user_cancelled_layer_job(db: Any, job: BuildJob) -> None:
-    if job.layer_plan_id is None:
-        return
-    from oreon_build.services.layer_engine import cascade_fail_dependents
-
-    await cascade_fail_dependents(db, job, "build", "Cancelled by user")
-    await maybe_settle_layer_plan(db, job.layer_plan_id)
+    return
 
 
 async def cancel_layer_plan_by_user(
@@ -358,16 +323,46 @@ async def cancel_layer_plan_by_user(
     *,
     layer_plan_id: int,
 ) -> LayerPlan:
-    result = await db.execute(select(LayerPlan).where(LayerPlan.id == layer_plan_id).with_for_update())
+    result = await db.execute(
+        update(LayerPlan)
+        .where(
+            LayerPlan.id == layer_plan_id,
+            LayerPlan.status.in_((LayerPlanStatus.PENDING, LayerPlanStatus.RUNNING)),
+        )
+        .values(
+            status=LayerPlanStatus.CANCELLED,
+            error_message="Cancelled by user",
+        )
+        .returning(LayerPlan)
+    )
     plan = result.scalar_one_or_none()
     if not plan:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Layer plan not found")
-    if plan.status in (LayerPlanStatus.SUCCESS, LayerPlanStatus.FAILED, LayerPlanStatus.CANCELLED):
+        existing = await db.get(LayerPlan, layer_plan_id)
+        if not existing:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Layer plan not found")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Layer plan is already {plan.status.value}",
+            detail=f"Layer plan is already {existing.status.value}",
         )
-    await fail_layer_plan(db, plan, "Cancelled by user", terminal=LayerPlanStatus.CANCELLED)
+    await db.execute(
+        update(BuildJob)
+        .where(
+            BuildJob.layer_plan_id == layer_plan_id,
+            BuildJob.status.in_((BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.BLOCKED, BuildStatus.RUNNING)),
+        )
+        .values(
+            status=BuildStatus.CANCELLED,
+            blocked_reason="Layer plan stopped: Cancelled by user",
+        )
+    )
+    await db.execute(
+        update(BuildAttempt)
+        .where(
+            BuildAttempt.build_job_id.in_(select(BuildJob.id).where(BuildJob.layer_plan_id == layer_plan_id)),
+            BuildAttempt.status.in_((BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.RUNNING)),
+        )
+        .values(status=BuildStatus.CANCELLED, error_message="Cancelled by user")
+    )
     await log_audit(
         db,
         "build.layer_cancel",
@@ -380,37 +375,6 @@ async def cancel_layer_plan_by_user(
     return plan
 
 
-def _blocker_sources_from_reason(reason: str | None) -> list[str]:
-    r = (reason or "").strip()
-    if not r:
-        return []
-    if r.startswith("Layer plan stopped:") or r == "Cancelled by user":
-        return []
-    m = _RE_UPSTREAM_FAILED.match(r)
-    if m:
-        return [m.group(1)]
-    if not r.startswith("waiting on:"):
-        return []
-    rest = r[len("waiting on:") :].strip()
-    out: list[str] = []
-    seen: set[str] = set()
-    for bit in rest.split(","):
-        name = _RE_WAITING_TRAIL.sub("", bit.strip()).strip()
-        if not name or name == "..." or name in seen:
-            continue
-        seen.add(name)
-        out.append(name)
-    return out
-
-
-async def _replace_job_blockers(db: Any, job_id: int, sources: list[str]) -> None:
-    old_r = await db.execute(select(LayerJobBlocker).where(LayerJobBlocker.build_job_id == job_id))
-    for row in old_r.scalars().all():
-        await db.delete(row)
-    for src in sources:
-        s = (src or "").strip()
-        if s:
-            db.add(LayerJobBlocker(build_job_id=job_id, blocking_source=s))
 
 
 async def resume_layer_plan_by_user(
@@ -420,12 +384,9 @@ async def resume_layer_plan_by_user(
     *,
     layer_plan_id: int,
 ) -> tuple[LayerPlan, list[int]]:
-    """Reopen failed/cancelled jobs. Returns (plan, reopened_job_ids).
-
-    Spec refresh + deep prune is scheduled by the caller after commit so the
-    HTTP request stays fast.
-    """
-    result = await db.execute(select(LayerPlan).where(LayerPlan.id == layer_plan_id).with_for_update())
+    result = await db.execute(
+        select(LayerPlan).where(LayerPlan.id == layer_plan_id)
+    )
     plan = result.scalar_one_or_none()
     if not plan:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Layer plan not found")
@@ -435,81 +396,33 @@ async def resume_layer_plan_by_user(
             detail=f"Layer plan is {plan.status.value}, resume only works for failed/cancelled",
         )
     jobs_r = await db.execute(
-        select(BuildJob)
-        .options(selectinload(BuildJob.package))
-        .where(BuildJob.layer_plan_id == plan.id)
+        select(BuildJob).where(BuildJob.layer_plan_id == plan.id)
     )
     jobs = list(jobs_r.scalars().all())
-    if not jobs:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Layer has no jobs to resume, trigger a new layer instead",
-        )
-
-    by_name: dict[str, list[BuildJob]] = {}
-    for j in jobs:
-        if j.package is None or not j.package.name:
-            continue
-        by_name.setdefault(j.package.name, []).append(j)
-
-    def _source_done(src: str) -> bool:
-        src_jobs = by_name.get(src) or []
-        if not src_jobs:
-            return True
-        return all(x.status in (BuildStatus.SUCCESS, BuildStatus.SKIPPED) for x in src_jobs)
-
     reopen = [j for j in jobs if j.status in (BuildStatus.FAILED, BuildStatus.CANCELLED)]
     if not reopen:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Nothing left to resume (no failed/cancelled jobs)",
         )
-
-    blocker_rows = await db.execute(
-        select(LayerJobBlocker).where(
-            LayerJobBlocker.build_job_id.in_([j.id for j in reopen])
-        )
-    )
-    blockers_by_job: dict[int, list[str]] = {}
-    for row in blocker_rows.scalars().all():
-        blockers_by_job.setdefault(int(row.build_job_id), []).append(row.blocking_source)
-
+    for job in reopen:
+        job.status = BuildStatus.BLOCKED
+        job.completed_at = None
+        job.blocked_reason = "waiting on repository"
     plan.status = LayerPlanStatus.RUNNING
     plan.error_message = None
-
-    for job in reopen:
-        sources = list(blockers_by_job.get(int(job.id)) or [])
-        if not sources:
-            sources = _blocker_sources_from_reason(job.blocked_reason)
-        still = [s for s in sources if s and not _source_done(s)]
-        job.completed_at = None
-        if still:
-            job.status = BuildStatus.BLOCKED
-            job.blocked_reason = f"waiting on: {', '.join(still[:8])}"[:500]
-            await _replace_job_blockers(db, int(job.id), still)
-        else:
-            job.status = BuildStatus.PENDING
-            job.blocked_reason = None
-            await _replace_job_blockers(db, int(job.id), [])
-
     await db.flush()
-
     await log_audit(
-        db,
-        "build.layer_resume",
-        account_id=user.id,
-        resource_type="layer_plan",
-        resource_id=str(plan.id),
-        details=f"reopened {len(reopen)} job(s)",
-        ip_address=get_client_ip(request),
-        user_agent=get_user_agent(request),
+        db, "build.layer_resume", account_id=user.id, resource_type="layer_plan",
+        resource_id=str(plan.id), details=f"reopened {len(reopen)} job(s)",
+        ip_address=get_client_ip(request), user_agent=get_user_agent(request),
     )
     return plan, [int(j.id) for j in reopen]
 
 
 async def maybe_settle_layer_plan(db: Any, layer_plan_id: int) -> None:
     """Mark a plan terminal once every job it owns has reached a terminal state."""
-    plan = await db.get(LayerPlan, layer_plan_id, with_for_update=True)
+    plan = await db.get(LayerPlan, layer_plan_id)
     if not plan or plan.status not in (LayerPlanStatus.PENDING, LayerPlanStatus.RUNNING):
         return
     jobs_r = await db.execute(
@@ -523,37 +436,25 @@ async def maybe_settle_layer_plan(db: Any, layer_plan_id: int) -> None:
 
     open_states = (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.BLOCKED, BuildStatus.RUNNING)
     active_states = (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.RUNNING)
-    if any(j.status == BuildStatus.BLOCKED for j in jobs) and not any(
-        j.status in active_states for j in jobs
-    ):
-        from oreon_build.services.layer_engine import (
-            finalize_blocked_on_dead_upstreams,
-            finalize_idle_blocked_jobs,
-            resolve_layer_blocker_cycles,
-        )
+    running_count = sum(1 for job in jobs if job.status == BuildStatus.RUNNING)
+    queued_count = sum(1 for job in jobs if job.status == BuildStatus.QUEUED)
+    blocked_count = sum(1 for job in jobs if job.status == BuildStatus.BLOCKED)
+    pending_count = sum(1 for job in jobs if job.status == BuildStatus.PENDING)
 
-        broke = await resolve_layer_blocker_cycles(db, plan.id)
-        finalized = await finalize_blocked_on_dead_upstreams(db, plan.id)
-        idle_n = await finalize_idle_blocked_jobs(db, plan.id)
-        if broke or finalized or idle_n:
-            jobs_r = await db.execute(
-                select(BuildJob)
-                .options(selectinload(BuildJob.package))
-                .where(BuildJob.layer_plan_id == plan.id)
-            )
-            jobs = list(jobs_r.scalars().all())
-            if any(j.status == BuildStatus.BLOCKED for j in jobs) and not any(
-                j.status in active_states for j in jobs
-            ):
-                more = await finalize_blocked_on_dead_upstreams(db, plan.id)
-                more += await finalize_idle_blocked_jobs(db, plan.id)
-                if more:
-                    jobs_r = await db.execute(
-                        select(BuildJob)
-                        .options(selectinload(BuildJob.package))
-                        .where(BuildJob.layer_plan_id == plan.id)
-                    )
-                    jobs = list(jobs_r.scalars().all())
+    if pending_count == 0 and running_count == 0 and queued_count == 0 and blocked_count > 0:
+        blocked_names = sorted({
+            job.package.name if job.package else f"job-{job.id}"
+            for job in jobs
+            if job.status == BuildStatus.BLOCKED
+        })
+        plan.status = LayerPlanStatus.FAILED
+        plan.error_message = (
+            "Layer deadlocked: no queued or running jobs remain and blocked dependencies "
+            "cannot be resolved"
+            + (" (" + ", ".join(blocked_names[:8]) + ")" if blocked_names else "")
+        )[:8000]
+        notify_layer_plan_terminal(plan.id, LayerPlanStatus.FAILED.value, plan.error_message)
+        return
 
     if any(j.status in open_states for j in jobs):
         if plan.status == LayerPlanStatus.PENDING and any(
@@ -616,7 +517,7 @@ async def cancel_interrupted_layer_planning(db: Any) -> list[int]:
     ids = await list_interrupted_layer_planning(db)
     if not ids:
         return []
-    result = await db.execute(select(LayerPlan).where(LayerPlan.id.in_(ids)).with_for_update())
+    result = await db.execute(select(LayerPlan).where(LayerPlan.id.in_(ids)))
     out: list[int] = []
     for plan in result.scalars():
         plan.status = LayerPlanStatus.CANCELLED
@@ -648,22 +549,6 @@ async def notify_layer_job_terminal_after_result(
             return
         pkg_name = job.package.name if job.package else None
         if st == "failed":
-            from oreon_build.services.layer_engine import parse_missing_provides_from_text
-
-            # publish blocked early so other sessions dont cascade-cancel waiters
-            if parse_missing_provides_from_text(reason) and job.status == BuildStatus.FAILED:
-                job.status = BuildStatus.BLOCKED
-                job.completed_at = None
-                job.blocked_reason = "expanding missing provides"
-                await db.commit()
-                job = await db.get(
-                    BuildJob,
-                    build_job_id,
-                    options=[selectinload(BuildJob.package)],
-                    with_for_update=True,
-                )
-                if job is None or job.layer_plan_id is None:
-                    return
             await on_build_job_failed_for_layer(db, job, reason, package_name=pkg_name)
         else:
             await on_user_cancelled_layer_job(db, job)

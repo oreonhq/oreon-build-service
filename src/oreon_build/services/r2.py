@@ -32,12 +32,15 @@ class R2Client:
         body: BinaryIO | bytes | io.BytesIO,
         content_type: Optional[str] = None,
         metadata: Optional[dict[str, str]] = None,
+        cache_control: Optional[str] = None,
     ) -> None:
         extra = {}
         if content_type:
             extra["ContentType"] = content_type
         if metadata:
             extra["Metadata"] = metadata
+        if cache_control:
+            extra["CacheControl"] = cache_control
         self._client.put_object(
             Bucket=self.bucket,
             Key=key,

@@ -106,9 +106,7 @@ def distgit_sources_for_perl_module(
     out: set[str] = set()
     for cand in perl_module_parent_packages(module):
         if cand in known:
-            out.add(cand)
-    if out:
-        return out
+            return {cand}
     dist = metacpan_distribution_for_module(module)
     if not dist:
         return out
