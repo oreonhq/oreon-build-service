@@ -306,6 +306,12 @@ async def trigger_build(
     from oreon_build.services.build_trigger_bg import run_single_trigger, spawn
     from oreon_build.services.build_trigger_exec import execute_build_trigger
 
+    release = await db.get(Release, data.release_id)
+    if release is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Release not found")
+    if not release.is_active:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Release is inactive")
+
     if background:
         await db.commit()
         spawn(
@@ -342,8 +348,11 @@ async def trigger_distgit_batch(
     if not names:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No package names provided")
     rr = await db.execute(select(Release).where(Release.id == data.release_id))
-    if not rr.scalar_one_or_none():
+    release = rr.scalar_one_or_none()
+    if not release:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Release not found")
+    if not release.is_active:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Release is inactive")
     payload = data.model_dump(mode="json")
     await db.commit()
     spawn(
@@ -756,6 +765,8 @@ async def upload_and_trigger(
     release = rr.scalar_one_or_none()
     if not release:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Release not found")
+    if not release.is_active:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Release is inactive")
     releasename = release.releasename
 
     mock_env_id: int | None = preferred_mock_environment_id
