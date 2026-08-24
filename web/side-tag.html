@@ -259,7 +259,7 @@
       }
       function loadOptions() {
         api.get('/packages?limit=500').then(function(r) { packages = (r && r.items) ? r.items : []; renderPackageList(); }).catch(function() { packages = []; });
-        api.get('/releases?limit=500').then(function(r) {
+        api.get('/releases?limit=500&active_only=true').then(function(r) {
           releases = (r && r.items) ? r.items : [];
           if (sideTag && sideTag.release_id) {
             selectedReleaseId = Number(sideTag.release_id);
@@ -776,7 +776,7 @@
         Promise.all([
           api.get(buildsUrl),
           api.get('/packages?limit=500').catch(function() { return { items: [] }; }),
-          api.get('/releases?limit=500').catch(function() { return { items: [] }; })
+          api.get('/releases?limit=500&active_only=true').catch(function() { return { items: [] }; })
         ]).then(function(results) {
           var data = results[0];
           var packagesList = (results[1] && results[1].items) ? results[1].items : [];
