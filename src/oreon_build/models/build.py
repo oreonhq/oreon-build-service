@@ -78,6 +78,7 @@ class BuildJob(Base):
     layer_plan_id: Mapped[Optional[int]] = mapped_column(ForeignKey("layer_plans.id"), nullable=True, index=True)
     layer_index: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     blocked_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    blocking_sources: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list, server_default="[]")
     rpmbuild_plan_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("rpmbuild_plans.id"), nullable=True, index=True
     )
