@@ -87,7 +87,7 @@
         }
       }
       function loadReleases() {
-        return api.get('/releases?limit=500').then(function(r) {
+        return api.get('/releases?limit=500&active_only=true').then(function(r) {
           var items = (r && r.items) ? r.items : [];
           var sel = document.getElementById('release-id');
           sel.innerHTML = items.map(function(x) {
