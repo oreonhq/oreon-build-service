@@ -160,15 +160,47 @@ def parse_package_blob(text: str) -> list[str]:
 
 _RE_SPEC_VERSION = re.compile(r"(?im)^(?P<pre>\s*Version\s*:\s*)(?P<val>\S+)(?P<post>.*)$")
 _RE_SPEC_RELEASE = re.compile(r"(?im)^(?P<pre>\s*Release\s*:\s*)(?P<num>\d+)(?P<rest>.*)$")
-_RE_SPEC_DEFINE_VER = re.compile(
-    r"(?im)^(?P<pre>\s*%(?:global|define)\s+version\s+)(?P<val>\S+)(?P<post>.*)$"
+_RE_SPEC_DEFINE = re.compile(
+    r"(?im)^(?P<pre>\s*%(?:global|define)\s+)(?P<name>[A-Za-z_][\w]*)(?P<sp>\s+)(?P<val>\S+)(?P<post>.*)$"
 )
+_RE_VERSION_MACRO = re.compile(r"^%\{([A-Za-z_][\w]*)\}$")
 
 def _split_spec_changelog(text: str) -> tuple[str, str]:
     m = re.search(r"(?im)^%changelog\b", text)
     if not m:
         return text, ""
     return text[: m.start()], text[m.start() :]
+
+def _define_literal(preamble: str, name: str) -> str | None:
+    want = (name or "").strip().lower()
+    if not want:
+        return None
+    found: str | None = None
+    for m in _RE_SPEC_DEFINE.finditer(preamble):
+        if m.group("name").lower() != want:
+            continue
+        val = (m.group("val") or "").strip()
+        if val:
+            found = val
+    return found
+
+def _expand_spec_version_token(preamble: str, val: str) -> str | None:
+    cur = (val or "").strip()
+    seen: set[str] = set()
+    for _ in range(8):
+        if not cur or cur in seen:
+            return None
+        seen.add(cur)
+        if "%" not in cur:
+            return cur
+        mm = _RE_VERSION_MACRO.fullmatch(cur)
+        if not mm:
+            return None
+        nxt = _define_literal(preamble, mm.group(1))
+        if not nxt:
+            return None
+        cur = nxt
+    return None
 
 def _spec_literal_version(preamble: str) -> tuple[str, str] | None:
     vm = _RE_SPEC_VERSION.search(preamble)
@@ -177,17 +209,36 @@ def _spec_literal_version(preamble: str) -> tuple[str, str] | None:
     val = vm.group("val").strip()
     if not val:
         return None
-    if re.fullmatch(r"%\{version\}", val, re.I):
-        dm = _RE_SPEC_DEFINE_VER.search(preamble)
-        if not dm:
-            return None
-        dval = dm.group("val").strip()
+    if "%" in val:
+        dval = _expand_spec_version_token(preamble, val)
         if not dval or "%" in dval:
             return None
-        return dval, "define"
-    if "%" in val:
-        return None
+        return dval, "macro"
     return val, "tag"
+
+def _dotted_prefixes(ver: str) -> dict[int, str]:
+    parts = [p for p in (ver or "").split(".") if p != ""]
+    out: dict[int, str] = {}
+    for n in range(2, len(parts)):
+        out[n] = ".".join(parts[:n])
+    return out
+
+def _rewrite_version_defines(preamble: str, old: str, new: str) -> str:
+    old_px = _dotted_prefixes(old)
+    new_px = _dotted_prefixes(new)
+
+    def _sub(m: re.Match[str]) -> str:
+        val = (m.group("val") or "").strip()
+        if val == old:
+            val = new
+        else:
+            for n, px in old_px.items():
+                if val == px and n in new_px:
+                    val = new_px[n]
+                    break
+        return m.group("pre") + m.group("name") + m.group("sp") + val + m.group("post")
+
+    return _RE_SPEC_DEFINE.sub(_sub, preamble)
 
 def _replace_version_token(text: str, old: str, new: str) -> str:
     if old == new:
@@ -208,12 +259,17 @@ def bump_spec_to_version(text: str, latest: str) -> tuple[str, str, str] | None:
     old, kind = found
     if old == latest:
         return text, old, latest
-    if kind == "define":
-        pre = _RE_SPEC_DEFINE_VER.sub(lambda m: m.group("pre") + latest + m.group("post"), pre, count=1)
+    if kind == "macro":
+        pre = _rewrite_version_defines(pre, old, latest)
     else:
         pre = _RE_SPEC_VERSION.sub(lambda m: m.group("pre") + latest + m.group("post"), pre, count=1)
+        pre = _rewrite_version_defines(pre, old, latest)
     pre = _RE_SPEC_RELEASE.sub(lambda m: m.group("pre") + "1" + m.group("rest"), pre, count=1)
     pre = _replace_version_token(pre, old, latest)
+    old_maj = old.split(".", 1)[0]
+    new_maj = latest.split(".", 1)[0]
+    if old_maj != new_maj and old_maj.isdigit() and new_maj.isdigit():
+        pre = pre.replace("v%s.x" % old_maj, "v%s.x" % new_maj)
     return pre + log, old, latest
 
 def find_pkg_specs(root: Path, pkg: str) -> list[Path]:
@@ -761,6 +817,11 @@ def cmd_build(
     default="main",
     help="Branch fragment in distgit URL",
 )
+@click.option(
+    "--skip-already-built/--no-skip-already-built",
+    default=False,
+    help="Omit packages already at distgit EVR in the side tag and linked repos",
+)
 def cmd_layer_build(
     spec_parts: tuple[str, ...],
     release_ref: str,
@@ -770,6 +831,7 @@ def cmd_layer_build(
     wait: bool,
     distgit_url: str,
     distgit_branch: str,
+    skip_already_built: bool,
 ) -> None:
     """Queue root package(s); dependencies are discovered and built reactively."""
     token = require_auth(get_token())
@@ -792,6 +854,7 @@ def cmd_layer_build(
         "architectures": arches,
         "distgit_url": distgit_url,
         "distgit_branch": distgit_branch,
+        "skip_already_built": bool(skip_already_built),
     }
     data = http_json("POST", api_base, "/api/builds/layer-trigger", token=token, json_body=body, timeout=300.0)
     if not isinstance(data, dict):
@@ -1259,15 +1322,17 @@ def logs_layer_fail(layer_id: int, out_dir: str | None) -> None:
             click.echo("job %s %s %s has no attempts" % (jid, pkg, arch), err=True)
             missing += 1
             continue
-        for att in attempts:
-            if not isinstance(att, dict):
-                continue
-            aid = int(att["id"])
-            name = "%s-%s-job%s-attempt%s.log" % (pkg, arch, jid, aid)
-            if _fetch_attempt_log(api_base, aid, dest / name):
-                wrote += 1
-            else:
-                missing += 1
+        att = next((a for a in attempts if isinstance(a, dict)), None)
+        if att is None:
+            click.echo("job %s %s %s has no attempts" % (jid, pkg, arch), err=True)
+            missing += 1
+            continue
+        aid = int(att["id"])
+        name = "%s-%s-job%s.log" % (pkg, arch, jid)
+        if _fetch_attempt_log(api_base, aid, dest / name):
+            wrote += 1
+        else:
+            missing += 1
     click.echo("layer %s failed jobs=%s logs written=%s missing=%s dir=%s" % (
         layer_id,
         len(jobs),
