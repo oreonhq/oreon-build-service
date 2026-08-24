@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -231,13 +232,23 @@ async def _discord_notify_advisory_resolved(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _configure_watchdog_logging()
+    periodic_task = None
     try:
-        from oreon_build.services.release_monitor import mark_stale_scans_failed
+        from oreon_build.services.release_monitor import (
+            mark_stale_scans_failed,
+            start_periodic_release_monitor,
+        )
 
         await mark_stale_scans_failed()
+        periodic_task = start_periodic_release_monitor()
     except Exception:
-        logger.exception("failed to reconcile stale release-monitor scans on startup")
-    yield
+        logger.exception("failed to start release-monitor scheduler")
+    try:
+        yield
+    finally:
+        if periodic_task is not None:
+            periodic_task.cancel()
+            await asyncio.gather(periodic_task, return_exceptions=True)
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Oreon Watchdog", version="1.0.0", lifespan=lifespan)
@@ -419,11 +430,16 @@ def create_app() -> FastAPI:
             release = None
             if release_id is not None:
                 release = await db.get(Release, release_id)
-                if release is None:
+                if release is None or not release.is_active:
                     return JSONResponse(content={"detail": "release not found"}, status_code=404)
             else:
                 release = (
-                    await db.execute(select(Release).order_by(Release.releasename).limit(1))
+                    await db.execute(
+                        select(Release)
+                        .where(Release.is_active.is_(True))
+                        .order_by(Release.releasename)
+                        .limit(1)
+                    )
                 ).scalar_one_or_none()
                 if release is None:
                     return JSONResponse(content={"detail": "no releases configured"}, status_code=400)
@@ -567,7 +583,7 @@ def create_app() -> FastAPI:
 
         async with async_session_maker() as db:
             res = await db.execute(
-                select(Release).order_by(Release.releasename)
+                select(Release).where(Release.is_active.is_(True)).order_by(Release.releasename)
             )
             releases = res.scalars().all()
             return JSONResponse(
