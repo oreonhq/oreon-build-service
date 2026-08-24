@@ -105,6 +105,8 @@ async def create_side_tag_endpoint(
     ).scalar_one_or_none()
     if not rel:
         raise HTTPException(status_code=404, detail="Release not found")
+    if not rel.is_active:
+        raise HTTPException(status_code=409, detail="Release is inactive")
     tag = await create_side_tag(
         db,
         release_id=data.release_id,
