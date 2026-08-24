@@ -31,7 +31,6 @@ def upgrade() -> None:
         unique=False,
     )
 
-
 def downgrade() -> None:
     op.drop_index("ix_build_attempts_worker_status", table_name="build_attempts")
     op.drop_index("ix_build_targets_release_arch_mock", table_name="build_targets")
