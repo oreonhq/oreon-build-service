@@ -40,6 +40,8 @@ async def promote_branch_tree(
     ).scalar_one_or_none()
     if not rel:
         raise HTTPException(status_code=404, detail="Release not found")
+    if not rel.is_active:
+        raise HTTPException(status_code=409, detail="Release is inactive")
     arches = list_release_arches(rel.architectures)
     try:
         job = await enqueue_branch_promote(
