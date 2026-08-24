@@ -409,6 +409,8 @@ async def resume_layer_plan_by_user(
         job.status = BuildStatus.BLOCKED
         job.completed_at = None
         job.blocked_reason = "waiting on repository"
+        job.error_message = None
+        job.blocking_sources = []
     plan.status = LayerPlanStatus.RUNNING
     plan.error_message = None
     await db.flush()

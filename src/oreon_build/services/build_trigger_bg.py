@@ -151,6 +151,15 @@ async def run_layer_seed(plan_id: int) -> None:
             try:
                 await complete_seed_layer_plan(db, int(plan_id))
                 await db.commit()
+                from oreon_build.services.layer_engine import evaluate_layer_buildability
+                async with async_session_maker() as eval_db:
+                    changed = await evaluate_layer_buildability(eval_db, int(plan_id))
+                    await eval_db.commit()
+                    logger.info(
+                        "background layer seed evaluation complete layer_plan_id=%s queued=%s",
+                        plan_id,
+                        len(changed),
+                    )
             except Exception as exc:
                 await db.rollback()
                 logger.exception("background layer seed layer_plan_id=%s failed", plan_id)
@@ -176,7 +185,21 @@ async def run_layer_seed(plan_id: int) -> None:
 
 
 async def run_layer_resume_refresh(plan_id: int, job_ids: list[int]) -> None:
-    return
+    from oreon_build.services.layer_engine import evaluate_layer_buildability
+    from oreon_build.services.layer_plan import maybe_settle_layer_plan
+
+    try:
+        async with async_session_maker() as db:
+            changed = await evaluate_layer_buildability(db, int(plan_id))
+            await maybe_settle_layer_plan(db, int(plan_id))
+            await db.commit()
+            logger.info(
+                "background layer resume evaluation complete layer_plan_id=%s queued=%s",
+                plan_id,
+                len(changed),
+            )
+    except Exception:
+        logger.exception("background layer resume evaluation failed layer_plan_id=%s", plan_id)
 
 
 def schedule_layer_resume_refresh(plan_id: int, job_ids: list[int]) -> None:

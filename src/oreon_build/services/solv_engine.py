@@ -358,6 +358,7 @@ class SolvArchEngine:
                         v.version,
                         v.release,
                         v.arch,
+                        tuple(sorted(v.requires)),
                     )
                     for k, v in packages.items()
                 )
@@ -545,7 +546,17 @@ class SolvArchEngine:
             pass
         problems = solver.solve(jobs)
         if not problems and not missing:
-            result = SolveResult(ok=True)
+            shadow_sources: set[str] = set()
+            try:
+                transaction = solver.transaction()
+                for solvable in transaction.newsolvables():
+                    if getattr(solvable, "repo", None) is self._overlay_repo:
+                        source = _source_name_from_solvable(solvable, solv)
+                        if source:
+                            shadow_sources.add(source)
+            except Exception:
+                logger.debug("unable to inspect overlay transaction", exc_info=True)
+            result = SolveResult(ok=True, shadow_sources=shadow_sources)
             self._resolve_cache[key] = result
             return result
 

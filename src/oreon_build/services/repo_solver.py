@@ -64,7 +64,7 @@ def nevra_to_name(nevra: str) -> str:
 _SOLVER_CACHE: dict[tuple[Any, ...], tuple[float, "OreonRepoSolver"]] = {}
 _SOLVER_CACHE_TTL_SEC = 300.0
 # keep both arches warm so dual-arch layers do not thrash-evict each other
-_SOLVER_CACHE_MAX = 1
+_SOLVER_CACHE_MAX = 32
 _SOLV_LOCK = threading.RLock()
 
 
@@ -154,6 +154,7 @@ class SolveResult:
     missing_provides: set[str] = field(default_factory=set)
     broken_binaries: set[str] = field(default_factory=set)
     problems: str = ""
+    shadow_sources: set[str] = field(default_factory=set)
 
     @property
     def missing(self) -> set[str]:
@@ -294,10 +295,15 @@ class OreonRepoSolver:
                     )
                     if not caps:
                         continue
+                    requires = frozenset(
+                        str(req).strip()
+                        for req in (provides.requires or ())
+                        if str(req).strip() and "%" not in str(req)
+                    )
                     new[src] = OverlayPackage(
                         source_name=src,
                         provides=caps,
-                        requires=frozenset(),
+                        requires=requires,
                         epoch=int(provides.epoch or 0),
                         version=(provides.version or "0").strip() or "0",
                         release=(provides.release or "0").strip() or "0",
@@ -566,6 +572,32 @@ def get_repo_solver(
     multi.warm()
     _SOLVER_CACHE[key] = (now, multi)
     return multi
+
+
+def invalidate_repo_solver_cache(
+    releasename: str,
+    branch: str,
+    architectures: Iterable[str] | None = None,
+) -> None:
+    rel = (releasename or "").strip()
+    target_branch = (branch or "").strip()
+    arch_set = {
+        (arch or "").strip()
+        for arch in (architectures or ())
+        if (arch or "").strip()
+    }
+    with _SOLV_LOCK:
+        for key, (_timestamp, solver) in list(_SOLVER_CACHE.items()):
+            key_rel, key_branches, key_arches = key
+            if key_rel != rel or target_branch not in key_branches:
+                continue
+            if arch_set and not arch_set.intersection(key_arches):
+                continue
+            _SOLVER_CACHE.pop(key, None)
+            try:
+                solver.close()
+            except Exception:
+                logger.debug("failed closing invalidated repo solver", exc_info=True)
 
 
 def clear_repo_solver_cache() -> None:
