@@ -221,7 +221,7 @@
         document.getElementById('mock-page-size').addEventListener('change', function() { mockPageSize = parseInt(this.value, 10) || 25; mockPage = 0; load(); });
       })();
       function fillReleases() {
-        api.get('/releases?limit=200').then(function(data) {
+        api.get('/releases?limit=200&active_only=true').then(function(data) {
           var list = (data && data.items) ? data.items : [];
           var sel = document.getElementById('create-mock-release-id');
           if (!sel) return;
