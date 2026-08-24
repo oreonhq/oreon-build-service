@@ -299,10 +299,12 @@ async def lifespan(app: FastAPI):
                     )
                     result = await db.execute(q)
                     tasks = list(result.scalars().all())
-                    if not tasks:
-                        await asyncio.sleep(random.uniform(idle_interval_s * 0.85, idle_interval_s * 1.15))
-                        continue
-                    await db.commit()
+                    if tasks:
+                        await db.commit()
+
+                if not tasks:
+                    await asyncio.sleep(random.uniform(idle_interval_s * 0.85, idle_interval_s * 1.15))
+                    continue
 
                 try:
                     await run_repo_publish_tasks_batch(tasks)

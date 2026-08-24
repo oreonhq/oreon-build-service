@@ -39,6 +39,8 @@ from oreon_build.models import (
     BuildJob,
     BuildStatus,
     BuildTarget,
+    LayerPlan,
+    LayerPlanStatus,
     MockEnvironment,
     PublishTask,
     RpmCompleteLock,
@@ -323,7 +325,13 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
     worker_arch = (locked_worker.architecture or "").strip() or None
     q = (
         select(BuildJob)
-        .where(BuildJob.status.in_([BuildStatus.PENDING, BuildStatus.QUEUED]))
+        .where(
+            or_(
+                BuildJob.layer_plan_id.is_(None),
+                BuildJob.status == BuildStatus.QUEUED,
+            ),
+            BuildJob.status.in_([BuildStatus.PENDING, BuildStatus.QUEUED]),
+        )
         .order_by(BuildJob.priority.desc(), BuildJob.created_at.asc())
     )
     if get_settings().rpmbuild_strict_gate_enabled:
@@ -341,8 +349,18 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
     if worker_arch:
         arch_vals = sql_arch_match_values(locked_worker.architecture)
         if arch_vals:
-            q = q.outerjoin(BuildTarget, BuildJob.target_id == BuildTarget.id).where(
-                (BuildJob.target_id.is_(None)) | (BuildTarget.architecture.in_(arch_vals))
+            compatible_target_ids = list(
+                (
+                    await db.execute(
+                        select(BuildTarget.id).where(
+                            BuildTarget.architecture.in_(arch_vals)
+                        )
+                    )
+                ).scalars().all()
+            )
+            q = q.where(
+                (BuildJob.target_id.is_(None))
+                | (BuildJob.target_id.in_(compatible_target_ids))
             )
 
     burst_workers_res = await db.execute(
@@ -366,12 +384,28 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
             (BuildJob.package_id.is_(None)) | (~func.lower(Package.name).in_(all_burst_names))
         )
 
-    q = q.limit(1).with_for_update(of=BuildJob, skip_locked=True)
+    q = q.limit(32)
     result = await db.execute(q)
-    job = result.scalar_one_or_none()
+    candidates = list(result.scalars().all())
+    job = None
+    for candidate in candidates:
+        claim_states = (BuildStatus.QUEUED,) if candidate.layer_plan_id is not None else (
+            BuildStatus.PENDING,
+            BuildStatus.QUEUED,
+        )
+        claim = await db.execute(
+            update(BuildJob)
+            .where(
+                BuildJob.id == candidate.id,
+                BuildJob.status.in_(claim_states),
+            )
+            .values(status=BuildStatus.RUNNING)
+        )
+        if claim.rowcount:
+            job = await db.get(BuildJob, candidate.id)
+            break
     if not job:
         return {"job": None}
-    job.status = BuildStatus.RUNNING
     count_result = await db.execute(
         select(func.count(BuildAttempt.id)).where(BuildAttempt.build_job_id == job.id)
     )
@@ -1722,14 +1756,6 @@ async def report_result(
     await db.flush()
     await sync_worker_state_after_attempt_finished(db, worker)
     await db.commit()
-
-    if queued_next_pass:
-        try:
-            from oreon_build.services.layer_engine import reblock_second_pass_if_needed
-
-            await reblock_second_pass_if_needed(int(job.id))
-        except Exception:
-            logger.exception("second pass re-block failed job_id=%s", job.id)
 
     await _burst_vm_stop_check()
 
