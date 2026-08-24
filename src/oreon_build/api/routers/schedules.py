@@ -35,8 +35,11 @@ async def create_schedule(
     admin: CurrentAdmin,
 ):
     result = await db.execute(select(Release).where(Release.id == data.release_id))
-    if not result.scalar_one_or_none():
+    release = result.scalar_one_or_none()
+    if not release:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Release not found")
+    if not release.is_active:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Release is inactive")
     schedule = Schedule(
         release_id=data.release_id,
         name=data.name,
