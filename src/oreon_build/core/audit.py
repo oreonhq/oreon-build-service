@@ -35,6 +35,8 @@ async def log_audit(
     )
     db.add(entry)
     await db.flush()
+    if not emit_discord:
+        return
     try:
         username = None
         if account_id is not None:
