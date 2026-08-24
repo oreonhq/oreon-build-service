@@ -476,6 +476,10 @@ def test_perl_metacpan_dist_maps_unprefixed_dpkg() -> None:
     from oreon_build.services.perl_resolve import distgit_sources_for_perl_module
 
     assert distgit_sources_for_perl_module("Dpkg::Version", {"dpkg"}) == {"dpkg"}
+    assert distgit_sources_for_perl_module(
+        "CPAN::Meta::Requirements::Range",
+        {"perl-CPAN", "perl-CPAN-Meta", "perl-CPAN-Meta-Requirements"},
+    ) == {"perl-CPAN-Meta-Requirements"}
 
 
 def test_lightweight_goipath_global_maps_to_golang_provide() -> None:

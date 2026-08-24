@@ -43,6 +43,15 @@ def test_current_0x_package_not_rejected_by_name():
     assert not _source_may_satisfy_crate_versions("rust-env_logger0.10", rich)
 
 
+def test_major_compat_suffix_is_a_series():
+    rich = "(crate(similar/default) >= 3.0.0 with crate(similar/default) < 4.0.0~)"
+    assert _source_may_satisfy_crate_versions("rust-similar", rich)
+    assert not _source_may_satisfy_crate_versions("rust-similar2", rich)
+    nom = "(crate(nom/default) >= 8.0.0 with crate(nom/default) < 9.0.0~)"
+    assert _source_may_satisfy_crate_versions("rust-nom", nom)
+    assert not _source_may_satisfy_crate_versions("rust-nom7", nom)
+
+
 def test_providers_for_requirement_prefers_compat_series():
     pmap = {
         "crate(rustix)": {"rust-rustix", "rust-rustix0.37", "rust-rustix0.38"},
@@ -126,3 +135,48 @@ def test_providers_for_versioned_perl_requirement_uses_metacpan_dist():
         package_names={"perl-MIME-tools"},
     )
     assert got == {"perl-MIME-tools"}
+
+
+def test_perl_range_module_drops_interpreter_and_shorter_prefixes():
+    got = providers_for_requirement(
+        "perl(CPAN::Meta::Requirements::Range)",
+        provider_map={
+            "perl(CPAN::Meta::Requirements::Range)": {
+                "perl",
+                "perl-CPAN",
+                "perl-CPAN-Meta-Requirements",
+            }
+        },
+        package_names={
+            "perl",
+            "perl-CPAN",
+            "perl-CPAN-Meta",
+            "perl-CPAN-Meta-Requirements",
+        },
+    )
+    assert got == {"perl-CPAN-Meta-Requirements"}
+
+
+def test_unversioned_crate_prefers_current_not_compat_zoo():
+    pmap = {
+        "crate(similar)": {"rust-similar", "rust-similar2"},
+        "crate(similar/default)": {"rust-similar", "rust-similar2"},
+        "crate(rand_xorshift/default)": {
+            "rust-rand_xorshift",
+            "rust-rand_xorshift0.1",
+            "rust-rand_xorshift0.2",
+        },
+    }
+    known = {
+        "rust-similar",
+        "rust-similar2",
+        "rust-rand_xorshift",
+        "rust-rand_xorshift0.1",
+        "rust-rand_xorshift0.2",
+    }
+    assert providers_for_requirement(
+        "crate(similar/default)", provider_map=pmap, package_names=known
+    ) == {"rust-similar"}
+    assert providers_for_requirement(
+        "crate(rand_xorshift/default)", provider_map=pmap, package_names=known
+    ) == {"rust-rand_xorshift"}

@@ -355,6 +355,11 @@ def test_devel_subpkg_resolves_via_declared_base() -> None:
     assert distgit_sources_for_virtual_cap(
         "wxGTK3-devel", package_names=known, provider_map=pmap
     ) == {"wxGTK"}
+    assert distgit_sources_for_virtual_cap(
+        "libavcodec-free-devel = 8.1-5.or11",
+        package_names={"ffmpeg"},
+        provider_map={"libavcodec-free": {"ffmpeg"}},
+    ) == {"ffmpeg"}
     # nothing declares the base, so nothing is invented
     assert distgit_sources_for_virtual_cap(
         "nosuchthing-devel", package_names=known, provider_map=pmap
@@ -371,3 +376,33 @@ def test_devel_subpkg_skips_ambiguous_and_real_names() -> None:
     assert distgit_sources_for_virtual_cap(
         "yelp-tools", package_names={"yelp", "yelp-tools"}, provider_map=pmap
     ) == {"yelp-tools"}
+
+
+def test_ghc_devel_hash_uses_libhs_when_lib_not_imported() -> None:
+    pmap = {"ghc-libhs(integer-conversion)": {"ghc-attoparsec-iso8601"}}
+    assert distgit_sources_for_virtual_cap(
+        "ghc-devel(integer-conversion-0.1.1-deadbeef)",
+        package_names={"ghc-attoparsec-iso8601"},
+        provider_map=pmap,
+    ) == {"ghc-attoparsec-iso8601"}
+
+
+def test_ghc_devel_prefers_dedicated_source() -> None:
+    pmap = {"ghc-libhs(integer-conversion)": {"ghc-attoparsec-iso8601"}}
+    assert distgit_sources_for_virtual_cap(
+        "ghc-devel(integer-conversion-0.1.1-deadbeef)",
+        package_names={"ghc-integer-conversion", "ghc-attoparsec-iso8601"},
+        provider_map=pmap,
+    ) == {"ghc-integer-conversion"}
+
+
+def test_soname_cap_maps_from_provider_data() -> None:
+    pmap = {
+        "libavformat.so.62()(64bit)": {"ffmpeg"},
+        "libavformat.so.62": {"ffmpeg"},
+    }
+    assert distgit_sources_for_virtual_cap(
+        "libavformat.so.62()(64bit)",
+        package_names={"ffmpeg"},
+        provider_map=pmap,
+    ) == {"ffmpeg"}

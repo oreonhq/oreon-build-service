@@ -27,6 +27,14 @@ def test_dep_to_cap_keeps_rich_deps() -> None:
     ]
     miss = _parse_missing_from_problems(texts)
     assert miss == {"askalono-cli", "trivy"}
+    dump = [
+        "nothing provides libfoo.so.1 needed by kalgebra",
+        "Installed: gcc-1 systemd-1 cups-1 curl-1 coreutils-1 bash-1",
+    ]
+    got = _parse_missing_from_problems(dump)
+    assert got == set()
+    assert "gcc-1" not in got
+    assert "systemd-1" not in got
 
 
 def test_resolve_never_inflates_miss_to_all_reqs() -> None:
@@ -66,6 +74,31 @@ def test_has_provider_sees_overlay_and_sources() -> None:
     )
     assert eng.has_provider("perl(DDP)") is True
     assert "perl-Data-Printer" in eng.sources_providing("perl(DDP)")
+
+
+def test_overlay_runtime_requires_are_transactional() -> None:
+    from oreon_build.services.solv_engine import SolvArchEngine
+
+    eng = SolvArchEngine(
+        releasename="oreon-11-rp1",
+        branches=["testing"],
+        arch="x86_64",
+    )
+    eng.set_overlay(
+        {
+            "planned-devel": OverlaySolvable(
+                source_name="planned-devel",
+                provides=frozenset({"planned-devel"}),
+                requires=frozenset({"missing-runtime-cap"}),
+            )
+        }
+    )
+
+    result = eng.resolve(["planned-devel"])
+
+    assert result.ok is False
+    assert "missing-runtime-cap" in result.missing_provides
+    assert result.broken_binaries == {"planned-devel"}
 
 
 def test_rel_flags_ge() -> None:

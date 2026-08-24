@@ -53,7 +53,7 @@ def test_multiarch_exclusive_ok_when_present_on_some_arch() -> None:
         is_arch_unavailable_failure,
     )
 
-    assert is_arch_unavailable_failure(
+    assert not is_arch_unavailable_failure(
         SolveResult(ok=False, missing_provides={"sgx"}, problems="No match for argument: sgx")
     )
     assert not is_arch_unavailable_failure(
@@ -89,7 +89,9 @@ def test_multiarch_exclusive_ok_when_present_on_some_arch() -> None:
             ),
         ]
     )
-    assert multi.resolve(["sgx-enclave-prebuilt-common"]).ok is True
+    result = multi.resolve(["sgx-enclave-prebuilt-common"])
+    assert result.ok is False
+    assert "aarch64" in result.problems
 
     both_missing = MultiArchRepoSolver(
         [

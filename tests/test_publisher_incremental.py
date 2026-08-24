@@ -6,6 +6,37 @@ from unittest.mock import MagicMock, patch
 from oreon_build.services.publisher import update_repodata_at_prefix
 
 
+def test_repodata_update_purges_cloudflare_repodata_cache(tmp_path: Path) -> None:
+    from oreon_build.services.publisher import _purge_repodata_cache
+
+    request = MagicMock()
+    response = MagicMock()
+    response.__enter__.return_value = response
+    response.read.return_value = b'{"success": true}'
+
+    with (
+        patch.dict(
+            "os.environ",
+            {
+                "CLOUDFLARE_ZONE_ID": "zone",
+                "CLOUDFLARE_API_TOKEN": "token",
+            },
+            clear=False,
+        ),
+        patch("oreon_build.services.publisher.get_settings") as settings,
+        patch("oreon_build.services.publisher.urllib.request.Request", return_value=request) as make_request,
+        patch("oreon_build.services.publisher.urllib.request.urlopen", return_value=response),
+    ):
+        settings.return_value.cloudflare_zone_id = None
+        settings.return_value.cloudflare_api_token = None
+        settings.return_value.r2_public_url = "https://repo.example/"
+        _purge_repodata_cache("oreon-11/dev/x86_64")
+
+    make_request.assert_called_once()
+    assert make_request.call_args.args[0].endswith("/zones/zone/purge_cache")
+    assert b"https://repo.example/oreon-11/dev/x86_64/repodata/*" in make_request.call_args.kwargs["data"]
+
+
 def test_skip_createrepo_when_no_rpm_changes(tmp_path: Path) -> None:
     prefix = "oreon-11-rp1/dev/x86_64"
     container = tmp_path / "stage"

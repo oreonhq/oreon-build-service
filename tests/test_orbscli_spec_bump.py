@@ -41,6 +41,44 @@ def test_bump_spec_define_version():
     assert "Release: 1%{?dist}" in out
 
 
+def test_bump_spec_follows_any_version_macro():
+    spec = "\n".join(
+        [
+            "%define specrpmversion 7.1.5",
+            "%define specversion 7.1.5",
+            "%define patchversion 7.1",
+            "%define tarfile_release 7.1.5",
+            "%define kabiversion 7.1.5",
+            "%define pkgrelease 200",
+            "Name: kernel",
+            "Version: %{specrpmversion}",
+            "Release: %{pkg_release}",
+            "Source0: https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-%{tarfile_release}.tar.xz",
+            "%changelog",
+            "* Wed Aug 19 2026 x - 7.1.5-200",
+            "",
+        ]
+    )
+    out, old, new = bump_spec_to_version(spec, "7.2.0")
+    assert old == "7.1.5"
+    assert new == "7.2.0"
+    assert "Version: %{specrpmversion}" in out
+    assert "%define specrpmversion 7.2.0" in out
+    assert "%define specversion 7.2.0" in out
+    assert "%define tarfile_release 7.2.0" in out
+    assert "%define kabiversion 7.2.0" in out
+    assert "%define patchversion 7.2" in out
+    assert "%define pkgrelease 200" in out
+    assert "* Wed Aug 19 2026 x - 7.1.5-200" in out
+    headers = "%define specversion 7.1.5\n%define tarfile_release 7.1.5\nVersion: %{specversion}\n"
+    hout, hold, hnew = bump_spec_to_version(headers, "7.2.0")
+    assert hold == "7.1.5"
+    assert hnew == "7.2.0"
+    assert "%define specversion 7.2.0" in hout
+    assert "%define tarfile_release 7.2.0" in hout
+    assert "Version: %{specversion}" in hout
+
+
 def test_find_pkg_specs_release_subdir(tmp_path: Path):
     p = tmp_path / "oreon-11-rp1" / "foo"
     p.mkdir(parents=True)

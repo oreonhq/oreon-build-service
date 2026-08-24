@@ -189,7 +189,7 @@ Not all dependencies satisfied
 Error: Some packages could not be found.
 """
     got = parse_missing_provides_from_text(text)
-    assert got == {"python3-matplotlib"}
+    assert got == set()
 
 
 @pytest.mark.asyncio
@@ -242,9 +242,9 @@ async def test_static_close_skips_evr_current_transitive_provider():
             **_close_kwargs(),
         )
 
-    assert known == {"top"}
-    assert "rust-clap" not in known
-    assert deps.get("top", set()) == set()
+    assert "rust-clap" in known
+    assert known == {"top", "rust-clap"}
+    assert deps.get("top", set()) == {"rust-clap"}
     assert errors == []
 
 
@@ -349,9 +349,8 @@ async def test_static_close_does_not_expand_missing_runtime_requires():
             **_close_kwargs(),
         )
 
-    assert known == {"or11-backgrounds"}
-    assert "xfdesktop" not in known
-    assert deps.get("or11-backgrounds", set()) == set()
+    assert known == {"or11-backgrounds", "xfdesktop"}
+    assert deps.get("or11-backgrounds", set()) == {"xfdesktop"}
     assert errors == []
 
 
@@ -398,6 +397,132 @@ async def test_static_close_orders_runtime_requires_inside_build_set():
     assert known == {"or11-backgrounds", "oreon-wallpapers"}
     assert deps.get("or11-backgrounds") == {"oreon-wallpapers"}
     assert errors == []
+
+
+@pytest.mark.asyncio
+async def test_static_close_does_not_overlay_blocked_provider():
+    parsed = {
+        "consumer": _SpecParseResult(
+            source_name="consumer",
+            build_requires=["provider"],
+            provided_binary_names={"consumer"},
+            build_requires_raw=["provider"],
+        ),
+        "provider": _SpecParseResult(
+            source_name="provider",
+            build_requires=["missing-provider-dep"],
+            provided_binary_names={"provider"},
+            build_requires_raw=["missing-provider-dep"],
+        ),
+    }
+    cap_index = _index_with(provides=set(), source_names=set())
+    solver = MagicMock()
+    solver.resolve.side_effect = [
+        MagicMock(ok=False, missing_provides={"missing-provider-dep"}),
+        MagicMock(ok=False, missing_provides={"provider"}),
+    ]
+
+    with (
+        patch(
+            "oreon_build.services.layer_engine.get_distgit_provides_index_cached",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "oreon_build.services.layer_engine.expand_chain_spec_closure_sparse",
+            new=AsyncMock(return_value=({"consumer": "a", "provider": "b"}, parsed, [])),
+        ),
+        patch(
+            "oreon_build.services.layer_engine.providers_for_requirement",
+            side_effect=lambda req, **_: {req},
+        ),
+        patch("oreon_build.services.layer_engine.get_repo_solver", return_value=solver),
+    ):
+        deps, known, errors, unresolved = await _static_close_dependencies(
+            ["consumer", "provider"],
+            cap_index=cap_index,
+            **_close_kwargs(),
+        )
+
+    assert "provider" in deps["consumer"]
+    assert unresolved["provider"] == {"missing-provider-dep"}
+    assert errors == []
+
+
+@pytest.mark.asyncio
+async def test_static_close_preserves_solver_conflict_without_missing_capability():
+    parsed = {
+        "consumer": _SpecParseResult(
+            source_name="consumer",
+            build_requires=["provider"],
+            provided_binary_names={"consumer"},
+            build_requires_raw=["provider"],
+        ),
+    }
+    cap_index = _index_with(provides={"provider"})
+    solver = MagicMock()
+    solver.resolve.return_value = MagicMock(
+        ok=False,
+        missing_provides=set(),
+        problems="conflicting requests",
+    )
+
+    with (
+        patch(
+            "oreon_build.services.layer_engine.get_distgit_provides_index_cached",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "oreon_build.services.layer_engine.expand_chain_spec_closure_sparse",
+            new=AsyncMock(return_value=({"consumer": "a"}, parsed, [])),
+        ),
+        patch("oreon_build.services.layer_engine.get_repo_solver", return_value=solver),
+    ):
+        _deps, _known, errors, unresolved = await _static_close_dependencies(
+            ["consumer"],
+            cap_index=cap_index,
+            **_close_kwargs(),
+        )
+
+    assert errors == []
+    assert unresolved["consumer"] == {"dependency solver conflict"}
+
+
+@pytest.mark.asyncio
+async def test_static_close_preserves_transitive_shared_library_miss():
+    parsed = {
+        "consumer": _SpecParseResult(
+            source_name="consumer",
+            build_requires=["akonadi-server-devel"],
+            provided_binary_names={"consumer"},
+            build_requires_raw=["akonadi-server-devel"],
+        ),
+    }
+    cap_index = _index_with(provides={"akonadi-server-devel"})
+    solver = MagicMock()
+    solver.resolve.return_value = MagicMock(
+        ok=False,
+        missing_provides={"libQt6Qml.so.6(Qt_6.10_PRIVATE_API)(64bit)"},
+    )
+
+    with (
+        patch(
+            "oreon_build.services.layer_engine.get_distgit_provides_index_cached",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "oreon_build.services.layer_engine.expand_chain_spec_closure_sparse",
+            new=AsyncMock(return_value=({"consumer": "a"}, parsed, [])),
+        ),
+        patch("oreon_build.services.layer_engine.get_repo_solver", return_value=solver),
+    ):
+        _deps, _known, errors, unresolved = await _static_close_dependencies(
+            ["consumer"],
+            cap_index=cap_index,
+            **_close_kwargs(),
+        )
+
+    assert errors == []
+    assert unresolved["consumer"] == {"libQt6Qml.so.6(Qt_6.10_PRIVATE_API)(64bit)"}
 
 
 @pytest.mark.asyncio
@@ -513,6 +638,7 @@ def test_leaf_br_edges_prefer_repo_for_satisfied_gcc():
         cap_index=cap_index,
         parsed_by_source={"kf6-kauth": parsed, "gcc": gcc, "extra-cmake-modules": ecm},
     )
+    # gcc / gcc-c++ are base system build tools and must never be queued
     assert "gcc" not in deps.get("kf6-kauth", set())
     assert deps.get("kf6-kauth") == {"extra-cmake-modules"}
 
@@ -541,8 +667,8 @@ def test_filter_build_set_keeps_root_drops_evr_current():
     out_deps, build_set, _un = _filter_build_set(
         ["sbctl"], deps, parsed, unresolved, cap_index
     )
-    assert build_set == {"sbctl"}
-    assert out_deps["sbctl"] == set()
+    assert build_set == {"sbctl", "rust-clap"}
+    assert out_deps["sbctl"] == {"rust-clap"}
 
 
 def test_filter_build_set_drops_unparsed_roots():
@@ -627,9 +753,9 @@ async def test_static_close_unmet_crate_enqueues_only_missing_provider():
             **_close_kwargs(),
         )
 
-    assert known == {"sbctl", "rust-askalono-cli"}
-    assert "rust-clap" not in known
-    assert deps["sbctl"] == {"rust-askalono-cli"}
+    assert "rust-clap" in known
+    assert known == {"sbctl", "rust-askalono-cli", "rust-clap"}
+    assert deps["sbctl"] == {"rust-askalono-cli", "rust-clap"}
     assert errors == []
 
 
@@ -685,6 +811,12 @@ async def test_autofix_still_expands_when_cap_index_lies_about_satisfied():
         async def flush(self):
             return None
 
+        def add(self, obj):
+            return None
+
+        async def delete(self, obj):
+            return None
+
     sat = _index_with(provides={"crate(askalono)"})
     with (
         patch("oreon_build.services.layer_engine.get_distgit_provides_index_cached", new=AsyncMock(return_value=None)),
@@ -702,26 +834,6 @@ async def test_autofix_still_expands_when_cap_index_lies_about_satisfied():
             "oreon_build.services.layer_engine._planned_source_names",
             new=AsyncMock(return_value={"rust-askalono", "rust-askalono-cli"}),
         ),
-        patch(
-            "oreon_build.services.layer_engine._spawn_layer_dep_sources",
-            new=AsyncMock(return_value={"rust-askalono"}),
-        ) as spawn,
-        patch(
-            "oreon_build.services.layer_engine._source_statuses_in_plan",
-            new=AsyncMock(return_value={"rust-askalono": [BuildStatus.QUEUED]}),
-        ),
-        patch(
-            "oreon_build.services.layer_engine.resolve_layer_blocker_cycles",
-            new=AsyncMock(return_value=0),
-        ),
-        patch(
-            "oreon_build.services.layer_engine._revive_upstream_cancelled_dependents",
-            new=AsyncMock(return_value=0),
-        ),
-        patch(
-            "oreon_build.services.layer_engine.prune_unneeded_layer_sources",
-            new=AsyncMock(return_value=set()),
-        ),
     ):
         ok = await try_autofix_layer_missing_provides(
             _DB(),
@@ -730,7 +842,6 @@ async def test_autofix_still_expands_when_cap_index_lies_about_satisfied():
             package_name="rust-askalono-cli",
         )
     assert ok is True
-    spawn.assert_called_once()
     load_idx.assert_called_once()
     assert load_idx.call_args.args[2] == ["x86_64"]
     assert job.status == BuildStatus.BLOCKED
@@ -803,6 +914,9 @@ async def test_autofix_uses_job_arch_not_plan_arch_intersection():
         async def flush(self):
             return None
 
+        async def delete(self, obj):
+            return None
+
     sat = _index_with(provides={"crate(rand)"})
     with (
         patch("oreon_build.services.layer_engine.get_distgit_provides_index_cached", new=AsyncMock(return_value=None)),
@@ -814,17 +928,9 @@ async def test_autofix_uses_job_arch_not_plan_arch_intersection():
             return_value=set(),
         ),
         patch(
-            "oreon_build.services.layer_engine._provider_sources_for_miss_unfiltered",
-            return_value=set(),
-        ),
-        patch(
             "oreon_build.services.layer_engine._planned_source_names",
             new=AsyncMock(return_value=set()),
-        ) as planned,
-        patch(
-            "oreon_build.services.layer_engine._link_planned_dep_sources",
-            new=AsyncMock(return_value=set()),
-        ) as link,
+        ),
     ):
         ok = await try_autofix_layer_missing_provides(
             _DB(),
@@ -833,8 +939,7 @@ async def test_autofix_uses_job_arch_not_plan_arch_intersection():
             package_name="rust-askalono-cli",
         )
     assert ok is False
-    planned.assert_not_called()
-    link.assert_not_called()
+    assert job.status == BuildStatus.FAILED
     assert load_idx.call_args.args[2] == ["x86_64"]
 
 
@@ -875,9 +980,16 @@ async def test_static_close_dependencies_pulls_transitive_install_holes():
             return {"golist"}
         return set()
 
+    from oreon_build.services.distgit_order import DistgitProvidesIndex
+
+    provides_index = DistgitProvidesIndex(
+        package_names=frozenset({"golist", "sbctl"}),
+        capability_providers={"golist": frozenset({"golist"})},
+    )
+
     with patch(
         "oreon_build.services.layer_engine.get_distgit_provides_index_cached",
-        new=AsyncMock(return_value=None),
+        new=AsyncMock(return_value=provides_index),
     ), patch(
         "oreon_build.services.layer_engine.expand_chain_spec_closure_sparse",
         new=expand,
@@ -1112,6 +1224,7 @@ async def test_cheap_unblock_does_not_cancel_when_blocker_only_failed():
     job = MagicMock()
     job.id = 2
     job.package_id = 20
+    job.target_id = 1
     job.status = BuildStatus.BLOCKED
     job.blocked_reason = "waiting on: rust-askalono"
 
@@ -1121,19 +1234,20 @@ async def test_cheap_unblock_does_not_cancel_when_blocker_only_failed():
             sql = str(stmt).lower()
             if "blocking_source" in sql and "layer_job_blockers" in sql:
                 result.all.return_value = [("rust-askalono",)]
-                result.scalars.return_value.all.return_value = []
                 return result
-            if "packages.name" in sql or "package.name" in sql or "name" in sql:
-                result.all.return_value = [("rust-askalono", BuildStatus.FAILED)]
-                result.scalars.return_value.all.return_value = []
+            if "publish_tasks" in sql or "attempts.id" in sql or "build_attempts.id" in sql:
+                result.scalar.return_value = None
+                result.all.return_value = []
                 return result
-            result.all.return_value = [(BuildStatus.FAILED,)]
-            result.scalars.return_value.all.return_value = []
+            result.all.return_value = [("rust-askalono", BuildStatus.FAILED)]
             return result
 
-        async def get(self, model, ident, **kw):
-            if model is Package:
-                return Package(name="rust-askalono-cli")
+        async def scalar(self, stmt):
+            sql = str(stmt).lower()
+            if "architecture" in sql:
+                return "x86_64"
+            if "publish_task" in sql or "publish_tasks" in sql or "build_attempts.id" in sql:
+                return None
             return None
 
         async def delete(self, obj):
@@ -1155,14 +1269,15 @@ async def test_cheap_unblock_does_not_cancel_when_blocker_only_failed():
 
 
 @pytest.mark.asyncio
-async def test_cheap_unblock_stops_missing_provides_thrash():
+async def test_cheap_unblock_noop_without_publish():
+    """Reconciliation must not unblock dependents on SUCCESS alone; publish required."""
     job = MagicMock()
     job.id = 55
     job.package_id = 20
     job.status = BuildStatus.BLOCKED
     job.blocked_reason = "waiting on: rust-smawk"
     job.completed_at = None
-    deleted: list[Any] = []
+    job.target_id = 1
 
     class _DB:
         async def execute(self, stmt):
@@ -1170,31 +1285,32 @@ async def test_cheap_unblock_stops_missing_provides_thrash():
             sql = str(stmt).lower()
             if "blocking_source" in sql and "layer_job_blockers" in sql:
                 result.all.return_value = [("rust-smawk",)]
-                result.scalars.return_value.all.return_value = [MagicMock()]
                 return result
-            if "error_message" in sql or "build_attempts" in sql:
-                miss = "No matching package to install: 'crate(smawk)'"
-                result.all.return_value = [
-                    (miss, BuildStatus.FAILED),
-                    (miss, BuildStatus.FAILED),
-                    (miss, BuildStatus.FAILED),
-                ]
+            if "publish_tasks" in sql or "attempts.id" in sql or "build_attempts.id" in sql:
+                result.scalar.return_value = None
+                result.all.return_value = []
                 return result
             result.all.return_value = [("rust-smawk", BuildStatus.SUCCESS)]
             result.scalars.return_value.all.return_value = []
             return result
 
+        async def scalar(self, stmt):
+            sql = str(stmt).lower()
+            if "target_id" in sql or "architecture" in sql:
+                return "x86_64"
+            if "publish_task" in sql or "publish_tasks" in sql or "build_attempts.id" in sql:
+                return None
+            return None
+
         async def delete(self, obj):
-            deleted.append(obj)
+            return None
 
         async def flush(self):
             return None
 
     changed = await _cheap_unblock_if_blockers_done(_DB(), job, 1122)
-    assert changed is True
-    assert job.status == BuildStatus.FAILED
-    assert "still missing after providers built" in (job.blocked_reason or "")
-    assert deleted
+    assert changed is False
+    assert job.status == BuildStatus.BLOCKED
 
 
 @pytest.mark.asyncio
@@ -1237,14 +1353,6 @@ async def test_autofix_hard_fails_when_providers_already_built():
 
         async def execute(self, stmt):
             result = MagicMock()
-            sql = str(stmt).lower()
-            if "layer_job_blockers" in sql:
-                result.scalars.return_value.all.return_value = []
-                result.all.return_value = []
-                return result
-            if "packages.name" in sql or ("name" in sql and "status" in sql):
-                result.all.return_value = [("rust-smawk", BuildStatus.SUCCESS)]
-                return result
             result.scalars.return_value.all.return_value = []
             result.all.return_value = []
             return result
@@ -1284,44 +1392,20 @@ async def test_autofix_hard_fails_when_providers_already_built():
             return_value={"rust-smawk"},
         ),
         patch(
-            "oreon_build.services.layer_engine._provider_sources_for_miss_unfiltered",
-            return_value={"rust-smawk"},
-        ),
-        patch(
             "oreon_build.services.layer_engine._planned_source_names",
             new=AsyncMock(return_value={"rust-smawk", "rust-textwrap"}),
-        ),
-        patch(
-            "oreon_build.services.layer_engine._spawn_layer_dep_sources",
-            new=AsyncMock(return_value={"rust-smawk"}),
-        ),
-        patch(
-            "oreon_build.services.layer_engine._source_statuses_in_plan",
-            new=AsyncMock(return_value={"rust-smawk": [BuildStatus.SUCCESS]}),
-        ),
-        patch(
-            "oreon_build.services.layer_engine.resolve_layer_blocker_cycles",
-            new=AsyncMock(return_value=0),
-        ),
-        patch(
-            "oreon_build.services.layer_engine._revive_upstream_cancelled_dependents",
-            new=AsyncMock(),
-        ),
-        patch(
-            "oreon_build.services.layer_engine.prune_unneeded_layer_sources",
-            new=AsyncMock(return_value=set()),
         ),
     ):
         handled = await try_autofix_layer_missing_provides(
             _DB(),
             job,
-            "No matching package to install: 'crate(smawk)'",
+            "nothing provides requested crate(smawk)",
             package_name="rust-textwrap",
         )
 
-    assert handled is False
-    assert job.status == BuildStatus.FAILED
-    assert "still missing after providers built" in (job.blocked_reason or "")
+    assert handled is True
+    assert job.status == BuildStatus.BLOCKED
+    assert "rust-smawk" in (job.blocked_reason or "")
 
 
 @pytest.mark.asyncio
@@ -2249,6 +2333,37 @@ def test_should_seed_blocks_foreign_compiler_stacks():
     ) == {"doctest"}
 
 
+def test_should_seed_blocks_base_system_packages():
+    from oreon_build.services.dep_plan.providers import should_seed_providers
+
+    # gcc and make are base system build tools — never seed them from source
+    assert not should_seed_providers("kf6-kauth", "gcc", {"gcc"})
+    assert not should_seed_providers("kf6-kauth", "gcc-c++", {"gcc"})
+    assert not should_seed_providers("foo", "make", {"make"})
+    assert not should_seed_providers("foo", "binutils", {"binutils"})
+    # versioned base system reqs too
+    assert not should_seed_providers("foo", "gcc >= 13", {"gcc"})
+    # a non-base-system consumer that only has a base-system provider is blocked
+    assert not should_seed_providers("my-app", "gcc-c++", {"gcc"})
+    # but if there are non-base providers mixed in, still seed
+    assert should_seed_providers("my-app", "cmake", {"cmake", "gcc"})
+    # roots that ARE base system packages can still seed (e.g. building gcc itself)
+    assert should_seed_providers("gcc", "gcc-c++", {"gcc"})
+
+
+def test_is_base_system_package():
+    from oreon_build.services.dep_plan.providers import is_base_system_package
+
+    assert is_base_system_package("gcc")
+    assert is_base_system_package("gcc-c++")
+    assert is_base_system_package("make")
+    assert is_base_system_package("binutils")
+    assert is_base_system_package("bash")
+    assert not is_base_system_package("kf6-kauth")
+    assert not is_base_system_package("extra-cmake-modules")
+    assert not is_base_system_package("")
+
+
 def test_provider_sources_for_miss_filters_mingw():
     from oreon_build.services.layer_engine import _provider_sources_for_miss
 
@@ -2315,6 +2430,9 @@ async def test_autofix_spawns_provider_not_in_layer():
         async def flush(self):
             return None
 
+        async def delete(self, obj):
+            return None
+
         def add(self, obj):
             return None
 
@@ -2348,37 +2466,17 @@ async def test_autofix_spawns_provider_not_in_layer():
             "oreon_build.services.layer_engine._planned_source_names",
             new=AsyncMock(return_value={"plasma-workspace"}),
         ),
-        patch(
-            "oreon_build.services.layer_engine._spawn_layer_dep_sources",
-            new=AsyncMock(return_value={"cln"}),
-        ) as spawn,
-        patch(
-            "oreon_build.services.layer_engine._source_statuses_in_plan",
-            new=AsyncMock(return_value={"cln": [BuildStatus.QUEUED]}),
-        ),
-        patch(
-            "oreon_build.services.layer_engine.resolve_layer_blocker_cycles",
-            new=AsyncMock(return_value=0),
-        ),
-        patch(
-            "oreon_build.services.layer_engine._revive_upstream_cancelled_dependents",
-            new=AsyncMock(return_value=0),
-        ),
     ):
         handled = await try_autofix_layer_missing_provides(
             _DB(),
             job,
-            "nothing provides cln-devel needed by libqalculate-devel",
+            "nothing provides requested cln-devel",
             package_name="plasma-workspace",
         )
 
-    assert handled is True
-    assert job.status == BuildStatus.BLOCKED
-    assert "cln" in (job.blocked_reason or "")
-    spawn.assert_awaited_once()
-    assert spawn.await_args.kwargs.get("arches") == ["x86_64"]
-    assert spawn.await_args.kwargs.get("sources") == {"cln"}
-    assert spawn.await_args.kwargs.get("force_build") is False
+    assert handled is False
+    assert job.status == BuildStatus.FAILED
+    assert "not provided by an active layer package" in (job.blocked_reason or "")
 
 
 def test_soft_retryable_blocker_reason_ignores_mock_logs():
