@@ -12,7 +12,7 @@ from oreon_build.api.schemas import (
 )
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
 from oreon_build.core.repo_branch import r2_publish_branch, release_distgit_branch
-from oreon_build.models import Release, ReleaseChannel, ReleaseRepo
+from oreon_build.models import BuildJob, Release, ReleaseChannel, ReleaseRepo
 
 router = APIRouter(prefix="/releases", tags=["releases"])
 
@@ -41,11 +41,16 @@ async def list_releases(
     db: DbSession,
     limit: int = Query(25, ge=1, le=1000),
     offset: int = Query(0, ge=0),
+    active_only: bool = Query(False),
 ):
-    total = (await db.execute(select(func.count()).select_from(Release))).scalar() or 0
+    count_stmt = select(func.count()).select_from(Release)
+    releases_stmt = select(Release).options(selectinload(Release.base_repos))
+    if active_only:
+        count_stmt = count_stmt.where(Release.is_active.is_(True))
+        releases_stmt = releases_stmt.where(Release.is_active.is_(True))
+    total = (await db.execute(count_stmt)).scalar() or 0
     result = await db.execute(
-        select(Release)
-        .options(selectinload(Release.base_repos))
+        releases_stmt
         .order_by(Release.releasename)
         .limit(limit)
         .offset(offset)
@@ -183,6 +188,17 @@ async def delete_release(
     release = result.scalar_one_or_none()
     if not release:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Release not found")
+    build_count = await db.scalar(
+        select(func.count(BuildJob.id)).where(BuildJob.release_id == release_id)
+    )
+    if int(build_count or 0) > 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Release {release.releasename!r} cannot be deleted because it has "
+                f"{int(build_count)} build job(s). Archive or deactivate the release instead."
+            ),
+        )
     await db.delete(release)
     await log_audit(
         db,
