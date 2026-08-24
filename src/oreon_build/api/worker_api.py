@@ -384,7 +384,7 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
             (BuildJob.package_id.is_(None)) | (~func.lower(Package.name).in_(all_burst_names))
         )
 
-    q = q.limit(32)
+    q = q.limit(1).with_for_update(of=BuildJob, skip_locked=True)
     result = await db.execute(q)
     candidates = list(result.scalars().all())
     job = None
