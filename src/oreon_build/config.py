@@ -152,6 +152,8 @@ class Settings(BaseSettings):
     r2_bucket_name: str = Field(default="oreon-repos")
     r2_endpoint_url: str = Field(default="")
     r2_public_url: Optional[str] = Field(default=None)
+    cloudflare_zone_id: Optional[str] = Field(default=None)
+    cloudflare_api_token: Optional[str] = Field(default=None)
     oreon_repo_tmpdir: Optional[str] = Field(
         default=None,
         description=(
