@@ -30,6 +30,7 @@ _RE_WITHOUT_SPACE = re.compile(r"%\{?\??without\s+([A-Za-z0-9_]+)\}?", re.IGNORE
 _RE_WITH_US = re.compile(r"%\{?\??with_([A-Za-z0-9_]+)\}?", re.IGNORECASE)
 _RE_WITHOUT_US = re.compile(r"%\{?\??without_([A-Za-z0-9_]+)\}?", re.IGNORECASE)
 _RE_DEFINED = re.compile(r"%\{defined\s+([A-Za-z0-9_]+)\}", re.IGNORECASE)
+_RE_UNDEFINED = re.compile(r"%\{undefined\s+([A-Za-z0-9_]+)\}", re.IGNORECASE)
 _RE_PY_DIST = re.compile(r"%\{(py\d*_?dist|python3_dist)\s+([^}]+)\}", re.IGNORECASE)
 # rpm %{?name} / %{?name:body} / %{!?name:body}  (do before bare %{name})
 # body may nest %{...}; matched by _expand_conditional_macros brace scan
@@ -82,13 +83,20 @@ def _expand_py_dist_macros(value: str) -> str:
 def _expand_defined_macros(
     text: str, macros: dict[str, str], bconds: dict[str, int]
 ) -> str:
-    def repl(m: re.Match[str]) -> str:
+    def repl_defined(m: re.Match[str]) -> str:
         name = (m.group(1) or "").strip()
         if name in macros or name in bconds:
             return "1"
         return "0"
 
-    return _RE_DEFINED.sub(repl, text or "")
+    def repl_undefined(m: re.Match[str]) -> str:
+        name = (m.group(1) or "").strip()
+        if name in macros or name in bconds:
+            return "0"
+        return "1"
+
+    out = _RE_DEFINED.sub(repl_defined, text or "")
+    return _RE_UNDEFINED.sub(repl_undefined, out)
 
 
 def _macro_is_defined(name: str, macros: dict[str, str], bconds: dict[str, int]) -> bool:
@@ -321,6 +329,7 @@ def _expand_macro_value(raw: str, macros: dict[str, str], bconds: dict[str, int]
         if text == prev:
             break
         prev = text
+        text = _expand_defined_macros(text, macros, bconds)
         text = _expand_conditional_macros(text, macros, bconds)
         text = _RE_WITHOUT_US.sub(lambda m: _macro_value(f"without_{m.group(1)}", macros, bconds), text)
         text = _RE_WITH_US.sub(lambda m: _macro_value(f"with_{m.group(1)}", macros, bconds), text)
