@@ -526,6 +526,14 @@ def _parse_spec_text(
     )
 
 
+def _spec_uses_dynamic_buildrequires(spec_text: str) -> bool:
+    from oreon_build.services.dynamic_brs import (
+        spec_has_generate_buildrequires,
+        spec_uses_cargo_generate_buildrequires,
+    )
+    return spec_has_generate_buildrequires(spec_text) or spec_uses_cargo_generate_buildrequires(spec_text)
+
+
 def _provider_map_from_specs(parsed_by_source: dict[str, _SpecParseResult]) -> dict[str, set[str]]:
     provider_map: dict[str, set[str]] = {}
     for src, p in parsed_by_source.items():
@@ -1494,6 +1502,7 @@ def _enrich_one_spec_brs(
     distro_macros: dict[str, str] | None,
     run_generate: bool,
     local_source_paths: list[Path] | None = None,
+    defines_extra: dict[str, str] | None = None,
 ) -> _SpecParseResult:
     """Merge rpmspec / rpmbuild -br BRs into the parse result."""
     from oreon_build.core.spec_bcond import default_build_defines, parse_spec_bconds
@@ -1505,8 +1514,14 @@ def _enrich_one_spec_brs(
     )
 
     bcond = parse_spec_bconds(spec_text, distro_macros=distro_macros)
-    defines = default_build_defines(bcond)
-    has_gen = parsed.has_generate_buildrequires or spec_has_generate_buildrequires(spec_text)
+    defines = {**default_build_defines(bcond), **(defines_extra or {})}
+    from oreon_build.services.dynamic_brs import spec_uses_cargo_generate_buildrequires
+
+    has_gen = (
+        parsed.has_generate_buildrequires
+        or spec_has_generate_buildrequires(spec_text)
+        or spec_uses_cargo_generate_buildrequires(spec_text)
+    )
     try:
         if run_generate and has_gen:
             dyn = evaluate_generate_buildrequires(
@@ -1636,6 +1651,7 @@ async def enrich_specs_buildrequires_with_rpm(
     repo: str | None = None,
     distgit_branch: str | None = None,
     headers: dict[str, str] | None = None,
+    defines_by_package: dict[str, dict[str, str]] | None = None,
 ) -> None:
     """In-place: set rpm_build_requires via rpmspec / rpmbuild -br for scoped pkgs.
 
@@ -1693,6 +1709,7 @@ async def enrich_specs_buildrequires_with_rpm(
             distro_macros=macros,
             run_generate=run_gen,
             local_source_paths=local_by_pkg.get(pkg),
+            defines_extra=(defines_by_package or {}).get(pkg),
         ): pkg
         for pkg, text, parsed, run_gen in jobs
     }
@@ -1811,7 +1828,7 @@ async def expand_chain_spec_closure_sparse(
                 generate_packages={
                     pkg
                     for pkg in batch_specs
-                    if getattr(parsed_by_source.get(pkg), "has_generate_buildrequires", False)
+                    if _spec_uses_dynamic_buildrequires(batch_specs[pkg])
                 },
                 owner=owner,
                 repo=repo,

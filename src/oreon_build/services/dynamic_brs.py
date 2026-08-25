@@ -31,6 +31,7 @@ _RE_CARGO_SPEC = re.compile(
 )
 _CACHE: dict[str, tuple[float, list[str], bool]] = {}
 _CACHE_TTL = 1800.0
+_DYNAMIC_BR_EVAL_VERSION = "3"
 
 
 def _scratch_base_dir() -> str | None:
@@ -380,8 +381,11 @@ def _extract_cargo_toml_from_tarball(data: bytes, dest_dir: Path) -> Path | None
         return None
 
 
-def _cargo2rpm_buildrequires(manifest: Path) -> list[str] | None:
-    proc = _run(["cargo2rpm", "--path", str(manifest), "buildrequires"], timeout=30)
+def _cargo2rpm_buildrequires(manifest: Path, *, with_check: bool = False) -> list[str] | None:
+    cmd = ["cargo2rpm", "--path", str(manifest), "buildrequires"]
+    if with_check:
+        cmd.append("--with-check")
+    proc = _run(cmd, timeout=30)
     if proc.returncode != 0:
         return None
     out: list[str] = []
@@ -395,6 +399,20 @@ def _cargo2rpm_buildrequires(manifest: Path) -> list[str] | None:
     return out
 
 
+def _cargo_generator_flags(spec_text: str) -> str:
+    """Raw text of the %cargo_generate_buildrequires invocation line.
+
+    Upstream macro passes extra flags straight to cargo2rpm. A bare call is
+    safe to mirror with cargo2rpm directly, anything carrying args is not.
+    """
+    m = re.search(
+        r"^[ \t]*%cargo_generate_buildrequires([ \t]+\S.*)?$",
+        (spec_text or ""),
+        re.IGNORECASE | re.MULTILINE,
+    )
+    return (m.group(1) or "").strip() if m else ""
+
+
 def _evaluate_cargo_buildrequires_fast(
     spec_text: str,
     *,
@@ -402,7 +420,20 @@ def _evaluate_cargo_buildrequires_fast(
     local_source_paths: list[Path] | None,
     target_arches: set[str] | None,
 ) -> DynBrResult | None:
+    from oreon_build.core.spec_bcond import parse_spec_bconds
     from oreon_build.services.cargo_target_brs import filter_foreign_target_crate_brs
+
+    if _cargo_generator_flags(spec_text):
+        return None
+
+    raw_check = str((defines or {}).get("with_check", "")).strip()
+    if not raw_check:
+        bcond = parse_spec_bconds(spec_text)
+        raw_check = str(bcond.defaults.get("with_check", "0"))
+    try:
+        with_check = int(raw_check or "0") > 0
+    except ValueError:
+        with_check = False
 
     url = _parse_source0_url(spec_text, defines)
     data: bytes | None = None
@@ -428,7 +459,7 @@ def _evaluate_cargo_buildrequires_fast(
         manifest = _extract_cargo_toml_from_tarball(data, Path(td))
         if manifest is None:
             return None
-        brs = _cargo2rpm_buildrequires(manifest)
+        brs = _cargo2rpm_buildrequires(manifest, with_check=with_check)
         if brs is None:
             return None
         brs = filter_foreign_target_crate_brs(
@@ -460,13 +491,14 @@ def evaluate_generate_buildrequires(
         find_cargo_tomls,
     )
 
-    if not spec_has_generate_buildrequires(spec_text):
+    has_dynamic = spec_has_generate_buildrequires(spec_text) or spec_uses_cargo_generate_buildrequires(spec_text)
+    if not has_dynamic:
         brs = rpmspec_query_buildrequires(spec_text, defines=defines)
         return DynBrResult(buildrequires=brs, complete=True)
 
     locals_ = [str(p) for p in (local_source_paths or []) if p and Path(p).is_file()]
     arch_key = ",".join(sorted((target_arches or set()) or {"x86_64"}))
-    key = _cache_key(spec_text, {**(defines or {}), "__arches__": arch_key}, locals_)
+    key = _cache_key(spec_text, {**(defines or {}), "__arches__": arch_key, "__v__": _DYNAMIC_BR_EVAL_VERSION}, locals_)
     now = time.monotonic()
     hit = _CACHE.get(key)
     if hit and now - hit[0] < _CACHE_TTL:
