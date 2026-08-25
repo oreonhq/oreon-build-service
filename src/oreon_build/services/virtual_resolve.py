@@ -546,20 +546,22 @@ def crate_to_sources(cap: str, package_names: set[str], provider_map: dict) -> s
     if not crate or "%" in crate:
         return set()
     known = package_names or set()
-    out = _pmap_sources(
-        provider_map,
-        f"crate({crate})",
-        f"crate({crate}/default)",
-        cap,
-    )
-    current = f"rust-{crate}"
-    out |= _hit(known, current)
-    if current in known:
-        return {s for s in out if s} | {current}
+    crate_forms = {crate, crate.replace("_", "-"), crate.replace("-", "_")}
+    out = set()
+    for form in crate_forms:
+        out |= _pmap_sources(
+            provider_map,
+            f"crate({form})",
+            f"crate({form}/default)",
+            cap,
+        )
+        out |= _hit(known, f"rust-{form}")
+    want = crate.replace("-", "_").lower()
     for pkg in known:
-        if not pkg.startswith("rust-"):
+        if not str(pkg).startswith("rust-"):
             continue
-        if _rust_crate_name_from_package(pkg) == crate:
+        extracted = _rust_crate_name_from_package(pkg)
+        if extracted and extracted.replace("-", "_").lower() == want:
             out.add(pkg)
     return {s for s in out if s}
 
@@ -735,8 +737,28 @@ def distgit_sources_for_virtual_cap(
             out |= golang_path_to_sources(primary, pmap)
             out |= crate_to_sources(primary, known, pmap)
             out |= subpkg_to_sources(primary, known, pmap)
+            out |= python_rpm_to_sources(primary, known)
             out |= path_or_binary_to_sources(primary, known, pmap)
     return {s for s in out if s}
+
+
+def python_rpm_to_sources(cap: str, package_names: set[str]) -> set[str]:
+    """python3-foo binary vs python-foo distgit source, same package."""
+    p = (cap or "").strip()
+    if not p or "(" in p or p.startswith("/"):
+        return set()
+    known = package_names or set()
+    if p in known:
+        return {p}
+    if p.startswith("python3-"):
+        alt = "python-" + p[8:]
+        if alt in known:
+            return {alt}
+    elif p.startswith("python-"):
+        alt = "python3-" + p[7:]
+        if alt in known:
+            return {alt}
+    return set()
 
 
 def golang_import_suggestion(cap: str) -> str | None:

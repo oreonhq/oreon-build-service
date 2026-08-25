@@ -437,26 +437,6 @@ async def maybe_settle_layer_plan(db: Any, layer_plan_id: int) -> None:
         return
 
     open_states = (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.BLOCKED, BuildStatus.RUNNING)
-    active_states = (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.RUNNING)
-    running_count = sum(1 for job in jobs if job.status == BuildStatus.RUNNING)
-    queued_count = sum(1 for job in jobs if job.status == BuildStatus.QUEUED)
-    blocked_count = sum(1 for job in jobs if job.status == BuildStatus.BLOCKED)
-    pending_count = sum(1 for job in jobs if job.status == BuildStatus.PENDING)
-
-    if pending_count == 0 and running_count == 0 and queued_count == 0 and blocked_count > 0:
-        blocked_names = sorted({
-            job.package.name if job.package else f"job-{job.id}"
-            for job in jobs
-            if job.status == BuildStatus.BLOCKED
-        })
-        plan.status = LayerPlanStatus.FAILED
-        plan.error_message = (
-            "Layer deadlocked: no queued or running jobs remain and blocked dependencies "
-            "cannot be resolved"
-            + (" (" + ", ".join(blocked_names[:8]) + ")" if blocked_names else "")
-        )[:8000]
-        notify_layer_plan_terminal(plan.id, LayerPlanStatus.FAILED.value, plan.error_message)
-        return
 
     if any(j.status in open_states for j in jobs):
         if plan.status == LayerPlanStatus.PENDING and any(
