@@ -1749,7 +1749,11 @@ async def report_result(
 
     # schedule_next_pass swaps the profile and clears the bootstrap defines. Only
     # flipping status here would rerun the same pass with tests still off forever.
-    queued_next_pass = terminal_st == "success" and schedule_next_pass_after_publish(job)
+    queued_next_pass = (
+        terminal_st == "success"
+        and job.layer_plan_id is None
+        and schedule_next_pass_after_publish(job)
+    )
     if not queued_next_pass:
         job.status = BuildStatus(terminal_st)
         job.completed_at = attempt.finished_at
