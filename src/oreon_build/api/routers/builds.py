@@ -5,7 +5,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Query, Request, Upload
 from fastapi.responses import JSONResponse
 
 from oreon_build.utils.spec import name_from_srpm_filename, parse_spec_content
-from sqlalchemy import String, cast, func, or_, select
+from sqlalchemy import String, cast, func, inspect as sa_inspect, or_, select
 from sqlalchemy.orm import selectinload
 
 from oreon_build.api.deps import CurrentAdmin, CurrentUser, DbSession
@@ -200,7 +200,12 @@ async def list_builds(
     limit: int = Query(25, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ):
-    q = select(BuildJob).options(selectinload(BuildJob.build_target)).order_by(BuildJob.created_at.desc())
+    q = select(BuildJob).options(
+        selectinload(BuildJob.build_target),
+        selectinload(BuildJob.package),
+        selectinload(BuildJob.release),
+        selectinload(BuildJob.side_tag),
+    ).order_by(BuildJob.created_at.desc())
     count_q = select(func.count()).select_from(BuildJob)
     search_trim = (search or "").strip()
     if search_trim:
@@ -529,7 +534,6 @@ async def list_layer_plans(
 
 
 async def _layer_plan_to_status_response(db: DbSession, plan) -> LayerPlanStatusResponse:
-    await db.refresh(plan)
     rel = await db.get(Release, plan.release_id)
     from oreon_build.models import SideTag
     from sqlalchemy import func
@@ -888,15 +892,28 @@ async def _job_to_response(
             .limit(1)
         )
         latest = r.scalar_one_or_none()
+    insp = sa_inspect(job)
     arch = None
-    if job.target_id:
+    if "build_target" not in insp.unloaded and job.build_target is not None:
+        arch = job.build_target.architecture
+    elif job.target_id:
         r = await db.execute(select(BuildTarget.architecture).where(BuildTarget.id == job.target_id))
         arch = r.scalars().one_or_none()
-    package_name = await db.scalar(select(Package.name).where(Package.id == job.package_id))
-    release_name = await db.scalar(select(Release.releasename).where(Release.id == job.release_id))
+    package_name = None
+    if "package" not in insp.unloaded and job.package is not None:
+        package_name = job.package.name
+    if not package_name:
+        package_name = await db.scalar(select(Package.name).where(Package.id == job.package_id))
+    release_name = None
+    if "release" not in insp.unloaded and job.release is not None:
+        release_name = job.release.releasename
+    if not release_name:
+        release_name = await db.scalar(select(Release.releasename).where(Release.id == job.release_id))
     side_tag_name = None
     st_id = getattr(job, "side_tag_id", None)
-    if st_id:
+    if "side_tag" not in insp.unloaded and job.side_tag is not None:
+        side_tag_name = job.side_tag.name
+    if st_id and not side_tag_name:
         from oreon_build.models import SideTag
 
         side_tag_name = await db.scalar(select(SideTag.name).where(SideTag.id == st_id))
