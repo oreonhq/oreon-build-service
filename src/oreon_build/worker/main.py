@@ -1204,6 +1204,22 @@ def _mock_rpmbuild_define_args(rpmbuild_defines: dict | None) -> list[str]:
             continue
         v = str(rpmbuild_defines.get(key) or "").strip()
         bcond = _bcond_define(k, v)
+        if k.startswith("with_"):
+            feature = k[5:]
+            if feature:
+                low = v.lower()
+                if low in {"0", "no", "false", "off"}:
+                    out += [f"--without={feature}"]
+                elif low in {"1", "yes", "true", "on"}:
+                    out += [f"--with={feature}"]
+        elif k.startswith("without_"):
+            feature = k[8:]
+            if feature:
+                low = v.lower()
+                if low in {"1", "yes", "true", "on"}:
+                    out += [f"--without={feature}"]
+                elif low in {"0", "no", "false", "off"}:
+                    out += [f"--with={feature}"]
         out += ["--define", bcond or f"{k} {v}"]
     return out
 
