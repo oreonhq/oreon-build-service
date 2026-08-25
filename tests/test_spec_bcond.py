@@ -57,7 +57,25 @@ BuildRequires: python3-devel
     assert "scancode-toolkit" in fbrs
 
 
-def test_parse_modern_bcond_expr_default() -> None:
+def test_undefined_rhel_keeps_oreon_bcond_on() -> None:
+    spec = """
+%bcond bench %[%{undefined rhel} || 0%{?rhel} < 11]
+%if %{with bench}
+BuildRequires: python3-matplotlib
+%endif
+BuildRequires: cmake
+"""
+    oreon = parse_spec_bconds(spec, distro_macros=default_distro_macros("oreon-11-rp1"))
+    assert oreon.defaults.get("with_bench") == 1
+    obrs = active_build_brs(oreon, default_build_defines(oreon))
+    assert "python3-matplotlib" in obrs
+    assert "cmake" in obrs
+
+    el11 = parse_spec_bconds(spec, distro_macros={"rhel": "11"})
+    assert el11.defaults.get("with_bench") == 0
+    ebrs = active_build_brs(el11, default_build_defines(el11))
+    assert "python3-matplotlib" not in ebrs
+    assert "cmake" in ebrs
     spec = """
 %bcond scancode 1
 %bcond scancode_tests %[ %{with scancode} && 1 ]

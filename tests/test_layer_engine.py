@@ -67,3 +67,103 @@ def test_missing_provides_ignores_unrelated_dnf_messages():
 
 def test_build_status_values_are_terminally_distinct():
     assert BuildStatus.BLOCKED != BuildStatus.QUEUED
+
+
+def test_manifest_requirements_honor_with_check():
+    from types import SimpleNamespace
+
+    from oreon_build.services.layer_engine import _manifest_build_requirements
+
+    spec = """
+Name: demo
+Version: 1
+Release: 1
+Summary: x
+License: MIT
+%bcond check 1
+BuildRequires: gcc
+%if %{with check}
+BuildRequires: python3dist(tox-current-env)
+%endif
+%description
+x
+%prep
+%build
+%install
+%files
+"""
+    parsed = SimpleNamespace(rpm_build_requires=None, build_requires=["gcc"], build_requires_raw=["gcc"])
+    full = _manifest_build_requirements(spec, parsed, architecture="x86_64")
+    boot = _manifest_build_requirements(
+        spec, parsed, architecture="x86_64", defines={"with_check": "0"}
+    )
+    assert any("gcc" in item for item in full)
+    assert any("tox-current-env" in item for item in full)
+    assert any("gcc" in item for item in boot)
+    assert not any("tox-current-env" in item for item in boot)
+
+
+def test_bootstrap_keeps_generated_crate_buildrequires():
+    from types import SimpleNamespace
+
+    from oreon_build.services.layer_engine import _manifest_build_requirements
+
+    spec = """
+Name: rust-rand0.8
+Version: 0.8.5
+Release: 1
+Summary: x
+License: MIT
+BuildRequires: rust
+BuildRequires: cargo-rpm-macros
+%description
+x
+"""
+    parsed = SimpleNamespace(
+        rpm_build_requires=["rust", "cargo-rpm-macros", "crate(rand_chacha) >= 0.3 with crate(rand_chacha) < 0.4~"],
+        build_requires=["rust", "cargo-rpm-macros"],
+        build_requires_raw=["rust", "cargo-rpm-macros"],
+    )
+    boot = _manifest_build_requirements(
+        spec, parsed, architecture="x86_64", defines={"with_check": "0"}
+    )
+    assert any("crate(rand_chacha)" in item for item in boot)
+
+
+def test_python3_binary_maps_to_python_source():
+    sources = _layer_sources_for_requirement(
+        "python3-matplotlib",
+        {},
+        {"blosc", "python-matplotlib"},
+    )
+    assert "python-matplotlib" in sources
+
+
+def test_crate_maps_to_compat_rust_source():
+    sources = _layer_sources_for_requirement(
+        "crate(rand_chacha)",
+        {},
+        {"rust-rand0.8", "rust-rand_chacha0.3"},
+    )
+    assert "rust-rand_chacha0.3" in sources
+    assert "rust-rand0.8" not in sources
+
+
+def test_crate_does_not_attach_longer_crate_name():
+    sources = _layer_sources_for_requirement(
+        "crate(toml)",
+        {},
+        {"rust-toml", "rust-toml_edit", "rust-toml_edit0.19"},
+    )
+    assert "rust-toml" in sources
+    assert "rust-toml_edit" not in sources
+    assert "rust-toml_edit0.19" not in sources
+
+
+def test_python3dist_maps_to_python_source():
+    sources = _layer_sources_for_requirement(
+        "python3dist(matplotlib)",
+        {},
+        {"blosc", "python-matplotlib"},
+    )
+    assert "python-matplotlib" in sources

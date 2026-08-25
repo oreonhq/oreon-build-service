@@ -153,6 +153,11 @@ def test_python_and_golang_do_not_collapse_to_runtime() -> None:
     assert distgit_sources_for_virtual_cap(
         "python3dist(requests)", package_names=known, provider_map={}
     ) == {"python-requests"}
+    assert distgit_sources_for_virtual_cap(
+        "python3-matplotlib",
+        package_names={"blosc", "python-matplotlib"},
+        provider_map={},
+    ) == {"python-matplotlib"}
     assert "python3" not in distgit_sources_for_virtual_cap(
         "python3dist(missingpkg)", package_names=known, provider_map={}
     )
