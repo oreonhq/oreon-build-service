@@ -799,6 +799,9 @@ async def _expand_missing_provider(
     return new_jobs
 
 
+_LAYER_JOB_WRITABLE = (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.BLOCKED)
+
+
 async def _update_layer_job_if_active(
     db: Any,
     job_id: int,
@@ -832,6 +835,7 @@ async def _update_layer_job_if_active(
         .where(
             BuildJob.id == int(job_id),
             BuildJob.layer_plan_id == int(plan_id),
+            BuildJob.status.in_(_LAYER_JOB_WRITABLE),
             exists(
                 select(1).where(
                     LayerPlan.id == int(plan_id),
@@ -1372,23 +1376,6 @@ async def _evaluate_layer_buildability(
         changed.extend(await _evaluate_layer_buildability(db, int(plan.id)))
     if expanded:
         changed.extend(await _evaluate_layer_buildability(db, int(plan.id)))
-    if not expanded and not failure_cascaded:
-        final_rows = await db.execute(
-            select(BuildJob.status).where(BuildJob.layer_plan_id == plan.id)
-        )
-        final_statuses = [status for (status,) in final_rows.all()]
-        active_count = sum(
-            status in (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.RUNNING)
-            for status in final_statuses
-        )
-        failed_count = sum(status == BuildStatus.FAILED for status in final_statuses)
-        blocked_count = sum(status == BuildStatus.BLOCKED for status in final_statuses)
-        if active_count == 0 and blocked_count == 0 and failed_count > 0:
-            plan.status = LayerPlanStatus.FAILED
-            plan.error_message = (
-                "Layer failed: upstream package failure left no active jobs"
-            )
-            await db.flush()
     return changed
 
 
@@ -1405,12 +1392,16 @@ async def evaluate_layer_buildability(
         lock = asyncio.Lock()
         _REACTIVE_PLAN_LOCKS[plan_id] = lock
     async with lock:
-        return await _evaluate_layer_buildability(
+        changed = await _evaluate_layer_buildability(
             db,
             plan_id,
             source_name=source_name,
             published_architecture=published_architecture,
         )
+        from oreon_build.services.layer_plan import maybe_settle_layer_plan
+
+        await maybe_settle_layer_plan(db, plan_id)
+        return changed
 
 
 
@@ -1509,7 +1500,31 @@ async def on_package_published(
 
 
 async def reconcile_settled_layer_plans() -> None:
-    return
+    from oreon_build.db.session import async_session_maker
+    from sqlalchemy import func
+
+    async with async_session_maker() as db:
+        rows = await db.execute(
+            select(LayerPlan.id).where(
+                LayerPlan.status.in_((LayerPlanStatus.PENDING, LayerPlanStatus.RUNNING))
+            )
+        )
+        plan_ids = [int(plan_id) for (plan_id,) in rows.all()]
+        for plan_id in plan_ids:
+            inflight = await db.scalar(
+                select(func.count())
+                .select_from(BuildJob)
+                .where(
+                    BuildJob.layer_plan_id == plan_id,
+                    BuildJob.status.in_(
+                        (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.RUNNING)
+                    ),
+                )
+            )
+            if int(inflight or 0) > 0:
+                continue
+            await evaluate_layer_buildability(db, plan_id)
+        await db.commit()
 
 
 async def reconcile_stuck_layer_blockers() -> None:

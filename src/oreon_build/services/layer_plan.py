@@ -210,6 +210,54 @@ def _job_build_terminal_ok(status_: BuildStatus) -> bool:
     return status_ in (BuildStatus.SUCCESS, BuildStatus.SKIPPED)
 
 
+_IN_FLIGHT_STATUSES = (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.RUNNING)
+
+
+def layer_plan_settlement(
+    jobs: list[Any],
+) -> tuple[LayerPlanStatus | None, str | None]:
+    """How a plan should look once nothing is in flight.
+
+    Blocked jobs are waiters, not work. If nothing is queued or running,
+    the layer cannot move and the plan must stop. Waiters stay blocked.
+    """
+    if not jobs:
+        return None, None
+    if any(j.status in _IN_FLIGHT_STATUSES for j in jobs):
+        return None, None
+    n_ok = sum(1 for j in jobs if _job_build_terminal_ok(j.status))
+    n_fail = sum(1 for j in jobs if j.status == BuildStatus.FAILED)
+    n_cancel = sum(1 for j in jobs if j.status == BuildStatus.CANCELLED)
+    n_block = sum(1 for j in jobs if j.status == BuildStatus.BLOCKED)
+    if n_block == 0 and n_fail == 0 and n_cancel == 0:
+        return LayerPlanStatus.SUCCESS, None
+    primary: list[str] = []
+    seen: set[str] = set()
+    for j in jobs:
+        if j.status != BuildStatus.FAILED:
+            continue
+        name = j.package.name if getattr(j, "package", None) else f"job-{j.id}"
+        if name in seen:
+            continue
+        reason = (getattr(j, "blocked_reason", None) or "").strip()
+        if reason.startswith("upstream ") or reason.startswith("Layer plan stopped:"):
+            continue
+        if reason.startswith("deadlock:") or reason.startswith("cycle "):
+            continue
+        if reason.startswith("waiting on:") or reason.startswith("waiting on "):
+            continue
+        seen.add(name)
+        primary.append(name)
+    bits = [f"{n_ok} success", f"{n_fail} failed", f"{n_block} blocked", f"{n_cancel} cancelled"]
+    if n_block > 0:
+        msg = "Layer stalled with no queued or running jobs (" + ", ".join(bits) + ")."
+    else:
+        msg = "Layer finished with failures (" + ", ".join(bits) + ")."
+    if primary:
+        msg += " Primary: " + ", ".join(primary)
+    return LayerPlanStatus.FAILED, msg
+
+
 async def _stop_job_and_running_attempts(
     db: Any,
     job: BuildJob,
@@ -308,6 +356,9 @@ async def on_build_job_failed_for_layer(
     job.blocked_reason = None
     job.error_message = (reason or "Build failed")[:8000]
     await db.flush()
+    from oreon_build.services.layer_engine import evaluate_layer_buildability
+
+    await evaluate_layer_buildability(db, int(plan.id))
     await maybe_settle_layer_plan(db, int(plan.id))
 
 
@@ -400,10 +451,11 @@ async def resume_layer_plan_by_user(
     )
     jobs = list(jobs_r.scalars().all())
     reopen = [j for j in jobs if j.status in (BuildStatus.FAILED, BuildStatus.CANCELLED)]
-    if not reopen:
+    blocked_left = [j for j in jobs if j.status == BuildStatus.BLOCKED]
+    if not reopen and not blocked_left:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Nothing left to resume (no failed/cancelled jobs)",
+            detail="Nothing left to resume (no failed/cancelled/blocked jobs)",
         )
     for job in reopen:
         job.status = BuildStatus.BLOCKED
@@ -416,7 +468,7 @@ async def resume_layer_plan_by_user(
     await db.flush()
     await log_audit(
         db, "build.layer_resume", account_id=user.id, resource_type="layer_plan",
-        resource_id=str(plan.id), details=f"reopened {len(reopen)} job(s)",
+        resource_id=str(plan.id), details=f"reopened {len(reopen)} job(s), {len(blocked_left)} still blocked",
         ip_address=get_client_ip(request), user_agent=get_user_agent(request),
     )
     return plan, [int(j.id) for j in reopen]
@@ -436,47 +488,18 @@ async def maybe_settle_layer_plan(db: Any, layer_plan_id: int) -> None:
     if not jobs:
         return
 
-    open_states = (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.BLOCKED, BuildStatus.RUNNING)
-
-    if any(j.status in open_states for j in jobs):
+    if any(j.status in _IN_FLIGHT_STATUSES for j in jobs):
         if plan.status == LayerPlanStatus.PENDING and any(
             j.status not in (BuildStatus.PENDING, BuildStatus.BLOCKED) for j in jobs
         ):
             plan.status = LayerPlanStatus.RUNNING
         return
-    if all(_job_build_terminal_ok(j.status) for j in jobs):
-        plan.status = LayerPlanStatus.SUCCESS
-        plan.error_message = None
-        notify_layer_plan_terminal(plan.id, LayerPlanStatus.SUCCESS.value, None)
+    terminal, message = layer_plan_settlement(jobs)
+    if terminal is None:
         return
-
-    n_ok = sum(1 for j in jobs if _job_build_terminal_ok(j.status))
-    n_fail = sum(1 for j in jobs if j.status == BuildStatus.FAILED)
-    n_cancel = sum(1 for j in jobs if j.status == BuildStatus.CANCELLED)
-    primary: list[str] = []
-    seen: set[str] = set()
-    for j in jobs:
-        if j.status != BuildStatus.FAILED:
-            continue
-        name = j.package.name if j.package else f"job-{j.id}"
-        if name in seen:
-            continue
-        reason = (j.blocked_reason or "").strip()
-        if reason.startswith("upstream ") or reason.startswith("Layer plan stopped:"):
-            continue
-        if reason.startswith("deadlock:") or reason.startswith("cycle "):
-            continue
-        if reason.startswith("waiting on:"):
-            continue
-        seen.add(name)
-        primary.append(name)
-    bits = [f"{n_ok} success", f"{n_fail} failed", f"{n_cancel} cancelled"]
-    msg = "Layer finished with failures (" + ", ".join(bits) + ")."
-    if primary:
-        msg += " Primary: " + ", ".join(primary)
-    plan.status = LayerPlanStatus.FAILED
-    plan.error_message = msg
-    notify_layer_plan_terminal(plan.id, LayerPlanStatus.FAILED.value, plan.error_message)
+    plan.status = terminal
+    plan.error_message = message
+    notify_layer_plan_terminal(plan.id, terminal.value, plan.error_message)
 
 
 async def list_interrupted_layer_planning(db: Any) -> list[int]:
