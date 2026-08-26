@@ -16,7 +16,8 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Body, Depends, File, Header, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
 from pydantic import BaseModel
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import delete, exists, func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from oreon_build.api.deps import DbSession
@@ -331,6 +332,12 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
                 BuildJob.status == BuildStatus.QUEUED,
             ),
             BuildJob.status.in_([BuildStatus.PENDING, BuildStatus.QUEUED]),
+            ~exists(
+                select(1).where(
+                    BuildAttempt.build_job_id == BuildJob.id,
+                    BuildAttempt.status == BuildStatus.RUNNING,
+                )
+            ),
         )
         .order_by(BuildJob.priority.desc(), BuildJob.created_at.asc())
     )
@@ -406,6 +413,14 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
             break
     if not job:
         return {"job": None}
+    already_running = await db.scalar(
+        select(BuildAttempt.id).where(
+            BuildAttempt.build_job_id == job.id,
+            BuildAttempt.status == BuildStatus.RUNNING,
+        ).limit(1)
+    )
+    if already_running is not None:
+        return {"job": None}
     count_result = await db.execute(
         select(func.count(BuildAttempt.id)).where(BuildAttempt.build_job_id == job.id)
     )
@@ -423,9 +438,13 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
     attempt.build_profile = str(pass_info.get("build_profile") or "full")
     defines = pass_info.get("rpmbuild_defines")
     attempt.rpmbuild_defines = dict(defines) if isinstance(defines, dict) else {}
-    db.add(attempt)
     locked_worker.state = WorkerState.BUSY
-    await db.flush()
+    try:
+        async with db.begin_nested():
+            db.add(attempt)
+            await db.flush()
+    except IntegrityError:
+        return {"job": None}
     locked_worker.current_build_attempt_id = attempt.id
     await db.flush()
     await db.refresh(attempt)
