@@ -4,7 +4,7 @@ import enum
 from datetime import datetime
 from typing import TYPE_CHECKING, List, Optional
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Integer, JSON, String, Text, func
+from sqlalchemy import DateTime, Enum, ForeignKey, Index, Integer, JSON, String, Text, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from oreon_build.db.base import Base
@@ -110,6 +110,15 @@ class BuildJob(Base):
 
 class BuildAttempt(Base):
     __tablename__ = "build_attempts"
+    __table_args__ = (
+        Index(
+            "ux_build_attempts_one_running_per_job",
+            "build_job_id",
+            unique=True,
+            postgresql_where=text("status = 'running'"),
+            sqlite_where=text("status = 'running'"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     build_job_id: Mapped[int] = mapped_column(ForeignKey("build_jobs.id"), nullable=False)
