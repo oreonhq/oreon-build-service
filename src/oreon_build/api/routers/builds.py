@@ -534,6 +534,7 @@ async def list_layer_plans(
 
 
 async def _layer_plan_to_status_response(db: DbSession, plan) -> LayerPlanStatusResponse:
+    await db.refresh(plan)
     rel = await db.get(Release, plan.release_id)
     from oreon_build.models import SideTag
     from sqlalchemy import func
@@ -954,6 +955,8 @@ async def retry_build(
     job = result.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Build job not found")
+    if job.status in (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.RUNNING, BuildStatus.BLOCKED):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Job is already active")
 
     pkg_result = await db.execute(select(Package).where(Package.id == job.package_id))
     pkg = pkg_result.scalar_one_or_none()
