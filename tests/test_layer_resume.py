@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from oreon_build.models import BuildJob, BuildStatus
+from types import SimpleNamespace
+
+from oreon_build.models import BuildJob, BuildStatus, LayerPlanStatus
 from oreon_build.services.build_pass import job_options_dict, schedule_next_pass_after_publish
+from oreon_build.services.layer_plan import layer_plan_settlement
 
 
 def test_bootstrap_publish_handoff_restores_full_profile():
@@ -35,3 +38,35 @@ def test_full_profile_without_handoff_is_unchanged():
     )
     assert not schedule_next_pass_after_publish(job)
     assert job.status == BuildStatus.SUCCESS
+
+
+def _job(status, name="pkg", reason=""):
+    pkg = SimpleNamespace(name=name)
+    return SimpleNamespace(id=1, status=status, package=pkg, blocked_reason=reason)
+
+
+def test_settlement_keeps_running_while_jobs_are_queued():
+    jobs = [
+        _job(BuildStatus.SUCCESS, "a"),
+        _job(BuildStatus.QUEUED, "b"),
+        _job(BuildStatus.BLOCKED, "c"),
+    ]
+    assert layer_plan_settlement(jobs) == (None, None)
+
+
+def test_settlement_stops_plan_when_only_blocked_remain():
+    jobs = [
+        _job(BuildStatus.SUCCESS, "a"),
+        _job(BuildStatus.FAILED, "blosc", "mock failed"),
+        _job(BuildStatus.BLOCKED, "kde", "waiting on layer jobs: blosc"),
+    ]
+    status, msg = layer_plan_settlement(jobs)
+    assert status == LayerPlanStatus.FAILED
+    assert "stalled" in (msg or "")
+    assert "blocked" in (msg or "")
+    assert "Primary: blosc" in (msg or "")
+
+
+def test_settlement_success_when_all_ok():
+    jobs = [_job(BuildStatus.SUCCESS, "a"), _job(BuildStatus.SKIPPED, "b")]
+    assert layer_plan_settlement(jobs) == (LayerPlanStatus.SUCCESS, None)
