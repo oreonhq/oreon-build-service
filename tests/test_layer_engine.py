@@ -4,6 +4,7 @@ from oreon_build.models import BuildStatus
 from oreon_build.services.layer_engine import (
     _bootstrap_drops_for_graph,
     _canonical_layer_name,
+    _incomplete_layer_sources,
     _layer_sources_for_requirement,
     _requirement_matches_sources,
     _strongly_connected_components,
@@ -62,7 +63,7 @@ def test_missing_provides_extracts_rich_tokens():
 
 
 def test_missing_provides_ignores_unrelated_dnf_messages():
-    assert parse_missing_provides_from_text("No matching package to install: python3-test") == set()
+    assert parse_missing_provides_from_text("Transaction failed: disk full") == set()
 
 
 def test_build_status_values_are_terminally_distinct():
@@ -160,6 +161,21 @@ def test_crate_does_not_attach_longer_crate_name():
     assert "rust-toml_edit0.19" not in sources
 
 
+def test_cmake_kf6_module_maps_to_kf6_source():
+    from oreon_build.services.virtual_resolve import distgit_sources_for_virtual_cap
+
+    known = {"kf6-kcoreaddons", "kf6-kio", "qt6-qtwebengine"}
+    assert "kf6-kcoreaddons" in distgit_sources_for_virtual_cap(
+        "cmake(KF6CoreAddons) >= 6.28.0", package_names=known, provider_map={}
+    )
+    assert "kf6-kio" in distgit_sources_for_virtual_cap(
+        "cmake(KF6KIO)", package_names=known, provider_map={}
+    )
+    assert "qt6-qtwebengine" in distgit_sources_for_virtual_cap(
+        "cmake(Qt6WebEngine)", package_names=known, provider_map={}
+    )
+
+
 def test_python3dist_maps_to_python_source():
     sources = _layer_sources_for_requirement(
         "python3dist(matplotlib)",
@@ -167,3 +183,83 @@ def test_python3dist_maps_to_python_source():
         {"blosc", "python-matplotlib"},
     )
     assert "python-matplotlib" in sources
+
+
+def test_incomplete_sources_drop_finished_providers():
+    names = {"kde", "blosc"}
+    provider_map = {"blosc": {"blosc"}}
+    statuses = {("blosc", "x86_64"): {BuildStatus.SUCCESS}}
+    assert _incomplete_layer_sources(("blosc",), provider_map, names, statuses, "x86_64") == set()
+    statuses = {("blosc", "x86_64"): {BuildStatus.FAILED}}
+    assert _incomplete_layer_sources(("blosc",), provider_map, names, statuses, "x86_64") == {"blosc"}
+
+
+def test_bootstrap_drops_hide_cycle_caps():
+    from oreon_build.services.layer_engine import _missing_caps_after_bootstrap_drops
+
+    names = {"rust-foo", "rust-bar"}
+    provider_map = {"crate(foo)": {"rust-foo"}, "crate(bar)": {"rust-bar"}}
+    kept = _missing_caps_after_bootstrap_drops(
+        ["crate(bar)", "pkgconfig(zlib)"],
+        {"rust-bar"},
+        provider_map,
+        names,
+    )
+    assert kept == ["pkgconfig(zlib)"]
+
+
+def test_missing_provides_extracts_needed_by():
+    text = "Error: nothing provides crate(foo) >= 1.2.3 needed by rust-bar.src"
+    values = parse_missing_provides_from_text(text)
+    assert "crate(foo)" in values
+
+
+def test_caps_provided_by_dropped_sources():
+    from oreon_build.services.layer_engine import _caps_provided_by_sources
+
+    caps = _caps_provided_by_sources(
+        {"rust-foo"},
+        {"crate(foo)": {"rust-foo"}, "crate(bar)": {"rust-bar"}},
+    )
+    assert "crate(foo)" in caps
+    assert "crate(bar)" not in caps
+
+
+def test_incomplete_sources_wait_for_repo_publish():
+    names = {"kde", "blosc"}
+    provider_map = {"blosc": {"blosc"}}
+    statuses = {("blosc", "x86_64"): {BuildStatus.SUCCESS}}
+    ready = {("blosc", "x86_64"): False}
+    assert _incomplete_layer_sources(
+        ("blosc",), provider_map, names, statuses, "x86_64", ready
+    ) == {"blosc"}
+    ready = {("blosc", "x86_64"): True}
+    assert _incomplete_layer_sources(
+        ("blosc",), provider_map, names, statuses, "x86_64", ready
+    ) == set()
+
+
+def test_spec_prepare_waits_for_unpublished_success():
+    from oreon_build.services.layer_engine import _layer_job_needs_spec_prepare
+
+    done = {("cmake", "x86_64"): {BuildStatus.SUCCESS}}
+    ready = {("cmake", "x86_64"): False}
+    assert _layer_job_needs_spec_prepare(["cmake"], "x86_64", done, ready) is False
+    ready = {("cmake", "x86_64"): True}
+    assert _layer_job_needs_spec_prepare(["cmake"], "x86_64", done, ready) is True
+
+
+def test_spec_prepare_skipped_while_in_layer_blockers_open():
+    from oreon_build.services.layer_engine import _layer_job_needs_spec_prepare
+
+    statuses = {("cmake", "x86_64"): {BuildStatus.BLOCKED}}
+    assert _layer_job_needs_spec_prepare(["cmake"], "x86_64", statuses) is False
+
+
+def test_spec_prepare_runs_when_blockers_are_done_or_outside_layer():
+    from oreon_build.services.layer_engine import _layer_job_needs_spec_prepare
+
+    done = {("cmake", "x86_64"): {BuildStatus.SUCCESS}}
+    assert _layer_job_needs_spec_prepare(["cmake"], "x86_64", done) is True
+    assert _layer_job_needs_spec_prepare(["outside"], "x86_64", done) is True
+    assert _layer_job_needs_spec_prepare([], "x86_64", done) is True

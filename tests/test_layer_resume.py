@@ -54,7 +54,16 @@ def test_settlement_keeps_running_while_jobs_are_queued():
     assert layer_plan_settlement(jobs) == (None, None)
 
 
-def test_settlement_stops_plan_when_only_blocked_remain():
+def test_settlement_keeps_running_when_only_blocked_remain():
+    jobs = [
+        _job(BuildStatus.SUCCESS, "a"),
+        _job(BuildStatus.BLOCKED, "kde", "waiting on layer jobs: foo"),
+        _job(BuildStatus.BLOCKED, "bar", "waiting on repository"),
+    ]
+    assert layer_plan_settlement(jobs) == (None, None)
+
+
+def test_settlement_stops_plan_when_failures_leave_only_blocked():
     jobs = [
         _job(BuildStatus.SUCCESS, "a"),
         _job(BuildStatus.FAILED, "blosc", "mock failed"),
