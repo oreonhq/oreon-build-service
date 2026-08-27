@@ -208,6 +208,8 @@ class ResultPayload(BaseModel):
     error_message: str | None = None
     log_r2_key: str | None = None
     artifacts: list[ArtifactPayload] = []
+    missing_provides: list[str] = []
+    resolve_stage: str | None = None
 
 class ArtifactPayload(BaseModel):
     kind: str
@@ -549,6 +551,7 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
             "mock_additional_repos": mock_additional_repos,
             "build_profile": pass_info.get("build_profile") or "full",
             "rpmbuild_defines": pass_info.get("rpmbuild_defines") or {},
+            "bootstrap_stub_provides": pass_info.get("bootstrap_stub_provides") or [],
         },
     }
 
@@ -1668,8 +1671,17 @@ async def report_result(
         return {"status": "ok", "job_cancelled": True}
 
     err_msg = payload.error_message
+    missing = [str(item).strip() for item in (payload.missing_provides or []) if str(item).strip()]
+    if not missing and isinstance(err_msg, str):
+        from oreon_build.core.dnf_missing import parse_dnf_missing_provides
+
+        missing = parse_dnf_missing_provides(err_msg)
     if isinstance(err_msg, str) and err_msg.strip():
         err_msg = prepare_build_error_message(err_msg)
+    if missing:
+        prefix = "\n".join(f"nothing provides requested {cap}" for cap in missing)
+        rest = err_msg if isinstance(err_msg, str) and err_msg.strip() else ""
+        err_msg = (prefix + "\n" + rest).strip()
     arch_line = find_architecture_excluded_line(err_msg)
     if arch_line:
         err_msg = arch_line
@@ -1776,6 +1788,12 @@ async def report_result(
     if not queued_next_pass:
         job.status = BuildStatus(terminal_st)
         job.completed_at = attempt.finished_at
+        if terminal_st == "success" and job.layer_plan_id is not None:
+            from oreon_build.services.build_pass import job_options_dict
+
+            opts = job_options_dict(job)
+            opts["repo_published"] = False
+            job.job_options = opts
     await db.flush()
     await sync_worker_state_after_attempt_finished(db, worker)
     await db.commit()
