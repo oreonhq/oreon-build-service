@@ -231,6 +231,8 @@ def layer_plan_settlement(
     n_block = sum(1 for j in jobs if j.status == BuildStatus.BLOCKED)
     if n_block == 0 and n_fail == 0 and n_cancel == 0:
         return LayerPlanStatus.SUCCESS, None
+    if n_fail == 0 and n_cancel == 0:
+        return None, None
     primary: list[str] = []
     seen: set[str] = set()
     for j in jobs:
@@ -554,6 +556,11 @@ async def notify_layer_job_terminal_after_result(
             return
         pkg_name = job.package.name if job.package else None
         if st == "failed":
+            from oreon_build.services.layer_engine import try_autofix_layer_missing_provides
+
+            if await try_autofix_layer_missing_provides(db, job, reason, package_name=pkg_name):
+                await db.commit()
+                return
             await on_build_job_failed_for_layer(db, job, reason, package_name=pkg_name)
         else:
             await on_user_cancelled_layer_job(db, job)

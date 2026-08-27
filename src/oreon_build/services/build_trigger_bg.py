@@ -146,42 +146,42 @@ async def run_single_trigger(payload: dict[str, Any], user_id: int, ip: str | No
 async def run_layer_seed(plan_id: int) -> None:
     from oreon_build.services.layer_engine import complete_seed_layer_plan
 
-    async with _plan_lock:
-        async with async_session_maker() as db:
-            try:
+    try:
+        async with _plan_lock:
+            async with async_session_maker() as db:
                 await complete_seed_layer_plan(db, int(plan_id))
                 await db.commit()
-                from oreon_build.services.layer_engine import evaluate_layer_buildability
-                async with async_session_maker() as eval_db:
-                    changed = await evaluate_layer_buildability(eval_db, int(plan_id))
-                    await eval_db.commit()
-                    logger.info(
-                        "background layer seed evaluation complete layer_plan_id=%s queued=%s",
-                        plan_id,
-                        len(changed),
-                    )
-            except Exception as exc:
-                await db.rollback()
-                logger.exception("background layer seed layer_plan_id=%s failed", plan_id)
-                try:
-                    from oreon_build.models import LayerPlan, LayerPlanStatus
-                    from oreon_build.services.layer_plan import fail_layer_plan
+        from oreon_build.services.layer_engine import evaluate_layer_buildability
 
-                    msg = f"Layer seeding failed: {exc}"
-                    async with async_session_maker() as db2:
-                        plan = await db2.get(LayerPlan, int(plan_id))
-                        if plan is not None and plan.status == LayerPlanStatus.PENDING:
-                            await fail_layer_plan(
-                                db2,
-                                plan,
-                                msg[:8000],
-                                terminal=LayerPlanStatus.FAILED,
-                            )
-                            await db2.commit()
-                except Exception:
-                    logger.exception(
-                        "background layer seed cleanup failed layer_plan_id=%s", plan_id
+        async with async_session_maker() as eval_db:
+            changed = await evaluate_layer_buildability(eval_db, int(plan_id))
+            await eval_db.commit()
+            logger.info(
+                "background layer seed evaluation complete layer_plan_id=%s queued=%s",
+                plan_id,
+                len(changed),
+            )
+    except Exception as exc:
+        logger.exception("background layer seed layer_plan_id=%s failed", plan_id)
+        try:
+            from oreon_build.models import LayerPlan, LayerPlanStatus
+            from oreon_build.services.layer_plan import fail_layer_plan
+
+            msg = f"Layer seeding failed: {exc}"
+            async with async_session_maker() as db2:
+                plan = await db2.get(LayerPlan, int(plan_id))
+                if plan is not None and plan.status == LayerPlanStatus.PENDING:
+                    await fail_layer_plan(
+                        db2,
+                        plan,
+                        msg[:8000],
+                        terminal=LayerPlanStatus.FAILED,
                     )
+                    await db2.commit()
+        except Exception:
+            logger.exception(
+                "background layer seed cleanup failed layer_plan_id=%s", plan_id
+            )
 
 
 async def run_layer_resume_refresh(plan_id: int, job_ids: list[int]) -> None:

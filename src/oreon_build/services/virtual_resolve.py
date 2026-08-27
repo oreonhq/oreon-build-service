@@ -330,6 +330,20 @@ def cmake_to_sources(cap: str, package_names: set[str], provider_map: dict) -> s
         f"lib{base}",
         f"lib{base}-devel",
     )
+    if inner.startswith("KF") and len(inner) > 3 and inner[2].isdigit():
+        ver = inner[2]
+        rest = inner[3:]
+        low = rest.lower()
+        kf_hits = [f"kf{ver}-k{low}", f"kf{ver}-{low}"]
+        if rest.startswith("K") and len(rest) > 1:
+            kf_hits.append(f"kf{ver}-{rest.lower()}")
+            kf_hits.append(f"kf{ver}-k{rest[1:].lower()}")
+        out |= _hit(known, *kf_hits)
+    if inner.startswith("Qt") and len(inner) > 3 and inner[2].isdigit():
+        ver = inner[2]
+        rest = inner[3:]
+        low = rest.lower()
+        out |= _hit(known, f"qt{ver}-qt{low}", f"qt{ver}-{low}")
     # config modules often carry the soname version in the provide
     # (cmake(bson-2.3.1)) while consumers ask for the bare cmake(bson).
     if not out:

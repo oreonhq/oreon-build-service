@@ -35,9 +35,13 @@ def apply_plan_to_job_options(job: BuildJob, plan: dict[str, Any]) -> None:
 def poll_payload_from_job(job: BuildJob) -> dict[str, Any]:
     opts = job_options_dict(job)
     defines = opts.get("rpmbuild_defines")
+    stubs = opts.get("bootstrap_stub_provides")
     out: dict[str, Any] = {
         "build_profile": str(opts.get("build_profile") or "full"),
         "rpmbuild_defines": dict(defines) if isinstance(defines, dict) else {},
+        "bootstrap_stub_provides": [str(x).strip() for x in (stubs or []) if str(x).strip()]
+        if isinstance(stubs, (list, tuple))
+        else [],
     }
     return out
 
@@ -64,6 +68,7 @@ def schedule_next_pass_after_publish(job: BuildJob) -> bool:
     opts["build_profile"] = nxt
     opts["rpmbuild_defines"] = {}
     opts.pop("next_profile", None)
+    opts.pop("bootstrap_stub_provides", None)
     opts["pass_parent_attempt_id"] = opts.get("pass_parent_attempt_id")
     job.job_options = opts
     job.status = BuildStatus.PENDING

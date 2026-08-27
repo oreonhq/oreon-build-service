@@ -23,6 +23,7 @@ from sqlalchemy import exists, select, update
 from sqlalchemy.orm import selectinload
 
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
+from oreon_build.core.dnf_missing import parse_dnf_missing_provides
 from oreon_build.core.machine_arch import normalize_machine_arch
 from oreon_build.core.repo_branch import release_distgit_branch
 from oreon_build.models import (
@@ -52,7 +53,6 @@ from oreon_build.core.rpm_requires import (
     split_requirement_evr,
 )
 from oreon_build.services.build_target_util import get_or_create_build_target, resolve_mock_environment_id
-from oreon_build.services.dep_plan.install_oracle import InstallOracle
 from oreon_build.services.dep_plan.providers import (
     filter_providers_for_consumer,
     is_base_system_package,
@@ -74,7 +74,7 @@ from oreon_build.services.repo_capability_index import (
     default_capability_extra_branches,
     load_repo_capability_index,
 )
-from oreon_build.services.repo_solver import get_repo_solver, invalidate_repo_solver_cache
+from oreon_build.services.repo_solver import invalidate_repo_solver_cache
 
 if TYPE_CHECKING:
     from oreon_build.models import Account
@@ -85,13 +85,13 @@ DEFAULT_ARCH = ["x86_64", "aarch64"]
 
 _REACTIVE_CACHE_TTL = 300.0
 _REACTIVE_CACHE_LIMIT = 2048
-_REACTIVE_REQUIREMENTS_CACHE_VERSION = "dynamic-br-v6"
+_REACTIVE_REQUIREMENTS_CACHE_VERSION = "static-br-v7"
 _REACTIVE_CACHE_LOCK = threading.RLock()
 _LAYER_EVAL_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="layer-eval")
 _REACTIVE_SPEC_CACHE: dict[tuple[str, str, str, str], tuple[float, str]] = {}
 _REACTIVE_REQUIREMENTS_CACHE: dict[tuple[str, str, str, str, str], tuple[float, tuple[str, ...], bool]] = {}
 _REACTIVE_INDEX_CACHE: dict[tuple[str, str, str], tuple[float, RepoCapabilityIndex]] = {}
-_REACTIVE_SOLVER_CACHE: dict[tuple[str, str, str], tuple[float, tuple[Any, InstallOracle]]] = {}
+_REACTIVE_SOLVER_CACHE: dict[tuple[str, str, str], tuple[float, Any]] = {}
 _REACTIVE_PLAN_LOCKS: dict[int, asyncio.Lock] = {}
 _REACTIVE_EXPANSION_MAX_DEPTH = 32
 
@@ -127,36 +127,8 @@ def _invalidate_reactive_repo_cache(releasename: str, branch: str, arch: str) ->
         _REACTIVE_SOLVER_CACHE.pop(key, None)
 
 
-_RE_NOTHING_PROVIDES_REQUESTED = re.compile(
-    r"nothing provides requested\s+(?P<cap>.+?)\s*$",
-    re.IGNORECASE | re.MULTILINE,
-)
-
-
 def parse_missing_provides_from_text(text: str) -> set[str]:
-    out: set[str] = set()
-    raw = text or ""
-    token_re = re.compile(r"[A-Za-z_][A-Za-z0-9_+:.@/-]*(?:\([^()]*\))?")
-    operators = {"and", "or", "with", "without"}
-    for m in _RE_NOTHING_PROVIDES_REQUESTED.finditer(raw):
-        cap = (m.group("cap") or "").strip().rstrip(".")
-        if not cap or "%" in cap:
-            continue
-        if cap.startswith("(") and cap.endswith(")"):
-            candidates = token_re.findall(cap[1:-1])
-        else:
-            candidates = [cap]
-        for candidate in candidates:
-            token = candidate.strip().rstrip(".")
-            if (
-                token.lower() in operators
-                or token in {"<", ">", "=", "<=", ">=", "!=", "=="}
-                or token[0].isdigit()
-            ):
-                continue
-            if token and "%" not in token:
-                out.add(token)
-    return out
+    return set(parse_dnf_missing_provides(text))
 
 
 async def _capability_arches_for_job(
@@ -613,23 +585,91 @@ async def fail_seed(db: Any, plan: LayerPlan, message: str) -> None:
     await db.flush()
 
 
-async def _refetch_spec_text(
-    pkg_name: str, *, owner: str, repo: str, distgit_branch: str, releasename: str, headers: dict[str, str]
-) -> str | None:
-    key = (owner + "/" + repo, distgit_branch, releasename, pkg_name)
-    cached = _reactive_cache_get(_REACTIVE_SPEC_CACHE, key)
-    if cached is not None:
-        return cached
+def _spec_cache_key(owner: str, repo: str, distgit_branch: str, releasename: str, pkg_name: str) -> tuple[str, str, str, str]:
+    return (owner + "/" + repo, distgit_branch, releasename, pkg_name)
+
+
+def _layer_job_needs_spec_prepare(
+    blocking_sources: list[str] | None,
+    architecture: str,
+    layer_statuses: dict[tuple[str, str], set[BuildStatus]],
+    layer_repo_ready: dict[tuple[str, str], bool] | None = None,
+) -> bool:
+    arch = normalize_machine_arch(str(architecture or ""))
+    stored = [
+        _canonical_layer_name(value)
+        for value in (blocking_sources or [])
+        if str(value).strip()
+    ]
+    if not stored:
+        return True
+    ready = layer_repo_ready or {}
+    for name in stored:
+        statuses = layer_statuses.get((name, arch), set())
+        if not statuses:
+            continue
+        if not all(status in (BuildStatus.SUCCESS, BuildStatus.SKIPPED) for status in statuses):
+            return False
+        if not ready.get((name, arch), True):
+            return False
+    return True
+
+
+async def _load_eval_spec_texts(
+    names: list[str],
+    *,
+    owner: str,
+    repo: str,
+    distgit_branch: str,
+    releasename: str,
+    headers: dict[str, str],
+) -> dict[str, str]:
+    specs: dict[str, str] = {}
+    missing: list[str] = []
+    for name in names:
+        cached = _reactive_cache_get(
+            _REACTIVE_SPEC_CACHE, _spec_cache_key(owner, repo, distgit_branch, releasename, name)
+        )
+        if cached is not None:
+            specs[name] = cached
+        else:
+            missing.append(name)
+    if not missing:
+        return specs
     import httpx
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0), headers=headers) as client:
         batch = await _fetch_distgit_specs_batch(
-            client, owner=owner, repo=repo, distgit_branch=distgit_branch, releasename=releasename, packages=[pkg_name]
+            client,
+            owner=owner,
+            repo=repo,
+            distgit_branch=distgit_branch,
+            releasename=releasename,
+            packages=missing,
         )
-    text = batch.get(pkg_name)
-    if text:
-        _reactive_cache_put(_REACTIVE_SPEC_CACHE, key, text)
-    return text
+    for name, text in batch.items():
+        if text:
+            specs[name] = text
+            _reactive_cache_put(
+                _REACTIVE_SPEC_CACHE,
+                _spec_cache_key(owner, repo, distgit_branch, releasename, name),
+                text,
+            )
+    return specs
+
+
+async def _refetch_spec_text(
+    pkg_name: str, *, owner: str, repo: str, distgit_branch: str, releasename: str, headers: dict[str, str]
+) -> str | None:
+    batch = await _load_eval_spec_texts(
+        [pkg_name],
+        owner=owner,
+        repo=repo,
+        distgit_branch=distgit_branch,
+        releasename=releasename,
+        headers=headers,
+    )
+    return batch.get(pkg_name)
 
 
 def _rich_dep_leaf_requirements(requirement: str) -> list[str]:
@@ -684,6 +724,8 @@ async def _candidate_satisfies_requirements(
             name, op, ver = parse_versioned_requirement(leaf)
             if not name or not op or not ver:
                 continue
+            if "(" in name:
+                continue
             if evr_satisfies(op, cand_evr, split_requirement_evr(ver)):
                 continue
             return False
@@ -699,38 +741,33 @@ async def _pick_expansion_candidates(
     distgit_branch: str,
     releasename: str,
     headers: dict[str, str],
+    package_names: set[str] | None = None,
 ) -> list[tuple[str, int]]:
     """Best provider per missing capability, verified against version bounds.
 
     Candidates violating any explicit bound are dropped. Survivors ranked by
     how many missing capabilities they cover.
     """
+    names = {_canonical_layer_name(str(name)) for name in (package_names or set()) if str(name).strip()}
+    orig_by_lower = {
+        _canonical_layer_name(str(name)): str(name).strip()
+        for name in (package_names or set())
+        if str(name).strip()
+    }
     per_candidate_reqs: dict[str, list[str]] = {}
     for capability in sorted(missing):
-        sources = _layer_sources_for_requirement(capability, providers)
+        sources = _layer_sources_for_requirement(str(capability), providers, names)
         for source in sources:
-            reqs = per_candidate_reqs.setdefault(source, [])
+            real = orig_by_lower.get(_canonical_layer_name(source))
+            if not real:
+                continue
+            reqs = per_candidate_reqs.setdefault(real, [])
             if capability not in reqs:
                 reqs.append(capability)
-    if not per_candidate_reqs:
-        return []
-    verified: list[tuple[str, int]] = []
-    check_gate = asyncio.Semaphore(8)
-
-    async def verify(source: str, requirements: list[str]) -> None:
-        async with check_gate:
-            ok = await _candidate_satisfies_requirements(
-                source, requirements, owner=owner, repo=repo,
-                distgit_branch=distgit_branch, releasename=releasename, headers=headers,
-            )
-        if ok:
-            verified.append((source, len(requirements)))
-
-    await asyncio.gather(
-        *(verify(source, requirements) for source, requirements in sorted(per_candidate_reqs.items()))
+    return sorted(
+        ((source, len(requirements)) for source, requirements in per_candidate_reqs.items()),
+        key=lambda item: (-item[1], item[0]),
     )
-    verified.sort(key=lambda item: (-item[1], item[0]))
-    return verified
 
 
 async def _expand_missing_provider(
@@ -752,8 +789,9 @@ async def _expand_missing_provider(
 ) -> list[BuildJob]:
     providers = provider_index.indexed_providers() if provider_index is not None else {}
     verified = await _pick_expansion_candidates(
-        missing, providers, owner=owner, repo=repo,
+        set(missing), providers, owner=owner, repo=repo,
         distgit_branch=distgit_branch, releasename=releasename, headers=_github_headers(),
+        package_names=set(getattr(provider_index, "package_names", ()) or ()),
     )
     if not verified:
         return []
@@ -775,7 +813,7 @@ async def _expand_missing_provider(
     selected = [
         candidate
         for candidate, _score in verified
-        if candidate not in existing and candidate not in visited and depth + 1 <= _REACTIVE_EXPANSION_MAX_DEPTH
+        if candidate not in existing and candidate not in visited
     ]
     if not selected:
         return []
@@ -866,6 +904,7 @@ def _layer_sources_for_requirement(
         if str(name).strip()
     }
     sources: set[str] = set()
+    restrict = bool(names)
     for capability in requirement_check_capabilities(requirement):
         cap = str(capability).strip()
         if not cap:
@@ -877,10 +916,11 @@ def _layer_sources_for_requirement(
                 sources.update(
                     _canonical_layer_name(str(value))
                     for value in values
-                    if str(value).strip() and _canonical_layer_name(str(value)) in names
+                    if str(value).strip()
+                    and (not restrict or _canonical_layer_name(str(value)) in names)
                 )
         canon = _canonical_layer_name(primary)
-        if canon in names:
+        if canon and (not restrict or canon in names):
             sources.add(canon)
     sources.update(
         _canonical_layer_name(source)
@@ -889,9 +929,20 @@ def _layer_sources_for_requirement(
             provider_map=provider_map,
             package_names=names,
         )
-        if _canonical_layer_name(source) in names
+        if _canonical_layer_name(source)
+        and (not restrict or _canonical_layer_name(source) in names)
     )
     return sources
+
+
+def _job_repo_published(status: BuildStatus, job_options: dict[str, Any] | None) -> bool:
+    if status == BuildStatus.SKIPPED:
+        return True
+    if status != BuildStatus.SUCCESS:
+        return False
+    if not isinstance(job_options, dict) or "repo_published" not in job_options:
+        return True
+    return bool(job_options.get("repo_published"))
 
 
 def _incomplete_layer_sources(
@@ -900,16 +951,44 @@ def _incomplete_layer_sources(
     package_names: set[str],
     layer_statuses: dict[tuple[str, str], set[BuildStatus]],
     architecture: str,
+    layer_repo_ready: dict[tuple[str, str], bool] | None = None,
 ) -> set[str]:
     arch = normalize_machine_arch(str(architecture or ""))
+    ready = layer_repo_ready or {}
     out: set[str] = set()
     for requirement in requirements:
         for source in _layer_sources_for_requirement(str(requirement), provider_map, package_names):
             name = _canonical_layer_name(source)
             statuses = layer_statuses.get((name, arch), set())
-            if statuses and not all(status in (BuildStatus.SUCCESS, BuildStatus.SKIPPED) for status in statuses):
+            if not statuses:
+                continue
+            if not all(status in (BuildStatus.SUCCESS, BuildStatus.SKIPPED) for status in statuses):
+                out.add(name)
+                continue
+            if not ready.get((name, arch), True):
                 out.add(name)
     return out
+
+
+def _missing_caps_after_bootstrap_drops(
+    missing: list[str] | set[str] | tuple[str, ...],
+    dropped_sources: set[str],
+    provider_map: dict[str, set[str]],
+    package_names: set[str],
+) -> list[str]:
+    caps = [str(cap) for cap in missing if str(cap).strip()]
+    if not dropped_sources or not caps:
+        return caps
+    kept: list[str] = []
+    for cap in caps:
+        sources = {
+            _canonical_layer_name(source)
+            for source in _layer_sources_for_requirement(cap, provider_map, package_names)
+        }
+        if sources and sources <= dropped_sources:
+            continue
+        kept.append(cap)
+    return kept
 
 
 def _requirement_matches_sources(
@@ -1014,17 +1093,48 @@ def _bootstrap_drops_for_graph(graph: dict[str, set[str]]) -> dict[str, set[str]
     return drops
 
 
-async def _start_bootstrap_pass(db: Any, job: BuildJob, dropped_sources: set[str]) -> bool:
+def _caps_provided_by_sources(
+    sources: set[str],
+    provider_map: dict[str, set[str]] | None,
+) -> list[str]:
+    want = {_canonical_layer_name(source) for source in sources if str(source).strip()}
+    if not want or not provider_map:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for cap, pkgs in provider_map.items():
+        token = str(cap).strip()
+        if not token or token in seen:
+            continue
+        for pkg in pkgs:
+            if _canonical_layer_name(str(pkg)) in want:
+                seen.add(token)
+                out.append(token)
+                break
+    return out
+
+
+async def _start_bootstrap_pass(
+    db: Any,
+    job: BuildJob,
+    dropped_sources: set[str],
+    *,
+    provider_map: dict[str, set[str]] | None = None,
+    extra_stubs: set[str] | None = None,
+) -> bool:
     dropped = sorted({_canonical_layer_name(source) for source in dropped_sources if str(source).strip()})
     if not dropped:
         return False
     opts = job_options_dict(job)
     if str(opts.get("build_profile") or "full").strip().lower() == "full" and opts.get("bootstrap_dropped"):
         return False
+    stubs = {str(value).strip() for value in (extra_stubs or set()) if str(value).strip()}
+    stubs.update(_caps_provided_by_sources(set(dropped), provider_map))
     opts["build_profile"] = "bootstrap"
     opts["rpmbuild_defines"] = {"with_check": "0"}
     opts["next_profile"] = "full"
     opts["bootstrap_dropped"] = dropped
+    opts["bootstrap_stub_provides"] = sorted(stubs)[:800]
     await _update_layer_job_if_active(
         db,
         job.id,
@@ -1044,7 +1154,14 @@ async def _evaluate_layer_buildability(
     published_architecture: str | None = None,
 ) -> list[BuildJob]:
     plan = await db.get(LayerPlan, int(layer_plan_id))
-    if plan is None or plan.status not in (LayerPlanStatus.PENDING, LayerPlanStatus.RUNNING):
+    if plan is None:
+        return []
+    stall = (plan.error_message or "").strip().lower()
+    if plan.status == LayerPlanStatus.FAILED and stall.startswith("layer stalled with no queued or running jobs"):
+        plan.status = LayerPlanStatus.RUNNING
+        plan.error_message = None
+        await db.flush()
+    if plan.status not in (LayerPlanStatus.PENDING, LayerPlanStatus.RUNNING):
         return []
     release = await db.get(Release, plan.release_id)
     if release is None:
@@ -1066,22 +1183,14 @@ async def _evaluate_layer_buildability(
         )
     )
     row_list = list(rows_result.all())
-    graph_rows_result = await db.execute(
-        select(BuildJob, BuildTarget.architecture)
-        .join(BuildTarget, BuildTarget.id == BuildJob.target_id)
-        .where(BuildJob.layer_plan_id == plan.id)
-    )
-    graph_row_list = list(graph_rows_result.all())
     changed: list[BuildJob] = []
-    expanded = False
     provider_index = await get_distgit_provides_index_cached(
         owner=owner, repo=repo, distgit_branch=distgit_branch,
         releasename=releasename, headers=_github_headers(),
     )
     provider_map = provider_index.indexed_providers() if provider_index is not None else {}
-    provider_package_names = set(getattr(provider_index, "package_names", ()) or ())
     layer_rows_result = await db.execute(
-        select(Package.name, BuildJob.status, BuildTarget.architecture)
+        select(Package.name, BuildJob.status, BuildTarget.architecture, BuildJob.job_options)
         .join(BuildJob, BuildJob.package_id == Package.id)
         .join(BuildTarget, BuildTarget.id == BuildJob.target_id)
         .where(BuildJob.layer_plan_id == plan.id)
@@ -1089,17 +1198,18 @@ async def _evaluate_layer_buildability(
     layer_rows = list(layer_rows_result.all())
     layer_statuses: dict[tuple[str, str], set[BuildStatus]] = {}
     layer_package_names: set[str] = set()
-    for name, job_status, job_arch in layer_rows:
+    layer_repo_ready: dict[tuple[str, str], bool] = {}
+    for name, job_status, job_arch, job_opts in layer_rows:
         if name:
             canonical_name = _canonical_layer_name(str(name))
             layer_package_names.add(canonical_name)
             arch_key = normalize_machine_arch(str(job_arch or ""))
             layer_statuses.setdefault((canonical_name, arch_key), set()).add(job_status)
-    from oreon_build.services.distgit_order import enrich_specs_buildrequires_with_rpm
-    from oreon_build.models import SideTag
-    side_tag = await db.get(SideTag, plan.side_tag_id) if plan.side_tag_id else None
-    side_tag_name = side_tag.name if side_tag is not None else str(options.get("branch") or "")
-    architectures = [str(value) for value in (options.get("architectures") or DEFAULT_ARCH) if value] or list(DEFAULT_ARCH)
+            published = _job_repo_published(
+                job_status, job_opts if isinstance(job_opts, dict) else None
+            )
+            prev = layer_repo_ready.get((canonical_name, arch_key))
+            layer_repo_ready[(canonical_name, arch_key)] = published if prev is None else (prev and published)
     published_arch = str(published_architecture or "").strip()
     arch_filter = normalize_machine_arch(published_arch) if published_arch else ""
     source_filter = _canonical_layer_name(source_name or "")
@@ -1117,19 +1227,73 @@ async def _evaluate_layer_buildability(
             )
             and (not arch_filter or normalize_machine_arch(str(architecture or "")) == arch_filter)
         ]
+    all_pkg_ids = {int(job.package_id) for job, _architecture in row_list}
+    packages_by_id: dict[int, Package] = {}
+    if all_pkg_ids:
+        pkg_rows = await db.execute(select(Package).where(Package.id.in_(all_pkg_ids)))
+        packages_by_id = {int(pkg.id): pkg for pkg in pkg_rows.scalars().all()}
+    mock_graph: dict[str, set[str]] = {}
+    job_consumer: dict[int, str] = {}
+    for job, _architecture in row_list:
+        pkg = packages_by_id.get(int(job.package_id))
+        if pkg is None or not pkg.name:
+            continue
+        consumer = _canonical_layer_name(pkg.name)
+        job_consumer[int(job.id)] = consumer
+        mock_graph.setdefault(consumer, set())
+        for value in (job.blocking_sources or []):
+            blocker = _canonical_layer_name(value)
+            if blocker and blocker != consumer:
+                mock_graph[consumer].add(blocker)
+    mock_drops = _bootstrap_drops_for_graph(mock_graph)
+    bootstrap_from_mock: dict[tuple[int, str], set[str]] = {}
+    for job, architecture in row_list:
+        consumer = job_consumer.get(int(job.id))
+        if not consumer:
+            continue
+        drops = mock_drops.get(consumer)
+        if not drops:
+            continue
+        arch = normalize_machine_arch(str(architecture or ""))
+        bootstrap_from_mock[(int(job.id), arch)] = set(drops)
+        await _start_bootstrap_pass(db, job, drops, provider_map=provider_map)
+    work_list = [
+        (job, architecture)
+        for job, architecture in row_list
+        if _layer_job_needs_spec_prepare(
+            job.blocking_sources, str(architecture or ""), layer_statuses, layer_repo_ready
+        )
+        or (int(job.id), normalize_machine_arch(str(architecture or ""))) in bootstrap_from_mock
+    ]
+    logger.info(
+        "layer eval start plan=%s open_jobs=%s prepare=%s",
+        plan.id,
+        len(row_list),
+        len(work_list),
+    )
+    unique_names = sorted({
+        packages_by_id[int(job.package_id)].name
+        for job, _architecture in work_list
+        if int(job.package_id) in packages_by_id and packages_by_id[int(job.package_id)].name
+    })
+    spec_by_name = await _load_eval_spec_texts(
+        unique_names,
+        owner=owner,
+        repo=repo,
+        distgit_branch=distgit_branch,
+        releasename=releasename,
+        headers=_github_headers(),
+    )
     prepared: dict[tuple[int, str], tuple[Package, str | None, Any | None, tuple[str, ...], bool]] = {}
     prepare_gate = asyncio.Semaphore(16)
 
     async def prepare_job(job: BuildJob, architecture: str) -> None:
         arch = normalize_machine_arch(str(architecture or ""))
-        package = await db.get(Package, job.package_id)
+        package = packages_by_id.get(int(job.package_id))
         if not arch or package is None:
             return
         async with prepare_gate:
-            text = await _refetch_spec_text(
-                package.name, owner=owner, repo=repo, distgit_branch=distgit_branch,
-                releasename=releasename, headers=_github_headers(),
-            )
+            text = spec_by_name.get(package.name)
             if not text:
                 prepared[(int(job.id), arch)] = (package, None, None, (), False)
                 return
@@ -1156,32 +1320,20 @@ async def _evaluate_layer_buildability(
                 profile_defines = (
                     dict(opts_probe.get("rpmbuild_defines") or {}) if profile_is_bootstrap else {}
                 )
-                await enrich_specs_buildrequires_with_rpm(
-                    {package.name: text}, {package.name: parsed}, releasename=releasename,
-                    scope_packages={package.name},
-                    generate_packages={package.name}
-                    if _manifest_has_dynamic_buildrequires(text, parsed)
-                    else set(),
-                    owner=owner, repo=repo, distgit_branch=distgit_branch, headers=_github_headers(),
-                    defines_by_package={package.name: profile_defines} if profile_defines else None,
-                )
                 requirements = tuple(sorted(_manifest_build_requirements(
                     text, parsed, architecture=arch, defines=profile_defines or None,
                     releasename=releasename,
                 )))
-                complete = (
-                    not _manifest_has_dynamic_buildrequires(text, parsed)
-                    or getattr(parsed, "dyn_br_complete", None) is True
-                )
+                complete = not _manifest_has_dynamic_buildrequires(text, parsed)
                 _reactive_cache_put(_REACTIVE_REQUIREMENTS_CACHE, req_key, (requirements, complete))
             prepared[(int(job.id), arch)] = (package, text, parsed, tuple(requirements), complete)
 
-    await asyncio.gather(*(prepare_job(job, architecture) for job, architecture in graph_row_list))
+    await asyncio.gather(*(prepare_job(job, architecture) for job, architecture in work_list))
     bootstrap_drops: dict[tuple[int, str], set[str]] = {}
-    for architecture in {normalize_machine_arch(str(value or "")) for _, value in graph_row_list}:
+    for architecture in {normalize_machine_arch(str(value or "")) for _, value in work_list}:
         arch_rows = [
             (job, prepared.get((int(job.id), normalize_machine_arch(str(arch or "")))) )
-            for job, arch in graph_row_list
+            for job, arch in work_list
             if normalize_machine_arch(str(arch or "")) == architecture
         ]
         graph: dict[str, set[str]] = {
@@ -1210,8 +1362,9 @@ async def _evaluate_layer_buildability(
             drops = graph_drops.get(consumer)
             if drops:
                 bootstrap_drops[(int(job.id), architecture)] = drops
-    failure_cascaded = False
-    for job, architecture in row_list:
+    for key, drops in bootstrap_from_mock.items():
+        bootstrap_drops.setdefault(key, set()).update(drops)
+    for job, architecture in work_list:
         if plan.status not in (LayerPlanStatus.PENDING, LayerPlanStatus.RUNNING):
             break
         arch = normalize_machine_arch(str(architecture or ""))
@@ -1222,10 +1375,10 @@ async def _evaluate_layer_buildability(
         dropped_sources = bootstrap_drops.get((int(job.id), arch), set())
         opts = job_options_dict(job)
         if dropped_sources and str(opts.get("build_profile") or "full").strip().lower() != "full":
-            await _start_bootstrap_pass(db, job, dropped_sources)
+            await _start_bootstrap_pass(db, job, dropped_sources, provider_map=provider_map)
             opts = job_options_dict(job)
         elif dropped_sources and not opts.get("bootstrap_dropped"):
-            await _start_bootstrap_pass(db, job, dropped_sources)
+            await _start_bootstrap_pass(db, job, dropped_sources, provider_map=provider_map)
             opts = job_options_dict(job)
         if str(opts.get("build_profile") or "full").strip().lower() == "bootstrap":
             dropped_sources = {
@@ -1235,45 +1388,28 @@ async def _evaluate_layer_buildability(
             }
             if text and parsed is not None:
                 profile_defines = dict(opts.get("rpmbuild_defines") or {"with_check": "0"})
-                if _manifest_has_dynamic_buildrequires(text, parsed):
-                    await enrich_specs_buildrequires_with_rpm(
-                        {package.name: text}, {package.name: parsed}, releasename=releasename,
-                        scope_packages={package.name},
-                        generate_packages={package.name},
-                        owner=owner, repo=repo, distgit_branch=distgit_branch, headers=_github_headers(),
-                        defines_by_package={package.name: profile_defines},
-                    )
                 requirements = tuple(sorted(_manifest_build_requirements(
                     text, parsed, architecture=arch,
                     defines=profile_defines,
                     releasename=releasename,
                 )))
-                complete = (
-                    not _manifest_has_dynamic_buildrequires(text, parsed)
-                    or getattr(parsed, "dyn_br_complete", None) is True
-                )
+                complete = True
+        else:
+            dropped_sources = set()
         effective_requirements = tuple(requirements)
-        stored_blockers = {
-            _canonical_layer_name(value)
-            for value in (job.blocking_sources or [])
-            if str(value).strip()
-        }
-        if source_filter:
-            stored_blockers.discard(source_filter)
+        if dropped_sources:
+            dropped_sources = {_canonical_layer_name(value) for value in dropped_sources if str(value).strip()}
         if not text:
             await _update_layer_job_if_active(
                 db, job.id, plan.id, blocked_reason="waiting on repository: source unavailable"
             )
             continue
-        if not complete:
-            await _update_layer_job_if_active(
-                db, job.id, plan.id, blocked_reason="waiting on repository: dynamic buildrequires"
-            )
-            continue
-        layer_blockers = set(stored_blockers)
-        layer_blockers.update(_incomplete_layer_sources(
-            effective_requirements, provider_map, layer_package_names, layer_statuses, arch
-        ))
+        layer_blockers = _incomplete_layer_sources(
+            effective_requirements, provider_map, layer_package_names, layer_statuses, arch,
+            layer_repo_ready,
+        )
+        if dropped_sources:
+            layer_blockers -= dropped_sources
         failed_sources = sorted(
             source
             for source in layer_blockers
@@ -1300,82 +1436,20 @@ async def _evaluate_layer_buildability(
                 blocking_sources=sorted(layer_blockers),
             )
             continue
-        cache_key = (releasename, job.branch, arch)
-        cached_solver = _reactive_cache_get(_REACTIVE_SOLVER_CACHE, cache_key)
-        if cached_solver is None:
-            solver = await _layer_to_thread(
-                get_repo_solver, releasename, job.branch, [arch],
-                extra_branches=default_capability_extra_branches(job.branch),
+        if job.status != BuildStatus.QUEUED:
+            changed_now = await _update_layer_job_if_active(
+                db, job.id, plan.id, status=BuildStatus.QUEUED, blocked_reason="", blocking_sources=[]
             )
-            cached_solver = (solver, InstallOracle(solver))
-            _reactive_cache_put(_REACTIVE_SOLVER_CACHE, cache_key, cached_solver)
-        _, oracle = cached_solver
-        oracle.clear_overlay()
-        real_result = await _layer_to_thread(oracle.resolve, effective_requirements)
-        missing = _solver_missing_caps(real_result)
-        if missing and provider_index is not None:
-            added_jobs = await _expand_missing_provider(
-                db, int(plan.id), missing, plan=plan, release=release,
-                side_tag_name=side_tag_name, architectures=architectures, options=options,
-                distgit_url=distgit_url, distgit_branch=distgit_branch, owner=owner, repo=repo,
-                releasename=releasename, provider_index=provider_index,
-            )
-            expanded = expanded or bool(added_jobs)
-        if missing:
-            layer_blockers.update(_incomplete_layer_sources(
-                tuple(sorted(missing)), provider_map, layer_package_names, layer_statuses, arch
-            ))
-        full_pass = str(opts.get("build_profile") or "full").strip().lower() == "full"
-        bootstrap_history = bool(opts.get("bootstrap_dropped"))
-        if missing and (layer_blockers or expanded):
-            await _update_layer_job_if_active(
-                db,
-                job.id,
-                plan.id,
-                status=BuildStatus.BLOCKED,
-                blocked_reason="waiting on layer jobs: " + ", ".join(sorted(layer_blockers or missing)[:8]),
-                blocking_sources=sorted(layer_blockers),
-            )
-            continue
-        if missing and full_pass and bootstrap_history and not layer_blockers:
-            failed_now = await _update_layer_job_if_active(
-                db,
-                job.id,
-                plan.id,
-                status=BuildStatus.FAILED,
-                blocked_reason="full pass unresolved: " + ", ".join(sorted(missing)[:8]),
-                blocking_sources=[],
-                error_message="Full pass unresolved after bootstrap: " + ", ".join(sorted(missing)[:8]),
-                completed_at=datetime.now(timezone.utc),
-            )
-            failure_cascaded = failure_cascaded or failed_now
-            continue
-        if real_result.ok and not missing and not layer_blockers:
-            if job.status != BuildStatus.QUEUED:
-                changed_now = await _update_layer_job_if_active(
-                    db, job.id, plan.id, status=BuildStatus.QUEUED, blocked_reason="", blocking_sources=[]
-                )
-                if changed_now:
-                    changed.append(job)
-            else:
-                await _update_layer_job_if_active(db, job.id, plan.id, blocked_reason="", blocking_sources=[])
+            if changed_now:
+                changed.append(job)
         else:
-            details = set(missing)
-            details.update(f"{source} (layer job)" for source in layer_blockers)
-            detail = ", ".join(sorted(details)) or "dependency solver failure"
-            await _update_layer_job_if_active(
-                db,
-                job.id,
-                plan.id,
-                status=BuildStatus.BLOCKED,
-                blocked_reason=f"waiting on repository: {detail}",
-                blocking_sources=sorted(layer_blockers),
-            )
+            await _update_layer_job_if_active(db, job.id, plan.id, blocked_reason="", blocking_sources=[])
     await db.flush()
-    if failure_cascaded:
-        changed.extend(await _evaluate_layer_buildability(db, int(plan.id)))
-    if expanded:
-        changed.extend(await _evaluate_layer_buildability(db, int(plan.id)))
+    logger.info(
+        "layer eval done plan=%s queued=%s",
+        plan.id,
+        len(changed),
+    )
     return changed
 
 
@@ -1432,10 +1506,97 @@ async def try_autofix_layer_missing_provides(
 ) -> bool:
     if job.layer_plan_id is None:
         return False
+    missing = parse_missing_provides_from_text(reason)
+    if not missing:
+        return False
+    plan = await db.get(LayerPlan, int(job.layer_plan_id))
+    if plan is None or plan.status not in (LayerPlanStatus.PENDING, LayerPlanStatus.RUNNING):
+        return False
+    release = await db.get(Release, plan.release_id)
+    if release is None:
+        return False
+    options = _plan_options(plan)
+    releasename = (release.releasename or "").strip()
+    distgit_url = str(options.get("distgit_url") or "https://github.com/oreonhq/rpm-specfiles.git").strip()
+    owner_repo = _github_owner_repo_from_git_url(distgit_url)
+    if not owner_repo:
+        return False
+    owner, repo = owner_repo
+    distgit_branch = str(options.get("distgit_branch") or release_distgit_branch(release)).strip()
+    from oreon_build.models import SideTag
+
+    side_tag = await db.get(SideTag, plan.side_tag_id) if plan.side_tag_id else None
+    side_tag_name = side_tag.name if side_tag is not None else str(options.get("branch") or "")
+    architectures = [str(value) for value in (options.get("architectures") or DEFAULT_ARCH) if value] or list(DEFAULT_ARCH)
+    provider_index = await get_distgit_provides_index_cached(
+        owner=owner, repo=repo, distgit_branch=distgit_branch,
+        releasename=releasename, headers=_github_headers(),
+    )
+    providers = provider_index.indexed_providers() if provider_index is not None else {}
+    distgit_names = set(getattr(provider_index, "package_names", ()) or ())
+    existing_rows = await db.execute(
+        select(Package.name)
+        .join(BuildJob, BuildJob.package_id == Package.id)
+        .where(BuildJob.layer_plan_id == int(plan.id))
+    )
+    existing = {_canonical_layer_name(str(name)) for (name,) in existing_rows.all() if name}
+    mapped: set[str] = set()
+    for cap in missing:
+        mapped.update(_layer_sources_for_requirement(str(cap), providers, distgit_names or existing))
+    if provider_index is not None:
+        added_jobs = await _expand_missing_provider(
+            db, int(plan.id), set(missing), plan=plan, release=release,
+            side_tag_name=side_tag_name, architectures=architectures, options=options,
+            distgit_url=distgit_url, distgit_branch=distgit_branch, owner=owner, repo=repo,
+            releasename=releasename, provider_index=provider_index,
+        )
+        for added in added_jobs:
+            pkg = await db.get(Package, added.package_id)
+            if pkg is not None and pkg.name:
+                mapped.add(_canonical_layer_name(pkg.name))
+    mapped = {name for name in mapped if name}
+    if not mapped:
+        return False
+    self_name = _canonical_layer_name(package_name or "")
+    mapped.discard(self_name)
+    if not mapped:
+        return False
+    blocker_jobs = await db.execute(
+        select(BuildJob, Package.name)
+        .join(Package, Package.id == BuildJob.package_id)
+        .where(BuildJob.layer_plan_id == int(plan.id))
+    )
+    cycle_sources: set[str] = set()
+    for other, other_name in blocker_jobs.all():
+        other_canon = _canonical_layer_name(str(other_name or ""))
+        if other_canon not in mapped:
+            continue
+        blocked_on = {
+            _canonical_layer_name(value)
+            for value in (other.blocking_sources or [])
+            if str(value).strip()
+        }
+        if self_name and self_name in blocked_on:
+            cycle_sources.add(other_canon)
     job.status = BuildStatus.BLOCKED
     job.completed_at = None
-    job.blocked_reason = "waiting on repository: dynamic buildrequires"
+    job.blocked_reason = "waiting on layer jobs: " + ", ".join(sorted(mapped)[:8])
+    job.blocking_sources = sorted(mapped)
     await db.flush()
+    if cycle_sources:
+        cycle_caps = {
+            cap
+            for cap in missing
+            if _layer_sources_for_requirement(str(cap), providers, distgit_names or existing) & cycle_sources
+        }
+        await _start_bootstrap_pass(
+            db,
+            job,
+            cycle_sources,
+            provider_map=providers,
+            extra_stubs=cycle_caps,
+        )
+    await evaluate_layer_buildability(db, int(plan.id))
     return True
 
 
@@ -1450,7 +1611,11 @@ async def on_package_published(
             .join(Release, Release.id == LayerPlan.release_id)
             .where(
                 Release.releasename == releasename,
-                LayerPlan.status.in_((LayerPlanStatus.PENDING, LayerPlanStatus.RUNNING)),
+                LayerPlan.status.in_((
+                    LayerPlanStatus.PENDING,
+                    LayerPlanStatus.RUNNING,
+                    LayerPlanStatus.FAILED,
+                )),
             )
         )
         plan_ids = [int(plan_id) for (plan_id,) in result.all()]
@@ -1471,6 +1636,9 @@ async def on_package_published(
                     )
                 )
                 for published_job in transition.scalars().all():
+                    opts = job_options_dict(published_job)
+                    opts["repo_published"] = True
+                    published_job.job_options = opts
                     if schedule_next_pass_after_publish(published_job):
                         published_job.blocked_reason = "waiting on repository"
                         published_job.blocking_sources = []
@@ -1504,26 +1672,48 @@ async def reconcile_settled_layer_plans() -> None:
     from sqlalchemy import func
 
     async with async_session_maker() as db:
-        rows = await db.execute(
-            select(LayerPlan.id).where(
-                LayerPlan.status.in_((LayerPlanStatus.PENDING, LayerPlanStatus.RUNNING))
+        stalled = await db.execute(
+            select(LayerPlan).where(
+                LayerPlan.status == LayerPlanStatus.FAILED,
+                LayerPlan.error_message.ilike("Layer stalled with no queued or running jobs%"),
             )
         )
-        plan_ids = [int(plan_id) for (plan_id,) in rows.all()]
-        for plan_id in plan_ids:
-            inflight = await db.scalar(
+        plan_ids: list[int] = []
+        for plan in stalled.scalars().all():
+            n_block = await db.scalar(
                 select(func.count())
                 .select_from(BuildJob)
                 .where(
-                    BuildJob.layer_plan_id == plan_id,
-                    BuildJob.status.in_(
-                        (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.RUNNING)
-                    ),
+                    BuildJob.layer_plan_id == plan.id,
+                    BuildJob.status == BuildStatus.BLOCKED,
                 )
             )
-            if int(inflight or 0) > 0:
-                continue
+            if int(n_block or 0) > 0:
+                plan.status = LayerPlanStatus.RUNNING
+                plan.error_message = None
+                plan_ids.append(int(plan.id))
+        for plan_id in plan_ids:
             await evaluate_layer_buildability(db, plan_id)
+        idle = await db.execute(
+            select(LayerPlan).where(LayerPlan.status == LayerPlanStatus.RUNNING)
+        )
+        for plan in idle.scalars().all():
+            if int(plan.id) in plan_ids:
+                continue
+            counts = await db.execute(
+                select(BuildJob.status, func.count())
+                .where(BuildJob.layer_plan_id == plan.id)
+                .group_by(BuildJob.status)
+            )
+            by_status = {status: int(n) for status, n in counts.all()}
+            inflight = (
+                by_status.get(BuildStatus.QUEUED, 0)
+                + by_status.get(BuildStatus.RUNNING, 0)
+                + by_status.get(BuildStatus.PENDING, 0)
+            )
+            if inflight == 0 and by_status.get(BuildStatus.BLOCKED, 0) > 0:
+                plan_ids.append(int(plan.id))
+                await evaluate_layer_buildability(db, int(plan.id))
         await db.commit()
 
 
