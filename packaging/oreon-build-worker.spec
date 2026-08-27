@@ -9,11 +9,11 @@
 
 Name:           oreon-build-worker
 Version:        1.0.0
-Release:        69%{?dist}
+Release:        70%{?dist}
 Summary:        Oreon Build Service worker daemon
 License:        GPLv3
 URL:            https://github.com/oreon/oreon-build-service
-Source0:        oreon-build-service-%{version}.tar.gz
+Source0:        oreon-build-worker-%{version}.tar.gz
 Source1:        oreon-worker.env.example
 
 BuildRequires:  python3-devel >= 3.11
@@ -21,15 +21,8 @@ BuildRequires:  python3-pip
 BuildRequires:  python3-setuptools
 BuildRequires:  python3-wheel
 BuildRequires:  gcc
-BuildRequires:  gcc-c++
 BuildRequires:  openssl-devel
 BuildRequires:  libffi-devel
-BuildRequires:  libpq-devel
-BuildRequires:  krb5-devel
-BuildRequires:  openldap-devel
-BuildRequires:  libxml2-devel
-BuildRequires:  libxslt-devel
-BuildRequires:  xz-devel
 
 Requires:       python3 >= 3.11
 Requires:       mock
@@ -45,7 +38,7 @@ Requires:       kf6-rpm-macros
 Worker daemon for Oreon Build Service.
 
 %prep
-%setup -q -n oreon_build_service-%{version}
+%setup -q -n oreon-build-worker-%{version}
 
 %build
 # Nothing
@@ -57,8 +50,6 @@ mkdir -p %{buildroot}%{_sysconfdir}/oreon-build-worker
 mkdir -p %{buildroot}%{_unitdir}
 
 python3 -m pip install --no-compile --ignore-installed \
-  --only-binary bcrypt,lxml \
-  --no-binary cryptography,cffi,psycopg2-binary \
   --target %{buildroot}%{_prefix}/lib/oreon-build-worker .
 
 cat > %{buildroot}%{_bindir}/oreon-worker << WRAPPER
