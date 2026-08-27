@@ -989,6 +989,18 @@ async def retry_build(
             job.target_id = target.id
     job.status = BuildStatus.PENDING
     job.completed_at = None
+    if job.layer_plan_id is not None:
+        job.status = BuildStatus.BLOCKED
+        job.blocked_reason = "waiting on repository"
+        job.blocking_sources = []
+        job.error_message = None
+        plan = await db.get(LayerPlan, job.layer_plan_id)
+        if plan is not None and plan.status in (LayerPlanStatus.FAILED, LayerPlanStatus.CANCELLED):
+            plan.status = LayerPlanStatus.RUNNING
+            plan.error_message = None
+        from oreon_build.services.build_trigger_bg import schedule_layer_resume_refresh
+
+        schedule_layer_resume_refresh(int(job.layer_plan_id), [int(job.id)])
     await log_audit(
         db,
         "build.retry",
