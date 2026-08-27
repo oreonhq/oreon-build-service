@@ -1083,6 +1083,7 @@ def _write_oreon_mock_mixed_repos_wrapper_cfg(
                 f'_oreon_extra += """',
                 'repo_gpgcheck=0',
                 'skip_if_unavailable=True',
+                'metadata_expire=0',
                 f'cost={cost}',
                 '',
                 '"""',
@@ -1232,10 +1233,13 @@ def _mock_cmd_base(
     *,
     attempt_id: int | None = None,
     rpmbuild_defines: dict | None = None,
+    no_clean: bool = False,
 ) -> list[str]:
     cmd: list[str] = ["mock", "-r", mock_config]
     if mock_unique_ext:
         cmd += ["--uniqueext", mock_unique_ext]
+    if no_clean:
+        cmd += ["--no-clean"]
     if attempt_id is not None and not _mock_shared_host_cache_enabled():
         cmd += ["--config-opts", f"cache_topdir={_mock_cache_topdir_for_attempt(attempt_id)}"]
     # addrepos go into the wrapper cfg (gpgkey + pkgverify macros). CLI --addrepo is opt-in only.
@@ -1914,6 +1918,7 @@ def _mock_rebuild_srpm(
     live_out: MockLiveOutput | None = None,
     rpmbuild_defines: dict | None = None,
     prefer_arch: str | None = None,
+    no_clean: bool = False,
 ) -> tuple[bool, str, bool]:
     eff_mock_config = _mock_config_for_mixed_addrepos(
         mock_config,
@@ -1929,12 +1934,187 @@ def _mock_rebuild_srpm(
         rpm_dist=rpm_dist,
         attempt_id=attempt_id,
         rpmbuild_defines=rpmbuild_defines,
+        no_clean=no_clean,
     )
     cmd += ["--rebuild", str(srpm_path), "--resultdir", str(result_dir)]
     rc, out = _run_with_abort(cmd, timeout_s=_mock_rebuild_timeout_sec(), abort_event=abort_event, live_out=live_out)
     if rc == _RC_MOCK_CANCELLED:
         return False, out, True
     return rc == 0, out, False
+
+
+def _mock_resolve_timeout_sec() -> int:
+    raw = os.environ.get(
+        "OREON_WORKER_MOCK_RESOLVE_TIMEOUT_SEC", str(_MOCK_STAGE_TIMEOUT_DEFAULT_SEC)
+    )
+    try:
+        v = int(raw)
+    except ValueError:
+        v = _MOCK_STAGE_TIMEOUT_DEFAULT_SEC
+    return max(_MOCK_STAGE_TIMEOUT_MIN_SEC, min(v, _MOCK_STAGE_TIMEOUT_MAX_SEC))
+
+
+def _mock_log_text_for_missing(result_dir: Path, wrapper_out: str) -> str:
+    chunks = [wrapper_out or ""]
+    for name in ("root.log", "build.log"):
+        path = result_dir / name
+        if not path.is_file():
+            continue
+        try:
+            chunks.append(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+    return "\n".join(chunks)
+
+
+def _missing_provides_from_mock(result_dir: Path, wrapper_out: str) -> list[str]:
+    from oreon_build.core.dnf_missing import parse_dnf_missing_provides
+
+    return parse_dnf_missing_provides(_mock_log_text_for_missing(result_dir, wrapper_out))
+
+
+def _mock_installdeps_srpm(
+    mock_config: str,
+    srpm_path: Path,
+    result_dir: Path,
+    abort_event: threading.Event | None = None,
+    mock_unique_ext: str | None = None,
+    addrepo_baseurls: list[str] | None = None,
+    rpm_dist: str | None = None,
+    attempt_id: int | None = None,
+    live_out: MockLiveOutput | None = None,
+    rpmbuild_defines: dict | None = None,
+    prefer_arch: str | None = None,
+    no_clean: bool = False,
+) -> tuple[bool, str, bool, list[str]]:
+    eff_mock_config = _mock_config_for_mixed_addrepos(
+        mock_config,
+        addrepo_baseurls or [],
+        result_dir.parent,
+        attempt_id,
+        prefer_arch=prefer_arch,
+    )
+    cmd = _mock_cmd_base(
+        eff_mock_config,
+        mock_unique_ext,
+        addrepo_baseurls or [],
+        rpm_dist=rpm_dist,
+        attempt_id=attempt_id,
+        rpmbuild_defines=rpmbuild_defines,
+        no_clean=no_clean,
+    )
+    cmd += ["--installdeps", str(srpm_path), "--resultdir", str(result_dir)]
+    rc, out = _run_with_abort(
+        cmd, timeout_s=_mock_resolve_timeout_sec(), abort_event=abort_event, live_out=live_out
+    )
+    missing = _missing_provides_from_mock(result_dir, out)
+    if rc == _RC_MOCK_CANCELLED:
+        return False, out, True, missing
+    return rc == 0, out, False, missing
+
+
+def _rpm_stub_provide_line(cap: str) -> str | None:
+    token = (cap or "").strip()
+    if not token or "\n" in token or "%" in token or len(token) > 240:
+        return None
+    if token.startswith("/"):
+        path = token.split()[0]
+        if " " in path or not path.startswith("/"):
+            return None
+        return f"Provides: {path}"
+    name = token.split()[0]
+    if not name:
+        return None
+    return f"Provides: {name} = 99999999"
+
+
+def _build_bootstrap_stub_rpm(caps: list[str], dest_dir: Path) -> Path | None:
+    lines: list[str] = []
+    seen: set[str] = set()
+    for cap in caps:
+        line = _rpm_stub_provide_line(cap)
+        if not line or line in seen:
+            continue
+        seen.add(line)
+        lines.append(line)
+    if not lines:
+        return None
+    top = dest_dir / "bootstrap-stub"
+    for sub in ("BUILD", "RPMS", "SOURCES", "SPECS", "SRPMS"):
+        (top / sub).mkdir(parents=True, exist_ok=True)
+    spec = top / "SPECS" / "oreon-bootstrap-stub.spec"
+    spec.write_text(
+        "\n".join(
+            [
+                "Name: oreon-bootstrap-stub",
+                "Version: 0",
+                "Release: 1",
+                "Summary: layer bootstrap provides",
+                "License: MIT",
+                *lines,
+                "%description",
+                "bootstrap provides",
+                "%files",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    rc, out = _run(
+        [
+            "rpmbuild",
+            "-bb",
+            "--define",
+            f"_topdir {top}",
+            str(spec),
+        ],
+        timeout_s=120,
+    )
+    if rc != 0:
+        logger.warning("bootstrap stub rpmbuild failed: %s", _tail_lines(out, 30))
+        return None
+    rpms = sorted((top / "RPMS").rglob("*.rpm"))
+    return rpms[0] if rpms else None
+
+
+def _mock_install_local_rpm(
+    mock_config: str,
+    rpm_path: Path,
+    result_dir: Path,
+    abort_event: threading.Event | None = None,
+    mock_unique_ext: str | None = None,
+    addrepo_baseurls: list[str] | None = None,
+    rpm_dist: str | None = None,
+    attempt_id: int | None = None,
+    live_out: MockLiveOutput | None = None,
+    rpmbuild_defines: dict | None = None,
+    prefer_arch: str | None = None,
+    no_clean: bool = False,
+) -> tuple[bool, str, bool]:
+    eff_mock_config = _mock_config_for_mixed_addrepos(
+        mock_config,
+        addrepo_baseurls or [],
+        result_dir.parent,
+        attempt_id,
+        prefer_arch=prefer_arch,
+    )
+    cmd = _mock_cmd_base(
+        eff_mock_config,
+        mock_unique_ext,
+        addrepo_baseurls or [],
+        rpm_dist=rpm_dist,
+        attempt_id=attempt_id,
+        rpmbuild_defines=rpmbuild_defines,
+        no_clean=no_clean,
+    )
+    cmd += ["--install", str(rpm_path), "--resultdir", str(result_dir)]
+    rc, out = _run_with_abort(
+        cmd, timeout_s=_mock_resolve_timeout_sec(), abort_event=abort_event, live_out=live_out
+    )
+    if rc == _RC_MOCK_CANCELLED:
+        return False, out, True
+    return rc == 0, out, False
+
 
 def _mock_buildsrpm_timeout_sec() -> int:
     raw = os.environ.get(
@@ -2530,6 +2710,138 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                 )
                 return
 
+            resolve_dir = tmp / "resolve"
+            resolve_dir.mkdir()
+            live_resolve_stop = threading.Event()
+            resolve_live = MockLiveOutput()
+
+            def _resolve_mock_tail() -> str:
+                return resolve_live.tail()
+
+            live_resolve_thread = _start_live_build_log_snapshot_thread(
+                session,
+                controller_url,
+                attempt_id,
+                resolve_dir,
+                live_resolve_stop,
+                log_prefix_getter=_live_log_prefix,
+                mock_output_getter=_resolve_mock_tail,
+                mock_config=mock_config,
+                mock_unique_ext=mock_unique_ext,
+            )
+            stub_caps = [
+                str(value).strip()
+                for value in (job.get("bootstrap_stub_provides") or [])
+                if str(value).strip()
+            ]
+            keep_root = False
+            try:
+                if stub_caps:
+                    stub_rpm = _build_bootstrap_stub_rpm(stub_caps, tmp)
+                    if stub_rpm is not None:
+                        stub_ok, stub_out, stub_cancelled = _mock_install_local_rpm(
+                            mock_config=mock_config,
+                            rpm_path=stub_rpm,
+                            result_dir=resolve_dir,
+                            abort_event=abort_event,
+                            mock_unique_ext=mock_unique_ext,
+                            addrepo_baseurls=mock_addrepos,
+                            rpm_dist=rpm_dist,
+                            attempt_id=attempt_id,
+                            live_out=resolve_live,
+                            rpmbuild_defines=rpmbuild_defines,
+                            prefer_arch=build_arch,
+                        )
+                        build_log_parts.append(
+                            "## bootstrap stub provides\n" + "\n".join(stub_caps[:40]) + "\n" + (stub_out or "")
+                        )
+                        if stub_cancelled:
+                            resolve_ok, resolve_out, resolve_cancelled, resolve_missing = False, stub_out, True, []
+                        else:
+                            keep_root = bool(stub_ok)
+                            resolve_ok = False
+                            resolve_out = ""
+                            resolve_cancelled = False
+                            resolve_missing = []
+                    else:
+                        resolve_ok = False
+                        resolve_out = ""
+                        resolve_cancelled = False
+                        resolve_missing = []
+                else:
+                    resolve_ok = False
+                    resolve_out = ""
+                    resolve_cancelled = False
+                    resolve_missing = []
+                if not resolve_cancelled:
+                    for round_i in range(3):
+                        resolve_ok, resolve_out, resolve_cancelled, resolve_missing = _mock_installdeps_srpm(
+                            mock_config=mock_config,
+                            srpm_path=srpm_path,
+                            result_dir=resolve_dir,
+                            abort_event=abort_event,
+                            mock_unique_ext=mock_unique_ext,
+                            addrepo_baseurls=mock_addrepos,
+                            rpm_dist=rpm_dist,
+                            attempt_id=attempt_id,
+                            live_out=resolve_live,
+                            rpmbuild_defines=rpmbuild_defines,
+                            prefer_arch=build_arch,
+                            no_clean=keep_root or round_i > 0,
+                        )
+                        keep_root = True
+                        if resolve_ok or resolve_cancelled or not resolve_missing:
+                            break
+                        if round_i < 2:
+                            time.sleep(5)
+            finally:
+                _stop_live_build_log_snapshot_thread(live_resolve_stop, live_resolve_thread)
+            _make_mock_resultdir_world_readable(resolve_dir)
+            build_log_parts.extend(
+                _mock_stage_log_sections(
+                    resolve_dir,
+                    stage_title="BuildRequires resolve (mock --installdeps)",
+                    mock_rc_ok=resolve_ok,
+                    cancelled=resolve_cancelled,
+                    wrapper_output=resolve_out,
+                    max_build_log_lines=log_max_lines,
+                )
+            )
+            if resolve_cancelled:
+                full_log = "\n\n".join([p for p in build_log_parts if p]).strip() + "\n"
+                log_key = _upload_build_log_via_controller(session, controller_url, attempt_id, full_log.encode("utf-8"))
+                _post_worker_build_result(
+                    session,
+                    controller_url,
+                    attempt_id,
+                    {
+                        "status": "cancelled",
+                        "log_r2_key": log_key,
+                        "error_message": "Build cancelled by user",
+                        "artifacts": [],
+                    },
+                )
+                return
+            if not resolve_ok:
+                full_log = "\n\n".join([p for p in build_log_parts if p]).strip() + "\n"
+                log_key = _upload_build_log_via_controller(
+                    session, controller_url, attempt_id, full_log.encode("utf-8")
+                )
+                _post_worker_build_result(
+                    session,
+                    controller_url,
+                    attempt_id,
+                    {
+                        "status": "failed",
+                        "log_r2_key": log_key,
+                        "error_message": (full_log if full_log else "mock --installdeps failed"),
+                        "artifacts": [],
+                        "missing_provides": resolve_missing,
+                        "resolve_stage": "installdeps",
+                    },
+                )
+                return
+
             result_dir = tmp / "result"
             result_dir.mkdir()
             live_rebuild_stop = threading.Event()
@@ -2562,6 +2874,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                     live_out=rebuild_live,
                     rpmbuild_defines=rpmbuild_defines,
                     prefer_arch=build_arch,
+                    no_clean=True,
                 )
             finally:
                 _stop_live_build_log_snapshot_thread(live_rebuild_stop, live_rebuild_thread)
@@ -2592,6 +2905,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                 )
                 return
             if not ok:
+                rebuild_missing = _missing_provides_from_mock(result_dir, rebuild_out)
                 full_log = "\n\n".join([p for p in build_log_parts if p]).strip() + "\n"
                 log_key = _upload_build_log_via_controller(
                     session, controller_url, attempt_id, full_log.encode("utf-8")
@@ -2605,6 +2919,8 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                         "log_r2_key": log_key,
                         "error_message": (full_log if full_log else "mock --rebuild failed"),
                         "artifacts": [],
+                        "missing_provides": rebuild_missing,
+                        "resolve_stage": "generate_buildrequires",
                     },
                 )
                 return
