@@ -590,7 +590,11 @@ async def cancel_check(
     return {"cancel_requested": cancel_requested}
 
 def _put_rpm_bytes_to_r2(key: str, raw: bytes) -> None:
-    get_r2_client().put_object(key, raw, content_type="application/x-rpm")
+    from oreon_build.services.publisher import REPO_RPM_CACHE_CONTROL
+
+    get_r2_client().put_object(
+        key, raw, content_type="application/x-rpm", cache_control=REPO_RPM_CACHE_CONTROL
+    )
 
 _RPM_UPLOAD_CONTENT_TYPE = "application/x-rpm"
 
@@ -1672,10 +1676,6 @@ async def report_result(
 
     err_msg = payload.error_message
     missing = [str(item).strip() for item in (payload.missing_provides or []) if str(item).strip()]
-    if not missing and isinstance(err_msg, str):
-        from oreon_build.core.dnf_missing import parse_dnf_missing_provides
-
-        missing = parse_dnf_missing_provides(err_msg)
     if isinstance(err_msg, str) and err_msg.strip():
         err_msg = prepare_build_error_message(err_msg)
     if missing:
@@ -1928,7 +1928,7 @@ async def report_result(
     if st_l in ("failed", "cancelled"):
         from oreon_build.services.build_trigger_bg import schedule_layer_terminal_notify
 
-        schedule_layer_terminal_notify(job.id, st_l, err_msg)
+        schedule_layer_terminal_notify(job.id, st_l, err_msg, payload.resolve_stage)
 
     return {"status": "ok"}
 

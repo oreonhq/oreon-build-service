@@ -528,6 +528,15 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.middleware("http")
+    async def _api_no_store(request, call_next):
+        response = await call_next(request)
+        path = request.url.path or ""
+        if path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+        return response
     app.include_router(auth.router, prefix="/api")
     app.include_router(accounts.router, prefix="/api")
     app.include_router(releases.router, prefix="/api")
