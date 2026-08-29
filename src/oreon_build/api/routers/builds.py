@@ -534,7 +534,9 @@ async def list_layer_plans(
 
 
 async def _layer_plan_to_status_response(db: DbSession, plan) -> LayerPlanStatusResponse:
-    await db.refresh(plan)
+    expired = sa_inspect(plan).expired_attributes
+    if expired:
+        await db.refresh(plan)
     rel = await db.get(Release, plan.release_id)
     from oreon_build.models import SideTag
     from sqlalchemy import func
@@ -546,28 +548,31 @@ async def _layer_plan_to_status_response(db: DbSession, plan) -> LayerPlanStatus
     )
     counts: dict[str, int] = {st.value: int(n) for st, n in counts_r.all()}
 
-    jobs_r = await db.execute(
-        select(BuildJob)
-        .options(selectinload(BuildJob.package), selectinload(BuildJob.build_target))
-        .where(
-            BuildJob.layer_plan_id == plan.id,
-            BuildJob.status == BuildStatus.FAILED,
+    rows: list[LayerJobRow] = []
+    if plan.status in (LayerPlanStatus.FAILED, LayerPlanStatus.CANCELLED, LayerPlanStatus.SUCCESS):
+        jobs_r = await db.execute(
+            select(BuildJob)
+            .options(selectinload(BuildJob.package), selectinload(BuildJob.build_target))
+            .where(
+                BuildJob.layer_plan_id == plan.id,
+                BuildJob.status == BuildStatus.FAILED,
+            )
+            .order_by(BuildJob.layer_index.asc().nulls_last(), BuildJob.id.asc())
+            .limit(50)
         )
-        .order_by(BuildJob.layer_index.asc().nulls_last(), BuildJob.id.asc())
-    )
-    jobs = list(jobs_r.scalars().all())
-    rows = [
-        LayerJobRow(
-            job_id=j.id,
-            package_name=j.package.name if j.package else "?",
-            status=j.status.value,
-            layer_index=j.layer_index,
-            blocked_reason=None,
-            architecture=j.build_target.architecture if j.build_target else None,
-            blocked_on=[],
-        )
-        for j in jobs
-    ]
+        jobs = list(jobs_r.scalars().all())
+        rows = [
+            LayerJobRow(
+                job_id=j.id,
+                package_name=j.package.name if j.package else "?",
+                status=j.status.value,
+                layer_index=j.layer_index,
+                blocked_reason=None,
+                architecture=j.build_target.architecture if j.build_target else None,
+                blocked_on=[],
+            )
+            for j in jobs
+        ]
 
     side_tag = await db.get(SideTag, plan.side_tag_id) if plan.side_tag_id else None
     return LayerPlanStatusResponse(
@@ -603,6 +608,7 @@ async def cancel_layer_build_endpoint(
 
     plan = await cancel_layer_plan_by_user(db, request, user, layer_plan_id=layer_plan_id)
     await db.commit()
+    await db.refresh(plan)
     return await _layer_plan_to_status_response(db, plan)
 
 
@@ -620,8 +626,10 @@ async def resume_layer_build_endpoint(
         db, request, user, layer_plan_id=layer_plan_id
     )
     await db.commit()
+    await db.refresh(plan)
+    response = await _layer_plan_to_status_response(db, plan)
     schedule_layer_resume_refresh(int(plan.id), reopen_ids)
-    return await _layer_plan_to_status_response(db, plan)
+    return response
 
 
 @router.post("/mass-rebuild/run", response_model=dict)
