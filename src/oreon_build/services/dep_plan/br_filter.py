@@ -27,13 +27,13 @@ def filter_plan_brs(brs: Iterable[str]) -> list[str]:
     Drops rpmlib, macros, and rich deps that are vacuously false (`if 0`).
     Does not invent allow/deny lists of package names.
     """
-    from oreon_build.core.rpm_requires import is_chain_plan_requirement
+    from oreon_build.core.rpm_requires import is_chain_plan_requirement, requirement_usable_for_solver
 
     out: list[str] = []
     seen: set[str] = set()
     for br in brs:
-        c = (br or "").strip()
-        if not c or c in seen or "%" in c:
+        c = requirement_usable_for_solver(br or "")
+        if not c or c in seen:
             continue
         if is_rpmlib_requirement(c):
             continue

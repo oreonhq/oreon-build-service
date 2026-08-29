@@ -75,6 +75,7 @@ def process_repo_publish_sync(
             _persistent_repo_root,
             _stage_container_for_prefix,
             _write_staged_rpm,
+            REPO_RPM_CACHE_CONTROL,
         )
 
         container = _stage_container_for_prefix(prefix)
@@ -94,7 +95,10 @@ def process_repo_publish_sync(
                     data = r2.get_object(key)
                     if not data:
                         continue
-                    r2.put_object(dest, data)
+                    r2.put_object(
+                        dest, data, content_type="application/x-rpm",
+                        cache_control=REPO_RPM_CACHE_CONTROL,
+                    )
                 continue
 
             dest = repo_rpms_key(releasename, branch, arch, fname)
@@ -104,11 +108,17 @@ def process_repo_publish_sync(
             elif "/builds/" in key:
                 data = r2.get_object(key)
                 if data:
-                    r2.put_object(dest, data)
+                    r2.put_object(
+                        dest, data, content_type="application/x-rpm",
+                        cache_control=REPO_RPM_CACHE_CONTROL,
+                    )
             elif key.endswith(f"/RPMS/{fname}") and f"/{branch}/" in key:
                 data = r2.get_object(key)
                 if data and key != dest:
-                    r2.put_object(dest, data)
+                    r2.put_object(
+                        dest, data, content_type="application/x-rpm",
+                        cache_control=REPO_RPM_CACHE_CONTROL,
+                    )
             if not data:
                 logger.warning(
                     "repo publish %s: skip artifact with unknown r2_key=%r filename=%r",

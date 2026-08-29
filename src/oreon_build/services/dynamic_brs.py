@@ -7,6 +7,7 @@ import io
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tarfile
@@ -31,7 +32,7 @@ _RE_CARGO_SPEC = re.compile(
 )
 _CACHE: dict[str, tuple[float, list[str], bool]] = {}
 _CACHE_TTL = 1800.0
-_DYNAMIC_BR_EVAL_VERSION = "3"
+_DYNAMIC_BR_EVAL_VERSION = "5"
 
 
 def _scratch_base_dir() -> str | None:
@@ -381,8 +382,45 @@ def _extract_cargo_toml_from_tarball(data: bytes, dest_dir: Path) -> Path | None
         return None
 
 
-def _cargo2rpm_buildrequires(manifest: Path, *, with_check: bool = False) -> list[str] | None:
-    cmd = ["cargo2rpm", "--path", str(manifest), "buildrequires"]
+def _cargo2rpm_flag_args(flag_text: str) -> list[str] | None:
+    raw = (flag_text or "").strip()
+    if not raw:
+        return []
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        return None
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok.startswith("%"):
+            return None
+        if tok in ("-a", "--all-features", "-n", "--no-default-features", "-t", "--with-check"):
+            out.append(tok)
+        elif tok in ("-f", "-F", "--features"):
+            if i + 1 >= len(tokens) or tokens[i + 1].startswith("%"):
+                return None
+            out.extend([tok, tokens[i + 1]])
+            i += 1
+        elif tok.startswith("--features="):
+            if "%" in tok:
+                return None
+            out.append(tok)
+        else:
+            return None
+        i += 1
+    return out
+
+
+def _cargo2rpm_buildrequires(
+    manifest: Path,
+    *,
+    with_check: bool = False,
+    extra_args: list[str] | None = None,
+) -> list[str] | None:
+    extra = [a for a in (extra_args or []) if a not in ("-t", "--with-check")]
+    cmd = ["cargo2rpm", "--path", str(manifest), "buildrequires", *extra]
     if with_check:
         cmd.append("--with-check")
     proc = _run(cmd, timeout=30)
@@ -400,11 +438,6 @@ def _cargo2rpm_buildrequires(manifest: Path, *, with_check: bool = False) -> lis
 
 
 def _cargo_generator_flags(spec_text: str) -> str:
-    """Raw text of the %cargo_generate_buildrequires invocation line.
-
-    Upstream macro passes extra flags straight to cargo2rpm. A bare call is
-    safe to mirror with cargo2rpm directly, anything carrying args is not.
-    """
     m = re.search(
         r"^[ \t]*%cargo_generate_buildrequires([ \t]+\S.*)?$",
         (spec_text or ""),
@@ -423,7 +456,8 @@ def _evaluate_cargo_buildrequires_fast(
     from oreon_build.core.spec_bcond import parse_spec_bconds
     from oreon_build.services.cargo_target_brs import filter_foreign_target_crate_brs
 
-    if _cargo_generator_flags(spec_text):
+    extra = _cargo2rpm_flag_args(_cargo_generator_flags(spec_text))
+    if extra is None:
         return None
 
     raw_check = str((defines or {}).get("with_check", "")).strip()
@@ -459,7 +493,7 @@ def _evaluate_cargo_buildrequires_fast(
         manifest = _extract_cargo_toml_from_tarball(data, Path(td))
         if manifest is None:
             return None
-        brs = _cargo2rpm_buildrequires(manifest, with_check=with_check)
+        brs = _cargo2rpm_buildrequires(manifest, with_check=with_check, extra_args=extra)
         if brs is None:
             return None
         brs = filter_foreign_target_crate_brs(
@@ -505,15 +539,14 @@ def evaluate_generate_buildrequires(
         return DynBrResult(buildrequires=list(hit[1]), complete=bool(hit[2]))
 
     if spec_uses_cargo_generate_buildrequires(spec_text):
-        fast = _evaluate_cargo_buildrequires_fast(
+        cargo_fast = _evaluate_cargo_buildrequires_fast(
             spec_text,
             defines=defines,
             local_source_paths=local_source_paths,
             target_arches=target_arches,
         )
-        if fast is not None:
-            _CACHE[key] = (now, list(fast.buildrequires), fast.complete)
-            return fast
+    else:
+        cargo_fast = None
 
     with tempfile.TemporaryDirectory(prefix="oreon-rpmbr-", dir=_scratch_base_dir()) as td:
         top = Path(td)
@@ -564,9 +597,8 @@ def evaluate_generate_buildrequires(
                     cargo_tomls=find_cargo_tomls(top / "BUILD"),
                     arches=target_arches,
                 )
-            # pyproject/%generate_buildrequires often exits non-zero after writing
-            # the nosrc Requires (deps not in the empty buildroot). that output is
-            # still the real DynamicBuildRequires list mock would use.
+            if cargo_fast is not None:
+                brs = merge_buildrequires(brs, cargo_fast.buildrequires)
             _CACHE[key] = (now, list(brs), True)
             return DynBrResult(buildrequires=brs, complete=True)
 
@@ -583,6 +615,10 @@ def evaluate_generate_buildrequires(
         if not err:
             err = "rpmbuild -br produced no buildreqs nosrc"
         cargo = spec_uses_cargo_generate_buildrequires(spec_text)
+        if cargo and cargo_fast is not None:
+            brs = merge_buildrequires(static, cargo_fast.buildrequires)
+            _CACHE[key] = (now, list(brs), True)
+            return DynBrResult(buildrequires=brs, complete=True)
         if cargo:
             # cargo second pass is rich crate() caps. static BRs alone are a lie.
             logger.info(

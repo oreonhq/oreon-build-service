@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Iterable
 from xml.etree import ElementTree as ET
 
-from oreon_build.core.rpm_requires import parse_versioned_requirement
+from oreon_build.core.rpm_requires import parse_versioned_requirement, requirement_usable_for_solver
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +93,11 @@ def _http_get(url: str, dest: Path, *, timeout: int = 180) -> None:
     tmp = dest.with_suffix(dest.suffix + ".tmp")
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "oreon-build-service/solv-engine"},
+        headers={
+            "User-Agent": "oreon-build-service/solv-engine",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        },
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp, open(tmp, "wb") as out:
         while True:
@@ -501,9 +505,9 @@ class SolvArchEngine:
         pool = self._pool
         reqs = sorted(
             {
-                (r or "").strip()
+                usable
                 for r in requirements
-                if (r or "").strip() and "%" not in (r or "")
+                if (usable := requirement_usable_for_solver(r or ""))
             }
         )
         if not reqs:
@@ -547,16 +551,20 @@ class SolvArchEngine:
         problems = solver.solve(jobs)
         if not problems and not missing:
             shadow_sources: set[str] = set()
+            repo_sources: set[str] = set()
             try:
                 transaction = solver.transaction()
                 for solvable in transaction.newsolvables():
-                    if getattr(solvable, "repo", None) is self._overlay_repo:
-                        source = _source_name_from_solvable(solvable, solv)
-                        if source:
-                            shadow_sources.add(source)
+                    source = _source_name_from_solvable(solvable, solv)
+                    if source:
+                        repo_sources.add(source)
+                    if getattr(solvable, "repo", None) is self._overlay_repo and source:
+                        shadow_sources.add(source)
             except Exception:
                 logger.debug("unable to inspect overlay transaction", exc_info=True)
-            result = SolveResult(ok=True, shadow_sources=shadow_sources)
+            result = SolveResult(
+                ok=True, shadow_sources=shadow_sources, repo_sources=repo_sources
+            )
             self._resolve_cache[key] = result
             return result
 

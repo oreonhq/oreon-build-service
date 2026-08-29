@@ -20,62 +20,98 @@ from typing import List
 from oreon_build.config import get_settings
 from oreon_build.services.r2 import R2Client, get_r2_client
 from oreon_build.services.signing import sign_repomd
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
+_CF_PURGE_BATCH = 30
+REPO_RPM_CACHE_CONTROL = "public, max-age=0, must-revalidate"
+_REPODATA_CACHE_CONTROL = "no-store, no-cache, max-age=0, must-revalidate"
 
-def _purge_repodata_cache(r2_prefix: str) -> None:
+
+def _cloudflare_auth() -> tuple[str, str, str] | None:
     settings = get_settings()
     zone_id = (getattr(settings, "cloudflare_zone_id", None) or os.environ.get("CLOUDFLARE_ZONE_ID") or "").strip()
     token = (getattr(settings, "cloudflare_api_token", None) or os.environ.get("CLOUDFLARE_API_TOKEN") or "").strip()
     public_url = (getattr(settings, "r2_public_url", None) or "").strip().rstrip("/")
-    prefix = r2_prefix.strip("/")
-    if not zone_id or not token or not public_url or not prefix:
-        return
-    urls = [
-        f"{public_url}/{prefix}/repodata/*",
-        f"{public_url}/{prefix}/repodata/repomd.xml",
-        f"{public_url}/{prefix}/repodata/repomd.xml.asc",
-    ]
-    body = json.dumps({"files": urls}).encode("utf-8")
+    if not zone_id or not token or not public_url:
+        return None
+    return zone_id, token, public_url
+
+
+def _cloudflare_prefix(public_url: str, object_prefix: str) -> str:
+    host = urlparse(public_url).netloc
+    path = object_prefix.strip("/")
+    return f"{host}/{path}/"
+
+
+def _cloudflare_purge_post(zone_id: str, token: str, payload: dict) -> None:
+    body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         f"https://api.cloudflare.com/client/v4/zones/{zone_id}/purge_cache",
         data=body,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         method="POST",
     )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        result = json.loads(response.read().decode("utf-8"))
+    if not result.get("success"):
+        raise RuntimeError(result.get("errors") or "Cloudflare cache purge failed")
+
+
+def _cloudflare_purge(*, files: list[str] | None = None, prefixes: list[str] | None = None) -> None:
+    auth = _cloudflare_auth()
+    if auth is None:
+        return
+    zone_id, token, _public_url = auth
+    file_list = [u for u in (files or []) if u]
+    prefix_list = [p for p in (prefixes or []) if p]
+    if not file_list and not prefix_list:
+        return
+    if prefix_list:
+        try:
+            _cloudflare_purge_post(zone_id, token, {"prefixes": prefix_list})
+        except Exception:
+            logger.exception("Cloudflare prefix purge failed prefixes=%s", prefix_list)
+    for i in range(0, len(file_list), _CF_PURGE_BATCH):
+        chunk = file_list[i : i + _CF_PURGE_BATCH]
+        try:
+            _cloudflare_purge_post(zone_id, token, {"files": chunk})
+        except Exception:
+            logger.exception("Cloudflare file purge failed count=%s", len(chunk))
+            raise
+
+
+def _purge_repodata_cache(r2_prefix: str) -> None:
+    auth = _cloudflare_auth()
+    if auth is None:
+        return
+    _zone_id, _token, public_url = auth
+    prefix = r2_prefix.strip("/")
+    files = [
+        f"{public_url}/{prefix}/repodata/repomd.xml",
+        f"{public_url}/{prefix}/repodata/repomd.xml.asc",
+    ]
+    prefixes = [_cloudflare_prefix(public_url, f"{prefix}/repodata")]
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            result = json.loads(response.read().decode("utf-8"))
-        if not result.get("success"):
-            raise RuntimeError(result.get("errors") or "Cloudflare cache purge failed")
+        _cloudflare_purge(files=files, prefixes=prefixes)
         logger.info("Purged Cloudflare repodata cache for %s", prefix)
     except Exception:
         logger.exception("Cloudflare repodata cache purge failed for %s", prefix)
 
 
 def _purge_replaced_rpm_cache(r2_prefix: str, filenames: list[str] | None) -> None:
-    settings = get_settings()
-    zone_id = (getattr(settings, "cloudflare_zone_id", None) or os.environ.get("CLOUDFLARE_ZONE_ID") or "").strip()
-    token = (getattr(settings, "cloudflare_api_token", None) or os.environ.get("CLOUDFLARE_API_TOKEN") or "").strip()
-    public_url = (getattr(settings, "r2_public_url", None) or "").strip().rstrip("/")
-    names = sorted({name for name in (filenames or []) if name and name.lower().endswith(".rpm")})
-    if not zone_id or not token or not public_url or not names:
+    auth = _cloudflare_auth()
+    if auth is None:
         return
-    urls = [f"{public_url}/{r2_prefix.strip('/')}/RPMS/{name}" for name in names]
-    body = json.dumps({"files": urls}).encode("utf-8")
-    request = urllib.request.Request(
-        f"https://api.cloudflare.com/client/v4/zones/{zone_id}/purge_cache",
-        data=body,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        method="POST",
-    )
+    _zone_id, _token, public_url = auth
+    prefix = r2_prefix.strip("/")
+    names = sorted({name for name in (filenames or []) if name and name.lower().endswith(".rpm")})
+    files = [f"{public_url}/{prefix}/RPMS/{name}" for name in names]
+    prefixes = [_cloudflare_prefix(public_url, f"{prefix}/RPMS")]
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            result = json.loads(response.read().decode("utf-8"))
-        if not result.get("success"):
-            raise RuntimeError(result.get("errors") or "Cloudflare cache purge failed")
-        logger.info("Purged Cloudflare cache for %d replaced RPMs under %s", len(urls), r2_prefix)
+        _cloudflare_purge(files=files, prefixes=prefixes)
+        logger.info("Purged Cloudflare cache for %s replaced RPMs under %s", len(files), prefix)
     except Exception:
         logger.exception("Cloudflare RPM cache purge failed for %s", r2_prefix)
 
@@ -883,7 +919,7 @@ def _upload_repodata_dir_ordered(client: R2Client, r2_prefix: str, repodata_dir:
         client.put_object(
             r2_key,
             f.read_bytes(),
-            cache_control="no-store, no-cache, max-age=0, must-revalidate",
+            cache_control=_REPODATA_CACHE_CONTROL,
         )
 
 def _count_primary_packages(repodata_dir: Path) -> int:
@@ -1118,7 +1154,10 @@ def publish_rpms_to_r2(
                 dest.write_bytes(data)
                 canonical = f"{prefix}/RPMS/{fname}"
                 if key != canonical:
-                    client.put_object(canonical, data)
+                    client.put_object(
+                        canonical, data, content_type="application/x-rpm",
+                        cache_control=REPO_RPM_CACHE_CONTROL,
+                    )
             _run_createrepo(repo_root)
             repodata_dir = repo_root / "repodata"
             if repodata_dir.exists():

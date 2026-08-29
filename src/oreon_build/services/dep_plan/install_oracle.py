@@ -72,12 +72,14 @@ class InstallOracle:
         self.set_overlay({})
 
     def resolve(self, requirements: Iterable[str]) -> SolveResult:
+        from oreon_build.core.rpm_requires import requirement_usable_for_solver
+
         reqs = tuple(
             sorted(
                 {
-                    (r or "").strip()
+                    usable
                     for r in requirements
-                    if (r or "").strip() and "%" not in (r or "")
+                    if (usable := requirement_usable_for_solver(r or ""))
                 }
             )
         )

@@ -272,7 +272,32 @@ def ghc_devel_to_sources(cap: str, package_names: set[str], provider_map: dict) 
         f"ghc-libhs({name})",
         f"ghc-libhs({hyphen})",
     )
+    if not out:
+        out |= _hit(known, "ghc")
     return {s for s in out if s}
+
+
+def ghc_rpm_to_sources(cap: str, package_names: set[str], provider_map: dict) -> set[str]:
+    p = (cap or "").strip()
+    if not p.lower().startswith("ghc-") or "(" in p:
+        return set()
+    known = package_names or set()
+    if p.lower().endswith("-devel"):
+        lib = p[: -len("-devel")]
+        hit = _hit(known, lib, p)
+        if hit:
+            return hit
+        mapped = _pmap_sources(provider_map, lib, p)
+        if mapped:
+            return mapped
+        return _hit(known, "ghc")
+    hit = _hit(known, p)
+    if hit:
+        return hit
+    mapped = _pmap_sources(provider_map, p)
+    if mapped:
+        return mapped
+    return _hit(known, "ghc")
 
 
 def ghc_prof_to_sources(cap: str, package_names: set[str], provider_map: dict) -> set[str]:
@@ -309,6 +334,10 @@ def cmake_to_sources(cap: str, package_names: set[str], provider_map: dict) -> s
         return set()
     known = package_names or set()
     out = _pmap_sources(provider_map, f"cmake({inner})", cap)
+    inner_key = inner.lower().removesuffix(".cmake")
+    if inner_key in {"ecm", "ecmconfig", "findecm"}:
+        out |= _pmap_sources(provider_map, "extra-cmake-modules", "cmake(ECM)")
+        out |= _hit(known, "extra-cmake-modules")
     base = inner
     vm = _RE_PC_VER.match(inner)
     if vm:
@@ -557,6 +586,7 @@ def crate_to_sources(cap: str, package_names: set[str], provider_map: dict) -> s
     if not m:
         return set()
     crate = (m.group(1) or "").strip()
+    crate = crate.split("/", 1)[0].strip()
     if not crate or "%" in crate:
         return set()
     known = package_names or set()
@@ -744,6 +774,7 @@ def distgit_sources_for_virtual_cap(
             out |= tex_to_sources(primary, known, pmap)
             out |= mvn_to_sources(primary, known, pmap)
             out |= ghc_devel_to_sources(primary, known, pmap)
+            out |= ghc_rpm_to_sources(primary, known, pmap)
             out |= ghc_prof_to_sources(primary, known, pmap)
             out |= ghc_libhs_to_sources(primary, known, pmap)
             out |= cmake_to_sources(primary, known, pmap)

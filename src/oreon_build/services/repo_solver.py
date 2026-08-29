@@ -155,6 +155,7 @@ class SolveResult:
     broken_binaries: set[str] = field(default_factory=set)
     problems: str = ""
     shadow_sources: set[str] = field(default_factory=set)
+    repo_sources: set[str] = field(default_factory=set)
 
     @property
     def missing(self) -> set[str]:
@@ -227,7 +228,24 @@ class OreonRepoSolver:
         self._resolve_cache: dict[tuple[str, ...], SolveResult] = {}
         self._solv_engine: Any | None = None
 
+    def _rpc_spec(self) -> dict[str, Any]:
+        return {
+            "releasename": self.releasename,
+            "branches": list(self.branches),
+            "arch": self.arch,
+        }
+
+    def _use_rpc(self) -> bool:
+        from oreon_build.services.solv_process import rpc_enabled
+
+        return rpc_enabled()
+
     def close(self) -> None:
+        if self._use_rpc():
+            from oreon_build.services.solv_process import rpc_close
+
+            rpc_close(self._rpc_spec())
+            return
         with _SOLV_LOCK:
             if self._solv_engine is not None:
                 try:
@@ -240,7 +258,10 @@ class OreonRepoSolver:
 
     def __del__(self) -> None:
         try:
-            self.close()
+            eng = self._solv_engine
+            self._solv_engine = None
+            if eng is not None:
+                eng.close()
         except Exception:
             pass
 
@@ -338,13 +359,21 @@ class OreonRepoSolver:
                     )
                 ).encode()
             ).hexdigest()
-            eng = self._get_solv_engine()
-            if fp == self._overlay_fp:
+            if fp == self._overlay_fp and not self._use_rpc():
                 return
             self._overlay_pkgs = new
             self._overlay_fp = fp
             self._resolve_cache.clear()
-            eng.set_overlay(self._overlay_to_solvables())
+            use_rpc = self._use_rpc()
+            spec = self._rpc_spec() if use_rpc else None
+            overlay = new if use_rpc else None
+            if not use_rpc:
+                eng = self._get_solv_engine()
+                eng.set_overlay(self._overlay_to_solvables())
+        if use_rpc:
+            from oreon_build.services.solv_process import rpc_set_overlay
+
+            rpc_set_overlay(spec, overlay)
 
     def reuse_overlay_from(self, other: "OreonRepoSolver") -> None:
         with _SOLV_LOCK:
@@ -364,25 +393,44 @@ class OreonRepoSolver:
         self._overlay_pkgs = other._overlay_pkgs
         self._overlay_fp = other._overlay_fp
         self._resolve_cache.clear()
+        if self._use_rpc():
+            from oreon_build.services.solv_process import rpc_set_overlay
+
+            rpc_set_overlay(self._rpc_spec(), dict(self._overlay_pkgs))
+            return
         eng = self._get_solv_engine()
         eng.set_overlay(self._overlay_to_solvables())
 
     def _get_base(self) -> Any:
+        if self._use_rpc():
+            from oreon_build.services.solv_process import rpc_warm
+
+            rpc_warm(self._rpc_spec())
+            return None
         with _SOLV_LOCK:
             eng = self._get_solv_engine()
             eng.warm()
         return eng
 
+    def warm(self) -> None:
+        self._get_base()
+
     def resolve(self, requirements: Iterable[str]) -> SolveResult:
+        if self._use_rpc():
+            from oreon_build.services.solv_process import rpc_resolve
+
+            return rpc_resolve(self._rpc_spec(), [str(r) for r in requirements])
         with _SOLV_LOCK:
             return self._resolve_locked(requirements)
 
     def _resolve_locked(self, requirements: Iterable[str]) -> SolveResult:
+        from oreon_build.core.rpm_requires import requirement_usable_for_solver
+
         reqs = sorted(
             {
-                (r or "").strip()
+                usable
                 for r in requirements
-                if (r or "").strip() and "%" not in (r or "")
+                if (usable := requirement_usable_for_solver(r or ""))
             }
         )
         if not reqs:
@@ -400,10 +448,18 @@ class OreonRepoSolver:
         return result
 
     def has_provider(self, requirement: str) -> bool:
+        if self._use_rpc():
+            from oreon_build.services.solv_process import rpc_has_provider
+
+            return rpc_has_provider(self._rpc_spec(), requirement)
         with _SOLV_LOCK:
             return bool(self._get_solv_engine().has_provider(requirement))
 
     def sources_providing(self, requirement: str) -> set[str]:
+        if self._use_rpc():
+            from oreon_build.services.solv_process import rpc_sources_providing
+
+            return rpc_sources_providing(self._rpc_spec(), requirement)
         with _SOLV_LOCK:
             return set(self._get_solv_engine().sources_providing(requirement))
 
@@ -433,18 +489,16 @@ class MultiArchRepoSolver:
             s.close()
 
     def warm(self) -> None:
-        with _SOLV_LOCK:
-            for solver in self.solvers:
-                solver._get_base()
+        for solver in self.solvers:
+            solver._get_base()
 
     def set_overlay(self, packages: dict[str, Iterable[str]]) -> None:
-        with _SOLV_LOCK:
-            if not self.solvers:
-                return
-            primary = self.solvers[0]
-            primary.set_overlay(packages)
-            for solver in self.solvers[1:]:
-                solver.reuse_overlay_from(primary)
+        if not self.solvers:
+            return
+        primary = self.solvers[0]
+        primary.set_overlay(packages)
+        for solver in self.solvers[1:]:
+            solver.reuse_overlay_from(primary)
 
     def has_provider(self, requirement: str) -> bool:
         return any(s.has_provider(requirement) for s in self.solvers)
@@ -478,29 +532,30 @@ class MultiArchRepoSolver:
         missing: set[str] = set()
         broken: set[str] = set()
         problems: list[str] = []
+        repo_sources: set[str] = set()
         ok_count = 0
         hard_fail = False
         soft_fail = False
-        with _SOLV_LOCK:
-            for solver in self.solvers:
-                r = solver.resolve(reqs)
-                if r.ok:
-                    ok_count += 1
-                    continue
-                if is_arch_unavailable_failure(r):
-                    soft_fail = True
-                    missing |= set(r.missing_provides or ())
-                    if r.problems:
-                        problems.append(f"[{solver.arch}] {r.problems}")
-                    continue
-                hard_fail = True
+        for solver in self.solvers:
+            r = solver.resolve(reqs)
+            if r.ok:
+                ok_count += 1
+                repo_sources |= set(getattr(r, "repo_sources", None) or ())
+                continue
+            if is_arch_unavailable_failure(r):
+                soft_fail = True
                 missing |= set(r.missing_provides or ())
-                broken |= set(r.broken_binaries or ())
                 if r.problems:
                     problems.append(f"[{solver.arch}] {r.problems}")
+                continue
+            hard_fail = True
+            missing |= set(r.missing_provides or ())
+            broken |= set(r.broken_binaries or ())
+            if r.problems:
+                problems.append(f"[{solver.arch}] {r.problems}")
 
         if not hard_fail and not soft_fail and ok_count == len(self.solvers):
-            return SolveResult(ok=True)
+            return SolveResult(ok=True, repo_sources=repo_sources)
         return SolveResult(
             ok=False,
             missing_provides=missing,
@@ -541,36 +596,43 @@ def get_repo_solver(
     ]
     key = (releasename, tuple(branches), tuple(arches))
     now = time.monotonic()
-    hit = _SOLVER_CACHE.get(key)
-    if hit and now - hit[0] < _SOLVER_CACHE_TTL_SEC:
-        _SOLVER_CACHE[key] = (now, hit[1])
-        return hit[1]
+    to_close: list[MultiArchRepoSolver] = []
+    with _SOLV_LOCK:
+        hit = _SOLVER_CACHE.get(key)
+        if hit and now - hit[0] < _SOLVER_CACHE_TTL_SEC:
+            _SOLVER_CACHE[key] = (now, hit[1])
+            return hit[1]
 
-    def _close_solver(sol: MultiArchRepoSolver) -> None:
+        def _queue_close(sol: MultiArchRepoSolver) -> None:
+            to_close.append(sol)
+
+        for k, (ts, sol) in list(_SOLVER_CACHE.items()):
+            if now - ts >= _SOLVER_CACHE_TTL_SEC or k == key:
+                _SOLVER_CACHE.pop(k, None)
+                _queue_close(sol)
+        while len(_SOLVER_CACHE) >= _SOLVER_CACHE_MAX:
+            oldest_k = min(_SOLVER_CACHE.items(), key=lambda kv: kv[1][0])[0]
+            _ts, sol = _SOLVER_CACHE.pop(oldest_k)
+            _queue_close(sol)
+
+        solvers = [
+            OreonRepoSolver(releasename=releasename, branches=branches, arch=a)
+            for a in arches
+        ]
+        multi = MultiArchRepoSolver(solvers)
+        _SOLVER_CACHE[key] = (now, multi)
+    for sol in to_close:
         try:
             sol.close()
         except Exception:
             pass
+        try:
+            from oreon_build.services.layer_engine import clear_reactive_solver_cache
 
-    for k, (ts, sol) in list(_SOLVER_CACHE.items()):
-        if now - ts >= _SOLVER_CACHE_TTL_SEC or k == key:
-            _SOLVER_CACHE.pop(k, None)
-            _close_solver(sol)
-    while len(_SOLVER_CACHE) >= _SOLVER_CACHE_MAX:
-        oldest_k = min(_SOLVER_CACHE.items(), key=lambda kv: kv[1][0])[0]
-        _ts, sol = _SOLVER_CACHE.pop(oldest_k)
-        _close_solver(sol)
-    import gc
-
-    gc.collect()
-
-    solvers = [
-        OreonRepoSolver(releasename=releasename, branches=branches, arch=a)
-        for a in arches
-    ]
-    multi = MultiArchRepoSolver(solvers)
+            clear_reactive_solver_cache()
+        except Exception:
+            pass
     multi.warm()
-    _SOLVER_CACHE[key] = (now, multi)
     return multi
 
 
@@ -598,6 +660,12 @@ def invalidate_repo_solver_cache(
                 solver.close()
             except Exception:
                 logger.debug("failed closing invalidated repo solver", exc_info=True)
+    try:
+        from oreon_build.services.solv_process import rpc_drop_release
+
+        rpc_drop_release(rel)
+    except Exception:
+        logger.debug("solv worker drop after invalidate failed", exc_info=True)
 
 
 def clear_repo_solver_cache() -> None:

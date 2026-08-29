@@ -341,6 +341,34 @@ async def fail_layer_plan(
     notify_layer_plan_terminal(plan.id, terminal.value, plan.error_message)
 
 
+async def on_layer_resolve_failed(
+    db: Any,
+    job: BuildJob,
+    reason: str,
+    *,
+    package_name: str | None = None,
+) -> None:
+    if job.layer_plan_id is None:
+        return
+    plan = await db.get(LayerPlan, job.layer_plan_id)
+    if plan is None or plan.status in (LayerPlanStatus.SUCCESS, LayerPlanStatus.FAILED, LayerPlanStatus.CANCELLED):
+        return
+    from oreon_build.services.layer_engine import (
+        evaluate_layer_buildability,
+        invalidate_reactive_requirements_for_package,
+    )
+
+    invalidate_reactive_requirements_for_package(package_name or "")
+    job.status = BuildStatus.BLOCKED
+    job.completed_at = None
+    job.blocked_reason = "waiting on repository"
+    job.blocking_sources = []
+    job.error_message = (reason or "resolve failed")[:8000]
+    await db.flush()
+    await evaluate_layer_buildability(db, int(plan.id))
+    await maybe_settle_layer_plan(db, int(plan.id))
+
+
 async def on_build_job_failed_for_layer(
     db: Any,
     job: BuildJob,
@@ -443,18 +471,52 @@ async def resume_layer_plan_by_user(
     plan = result.scalar_one_or_none()
     if not plan:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Layer plan not found")
-    if plan.status not in (LayerPlanStatus.FAILED, LayerPlanStatus.CANCELLED):
+    if plan.status == LayerPlanStatus.SUCCESS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Layer plan is {plan.status.value}, resume only works for failed/cancelled",
+            detail="Layer plan already succeeded",
         )
     jobs_r = await db.execute(
         select(BuildJob).where(BuildJob.layer_plan_id == plan.id)
     )
     jobs = list(jobs_r.scalars().all())
-    reopen = [j for j in jobs if j.status in (BuildStatus.FAILED, BuildStatus.CANCELLED)]
-    blocked_left = [j for j in jobs if j.status == BuildStatus.BLOCKED]
-    if not reopen and not blocked_left:
+    live_ids = [
+        int(j.id)
+        for j in jobs
+        if j.status in (BuildStatus.QUEUED, BuildStatus.PENDING, BuildStatus.RUNNING)
+    ]
+    live_attempt_jobs: set[int] = set()
+    if live_ids:
+        att_r = await db.execute(
+            select(BuildAttempt.build_job_id).where(
+                BuildAttempt.build_job_id.in_(live_ids),
+                BuildAttempt.status.in_(
+                    (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.RUNNING)
+                ),
+            )
+        )
+        live_attempt_jobs = {int(jid) for (jid,) in att_r.all()}
+    real_inflight = [
+        j
+        for j in jobs
+        if j.status in (BuildStatus.QUEUED, BuildStatus.PENDING)
+        or (j.status == BuildStatus.RUNNING and int(j.id) in live_attempt_jobs)
+    ]
+    if plan.status not in (LayerPlanStatus.FAILED, LayerPlanStatus.CANCELLED) and real_inflight:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Layer still has {len(real_inflight)} queued or running jobs. "
+                "Cancel the layer first if you want a full retry."
+            ),
+        )
+    reopen = [
+        j
+        for j in jobs
+        if j.status not in (BuildStatus.SUCCESS, BuildStatus.SKIPPED)
+        and not (j.status == BuildStatus.RUNNING and int(j.id) in live_attempt_jobs)
+    ]
+    if not reopen:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Nothing left to resume (no failed/cancelled/blocked jobs)",
@@ -470,7 +532,7 @@ async def resume_layer_plan_by_user(
     await db.flush()
     await log_audit(
         db, "build.layer_resume", account_id=user.id, resource_type="layer_plan",
-        resource_id=str(plan.id), details=f"reopened {len(reopen)} job(s), {len(blocked_left)} still blocked",
+        resource_id=str(plan.id), details=f"reopened {len(reopen)} job(s)",
         ip_address=get_client_ip(request), user_agent=get_user_agent(request),
     )
     return plan, [int(j.id) for j in reopen]
@@ -538,6 +600,7 @@ async def notify_layer_job_terminal_after_result(
     build_job_id: int,
     status_str: str,
     error_message: str | None,
+    resolve_stage: str | None = None,
 ) -> None:
     st = (status_str or "").lower()
     if st not in ("failed", "cancelled"):
@@ -546,6 +609,7 @@ async def notify_layer_job_terminal_after_result(
     from sqlalchemy.orm import selectinload
 
     reason = (error_message or "").strip() or f"Build {st}"
+    stage = str(resolve_stage or "").strip().lower()
     async with async_session_maker() as db:
         job = await db.get(
             BuildJob,
@@ -555,12 +619,9 @@ async def notify_layer_job_terminal_after_result(
         if job is None or job.layer_plan_id is None:
             return
         pkg_name = job.package.name if job.package else None
-        if st == "failed":
-            from oreon_build.services.layer_engine import try_autofix_layer_missing_provides
-
-            if await try_autofix_layer_missing_provides(db, job, reason, package_name=pkg_name):
-                await db.commit()
-                return
+        if st == "failed" and stage in ("installdeps", "generate_buildrequires"):
+            await on_layer_resolve_failed(db, job, reason, package_name=pkg_name)
+        elif st == "failed":
             await on_build_job_failed_for_layer(db, job, reason, package_name=pkg_name)
         else:
             await on_user_cancelled_layer_job(db, job)

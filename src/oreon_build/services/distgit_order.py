@@ -765,8 +765,18 @@ def _cmake_module_from_file_path(path: str) -> str | None:
     name = m.group(1)
     if not name or "%" in name or "*" in name:
         return None
-    # bson- from failed %{version} expand is junk
     if name.endswith("-") or name.startswith("-"):
+        return None
+    low = name.lower()
+    if low.endswith("configversion.cmake"):
+        name = name[: -len("ConfigVersion.cmake")]
+    elif low.endswith("config.cmake"):
+        name = name[: -len("Config.cmake")]
+    elif low.startswith("find") and low.endswith(".cmake"):
+        name = name[4:-6]
+    elif low.endswith(".cmake"):
+        name = name[:-6]
+    if not name or name.endswith("-") or name.startswith("-"):
         return None
     return f"cmake({name})"
 

@@ -24,7 +24,7 @@ from oreon_build.services.dynamic_brs import (
 
 logger = logging.getLogger(__name__)
 
-_DISK_CACHE_VERSION = 5
+_DISK_CACHE_VERSION = 7
 
 
 def _hash_key(spec_text: str, defines: dict[str, str] | None, local_paths: Iterable[Path]) -> str:
@@ -97,7 +97,9 @@ def evaluate_package_brs(
         arch_defines["__target_arches__"] = ",".join(sorted(target_arches))
     static = rpmspec_query_buildrequires(spec_text, defines=defines)
 
-    if not spec_has_generate_buildrequires(spec_text):
+    if not spec_has_generate_buildrequires(spec_text) and not spec_uses_cargo_generate_buildrequires(
+        spec_text
+    ):
         return BrEval(buildrequires=static, complete=True, pass_kind="final")
 
     cache_pkg = pkg or "_"
