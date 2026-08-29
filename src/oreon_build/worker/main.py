@@ -1954,23 +1954,10 @@ def _mock_resolve_timeout_sec() -> int:
     return max(_MOCK_STAGE_TIMEOUT_MIN_SEC, min(v, _MOCK_STAGE_TIMEOUT_MAX_SEC))
 
 
-def _mock_log_text_for_missing(result_dir: Path, wrapper_out: str) -> str:
-    chunks = [wrapper_out or ""]
-    for name in ("root.log", "build.log"):
-        path = result_dir / name
-        if not path.is_file():
-            continue
-        try:
-            chunks.append(path.read_text(encoding="utf-8", errors="replace"))
-        except OSError:
-            continue
-    return "\n".join(chunks)
-
-
 def _missing_provides_from_mock(result_dir: Path, wrapper_out: str) -> list[str]:
     from oreon_build.core.dnf_missing import parse_dnf_missing_provides
 
-    return parse_dnf_missing_provides(_mock_log_text_for_missing(result_dir, wrapper_out))
+    return parse_dnf_missing_provides(wrapper_out or "")
 
 
 def _mock_installdeps_srpm(
@@ -2729,50 +2716,12 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                 mock_config=mock_config,
                 mock_unique_ext=mock_unique_ext,
             )
-            stub_caps = [
-                str(value).strip()
-                for value in (job.get("bootstrap_stub_provides") or [])
-                if str(value).strip()
-            ]
             keep_root = False
             try:
-                if stub_caps:
-                    stub_rpm = _build_bootstrap_stub_rpm(stub_caps, tmp)
-                    if stub_rpm is not None:
-                        stub_ok, stub_out, stub_cancelled = _mock_install_local_rpm(
-                            mock_config=mock_config,
-                            rpm_path=stub_rpm,
-                            result_dir=resolve_dir,
-                            abort_event=abort_event,
-                            mock_unique_ext=mock_unique_ext,
-                            addrepo_baseurls=mock_addrepos,
-                            rpm_dist=rpm_dist,
-                            attempt_id=attempt_id,
-                            live_out=resolve_live,
-                            rpmbuild_defines=rpmbuild_defines,
-                            prefer_arch=build_arch,
-                        )
-                        build_log_parts.append(
-                            "## bootstrap stub provides\n" + "\n".join(stub_caps[:40]) + "\n" + (stub_out or "")
-                        )
-                        if stub_cancelled:
-                            resolve_ok, resolve_out, resolve_cancelled, resolve_missing = False, stub_out, True, []
-                        else:
-                            keep_root = bool(stub_ok)
-                            resolve_ok = False
-                            resolve_out = ""
-                            resolve_cancelled = False
-                            resolve_missing = []
-                    else:
-                        resolve_ok = False
-                        resolve_out = ""
-                        resolve_cancelled = False
-                        resolve_missing = []
-                else:
-                    resolve_ok = False
-                    resolve_out = ""
-                    resolve_cancelled = False
-                    resolve_missing = []
+                resolve_ok = False
+                resolve_out = ""
+                resolve_cancelled = False
+                resolve_missing = []
                 if not resolve_cancelled:
                     for round_i in range(3):
                         resolve_ok, resolve_out, resolve_cancelled, resolve_missing = _mock_installdeps_srpm(
