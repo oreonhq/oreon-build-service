@@ -25,6 +25,7 @@ class BuildStatus(str, enum.Enum):
     SUCCESS = "success"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    CANCELED = "cancelled"
     SKIPPED = "skipped"
 
 
