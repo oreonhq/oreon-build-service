@@ -519,8 +519,11 @@
       function pollLayerStatus(layerId) {
         watchedLayerId = layerId;
         stopLayerPoll();
+        var seq = 0;
         function tick() {
-          api.get('/builds/layer/' + layerId + '/status').then(function(data) {
+          var mine = ++seq;
+          api.get('/builds/layer/' + layerId + '/status?t=' + Date.now()).then(function(data) {
+            if (mine !== seq || watchedLayerId !== layerId) return;
             renderLayerAlertFromStatus(data);
             if (data.status === 'failed' || data.status === 'cancelled' || data.status === 'success') {
               render();
@@ -528,7 +531,7 @@
           }).catch(function() {});
         }
         tick();
-        layerPollTimer = setInterval(tick, 6000);
+        layerPollTimer = setInterval(tick, 2500);
       }
       function followNewLayer(data) {
         var lid = data && data.layer_plan_id;
