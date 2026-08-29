@@ -368,6 +368,31 @@ def parse_versioned_requirement(requirement: str) -> tuple[str | None, str | Non
     return name, op, ver
 
 
+def expand_version_macros(requirement: str, version: str) -> str:
+    raw = requirement or ""
+    ver = (version or "").strip()
+    if not raw or not ver or "%" in ver:
+        return raw
+    out = raw.replace("%{version}", ver).replace("%{?version}", ver)
+    out = re.sub(r"(?<![A-Za-z0-9_{])%version(?![A-Za-z0-9_}])", ver, out)
+    return out
+
+
+def requirement_usable_for_solver(requirement: str) -> str | None:
+    raw = (requirement or "").strip()
+    if not raw:
+        return None
+    if "%" not in raw:
+        return raw
+    name, _op, _ver = parse_versioned_requirement(raw)
+    if name and "%" not in name:
+        return name
+    primary = rpm_requirement_primary(raw)
+    if primary and "%" not in primary:
+        return primary
+    return None
+
+
 def split_requirement_evr(version: str) -> tuple[str, str, str]:
     """Parse epoch:version-release or version into (epoch, ver, rel)."""
     raw = (version or "").strip()
