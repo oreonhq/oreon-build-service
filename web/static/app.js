@@ -113,9 +113,13 @@ window.oreonApi = {
   isAdmin() {
     return this.role === 'admin';
   },
-  async request(method, path, body) {
-    const opts = { method, headers: {} };
+    async request(method, path, body) {
+    const opts = { method, headers: {}, cache: 'no-store' };
     if (this.token) opts.headers['Authorization'] = 'Bearer ' + this.token;
+    if (method === 'GET') {
+      opts.headers['Cache-Control'] = 'no-cache';
+      opts.headers['Pragma'] = 'no-cache';
+    }
     if (body && typeof body === 'object' && !(body instanceof FormData)) {
       opts.headers['Content-Type'] = 'application/json';
       opts.body = JSON.stringify(body);
