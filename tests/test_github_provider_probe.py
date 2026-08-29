@@ -423,6 +423,18 @@ Name: libbson
     assert "cmake(bson-1.0)" in provided
 
 
+def test_lightweight_ecm_config_cmake_provide():
+    spec = """
+Name: extra-cmake-modules
+%files
+%{_datadir}/ECM/cmake/ECMConfig.cmake
+%{_datadir}/ECM/cmake/ECMConfigVersion.cmake
+"""
+    provided = _lightweight_provides_from_spec_text("extra-cmake-modules", spec)
+    assert "cmake(ECM)" in provided
+    assert "cmake(ECMConfig.cmake)" not in provided
+
+
 def test_lightweight_perl_nested_module_from_file_path() -> None:
     spec = """
 Name: perl-Log-Report-Minimal

@@ -226,6 +226,52 @@ x
     assert any("libc" in br for br in result.buildrequires)
 
 
+def test_cargo_fast_path_honors_feature_flag(tmp_path) -> None:
+    cargo_toml = """
+[package]
+name = "demo-crate"
+version = "0.1.0"
+edition = "2018"
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"
+
+[features]
+debug = []
+"""
+    crate_path = tmp_path / "demo-crate-0.1.0.crate"
+    crate_path.write_bytes(_make_crate_tarball(cargo_toml))
+    spec = """
+Name: rust-demo-crate
+Version: 0.1.0
+Release: 1%{?dist}
+Summary: demo
+License: MIT
+Source0: demo-crate-0.1.0.crate
+%generate_buildrequires
+%cargo_generate_buildrequires -f debug
+%description
+x
+%prep
+%build
+%install
+%files
+"""
+    result = _evaluate_cargo_buildrequires_fast(
+        spec, defines=None, local_source_paths=[crate_path], target_arches=None
+    )
+    assert result is not None
+    assert result.complete
+    assert any("libc" in br for br in result.buildrequires)
+
+
 def test_requires_from_nosrc_via_python_rpm(tmp_path) -> None:
     """Mocked nosrc path: python-rpm reader returns rich Requires when present."""
     from unittest.mock import MagicMock, patch
@@ -323,9 +369,15 @@ x
     assert not any("snapbox" in br for br in off.buildrequires)
 
 
-def test_cargo_generator_with_args_skips_fast_path() -> None:
-    from oreon_build.services.dynamic_brs import _cargo_generator_flags
+def test_cargo_generator_flags_map_to_cargo2rpm() -> None:
+    from oreon_build.services.dynamic_brs import _cargo_generator_flags, _cargo2rpm_flag_args
 
     assert _cargo_generator_flags("%cargo_generate_buildrequires\n") == ""
     assert _cargo_generator_flags("%cargo_generate_buildrequires -a\n") == "-a"
+    assert _cargo_generator_flags("%cargo_generate_buildrequires -f debug\n") == "-f debug"
+    assert _cargo2rpm_flag_args("") == []
+    assert _cargo2rpm_flag_args("-a") == ["-a"]
+    assert _cargo2rpm_flag_args("-f debug") == ["-f", "debug"]
+    assert _cargo2rpm_flag_args("%{?with_check:-t}") is None
+    assert _cargo2rpm_flag_args("--bogus") is None
 

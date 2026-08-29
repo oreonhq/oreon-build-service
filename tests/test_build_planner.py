@@ -400,6 +400,31 @@ x
     assert "python3-devel" in br.buildrequires
 
 
+def test_cargo_generate_without_percent_generate_still_runs_dyn_brs() -> None:
+    from unittest.mock import patch
+
+    from oreon_build.core.spec_bcond import SpecBcondInfo
+    from oreon_build.services.dep_plan import br_oracle
+    from oreon_build.services.dep_plan.types import BrEval
+    from oreon_build.services.dynamic_brs import DynBrResult
+
+    spec = "Name: rust-x\nVersion: 1\nRelease: 1\n%cargo_generate_buildrequires\n"
+    empty = SpecBcondInfo(defaults={})
+    with (
+        patch.object(br_oracle, "rpmspec_query_buildrequires", return_value=["cargo"]),
+        patch.object(br_oracle, "parse_spec_bconds", return_value=empty),
+        patch.object(
+            br_oracle,
+            "evaluate_generate_buildrequires",
+            return_value=DynBrResult(buildrequires=["crate(signal-hook-registry/default)"], complete=True),
+        ) as dyn,
+    ):
+        br = br_oracle.evaluate_package_brs(spec, pkg="rust-x-uniquecargotest")
+    assert dyn.called
+    assert isinstance(br, BrEval)
+    assert "crate(signal-hook-registry/default)" in br.buildrequires
+
+
 def test_crates_io_static_url_rewrite() -> None:
     from oreon_build.services.dynamic_brs import _crates_io_static_url
 

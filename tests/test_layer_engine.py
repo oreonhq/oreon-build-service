@@ -28,6 +28,14 @@ def test_non_cycle_edge_is_not_dropped():
     assert _bootstrap_drops_for_graph({"consumer": {"provider"}, "provider": set()}) == {}
 
 
+def test_cargo_specs_skip_layer_bootstrap_drops():
+    from oreon_build.services.layer_engine import _spec_skips_layer_bootstrap
+
+    assert _spec_skips_layer_bootstrap("%cargo_generate_buildrequires -f debug\n")
+    assert _spec_skips_layer_bootstrap("%cargo_prep\n")
+    assert not _spec_skips_layer_bootstrap("BuildRequires: gcc\n")
+
+
 def test_scc_handles_large_graph_without_recursion():
     size = 3000
     graph = {f"pkg-{index}": {f"pkg-{(index + 1) % size}"} for index in range(size)}
@@ -68,6 +76,8 @@ def test_missing_provides_ignores_unrelated_dnf_messages():
 
 def test_build_status_values_are_terminally_distinct():
     assert BuildStatus.BLOCKED != BuildStatus.QUEUED
+    assert BuildStatus.CANCELED == BuildStatus.CANCELLED
+    assert BuildStatus.CANCELED.value == "cancelled"
 
 
 def test_manifest_requirements_honor_with_check():
@@ -140,6 +150,34 @@ def test_python3_binary_maps_to_python_source():
     assert "python-matplotlib" in sources
 
 
+def test_ghc_subpackage_devel_maps_to_ghc():
+    sources = _layer_sources_for_requirement(
+        "ghc-extra-devel",
+        {},
+        {"ghc", "shake"},
+    )
+    assert "ghc" in sources
+
+
+def test_ghc_library_devel_maps_to_library_source_not_compiler_alts():
+    sources = _layer_sources_for_requirement(
+        "ghc-extra-devel",
+        {},
+        {"ghc", "ghc-extra", "ghc9.8", "shake"},
+    )
+    assert "ghc-extra" in sources
+    assert "ghc9.8" not in sources
+
+
+def test_ghc_core_devel_collapses_compiler_alts_to_ghc():
+    sources = _layer_sources_for_requirement(
+        "ghc-base-devel",
+        {"ghc-base-devel": {"ghc", "ghc9.8", "ghc9.10"}},
+        {"ghc", "ghc9.8", "ghc9.10", "shake"},
+    )
+    assert sources == {"ghc"}
+
+
 def test_crate_maps_to_compat_rust_source():
     sources = _layer_sources_for_requirement(
         "crate(rand_chacha)",
@@ -176,6 +214,36 @@ def test_cmake_kf6_module_maps_to_kf6_source():
     )
 
 
+def test_cmake_ecm_maps_to_extra_cmake_modules():
+    names = {"extra-cmake-modules", "kf6-karchive"}
+    for cap in ("cmake(ECM)", "cmake(ECM) >= 6.28.0", "extra-cmake-modules >= %{version}"):
+        sources = _layer_sources_for_requirement(cap, {}, names)
+        assert "extra-cmake-modules" in sources
+        assert "kf6-karchive" not in sources
+    statuses = {("extra-cmake-modules", "x86_64"): {BuildStatus.BLOCKED}}
+    assert "extra-cmake-modules" in _incomplete_layer_sources(
+        ("cmake(ECM)",), {}, names, statuses, "x86_64"
+    )
+
+
+def test_unexpanded_version_br_keeps_package_name():
+    from oreon_build.core.rpm_requires import requirement_usable_for_solver
+
+    assert requirement_usable_for_solver("extra-cmake-modules >= %{version}") == "extra-cmake-modules"
+    assert requirement_usable_for_solver("cmake(ECM) >= %{version}") == "cmake(ECM)"
+    assert requirement_usable_for_solver("%{foo}") is None
+    assert requirement_usable_for_solver("zlib >= 1.2") == "zlib >= 1.2"
+
+
+def test_version_macro_expand_keeps_evr():
+    from oreon_build.core.rpm_requires import expand_version_macros, requirement_usable_for_solver
+
+    expanded = expand_version_macros("extra-cmake-modules >= %{version}", "6.28.0")
+    assert expanded == "extra-cmake-modules >= 6.28.0"
+    assert requirement_usable_for_solver(expanded) == "extra-cmake-modules >= 6.28.0"
+    assert expand_version_macros("cmake(ECM) >= %{version}", "6.28.0") == "cmake(ECM) >= 6.28.0"
+
+
 def test_python3dist_maps_to_python_source():
     sources = _layer_sources_for_requirement(
         "python3dist(matplotlib)",
@@ -189,7 +257,10 @@ def test_incomplete_sources_drop_finished_providers():
     names = {"kde", "blosc"}
     provider_map = {"blosc": {"blosc"}}
     statuses = {("blosc", "x86_64"): {BuildStatus.SUCCESS}}
-    assert _incomplete_layer_sources(("blosc",), provider_map, names, statuses, "x86_64") == set()
+    assert _incomplete_layer_sources(("blosc",), provider_map, names, statuses, "x86_64") == {"blosc"}
+    assert _incomplete_layer_sources(
+        ("blosc",), provider_map, names, statuses, "x86_64", {("blosc", "x86_64"): True}
+    ) == set()
     statuses = {("blosc", "x86_64"): {BuildStatus.FAILED}}
     assert _incomplete_layer_sources(("blosc",), provider_map, names, statuses, "x86_64") == {"blosc"}
 
@@ -260,6 +331,143 @@ def test_spec_prepare_runs_when_blockers_are_done_or_outside_layer():
     from oreon_build.services.layer_engine import _layer_job_needs_spec_prepare
 
     done = {("cmake", "x86_64"): {BuildStatus.SUCCESS}}
-    assert _layer_job_needs_spec_prepare(["cmake"], "x86_64", done) is True
+    assert _layer_job_needs_spec_prepare(["cmake"], "x86_64", done, {("cmake", "x86_64"): True}) is True
     assert _layer_job_needs_spec_prepare(["outside"], "x86_64", done) is True
     assert _layer_job_needs_spec_prepare([], "x86_64", done) is True
+
+
+def test_open_layer_blockers_are_spec_mapped_only():
+    from oreon_build.services.layer_engine import _open_layer_blockers
+
+    statuses = {
+        ("glibc", "x86_64"): {BuildStatus.BLOCKED},
+        ("extra-cmake-modules", "x86_64"): {BuildStatus.BLOCKED},
+    }
+    out = _open_layer_blockers(
+        {"extra-cmake-modules"}, statuses, "x86_64", "kwin"
+    )
+    assert out == {"extra-cmake-modules"}
+    out = _open_layer_blockers(set(), statuses, "x86_64", "kwin")
+    assert out == set()
+
+
+def test_unpublished_layer_success_still_blocks():
+    from oreon_build.services.layer_engine import _open_layer_blockers
+
+    statuses = {("libfoo", "x86_64"): {BuildStatus.SUCCESS}}
+    ready = {("libfoo", "x86_64"): False}
+    out = _open_layer_blockers({"libfoo"}, statuses, "x86_64", "consumer", ready)
+    assert out == {"libfoo"}
+    ready = {("libfoo", "x86_64"): True}
+    out = _open_layer_blockers({"libfoo"}, statuses, "x86_64", "consumer", ready)
+    assert out == set()
+
+
+def test_unbuilt_layer_job_blocks_even_if_repo_has_a_hole():
+    from oreon_build.services.layer_engine import _open_layer_blockers
+
+    statuses = {("libfoo", "x86_64"): {BuildStatus.BLOCKED}}
+    out = _open_layer_blockers({"libfoo"}, statuses, "x86_64", "consumer")
+    assert out == {"libfoo"}
+
+
+def test_sat_job_requirements_drop_chroot_tools_keep_real_brs():
+    from oreon_build.services.layer_engine import _sat_job_requirements
+
+    out = _sat_job_requirements(
+        (
+            "gcc",
+            "gcc >= 15",
+            "make",
+            "cmake(KF6Config) >= 6.28.0",
+            "python3-devel",
+            "rpmlib(CompressedFileNames) <= 3.0.4-1",
+        )
+    )
+    assert "gcc" not in out
+    assert "make" not in out
+    assert "gcc >= 15" in out
+    assert "cmake(KF6Config) >= 6.28.0" in out
+    assert "python3-devel" in out
+
+
+def test_missing_caps_only_block_on_in_layer_sources():
+    from oreon_build.services.layer_engine import _layer_blockers_for_caps
+
+    names = {"kf6-baloo", "qt6-qtwebengine"}
+    statuses = {
+        ("kf6-baloo", "x86_64"): {BuildStatus.BLOCKED},
+        ("qt6-qtwebengine", "x86_64"): {BuildStatus.BLOCKED},
+    }
+    out = _layer_blockers_for_caps(
+        {"gcc-toolset-13", "cmake(KF6Config) >= 6.28.0"},
+        {},
+        names,
+        statuses,
+        "x86_64",
+        "plasma-desktop",
+    )
+    assert out == set()
+    out = _layer_blockers_for_caps(
+        {"qt6-qtwebengine"},
+        {},
+        names,
+        statuses,
+        "x86_64",
+        "kio-extras",
+    )
+    assert out == {"qt6-qtwebengine"}
+
+
+def test_heal_sources_pull_real_distgit_not_chroot_tools():
+    from oreon_build.services.layer_engine import _heal_sources_for_requirement
+
+    distgit = {"kf6-kconfig", "kf6-baloo", "gcc", "extra-cmake-modules", "python-tox"}
+    out = _heal_sources_for_requirement(
+        "cmake(KF6Config) >= 6.28.0",
+        {},
+        distgit,
+        "kf6-baloo",
+    )
+    assert out == {"kf6-kconfig"}
+    assert _heal_sources_for_requirement("gcc >= 15", {}, distgit, "plasma-desktop") == set()
+    tox = _heal_sources_for_requirement(
+        "python3dist(tox)",
+        {},
+        distgit,
+        "python-cssselect",
+    )
+    assert "python-tox" in tox
+
+
+def test_heal_crate_feature_maps_to_rust_source():
+    from oreon_build.services.layer_engine import _heal_sources_for_requirement
+
+    distgit = {"rust-signal-hook", "rust-signal-hook-registry"}
+    out = _heal_sources_for_requirement(
+        "crate(signal-hook-registry/default)",
+        {},
+        distgit,
+        "rust-signal-hook",
+    )
+    assert "rust-signal-hook-registry" in out
+
+
+def test_sat_extra_branches_follow_mock_urls_not_all_channels():
+    from oreon_build.services.layer_engine import _sat_extra_branches
+
+    urls = ["https://repo-us.oreonhq.com/test1/stable/x86_64/"]
+    assert _sat_extra_branches("side-plasma", "test1", urls) == ["stable"]
+    assert sorted(_sat_extra_branches("dev", "test1", None)) == ["stable", "testing"]
+
+
+def test_gcc_br_does_not_map_outside_layer():
+    sources = _layer_sources_for_requirement(
+        "gcc >= 15",
+        {},
+        {"plasma-desktop", "kwin", "extra-cmake-modules"},
+    )
+    assert "gcc" not in sources
+    assert "glibc" not in sources
+    sources = _layer_sources_for_requirement("gcc >= 15", {}, {"gcc", "plasma-desktop"})
+    assert "gcc" in sources

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -32,9 +33,44 @@ def test_repodata_update_purges_cloudflare_repodata_cache(tmp_path: Path) -> Non
         settings.return_value.r2_public_url = "https://repo.example/"
         _purge_repodata_cache("oreon-11/dev/x86_64")
 
-    make_request.assert_called_once()
-    assert make_request.call_args.args[0].endswith("/zones/zone/purge_cache")
-    assert b"https://repo.example/oreon-11/dev/x86_64/repodata/*" in make_request.call_args.kwargs["data"]
+    make_request.assert_called()
+    payloads = [call.kwargs["data"] for call in make_request.call_args_list]
+    blob = b"".join(payloads)
+    assert b"https://repo.example/oreon-11/dev/x86_64/repodata/repomd.xml" in blob
+    assert b"repo.example/oreon-11/dev/x86_64/repodata/" in blob
+    assert b"repodata/*" not in blob
+
+
+def test_rpm_purge_batches_over_cloudflare_limit() -> None:
+    from oreon_build.services.publisher import _purge_replaced_rpm_cache
+
+    request = MagicMock()
+    response = MagicMock()
+    response.__enter__.return_value = response
+    response.read.return_value = b'{"success": true}'
+    names = [f"pkg-{i}-1-1.x86_64.rpm" for i in range(31)]
+
+    with (
+        patch.dict(
+            "os.environ",
+            {"CLOUDFLARE_ZONE_ID": "zone", "CLOUDFLARE_API_TOKEN": "token"},
+            clear=False,
+        ),
+        patch("oreon_build.services.publisher.get_settings") as settings,
+        patch("oreon_build.services.publisher.urllib.request.Request", return_value=request) as make_request,
+        patch("oreon_build.services.publisher.urllib.request.urlopen", return_value=response),
+    ):
+        settings.return_value.cloudflare_zone_id = None
+        settings.return_value.cloudflare_api_token = None
+        settings.return_value.r2_public_url = "https://repo.example/"
+        _purge_replaced_rpm_cache("oreon-11/dev/x86_64", names)
+
+    payloads = [json.loads(call.kwargs["data"]) for call in make_request.call_args_list]
+    assert any("prefixes" in p for p in payloads)
+    file_batches = [p["files"] for p in payloads if "files" in p]
+    assert sum(len(b) for b in file_batches) == 31
+    assert all(len(b) <= 30 for b in file_batches)
+    assert not any("*" in u for b in file_batches for u in b)
 
 
 def test_skip_createrepo_when_no_rpm_changes(tmp_path: Path) -> None:
