@@ -124,6 +124,10 @@ button, .btn {
   transition: background 0.12s ease-out, border-color 0.12s ease-out, color 0.12s ease-out;
 }
 button:hover, .btn:hover { border-color: var(--accent); color: var(--accent); }
+button:focus, .btn:focus, button:focus-visible, .btn:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
 button.primary, .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 button.primary:hover, .btn.primary:hover { opacity: 0.96; }
 button:active, .btn:active { opacity: 0.92; }
