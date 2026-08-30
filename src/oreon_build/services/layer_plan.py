@@ -213,13 +213,29 @@ def _job_build_terminal_ok(status_: BuildStatus) -> bool:
 _IN_FLIGHT_STATUSES = (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.RUNNING)
 
 
+def _is_failure_fallout(job: Any, failed_names: set[str]) -> bool:
+    reason = (getattr(job, "blocked_reason", None) or "").strip()
+    if reason.lower().startswith("upstream failure:"):
+        return True
+    failed_l = {str(n).strip().lower() for n in failed_names if str(n).strip()}
+    sources: set[str] = set()
+    for raw in getattr(job, "blocking_sources", None) or []:
+        name = str(raw or "").strip().lower()
+        if name.endswith(".spec"):
+            name = name[:-5]
+        if name:
+            sources.add(name)
+    return bool(sources) and bool(failed_l) and sources <= failed_l
+
+
 def layer_plan_settlement(
     jobs: list[Any],
 ) -> tuple[LayerPlanStatus | None, str | None]:
     """How a plan should look once nothing is in flight.
 
-    Blocked jobs are waiters, not work. If nothing is queued or running,
-    the layer cannot move and the plan must stop. Waiters stay blocked.
+    Blocked jobs are waiters, not work. Failures only stop the plan when
+    every remaining waiter is fallout of those failures. Other blocked
+    jobs can still SAT-queue.
     """
     if not jobs:
         return None, None
@@ -232,6 +248,19 @@ def layer_plan_settlement(
     if n_block == 0 and n_fail == 0 and n_cancel == 0:
         return LayerPlanStatus.SUCCESS, None
     if n_fail == 0 and n_cancel == 0:
+        return None, None
+    failed_names = set()
+    for j in jobs:
+        if j.status != BuildStatus.FAILED:
+            continue
+        name = j.package.name if getattr(j, "package", None) else ""
+        if name:
+            failed_names.add(str(name).strip())
+    if n_block > 0 and any(
+        not _is_failure_fallout(j, failed_names)
+        for j in jobs
+        if j.status == BuildStatus.BLOCKED
+    ):
         return None, None
     primary: list[str] = []
     seen: set[str] = set()
@@ -347,23 +376,41 @@ async def on_layer_resolve_failed(
     reason: str,
     *,
     package_name: str | None = None,
+    missing_provides: list[str] | None = None,
 ) -> None:
     if job.layer_plan_id is None:
         return
     plan = await db.get(LayerPlan, job.layer_plan_id)
     if plan is None or plan.status in (LayerPlanStatus.SUCCESS, LayerPlanStatus.FAILED, LayerPlanStatus.CANCELLED):
         return
+    from oreon_build.core.dnf_missing import parse_dnf_missing_provides
+    from oreon_build.services.build_pass import job_options_dict
     from oreon_build.services.layer_engine import (
         evaluate_layer_buildability,
         invalidate_reactive_requirements_for_package,
     )
 
+    caps: list[str] = []
+    seen: set[str] = set()
+    for item in list(missing_provides or []) + parse_dnf_missing_provides(reason or ""):
+        cap = str(item or "").strip()
+        if not cap or cap in seen:
+            continue
+        seen.add(cap)
+        caps.append(cap)
+    if not caps:
+        await on_build_job_failed_for_layer(
+            db, job, reason, package_name=package_name,
+        )
+        return
     invalidate_reactive_requirements_for_package(package_name or "")
+    opts = job_options_dict(job)
+    opts["sat_hold_caps"] = caps
+    job.job_options = opts
     job.status = BuildStatus.BLOCKED
     job.completed_at = None
-    job.blocked_reason = "waiting on repository"
+    job.blocked_reason = "waiting on repository: " + ", ".join(caps)[:480]
     job.blocking_sources = []
-    job.error_message = (reason or "resolve failed")[:8000]
     await db.flush()
     await evaluate_layer_buildability(db, int(plan.id))
     await maybe_settle_layer_plan(db, int(plan.id))
@@ -601,6 +648,7 @@ async def notify_layer_job_terminal_after_result(
     status_str: str,
     error_message: str | None,
     resolve_stage: str | None = None,
+    missing_provides: list[str] | None = None,
 ) -> None:
     st = (status_str or "").lower()
     if st not in ("failed", "cancelled"):
@@ -620,7 +668,9 @@ async def notify_layer_job_terminal_after_result(
             return
         pkg_name = job.package.name if job.package else None
         if st == "failed" and stage in ("installdeps", "generate_buildrequires"):
-            await on_layer_resolve_failed(db, job, reason, package_name=pkg_name)
+            await on_layer_resolve_failed(
+                db, job, reason, package_name=pkg_name, missing_provides=missing_provides,
+            )
         elif st == "failed":
             await on_build_job_failed_for_layer(db, job, reason, package_name=pkg_name)
         else:

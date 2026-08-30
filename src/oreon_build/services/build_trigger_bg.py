@@ -211,12 +211,17 @@ async def run_layer_terminal_notify(
     status_str: str,
     error_message: str | None,
     resolve_stage: str | None = None,
+    missing_provides: list[str] | None = None,
 ) -> None:
     from oreon_build.services.layer_plan import notify_layer_job_terminal_after_result
 
     try:
         await notify_layer_job_terminal_after_result(
-            int(job_id), status_str, error_message, resolve_stage=resolve_stage
+            int(job_id),
+            status_str,
+            error_message,
+            resolve_stage=resolve_stage,
+            missing_provides=missing_provides,
         )
     except Exception:
         logger.exception("background layer terminal notify failed job_id=%s", job_id)
@@ -227,5 +232,10 @@ def schedule_layer_terminal_notify(
     status_str: str,
     error_message: str | None,
     resolve_stage: str | None = None,
+    missing_provides: list[str] | None = None,
 ) -> None:
-    spawn(run_layer_terminal_notify(int(job_id), status_str, error_message, resolve_stage))
+    spawn(
+        run_layer_terminal_notify(
+            int(job_id), status_str, error_message, resolve_stage, missing_provides
+        )
+    )

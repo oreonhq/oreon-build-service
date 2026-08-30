@@ -1,8 +1,7 @@
 """OBS-style reactive layer scheduler.
 
-Layer jobs are seeded blocked, SAT-checked against the real repos, and
-released when those deps are actually in the side tag. Cycles wait. We do
-not stub Provides or SAT-skip BRs mock will still install.
+Seed blocked. SAT against published repos. Queue when SAT installs. Wait or
+heal only on caps SAT actually missed. No stub Provides. No cycle bypass.
 """
 
 from __future__ import annotations
@@ -930,7 +929,9 @@ def _layer_sources_for_requirement(
                     and (not restrict or _canonical_layer_name(str(value)) in names)
                 )
         canon = _canonical_layer_name(primary)
-        if canon and (not restrict or canon in names):
+        if canon and "(" not in canon and not canon.startswith("/") and (
+            not restrict or canon in names
+        ):
             sources.add(canon)
     sources.update(
         _canonical_layer_name(source)
@@ -957,6 +958,68 @@ def _job_repo_published(status: BuildStatus, job_options: dict[str, Any] | None)
     if not isinstance(job_options, dict):
         return False
     return bool(job_options.get("repo_published"))
+
+
+def _sat_hold_caps_from_job(job: Any) -> tuple[str, ...]:
+    opts = job_options_dict(job)
+    raw = opts.get("sat_hold_caps")
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        cap = str(item or "").strip()
+        if not cap or cap in seen:
+            continue
+        seen.add(cap)
+        out.append(cap)
+    return tuple(out)
+
+
+def _merge_requirement_caps(*groups: tuple[str, ...] | list[str] | set[str]) -> tuple[str, ...]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for item in group:
+            cap = str(item or "").strip()
+            if not cap or cap in seen:
+                continue
+            seen.add(cap)
+            out.append(cap)
+    return tuple(out)
+
+
+def _hold_caps_layer_sources(
+    hold: tuple[str, ...] | list[str],
+    provider_map: dict[str, set[str]],
+    package_names: set[str],
+    consumer: str,
+) -> set[str]:
+    mapped: set[str] = set()
+    skip = _canonical_layer_name(consumer)
+    for cap in hold:
+        for source in _layer_sources_for_requirement(str(cap), provider_map, package_names):
+            name = _canonical_layer_name(source)
+            if name and name != skip:
+                mapped.add(name)
+    return mapped
+
+
+def _hold_caps_ready_on_layer(
+    hold: tuple[str, ...] | list[str],
+    provider_map: dict[str, set[str]],
+    package_names: set[str],
+    layer_repo_ready: dict[tuple[str, str], bool],
+    architecture: str,
+    consumer: str,
+) -> bool:
+    if not hold:
+        return True
+    arch = normalize_machine_arch(str(architecture or ""))
+    mapped = _hold_caps_layer_sources(hold, provider_map, package_names, consumer)
+    if not mapped:
+        return False
+    return all(layer_repo_ready.get((name, arch), False) for name in mapped)
 
 
 def _incomplete_layer_sources(
@@ -1199,21 +1262,12 @@ def _spec_skips_layer_bootstrap(spec_text: str) -> bool:
     return spec_uses_cargo_generate_buildrequires(spec_text or "")
 
 
-async def _clear_bootstrap_pass(db: Any, job: BuildJob) -> bool:
+async def _strip_bootstrap_stubs(db: Any, job: BuildJob) -> bool:
     opts = job_options_dict(job)
-    profile = str(opts.get("build_profile") or "full").strip().lower()
-    if profile != "bootstrap" and not opts.get("bootstrap_dropped") and not opts.get("bootstrap_stub_provides"):
+    if not opts.get("bootstrap_stub_provides") and not opts.get("bootstrap_dropped"):
         return False
-    opts["build_profile"] = "full"
-    opts.pop("bootstrap_dropped", None)
     opts.pop("bootstrap_stub_provides", None)
-    opts.pop("next_profile", None)
-    defines = dict(opts.get("rpmbuild_defines") or {})
-    defines.pop("with_check", None)
-    if defines:
-        opts["rpmbuild_defines"] = defines
-    else:
-        opts.pop("rpmbuild_defines", None)
+    opts.pop("bootstrap_dropped", None)
     await _update_layer_job_if_active(
         db,
         job.id,
@@ -1354,7 +1408,7 @@ async def _settle_layer_fixpoint(db: Any, plan: LayerPlan) -> None:
             unpublished_success += 1
     if active_count > 0 or unpublished_success > 0:
         return
-    if failed_count <= 0:
+    if failed_count <= 0 or blocked_count > 0:
         return
     plan.status = LayerPlanStatus.FAILED
     plan.error_message = (
@@ -1450,6 +1504,13 @@ async def _evaluate_layer_buildability_locked(
                 if str(u).strip()
             ]
     sat_extra = _sat_extra_branches(branch, releasename, mock_urls)
+    if source_name or published_architecture:
+        logger.info(
+            "layer eval trigger plan=%s source=%s arch=%s",
+            plan.id,
+            source_name,
+            published_architecture,
+        )
     rows_result = await db.execute(
         select(BuildJob, BuildTarget.architecture)
         .join(BuildTarget, BuildTarget.id == BuildJob.target_id)
@@ -1490,23 +1551,6 @@ async def _evaluate_layer_buildability_locked(
             published = False
         prev = layer_repo_ready.get((canonical_name, arch_key))
         layer_repo_ready[(canonical_name, arch_key)] = published if prev is None else (prev or published)
-    published_arch = str(published_architecture or "").strip()
-    arch_filter = normalize_machine_arch(published_arch) if published_arch else ""
-    source_filter = _canonical_layer_name(source_name or "")
-    if source_filter or arch_filter:
-        row_list = [
-            (job, architecture)
-            for job, architecture in row_list
-            if (
-                not source_filter
-                or not job.blocking_sources
-                or source_filter in {
-                    _canonical_layer_name(value)
-                    for value in (job.blocking_sources or [])
-                }
-            )
-            and (not arch_filter or normalize_machine_arch(str(architecture or "")) == arch_filter)
-        ]
     all_pkg_ids = {int(job.package_id) for job, _architecture in row_list}
     packages_by_id: dict[int, Package] = {}
     if all_pkg_ids:
@@ -1534,7 +1578,7 @@ async def _evaluate_layer_buildability_locked(
     )
     cargo_cleared = False
     for job, _architecture in work_list:
-        if await _clear_bootstrap_pass(db, job):
+        if await _strip_bootstrap_stubs(db, job):
             cargo_cleared = True
     if cargo_cleared:
         await db.flush()
@@ -1617,7 +1661,8 @@ async def _evaluate_layer_buildability_locked(
             continue
         package, text, parsed, requirements, complete = prepared_job
         consumer = _canonical_layer_name(package.name)
-        effective_requirements = tuple(requirements)
+        hold_caps = _sat_hold_caps_from_job(job)
+        effective_requirements = _merge_requirement_caps(requirements, hold_caps)
         if not text:
             await _update_layer_job_if_active(
                 db, job.id, plan.id, status=BuildStatus.BLOCKED,
@@ -1634,40 +1679,6 @@ async def _evaluate_layer_buildability_locked(
             continue
         if parsed is _SPEC_UNPARSED:
             parsed = None
-        mapped = _incomplete_layer_sources(
-            effective_requirements, provider_map, layer_package_names, layer_statuses, arch,
-            layer_repo_ready,
-        )
-        layer_blockers = _open_layer_blockers(
-            mapped, layer_statuses, arch, consumer, layer_repo_ready,
-        )
-        failed_sources = _failed_upstream_sources(layer_blockers, layer_statuses, arch)
-        if failed_sources:
-            reason = "upstream failure: " + ", ".join(failed_sources)
-            await _update_layer_job_if_active(
-                db,
-                job.id,
-                plan.id,
-                status=BuildStatus.BLOCKED,
-                blocked_reason=reason,
-                blocking_sources=sorted(layer_blockers),
-            )
-            job.status = BuildStatus.BLOCKED
-            job.blocked_reason = reason
-            job.blocking_sources = sorted(layer_blockers)
-            await _checkpoint()
-            continue
-        if layer_blockers:
-            await _update_layer_job_if_active(
-                db,
-                job.id,
-                plan.id,
-                status=BuildStatus.BLOCKED,
-                blocked_reason="waiting on layer jobs: " + ", ".join(sorted(layer_blockers)),
-                blocking_sources=sorted(layer_blockers),
-            )
-            await _checkpoint()
-            continue
         oracle = await asyncio.to_thread(_repo_oracle_for, releasename, branch, arch, sat_extra)
         sat_reqs = _sat_job_requirements(effective_requirements)
         missing: set[str] = set()
@@ -1701,6 +1712,22 @@ async def _evaluate_layer_buildability_locked(
                 missing, provider_map, layer_package_names, layer_statuses, arch, consumer,
                 layer_repo_ready,
             )
+            failed_sources = _failed_upstream_sources(miss_blockers, layer_statuses, arch)
+            if failed_sources:
+                reason = "upstream failure: " + ", ".join(failed_sources)
+                await _update_layer_job_if_active(
+                    db,
+                    job.id,
+                    plan.id,
+                    status=BuildStatus.BLOCKED,
+                    blocked_reason=reason,
+                    blocking_sources=sorted(miss_blockers),
+                )
+                job.status = BuildStatus.BLOCKED
+                job.blocked_reason = reason
+                job.blocking_sources = sorted(miss_blockers)
+                await _checkpoint()
+                continue
             if miss_blockers:
                 await _update_layer_job_if_active(
                     db,
@@ -1758,6 +1785,13 @@ async def _evaluate_layer_buildability_locked(
             await _checkpoint()
             continue
         if job.status != BuildStatus.QUEUED:
+            if hold_caps:
+                opts = job_options_dict(job)
+                opts.pop("sat_hold_caps", None)
+                await _update_layer_job_if_active(
+                    db, job.id, plan.id, job_options=opts,
+                )
+                job.job_options = opts
             changed_now = await _update_layer_job_if_active(
                 db, job.id, plan.id, status=BuildStatus.QUEUED, blocked_reason="", blocking_sources=[]
             )

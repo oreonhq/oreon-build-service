@@ -102,15 +102,16 @@ def distgit_sources_for_perl_module(
     package_names: set[str],
 ) -> set[str]:
     """Resolve perl module to existing distgit source package names."""
-    known = package_names or set()
+    known = {str(s).strip() for s in (package_names or set()) if str(s).strip()}
+    by_lower = {s.lower(): s for s in known}
     out: set[str] = set()
     for cand in perl_module_parent_packages(module):
-        if cand in known:
-            return {cand}
+        hit = by_lower.get(cand.lower())
+        if hit:
+            return {hit}
     dist = metacpan_distribution_for_module(module)
     if not dist:
         return out
-    # Data-Printer → perl-Data-Printer; Dpkg → dpkg (dist name itself)
     leaf = dist.replace("::", "-")
     for cand in (
         f"perl-{leaf}",
@@ -118,6 +119,7 @@ def distgit_sources_for_perl_module(
         leaf,
         leaf.lower(),
     ):
-        if cand in known:
-            out.add(cand)
+        hit = by_lower.get(cand.lower())
+        if hit:
+            out.add(hit)
     return out
