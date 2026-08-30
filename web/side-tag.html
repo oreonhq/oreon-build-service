@@ -57,12 +57,22 @@
       color: var(--text-muted, #777);
       min-width: 5rem;
     }
-    #layer-build-alert { display: none; margin: 1rem 0; padding: 1rem 1.1rem; border-radius: 6px; border: 1px solid var(--border); }
-    #layer-build-alert.layer-alert-error { background: rgba(220,53,69,0.08); border-color: rgba(220,53,69,0.45); }
-    #layer-build-alert.layer-alert-info { background: rgba(13,110,253,0.08); border-color: rgba(13,110,253,0.35); }
-    #layer-build-alert.layer-alert-success { background: rgba(25,135,84,0.08); border-color: rgba(25,135,84,0.35); }
+    #layer-build-alert { display: none; margin: 1rem 0; padding: 1rem 1.1rem; border-radius: 6px; border: none; box-shadow: none; outline: none; }
+    #layer-build-alert.layer-alert-error { background: rgba(220,53,69,0.08); }
+    #layer-build-alert.layer-alert-info { background: rgba(13,110,253,0.08); }
+    #layer-build-alert.layer-alert-success { background: rgba(25,135,84,0.08); }
     #layer-build-alert h3 { margin: 0 0 0.5rem 0; font-size: 1.05rem; }
     #layer-build-alert .layer-alert-actions { margin-top: 0.75rem; display: flex; flex-wrap: wrap; gap: 0.5rem; }
+    #layer-build-alert .btn,
+    #layer-build-alert .btn:hover,
+    #layer-build-alert .btn:focus,
+    #layer-build-alert .btn:focus-visible,
+    #layer-build-alert .btn:active {
+      border-color: var(--border);
+      color: var(--text);
+      outline: none;
+      box-shadow: none;
+    }
   </style>
 </head>
 <body>
@@ -413,21 +423,7 @@
       function stopLayerPoll() {
         if (layerPollTimer) { clearInterval(layerPollTimer); layerPollTimer = null; }
       }
-      function showLayerAlert(kind, title, bodyHtml, opts) {
-        opts = opts || {};
-        var el = document.getElementById('layer-build-alert');
-        if (!el) return;
-        el.style.display = 'block';
-        el.className = 'layer-alert-' + (kind || 'info');
-        var actions = '<div class="layer-alert-actions">';
-        if (opts.showResume) {
-          actions += '<button type="button" class="btn" id="layer-alert-resume">Resume layer</button>';
-        }
-        if (opts.showCancel) {
-          actions += '<button type="button" class="btn" id="layer-alert-cancel">Cancel layer</button>';
-        }
-        actions += '<button type="button" class="btn" id="layer-alert-dismiss">Dismiss</button></div>';
-        el.innerHTML = '<h3>' + escapeHtml(title) + '</h3>' + bodyHtml + actions;
+      function bindLayerAlertActions(el, opts) {
         var dismiss = document.getElementById('layer-alert-dismiss');
         if (dismiss) dismiss.onclick = function() { el.style.display = 'none'; stopLayerPoll(); };
         var resumeBtn = document.getElementById('layer-alert-resume');
@@ -463,6 +459,32 @@
             });
           };
         }
+      }
+      function showLayerAlert(kind, title, bodyHtml, opts) {
+        opts = opts || {};
+        var el = document.getElementById('layer-build-alert');
+        if (!el) return;
+        el.style.display = 'block';
+        el.className = 'layer-alert-' + (kind || 'info');
+        var shellKey = [kind || 'info', opts.showResume ? '1' : '0', opts.showCancel ? '1' : '0', String(opts.layerId || '')].join('|');
+        var titleEl = el.querySelector('h3');
+        var bodyEl = el.querySelector('.layer-alert-body');
+        if (el.getAttribute('data-alert-shell') === shellKey && titleEl && bodyEl) {
+          titleEl.textContent = title;
+          bodyEl.innerHTML = bodyHtml;
+          return;
+        }
+        el.setAttribute('data-alert-shell', shellKey);
+        var actions = '<div class="layer-alert-actions">';
+        if (opts.showResume) {
+          actions += '<button type="button" class="btn" id="layer-alert-resume">Resume layer</button>';
+        }
+        if (opts.showCancel) {
+          actions += '<button type="button" class="btn" id="layer-alert-cancel">Cancel layer</button>';
+        }
+        actions += '<button type="button" class="btn" id="layer-alert-dismiss">Dismiss</button></div>';
+        el.innerHTML = '<h3>' + escapeHtml(title) + '</h3><div class="layer-alert-body">' + bodyHtml + '</div>' + actions;
+        bindLayerAlertActions(el, opts);
       }
       function renderLayerFailedJobs(data) {
         var jobs = (data.jobs || []).filter(function(j) {
