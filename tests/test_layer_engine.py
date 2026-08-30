@@ -199,6 +199,15 @@ def test_crate_does_not_attach_longer_crate_name():
     assert "rust-toml_edit0.19" not in sources
 
 
+def test_cmake_qt6qml_does_not_attach_webengine():
+    sources = _layer_sources_for_requirement(
+        "cmake(Qt6Qml)",
+        {},
+        {"qt6-qtwebengine", "qt6-qtdeclarative", "kf6-ki18n"},
+    )
+    assert "qt6-qtwebengine" not in sources
+
+
 def test_cmake_kf6_module_maps_to_kf6_source():
     from oreon_build.services.virtual_resolve import distgit_sources_for_virtual_cap
 
@@ -296,7 +305,25 @@ def test_caps_provided_by_dropped_sources():
     assert "crate(bar)" not in caps
 
 
-def test_incomplete_sources_wait_for_repo_publish():
+def test_hold_caps_do_not_queue_without_published_provider():
+    from oreon_build.services.layer_engine import (
+        _hold_caps_layer_sources,
+        _hold_caps_ready_on_layer,
+        _merge_requirement_caps,
+    )
+
+    names = {"sdl3_image", "perl-cpan-meta-requirements"}
+    hold = ("perl(CPAN::Meta::Requirements::Range)",)
+    mapped = _hold_caps_layer_sources(hold, {}, names, "sdl3_image")
+    assert "perl-cpan-meta-requirements" in mapped
+    ready = {("perl-cpan-meta-requirements", "x86_64"): False}
+    assert not _hold_caps_ready_on_layer(hold, {}, names, ready, "x86_64", "sdl3_image")
+    ready = {("perl-cpan-meta-requirements", "x86_64"): True}
+    assert _hold_caps_ready_on_layer(hold, {}, names, ready, "x86_64", "sdl3_image")
+    assert not _hold_caps_ready_on_layer(hold, {}, {"sdl3_image"}, {}, "x86_64", "sdl3_image")
+    merged = _merge_requirement_caps(("cmake",), hold)
+    assert "perl(CPAN::Meta::Requirements::Range)" in merged
+    assert "cmake" in merged
     names = {"kde", "blosc"}
     provider_map = {"blosc": {"blosc"}}
     statuses = {("blosc", "x86_64"): {BuildStatus.SUCCESS}}

@@ -40,9 +40,11 @@ def test_full_profile_without_handoff_is_unchanged():
     assert job.status == BuildStatus.SUCCESS
 
 
-def _job(status, name="pkg", reason=""):
+def _job(status, name="pkg", reason="", blocking=None):
     pkg = SimpleNamespace(name=name)
-    return SimpleNamespace(id=1, status=status, package=pkg, blocked_reason=reason)
+    return SimpleNamespace(
+        id=1, status=status, package=pkg, blocked_reason=reason, blocking_sources=blocking or [],
+    )
 
 
 def test_settlement_keeps_running_while_jobs_are_queued():
@@ -75,13 +77,23 @@ def test_settlement_stops_plan_when_failures_leave_only_blocked():
     jobs = [
         _job(BuildStatus.SUCCESS, "a"),
         _job(BuildStatus.FAILED, "blosc", "mock failed"),
-        _job(BuildStatus.BLOCKED, "kde", "waiting on layer jobs: blosc"),
+        _job(BuildStatus.BLOCKED, "kde", "waiting on layer jobs: blosc", ["blosc"]),
     ]
     status, msg = layer_plan_settlement(jobs)
     assert status == LayerPlanStatus.FAILED
     assert "stalled" in (msg or "")
     assert "blocked" in (msg or "")
     assert "Primary: blosc" in (msg or "")
+
+
+def test_settlement_keeps_running_when_blocked_are_not_failure_fallout():
+    jobs = [
+        _job(BuildStatus.SUCCESS, "a"),
+        _job(BuildStatus.FAILED, "hdf5", "mock failed"),
+        _job(BuildStatus.BLOCKED, "kf6-ki18n", "waiting on layer jobs: qt6-qtwebengine", ["qt6-qtwebengine"]),
+        _job(BuildStatus.BLOCKED, "qt6-qtwebengine", "waiting on layer jobs: python-zombie-imp", ["python-zombie-imp"]),
+    ]
+    assert layer_plan_settlement(jobs) == (None, None)
 
 
 def test_settlement_success_when_all_ok():
