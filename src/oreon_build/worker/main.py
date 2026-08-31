@@ -878,7 +878,7 @@ def _upload_rpm_via_presigned_r2(
                 last_exc = e
                 detail = ""
                 sc = e.response.status_code if e.response is not None else None
-                if sc in (502, 503, 504, 522, 524):
+                if sc in (500, 502, 503, 504, 522, 524):
                     logger.warning(
                         "rpm complete got HTTP %s for %s (attempt_id=%s), probing finalize status",
                         sc,
