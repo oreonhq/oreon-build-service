@@ -186,6 +186,40 @@ def test_pkgconfig_glob_match_from_files() -> None:
         "pkgconfig(Qt5*)",
         {"pkgconfig(Qt5Core)", "pkgconfig(Qt5Gui)", "qt5-qtbase"},
     )
+    assert _provides_match_capability(
+        "pkgconfig(absl_test_instance_tracker)",
+        {"pkgconfig(absl_*)"},
+    )
+
+
+def test_lightweight_bindir_glob_keeps_pattern() -> None:
+    spec = """
+Name: python-sphinx
+%files -n python3-sphinx
+%{_bindir}/sphinx-*
+"""
+    provided = _lightweight_provides_from_spec_text("python-sphinx", spec)
+    assert "__glob__/usr/bin/sphinx-*" in provided
+    assert "/usr/bin/sphinx" in provided
+
+
+def test_lightweight_pkgconfig_prefix_glob() -> None:
+    spec = """
+Name: abseil-cpp
+%files devel
+%{_libdir}/pkgconfig/absl_*.pc
+"""
+    provided = _lightweight_provides_from_spec_text("abseil-cpp", spec)
+    assert "pkgconfig(absl_*)" in provided
+    assert "pkgconfig(absl_)" not in provided
+    spec_bare = """
+Name: libcaca
+%files devel
+%{_libdir}/pkgconfig/*.pc
+"""
+    bare = _lightweight_provides_from_spec_text("libcaca", spec_bare)
+    assert "pkgconfig(*)" not in bare
+    assert not any(c.startswith("pkgconfig(") for c in bare)
 
 
 def test_lightweight_python_pkgversion_package() -> None:

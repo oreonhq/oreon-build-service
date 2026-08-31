@@ -28,12 +28,68 @@ def test_non_cycle_edge_is_not_dropped():
     assert _bootstrap_drops_for_graph({"consumer": {"provider"}, "provider": set()}) == {}
 
 
-def test_cargo_specs_skip_layer_bootstrap_drops():
-    from oreon_build.services.layer_engine import _spec_skips_layer_bootstrap
+def test_sat_frontier_skips_acyclic_blocked_waiters():
+    from oreon_build.services.layer_engine import _cyclic_wait_names, _job_on_sat_frontier
 
-    assert _spec_skips_layer_bootstrap("%cargo_generate_buildrequires -f debug\n")
-    assert _spec_skips_layer_bootstrap("%cargo_prep\n")
-    assert not _spec_skips_layer_bootstrap("BuildRequires: gcc\n")
+    graph = {
+        "pimcommon": {"akonadi-contacts"},
+        "akonadi-contacts": set(),
+        "ghc": {"shake"},
+        "shake": {"ghc"},
+    }
+    cyclic = _cyclic_wait_names(graph)
+    assert cyclic == {"ghc", "shake"}
+    assert _job_on_sat_frontier("akonadi-contacts", set(), cyclic) is True
+    assert _job_on_sat_frontier("pimcommon", {"akonadi-contacts"}, cyclic) is False
+    assert _job_on_sat_frontier("ghc", {"shake"}, cyclic) is True
+    assert _job_on_sat_frontier("ffmpeg", set(), cyclic) is True
+
+
+def test_cycle_peers_for_sat_miss():
+    from oreon_build.services.layer_engine import _cycle_peers_for_miss
+
+    graph = {"ghc": {"shake"}, "shake": {"ghc"}}
+    assert _cycle_peers_for_miss("ghc", {"shake", "ghc-extra"}, graph) == {"shake"}
+    assert _cycle_peers_for_miss("leaf", {"cmake"}, {"leaf": {"cmake"}, "cmake": set()}) == set()
+
+
+def test_bootstrap_defines_flip_spec_bcond():
+    from oreon_build.services.layer_engine import _bootstrap_rpmbuild_defines
+
+    spec = "%bcond_with bootstrap\nName: ghc\n"
+    defines = _bootstrap_rpmbuild_defines(spec, "oreon-11-rp1", "x86_64")
+    assert defines.get("with_bootstrap") == "1"
+    assert defines.get("with_check") == "0"
+    cargo = _bootstrap_rpmbuild_defines(
+        "%cargo_generate_buildrequires\nName: rust-toml\n",
+        "oreon-11-rp1",
+        "x86_64",
+    )
+    assert cargo.get("with_check") == "0"
+
+
+def test_skip_repeat_sat_holds_until_wait_inputs_move():
+    from types import SimpleNamespace
+
+    from oreon_build.models import BuildStatus
+    from oreon_build.services.layer_engine import _sat_eval_fingerprint
+
+    job = SimpleNamespace(
+        blocking_sources=["shake"],
+        job_options={"build_profile": "full", "rpmbuild_defines": {}},
+    )
+    statuses = {("shake", "x86_64"): {BuildStatus.BLOCKED}}
+    ready = {("shake", "x86_64"): False}
+    fp1 = _sat_eval_fingerprint(job, "x86_64", statuses, ready, 4)
+    fp2 = _sat_eval_fingerprint(job, "x86_64", statuses, ready, 9)
+    assert fp1 == fp2
+    statuses2 = {("shake", "x86_64"): {BuildStatus.SUCCESS}}
+    ready2 = {("shake", "x86_64"): True}
+    assert _sat_eval_fingerprint(job, "x86_64", statuses2, ready2, 4) != fp1
+    empty = SimpleNamespace(blocking_sources=[], job_options={"build_profile": "full"})
+    assert _sat_eval_fingerprint(empty, "x86_64", {}, {}, 4) != _sat_eval_fingerprint(
+        empty, "x86_64", {}, {}, 5
+    )
 
 
 def test_scc_handles_large_graph_without_recursion():
@@ -53,6 +109,30 @@ def test_requirement_provider_matching_handles_rich_capability():
 def test_requirement_provider_matching_handles_virtual_capability():
     provider_map = {"cmake(FooConfig)": {"foo"}}
     assert _layer_sources_for_requirement("cmake(FooConfig)", provider_map, {"foo", "bar"}) == {"foo"}
+    from oreon_build.services.layer_engine import _declared_layer_sources_for_requirement
+
+    assert _declared_layer_sources_for_requirement(
+        "cmake(FooConfig)", provider_map, {"foo", "bar"}
+    ) == {"foo"}
+    assert _declared_layer_sources_for_requirement(
+        "cmake(Qt6Qml)",
+        {},
+        {"qt6-qtwebengine", "qt6-qtdeclarative", "kf6-ki18n", "cln", "texlive-collection-luatex"},
+    ) == set()
+    assert _declared_layer_sources_for_requirement(
+        "qt6-qtwebengine", {}, {"qt6-qtwebengine", "kf6-kio"}
+    ) == {"qt6-qtwebengine"}
+    assert "perl-cpan-meta-requirements" in _declared_layer_sources_for_requirement(
+        "perl(CPAN::Meta::Requirements::Range)",
+        {},
+        {"sdl3_image", "perl-cpan-meta-requirements"},
+    )
+    from oreon_build.services.layer_engine import _prefer_declared_providers
+
+    assert _prefer_declared_providers(
+        "texinfo-tex",
+        {"texlive-collection-luatex", "texinfo", "texi2html"},
+    ) == {"texinfo"}
 
 
 def test_requirement_provider_matching_does_not_match_unrelated_source():
@@ -114,31 +194,35 @@ x
     assert not any("tox-current-env" in item for item in boot)
 
 
-def test_bootstrap_keeps_generated_crate_buildrequires():
+def test_manifest_does_not_readd_dumped_check_brs():
     from types import SimpleNamespace
 
     from oreon_build.services.layer_engine import _manifest_build_requirements
 
     spec = """
-Name: rust-rand0.8
-Version: 0.8.5
+Name: perl-CPAN-Meta-Requirements
+Version: 1
 Release: 1
 Summary: x
 License: MIT
-BuildRequires: rust
-BuildRequires: cargo-rpm-macros
+%bcond check 1
+BuildRequires: perl-generators
+%if %{with check}
+BuildRequires: perl(Test::MinimumVersion)
+%endif
 %description
 x
 """
     parsed = SimpleNamespace(
-        rpm_build_requires=["rust", "cargo-rpm-macros", "crate(rand_chacha) >= 0.3 with crate(rand_chacha) < 0.4~"],
-        build_requires=["rust", "cargo-rpm-macros"],
-        build_requires_raw=["rust", "cargo-rpm-macros"],
+        rpm_build_requires=["perl-generators", "perl(Test::MinimumVersion)"],
+        build_requires=["perl-generators"],
+        build_requires_raw=["perl-generators"],
     )
     boot = _manifest_build_requirements(
         spec, parsed, architecture="x86_64", defines={"with_check": "0"}
     )
-    assert any("crate(rand_chacha)" in item for item in boot)
+    assert any("perl-generators" in item for item in boot)
+    assert not any("MinimumVersion" in item for item in boot)
 
 
 def test_python3_binary_maps_to_python_source():
@@ -350,8 +434,10 @@ def test_spec_prepare_waits_for_unpublished_success():
 def test_spec_prepare_skipped_while_in_layer_blockers_open():
     from oreon_build.services.layer_engine import _layer_job_needs_spec_prepare
 
-    statuses = {("cmake", "x86_64"): {BuildStatus.BLOCKED}}
+    statuses = {("cmake", "x86_64"): {BuildStatus.RUNNING}}
     assert _layer_job_needs_spec_prepare(["cmake"], "x86_64", statuses) is False
+    statuses = {("cmake", "x86_64"): {BuildStatus.BLOCKED}}
+    assert _layer_job_needs_spec_prepare(["cmake"], "x86_64", statuses) is True
 
 
 def test_spec_prepare_runs_when_blockers_are_done_or_outside_layer():
@@ -416,6 +502,15 @@ def test_sat_job_requirements_drop_chroot_tools_keep_real_brs():
     assert "gcc >= 15" in out
     assert "cmake(KF6Config) >= 6.28.0" in out
     assert "python3-devel" in out
+    self_out = _sat_job_requirements(
+        ("cmake", "cmake = 4.2.3-2", "requested cmake = 4.2.3-2", "/usr/bin/sphinx-build", "BuildRequires:"),
+        consumer="cmake",
+        version="4.2.3",
+    )
+    assert "cmake" in self_out
+    assert "cmake = 4.2.3-2" not in self_out
+    assert "/usr/bin/sphinx-build" in self_out
+    assert "BuildRequires:" not in self_out
 
 
 def test_missing_caps_only_block_on_in_layer_sources():
@@ -498,3 +593,127 @@ def test_gcc_br_does_not_map_outside_layer():
     assert "glibc" not in sources
     sources = _layer_sources_for_requirement("gcc >= 15", {}, {"gcc", "plasma-desktop"})
     assert "gcc" in sources
+
+
+def test_schedule_layer_evaluation_coalesces(monkeypatch):
+    from oreon_build.services import layer_engine as le
+
+    spawned = []
+
+    def fake_spawn(coro):
+        spawned.append(coro)
+        coro.close()
+
+    monkeypatch.setattr("oreon_build.services.build_trigger_bg.spawn", fake_spawn)
+    le._LAYER_EVAL_PENDING.clear()
+    le._LAYER_EVAL_DRAINING.clear()
+    le.schedule_layer_evaluation(1256)
+    le.schedule_layer_evaluation(1256)
+    assert len(spawned) == 1
+    assert 1256 in le._LAYER_EVAL_PENDING
+    le._LAYER_EVAL_PENDING.clear()
+    le._LAYER_EVAL_DRAINING.clear()
+
+
+def test_pkgconfig_miss_waits_on_unpublished_layer_source():
+    from oreon_build.services.layer_engine import _layer_blockers_for_caps
+
+    names = {"ffmpeg", "libcaca"}
+    statuses = {("libcaca", "x86_64"): {BuildStatus.BLOCKED}}
+    providers = {"pkgconfig(caca)": {"libcaca"}}
+    out = _layer_blockers_for_caps(
+        {"pkgconfig(caca)"},
+        providers,
+        names,
+        statuses,
+        "x86_64",
+        "ffmpeg",
+    )
+    assert out == {"libcaca"}
+    ready = {("libcaca", "x86_64"): True}
+    statuses_done = {("libcaca", "x86_64"): {BuildStatus.SUCCESS}}
+    out = _layer_blockers_for_caps(
+        {"pkgconfig(caca)"},
+        providers,
+        names,
+        statuses_done,
+        "x86_64",
+        "ffmpeg",
+        ready,
+    )
+    assert out == set()
+
+
+def test_published_wait_name_is_not_an_open_blocker():
+    from oreon_build.services.layer_engine import _open_layer_blockers
+
+    statuses = {("rust-serde_json", "x86_64"): {BuildStatus.SUCCESS}}
+    ready = {("rust-serde_json", "x86_64"): True}
+    out = _open_layer_blockers(
+        {"rust-serde_json"},
+        statuses,
+        "x86_64",
+        "rust-similar2",
+        ready,
+    )
+    assert out == set()
+    out = _open_layer_blockers(
+        {"rust-serde_json"},
+        statuses,
+        "x86_64",
+        "rust-similar2",
+        {("rust-serde_json", "x86_64"): False},
+    )
+    assert out == {"rust-serde_json"}
+
+
+def test_failed_package_is_not_an_open_blocker():
+    from oreon_build.services.layer_engine import _open_layer_blockers
+
+    statuses = {("texlive-collection-latexextra", "x86_64"): {BuildStatus.FAILED}}
+    out = _open_layer_blockers(
+        {"texlive-collection-latexextra", "mupdf"},
+        {**statuses, ("mupdf", "x86_64"): {BuildStatus.BLOCKED}},
+        "x86_64",
+        "python-sphinx",
+        {},
+    )
+    assert out == {"mupdf"}
+
+
+def test_self_subpackage_miss_is_dropped():
+    from oreon_build.core.rpm_requires import index_provider_map
+    from oreon_build.services.layer_engine import _strip_self_output_missing
+
+    pmap = index_provider_map(
+        {
+            "okular-part": {"okular"},
+            "plasma-discover-libs": {"plasma-discover"},
+            "ghc-vault-prof": {"ghc-vault"},
+        }
+    )
+    names = {"okular", "plasma-discover", "ghc-vault", "ghc-wai"}
+    assert _strip_self_output_missing(
+        {"okular-part", "okular-part = 26.04.3-2"},
+        "okular",
+        pmap,
+        names,
+    ) == set()
+    assert _strip_self_output_missing(
+        {"plasma-discover-libs = 6.7.4-1"},
+        "plasma-discover",
+        pmap,
+        names,
+    ) == set()
+    assert _strip_self_output_missing(
+        {"ghc-vault-prof"},
+        "ghc-wai",
+        pmap,
+        names,
+    ) == {"ghc-vault-prof"}
+    assert _strip_self_output_missing(
+        {"cmake", "cmake = 4.2.3-2", "/usr/bin/sphinx-build"},
+        "cmake",
+        {},
+        {"cmake"},
+    ) == {"/usr/bin/sphinx-build"}

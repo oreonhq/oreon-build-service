@@ -411,3 +411,23 @@ def test_soname_cap_maps_from_provider_data() -> None:
         package_names={"ffmpeg"},
         provider_map=pmap,
     ) == {"ffmpeg"}
+
+
+def test_pkgconfig_prefix_glob_from_files_map() -> None:
+    from oreon_build.core.rpm_requires import index_provider_map
+
+    pmap = index_provider_map({"pkgconfig(absl_*)": {"abseil-cpp"}})
+    assert "abseil-cpp" in distgit_sources_for_virtual_cap(
+        "pkgconfig(absl_test_instance_tracker)",
+        package_names={"abseil-cpp", "ffmpeg"},
+        provider_map=pmap,
+    )
+
+
+def test_bindir_glob_maps_sphinx_build() -> None:
+    pmap = {"__glob__/usr/bin/sphinx-*": {"python-sphinx"}}
+    assert "python-sphinx" in distgit_sources_for_virtual_cap(
+        "/usr/bin/sphinx-build",
+        package_names={"python-sphinx", "cmake"},
+        provider_map=pmap,
+    )

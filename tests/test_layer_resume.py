@@ -65,11 +65,13 @@ def test_settlement_keeps_running_when_only_blocked_remain():
     assert layer_plan_settlement(jobs) == (None, None)
 
 
-def test_layer_job_prepare_skips_unfinished_blockers():
+def test_layer_job_prepare_skips_inflight_blockers():
     from oreon_build.services.layer_engine import _layer_job_needs_spec_prepare
 
-    statuses = {("kwin", "x86_64"): {BuildStatus.BLOCKED}}
+    statuses = {("kwin", "x86_64"): {BuildStatus.RUNNING}}
     assert _layer_job_needs_spec_prepare(["kwin"], "x86_64", statuses) is False
+    statuses = {("kwin", "x86_64"): {BuildStatus.BLOCKED}}
+    assert _layer_job_needs_spec_prepare(["kwin"], "x86_64", statuses) is True
     assert _layer_job_needs_spec_prepare([], "x86_64", statuses) is True
 
 
