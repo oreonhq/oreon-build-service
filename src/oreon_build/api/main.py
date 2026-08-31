@@ -277,14 +277,12 @@ async def lifespan(app: FastAPI):
 
         while True:
             try:
-                s = get_settings()
                 raw_idle = (os.environ.get("OREON_PUBLISH_TASK_IDLE_POLL_SEC") or "15").strip()
                 try:
                     idle_interval_s = float(raw_idle)
                 except ValueError:
                     idle_interval_s = 15.0
                 idle_interval_s = max(1.0, min(idle_interval_s, 60.0))
-                batch = max(1, int(s.repo_publish_poll_batch))
                 async with async_session_maker() as db:
                     q = (
                         select(PublishTask)
@@ -294,7 +292,6 @@ async def lifespan(app: FastAPI):
                             BuildJob.layer_plan_id.isnot(None).desc(),
                             PublishTask.created_at.asc(),
                         )
-                        .limit(batch)
                         .with_for_update(of=PublishTask, skip_locked=True)
                     )
                     result = await db.execute(q)
@@ -313,9 +310,6 @@ async def lifespan(app: FastAPI):
                         "Publish batch failed tasks=%s",
                         [(t.id, t.attempt_id) for t in tasks],
                     )
-
-                if len(tasks) < batch:
-                    await asyncio.sleep(0)
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -521,6 +515,30 @@ def create_app() -> FastAPI:
         version="1.0.0",
         lifespan=lifespan,
     )
+
+    @app.exception_handler(OperationalError)
+    async def _db_operational_error(request, exc: OperationalError):
+        from fastapi.responses import JSONResponse
+
+        if _too_many_connections(exc):
+            logger.warning("database saturated path=%s", request.url.path)
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "database busy"},
+                headers={"Retry-After": "5"},
+            )
+        raise exc
+
+    @app.exception_handler(asyncpg.TooManyConnectionsError)
+    async def _db_too_many_connections(request, exc: asyncpg.TooManyConnectionsError):
+        from fastapi.responses import JSONResponse
+
+        logger.warning("database saturated path=%s", request.url.path)
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "database busy"},
+            headers={"Retry-After": "5"},
+        )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],

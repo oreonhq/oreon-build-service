@@ -995,6 +995,20 @@ async def upload_worker_rpm_complete(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"pesign failed on controller: {e}",
             ) from e
+        except Exception as e:
+            low = str(e).lower()
+            logger.exception("rpm presigned complete failed attempt_id=%s key=%s", attempt_id, r2_key)
+            busy = (
+                "too many clients" in low
+                or "too many connections" in low
+                or "disk quota" in low
+                or "no space left" in low
+                or "timeout" in low
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="RPM finalize busy, retry" if busy else f"RPM finalize failed: {e}",
+            ) from e
     finally:
         if lock_acquired:
             try:
