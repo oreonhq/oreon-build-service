@@ -384,6 +384,7 @@ async def on_layer_resolve_failed(
     if plan is None or plan.status in (LayerPlanStatus.SUCCESS, LayerPlanStatus.FAILED, LayerPlanStatus.CANCELLED):
         return
     from oreon_build.core.dnf_missing import parse_dnf_missing_provides
+    from oreon_build.core.rpm_requires import is_malformed_rpm_requirement
     from oreon_build.services.build_pass import job_options_dict
     from oreon_build.services.layer_engine import (
         evaluate_layer_buildability,
@@ -398,7 +399,7 @@ async def on_layer_resolve_failed(
             continue
         seen.add(cap)
         caps.append(cap)
-    if not caps:
+    if not caps or any(is_malformed_rpm_requirement(cap) for cap in caps):
         await on_build_job_failed_for_layer(
             db, job, reason, package_name=package_name,
         )

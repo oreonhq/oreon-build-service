@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import multiprocessing
+import os
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Iterable
@@ -77,6 +78,7 @@ def evaluate_package_brs(
     local_source_paths: list[Path] | None = None,
     allow_source_download: bool = True,
     force_refresh: bool = False,
+    extra_defines: dict[str, str] | None = None,
 ) -> BrEval:
     """Authoritative BR list for one spec (sqlite-cached when complete).
 
@@ -91,6 +93,8 @@ def evaluate_package_brs(
         spec_text, distro_macros=distro_macros, target_arches=target_arches
     )
     defines = default_build_defines(bcond)
+    if extra_defines:
+        defines = {**defines, **{str(k): str(v) for k, v in extra_defines.items() if str(k).strip()}}
     locals_ = [p for p in (local_source_paths or []) if p and p.is_file()]
     arch_defines = dict(defines)
     if target_arches:
@@ -175,7 +179,7 @@ def evaluate_many_brs(
     *,
     distro_macros: dict[str, str] | None = None,
     target_arches: set[str] | None = None,
-    max_workers: int = 6,
+    max_workers: int | None = None,
     force_refresh: bool = False,
     use_processes: bool = False,
 ) -> dict[str, BrEval]:
@@ -198,7 +202,8 @@ def evaluate_many_brs(
     out: dict[str, BrEval] = {}
     if not items:
         return out
-    workers = max(1, min(max_workers, len(items)))
+    workers = max(1, max_workers if max_workers is not None else (os.cpu_count() or 1))
+    workers = min(workers, len(items))
 
     def _run(executor_cls: type, **extra: Any) -> dict[str, BrEval]:
         result: dict[str, BrEval] = {}

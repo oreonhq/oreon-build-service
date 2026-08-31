@@ -3,13 +3,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from sqlalchemy import select, update
 
-from oreon_build.config import get_settings
 from oreon_build.core.repo_branch import job_publish_branch
 from oreon_build.db.session import async_session_maker
 from oreon_build.models import Artifact, BuildAttempt, BuildJob, BuildTarget, PublishTask, Release
@@ -19,8 +17,6 @@ from oreon_build.services.r2 import get_r2_client, repo_r2_prefix, repo_rpms_key
 logger = logging.getLogger(__name__)
 
 _publish_locks: dict[int, asyncio.Lock] = {}
-_publish_global_sem: asyncio.Semaphore | None = None
-_publish_global_sem_lock = threading.Lock()
 _publish_completed_attempts: set[int] = set()
 
 def _repo_publish_timeout_sec() -> int:
@@ -31,14 +27,6 @@ def _repo_publish_timeout_sec() -> int:
         n = 2400
     return max(120, min(n, 12 * 3600))
 
-def _global_publish_semaphore() -> asyncio.Semaphore:
-    global _publish_global_sem
-    with _publish_global_sem_lock:
-        if _publish_global_sem is None:
-            n = max(1, int(get_settings().repo_publish_max_concurrent))
-            _publish_global_sem = asyncio.Semaphore(n)
-            logger.info("repo publish global concurrency limit=%s", n)
-        return _publish_global_sem
 
 def _lock_for(attempt_id: int) -> asyncio.Lock:
     lock = _publish_locks.get(attempt_id)
@@ -291,14 +279,14 @@ async def _mark_publish_tasks_failed(task_ids: list[int], attempt_ids: list[int]
 
 async def _source_and_release_for_attempt(
     attempt_id: int,
-) -> tuple[str, str, str | None] | None:
+) -> tuple[str, str, str | None, int] | None:
     from sqlalchemy import select as _select
 
     from oreon_build.models import BuildAttempt, BuildJob, Package, Release
 
     async with async_session_maker() as db:
         row = await db.execute(
-            _select(Package.name, Release.releasename, BuildTarget.architecture)
+            _select(Package.name, Release.releasename, BuildTarget.architecture, BuildJob.id)
             .join(BuildJob, BuildJob.package_id == Package.id)
             .join(BuildAttempt, BuildAttempt.build_job_id == BuildJob.id)
             .join(Release, Release.id == BuildJob.release_id)
@@ -309,7 +297,7 @@ async def _source_and_release_for_attempt(
         hit = row.first()
         if not hit:
             return None
-        return str(hit[0]), str(hit[1] or ""), str(hit[2] or "") or None
+        return str(hit[0]), str(hit[1] or ""), str(hit[2] or "") or None, int(hit[3])
 
 
 async def _notify_publish_success(attempt_ids: list[int]) -> None:
@@ -320,7 +308,7 @@ async def _notify_publish_success(attempt_ids: list[int]) -> None:
         try:
             info = await _source_and_release_for_attempt(attempt_id)
             if info:
-                await on_package_published(info[0], info[1], info[2])
+                await on_package_published(info[0], info[1], info[2], job_id=info[3])
         except Exception:
             logger.exception("layer engine unblock after publish attempt_id=%s", attempt_id)
         try:
@@ -385,20 +373,18 @@ async def run_repo_publish_tasks_batch(tasks: list[PublishTask]) -> None:
     if not tasks:
         return
 
-    async with _global_publish_semaphore():
-        loaded: list[_PrefixPublishBatch] = []
-        for task in tasks:
-            async with _lock_for(task.attempt_id):
-                batch = await _load_publish_batch(task)
-            if batch is not None:
-                loaded.append(batch)
+    loaded: list[_PrefixPublishBatch] = []
+    for task in tasks:
+        async with _lock_for(task.attempt_id):
+            batch = await _load_publish_batch(task)
+        if batch is not None:
+            loaded.append(batch)
 
-        if not loaded:
-            return
+    if not loaded:
+        return
 
-        grouped = list(_group_publish_tasks_by_prefix(loaded).values())
-        for batch in grouped:
-            await _run_prefix_publish_batch(batch)
+    grouped = list(_group_publish_tasks_by_prefix(loaded).values())
+    await asyncio.gather(*(_run_prefix_publish_batch(batch) for batch in grouped))
 
 async def run_repo_publish_for_attempt(
     attempt_id: int,

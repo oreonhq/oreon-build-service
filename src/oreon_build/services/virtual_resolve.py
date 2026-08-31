@@ -92,6 +92,21 @@ def pkgconfig_to_sources(cap: str, package_names: set[str], provider_map: dict) 
                     out.add(src)
 
     add_from_map(f"pkgconfig({inner})")
+    from oreon_build.core.rpm_requires import _pkgconfig_glob_match
+
+    globs = provider_map.get("__pcglob__")
+    want_pc = f"pkgconfig({inner})"
+    if isinstance(globs, dict):
+        for pat, srcs in globs.items():
+            if _pkgconfig_glob_match(want_pc, str(pat)):
+                if isinstance(srcs, (set, frozenset, list, tuple)):
+                    out.update(s for s in srcs if s)
+    else:
+        for key, srcs in provider_map.items():
+            if key == "__lower__" or not isinstance(key, str) or "*" not in key:
+                continue
+            if _pkgconfig_glob_match(want_pc, key) and isinstance(srcs, (set, frozenset, list, tuple)):
+                out.update(s for s in srcs if s)
     # a .pc name carries its api version (liborcus-0.20), the packaged one may sit
     # at another revision, so match any declared pkgconfig(base-*) provide.
     base = inner

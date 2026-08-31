@@ -56,12 +56,8 @@ logger = logging.getLogger(__name__)
 
 @lru_cache(maxsize=1)
 def _distgit_spec_parse_executor() -> ThreadPoolExecutor:
-    raw = (os.getenv("OREON_CHAIN_PREPARE_WORKERS") or "32").strip()
-    try:
-        n = int(raw)
-    except ValueError:
-        n = 32
-    return ThreadPoolExecutor(max_workers=max(4, min(n, 64)))
+    n = os.cpu_count() or 1
+    return ThreadPoolExecutor(max_workers=max(1, n), thread_name_prefix="distgit-parse")
 
 _BR_NAME = re.compile(r"^([A-Za-z0-9_][A-Za-z0-9+._-]*)")
 
@@ -936,7 +932,7 @@ _PROVIDES_INDEX_CACHE: dict[tuple[str, str, str, str, str], tuple[float, Distgit
 _provides_index_tasks: dict[tuple[str, str, str, str, str], asyncio.Task[DistgitProvidesIndex | None]] = {}
 _PACKAGE_NAMES_CACHE: dict[tuple[str, str, str, str], tuple[float, frozenset[str]]] = {}
 _PACKAGE_NAMES_CACHE_TTL_SEC = 1800.0
-_PROVIDES_INDEX_DISK_VERSION = "v15"
+_PROVIDES_INDEX_DISK_VERSION = "v16"
 
 
 def _so_file_provides(libstem: str) -> set[str]:
@@ -1084,9 +1080,10 @@ def _lightweight_provides_from_spec_text(pkg: str, spec_text: str) -> set[str]:
             if m and "%" not in m.group(1) and "*" not in m.group(1):
                 provided.add(f"pkgconfig({m.group(1)})")
             elif "*" in expanded and "/pkgconfig/" in expanded:
-                gm = re.search(r"/pkgconfig/([A-Za-z0-9_+.-]+)\*\.pc\b", expanded)
-                if gm and gm.group(1):
-                    provided.add(f"pkgconfig({gm.group(1)})")
+                gm = re.search(r"/pkgconfig/([A-Za-z0-9_+.-]*)\*\.pc\b", expanded)
+                prefix = (gm.group(1) or "") if gm else ""
+                if prefix:
+                    provided.add(f"pkgconfig({prefix}*)")
         if ".so" in expanded and not mingw_path:
             m = _RE_SO_FILE.search(expanded)
             if m and "%" not in m.group(1):
@@ -1122,6 +1119,7 @@ def _lightweight_provides_from_spec_text(pkg: str, spec_text: str) -> set[str]:
                 if stem and "%" not in stem:
                     provided.add(f"/usr/bin/{stem}")
                     provided.add(stem)
+                provided.add(f"__glob__{path}")
             elif path.startswith("/") and any(c in path for c in "*?["):
                 provided.add(f"__glob__{path}")
     provided.add(source_name)
@@ -1415,24 +1413,6 @@ def _read_specs_from_tarball(
     return specs
 
 
-def _chain_distgit_max_parse() -> int:
-    raw = (os.getenv("OREON_CHAIN_DISTGIT_MAX_PARSE") or "512").strip()
-    try:
-        n = int(raw)
-    except ValueError:
-        n = 4096
-    return max(64, min(n, 20000))
-
-
-def _chain_distgit_parse_wave_size() -> int:
-    raw = (os.getenv("OREON_CHAIN_DISTGIT_PARSE_WAVE") or "128").strip()
-    try:
-        n = int(raw)
-    except ValueError:
-        n = 96
-    return max(8, min(n, 128))
-
-
 def _distgit_spec_raw_url(
     owner: str,
     repo: str,
@@ -1638,7 +1618,7 @@ def _download_distgit_local_sources(
     )
     jobs = [(name, f"{base}/{name}", dest_dir / name) for name in names]
     out: list[Path] = []
-    with ThreadPoolExecutor(max_workers=min(8, max(1, len(jobs)))) as pool:
+    with ThreadPoolExecutor(max_workers=max(1, len(jobs))) as pool:
         futs = {
             pool.submit(_fetch_one_local_source, name, url, dest, headers, pkg): name
             for name, url, dest in jobs
@@ -1769,8 +1749,6 @@ async def expand_chain_spec_closure_sparse(
         needed.add(rn)
         queue.append(rn)
 
-    max_parse = _chain_distgit_max_parse()
-    wave_size = _chain_distgit_parse_wave_size()
     pool = _distgit_spec_parse_executor()
     arches = {a.lower() for a in (target_arches or set()) if a} or None
     parse_fn = _spec_parse_fn(releasename, target_arches=arches)
@@ -1785,9 +1763,9 @@ async def expand_chain_spec_closure_sparse(
         follow_redirects=True,
         limits=limits,
     ) as client:
-        while queue and len(needed) <= max_parse:
+        while queue:
             wave: list[str] = []
-            while queue and len(wave) < wave_size:
+            while queue:
                 pkg = queue.popleft()
                 if pkg in parsed_by_source:
                     continue
@@ -1934,11 +1912,6 @@ async def expand_chain_spec_closure_sparse(
                     for prov in provs:
                         _enqueue_prov(prov)
 
-    if len(needed) > max_parse:
-        err.append(
-            f"Chain distgit closure exceeded OREON_CHAIN_DISTGIT_MAX_PARSE ({max_parse}); narrow the chain spec."
-        )
-
     logger.info(
         "sparse distgit closure %s/%s: roots=%s fetched=%s parsed=%s in %.1fs",
         releasename,
@@ -2070,14 +2043,12 @@ def _expand_chain_spec_closure(
         needed.add(rn)
         queue.append(rn)
 
-    max_parse = _chain_distgit_max_parse()
-    wave_size = _chain_distgit_parse_wave_size()
     pool = _distgit_spec_parse_executor()
     parse_fn = _spec_parse_fn(releasename)
 
-    while queue and len(needed) <= max_parse:
+    while queue:
         wave: list[str] = []
-        while queue and len(wave) < wave_size:
+        while queue:
             pkg = queue.popleft()
             if pkg in parsed_by_source:
                 continue
@@ -2133,10 +2104,6 @@ def _expand_chain_spec_closure(
                         needed.add(prov)
                         queue.append(prov)
 
-    if len(needed) > max_parse:
-        err.append(
-            f"Chain distgit closure exceeded OREON_CHAIN_DISTGIT_MAX_PARSE ({max_parse}); narrow the chain spec."
-        )
     return specs, parsed_by_source, err
 
 
@@ -2181,15 +2148,6 @@ async def expand_chain_spec_closure_tarball(
         time.monotonic() - t0,
     )
     return specs, parsed_by_source, err
-
-
-def _chain_repo_transitive_max_waves() -> int:
-    raw = (os.getenv("OREON_CHAIN_REPO_TRANSITIVE_MAX_WAVES") or "12").strip()
-    try:
-        n = int(raw)
-    except ValueError:
-        n = 12
-    return max(1, min(n, 64))
 
 
 def _repo_caps_to_walk(repo: Any, br: str) -> list[str]:
@@ -2901,8 +2859,6 @@ async def expand_unsatisfied_build_dep_sources(
     arches = {a.lower() for a in (target_arches or set()) if a} or None
     active_scope = set(scope_packages) if scope_packages is not None else None
 
-    max_parse = _chain_distgit_max_parse()
-    wave_size = _chain_distgit_parse_wave_size()
     pool = _distgit_spec_parse_executor()
     parse_fn = _spec_parse_fn(releasename, target_arches=arches)
     distro_macros = default_distro_macros(releasename)
@@ -2917,7 +2873,9 @@ async def expand_unsatisfied_build_dep_sources(
         follow_redirects=True,
         limits=limits,
     ) as client:
-        for wave_num in range(1, 17):
+        wave_num = 0
+        while True:
+            wave_num += 1
             if _has_unresolved_distgit_build_deps(
                 specs,
                 parsed_by_source,
@@ -2980,7 +2938,7 @@ async def expand_unsatisfied_build_dep_sources(
             to_fetch = sorted(
                 c for c in candidates if c not in parsed_by_source and c not in attempted_fetch
             )
-            if not to_fetch or len(parsed_by_source) >= max_parse:
+            if not to_fetch:
                 break
             logger.info(
                 "builddep expand wave %s %s/%s: candidates=%s to_fetch=%s scope=%s parsed=%s",
@@ -2998,9 +2956,9 @@ async def expand_unsatisfied_build_dep_sources(
                 repo=repo_name,
                 distgit_branch=distgit_branch,
                 releasename=releasename,
-                packages=to_fetch[:wave_size],
+                packages=to_fetch,
             )
-            for pkg in to_fetch[:wave_size]:
+            for pkg in to_fetch:
                 if pkg not in batch_specs:
                     attempted_fetch.add(pkg)
                     missing_distgit.add(pkg)
@@ -3077,7 +3035,7 @@ async def fetch_repo_transitive_extras_for_roots(
         follow_redirects=True,
         limits=limits,
     ) as client:
-        for _ in range(3):
+        while True:
             n = await _resolve_missing_runtime_via_github(
                 parsed_by_source,
                 repo,
@@ -3115,7 +3073,7 @@ async def fetch_repo_transitive_extras_for_roots(
                 repo=repo_name,
                 distgit_branch=distgit_branch,
                 releasename=releasename,
-                packages=to_fetch[: _chain_distgit_parse_wave_size()],
+                packages=to_fetch,
             )
             if not batch_specs:
                 break
@@ -3169,8 +3127,6 @@ async def expand_closure_for_repo_transitive_deps(
     if not parsed_by_source:
         return specs, parsed_by_source, err
 
-    max_parse = _chain_distgit_max_parse()
-    wave_size = _chain_distgit_parse_wave_size()
     pool = _distgit_spec_parse_executor()
     parse_fn = _spec_parse_fn(releasename)
     t0 = time.monotonic()
@@ -3190,11 +3146,10 @@ async def expand_closure_for_repo_transitive_deps(
         follow_redirects=True,
         limits=limits,
     ) as client:
-        max_waves = _chain_repo_transitive_max_waves()
         wave_num = 0
         to_fetch: list[str] = []
         attempted_fetch: set[str] = set()
-        while len(parsed_by_source) <= max_parse and wave_num < max_waves:
+        while True:
             wave_num += 1
             candidates = await asyncio.to_thread(
                 _collect_repo_transitive_candidates,
@@ -3206,9 +3161,8 @@ async def expand_closure_for_repo_transitive_deps(
                 c for c in candidates if c not in parsed_by_source and c not in attempted_fetch
             )
             logger.info(
-                "repo transitive wave %s/%s %s/%s: candidates=%s to_fetch=%s parsed=%s",
+                "repo transitive wave %s %s/%s: candidates=%s to_fetch=%s parsed=%s",
                 wave_num,
-                max_waves,
                 releasename,
                 distgit_branch,
                 len(candidates),
@@ -3219,53 +3173,41 @@ async def expand_closure_for_repo_transitive_deps(
                 break
 
             wave_added = False
-            for off in range(0, len(to_fetch), wave_size):
-                wave = to_fetch[off : off + wave_size]
-                batch_specs = await _fetch_distgit_specs_batch(
-                    client,
-                    owner=owner,
-                    repo=repo_name,
-                    distgit_branch=distgit_branch,
-                    releasename=releasename,
-                    packages=wave,
-                )
-                for pkg in wave:
-                    if pkg not in batch_specs:
-                        attempted_fetch.add(pkg)
-                if not batch_specs:
-                    continue
-                wave_added = True
-                fetched_extra += len(batch_specs)
-                futures = {
-                    pool.submit(parse_fn, batch_specs[pkg], f"{pkg}.spec"): pkg
-                    for pkg in batch_specs
-                }
-                for fut in as_completed(futures):
-                    pkg = futures[fut]
-                    try:
-                        parsed = fut.result()
-                    except Exception as exc:
-                        err.append(f"{pkg}: parse failed ({type(exc).__name__}: {exc})")
-                        parsed = _SpecParseResult(
-                            source_name=pkg,
-                            build_requires=[],
-                            provided_binary_names={pkg},
-                            build_requires_raw=[],
-                        )
-                    specs[pkg] = batch_specs[pkg]
-                    parsed_by_source[pkg] = parsed
+            batch_specs = await _fetch_distgit_specs_batch(
+                client,
+                owner=owner,
+                repo=repo_name,
+                distgit_branch=distgit_branch,
+                releasename=releasename,
+                packages=to_fetch,
+            )
+            for pkg in to_fetch:
+                if pkg not in batch_specs:
+                    attempted_fetch.add(pkg)
+            if not batch_specs:
+                break
+            wave_added = True
+            fetched_extra += len(batch_specs)
+            futures = {
+                pool.submit(parse_fn, batch_specs[pkg], f"{pkg}.spec"): pkg
+                for pkg in batch_specs
+            }
+            for fut in as_completed(futures):
+                pkg = futures[fut]
+                try:
+                    parsed = fut.result()
+                except Exception as extra_exc:
+                    err.append(f"{pkg}: parse failed ({type(extra_exc).__name__}: {extra_exc})")
+                    parsed = _SpecParseResult(
+                        source_name=pkg,
+                        build_requires=[],
+                        provided_binary_names={pkg},
+                        build_requires_raw=[],
+                    )
+                specs[pkg] = batch_specs[pkg]
+                parsed_by_source[pkg] = parsed
             if not wave_added:
                 break
-
-    if wave_num >= max_waves and to_fetch:
-        err.append(
-            f"Repo transitive distgit closure hit OREON_CHAIN_REPO_TRANSITIVE_MAX_WAVES ({max_waves}); some runtime deps may be missing."
-        )
-
-    if len(parsed_by_source) > max_parse:
-        err.append(
-            f"Chain distgit closure exceeded OREON_CHAIN_DISTGIT_MAX_PARSE ({max_parse}); narrow the chain spec."
-        )
 
     logger.info(
         "repo transitive distgit closure %s/%s: parsed=%s extra_fetched=%s in %.1fs",
