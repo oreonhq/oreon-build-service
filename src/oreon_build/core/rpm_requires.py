@@ -46,10 +46,36 @@ def is_low_level_runtime_requirement(cap: str) -> bool:
     return False
 
 
+_RE_RPM_HEADER_TOKEN = re.compile(
+    r"^(?:requested\s+)?(?:"
+    r"buildrequires|requires|buildconflicts|conflicts|obsoletes|provides|"
+    r"recommends|suggests|supplements|enhances"
+    r")\s*:?\s*$",
+    re.IGNORECASE,
+)
+
+
+def is_malformed_rpm_requirement(cap: str) -> bool:
+    c = (cap or "").strip().strip("'\"")
+    if not c:
+        return True
+    if c.lower().startswith("requested "):
+        c = c[10:].strip()
+    if not c:
+        return True
+    if _RE_RPM_HEADER_TOKEN.match(c):
+        return True
+    if c in {":", "=", "-", "*"}:
+        return True
+    return False
+
+
 def is_spurious_solver_miss(cap: str) -> bool:
     """junk caps from bad macro split / version-only solver jobs."""
     c = (cap or "").strip()
     if not c:
+        return True
+    if is_malformed_rpm_requirement(c):
         return True
     if _RE_VERSION_ONLY_TOKEN.match(c):
         return True
@@ -105,7 +131,7 @@ def is_distgit_source_name(name: str) -> bool:
 
 
 def _pkgconfig_glob_match(cap: str, key: str) -> bool:
-    """Match when the requirement has a glob (pkgconfig(Qt5*) vs pkgconfig(Qt5Core))."""
+    """pkgconfig(Qt5*) vs pkgconfig(Qt5Core), or the reverse from %files absl_*.pc."""
     c = (cap or "").strip().lower()
     k = (key or "").strip().lower()
     if not (c.startswith("pkgconfig(") and c.endswith(")")):
@@ -114,16 +140,20 @@ def _pkgconfig_glob_match(cap: str, key: str) -> bool:
         return False
     cinner = c[len("pkgconfig(") : -1]
     kinner = k[len("pkgconfig(") : -1]
-    if "*" in kinner:
+    if "*" in cinner and "*" in kinner:
         return False
-    if "*" not in cinner:
+    if "*" in cinner:
+        pattern, text = cinner, kinner
+    elif "*" in kinner:
+        pattern, text = kinner, cinner
+    else:
         return cinner == kinner
-    if cinner == "*":
+    if not pattern or pattern == "*":
         return False
-    prefix, _, suffix = cinner.partition("*")
+    prefix, _, suffix = pattern.partition("*")
     if "*" in suffix:
         return False
-    return bool(kinner) and kinner.startswith(prefix) and kinner.endswith(suffix)
+    return bool(text) and text.startswith(prefix) and text.endswith(suffix)
 
 
 def _soname_prefix_match(cap: str, key: str) -> bool:
@@ -187,10 +217,15 @@ def _providers_from_maps(
                 hit = pmap.get(sk)
                 if hit:
                     out.update(hit)
+            pcglobs = pmap.get("__pcglob__")
             if need_pkgconfig_glob:
                 for key, srcs in pmap.items():
-                    if key == "__lower__":
+                    if key.startswith("__"):
                         continue
+                    if _pkgconfig_glob_match(c, key):
+                        out.update(srcs)
+            elif cl.startswith("pkgconfig(") and isinstance(pcglobs, dict):
+                for key, srcs in pcglobs.items():
                     if _pkgconfig_glob_match(c, key):
                         out.update(srcs)
             continue
@@ -202,10 +237,15 @@ def _providers_from_maps(
                 hit = pmap.get(sk) or lower_index.get(sk.lower())
                 if hit:
                     out.update(hit)
+            pcglobs = pmap.get("__pcglob__")
             if need_pkgconfig_glob:
                 for key, srcs in pmap.items():
-                    if key == "__lower__":
+                    if key.startswith("__"):
                         continue
+                    if _pkgconfig_glob_match(c, key):
+                        out.update(srcs)
+            elif cl.startswith("pkgconfig(") and isinstance(pcglobs, dict):
+                for key, srcs in pcglobs.items():
                     if _pkgconfig_glob_match(c, key):
                         out.update(srcs)
             continue
@@ -220,20 +260,39 @@ def _providers_from_maps(
     return out
 
 
+def _pcglob_from_keys(pmap: dict[str, Any]) -> dict[str, set[str]]:
+    pcglob: dict[str, set[str]] = {}
+    for k, srcs in pmap.items():
+        if not isinstance(k, str) or k.startswith("__"):
+            continue
+        if not (k.startswith("pkgconfig(") and k.endswith(")") and "*" in k):
+            continue
+        inner = k[len("pkgconfig(") : -1]
+        if not inner or inner == "*":
+            continue
+        if isinstance(srcs, (set, frozenset, list, tuple)):
+            pcglob.setdefault(k, set()).update(s for s in srcs if s)
+    return pcglob
+
+
 def index_provider_map(pmap: dict[str, set[str]] | None) -> dict[str, set[str]]:
     """Attach a lower-case lookup index. Keeps exact keys for soname/pkgconfig forms."""
     if not pmap:
-        return {"__lower__": {}}  # type: ignore[dict-item]
+        return {"__lower__": {}, "__pcglob__": {}}  # type: ignore[dict-item]
     if "__lower__" in pmap and isinstance(pmap.get("__lower__"), dict):
+        if not isinstance(pmap.get("__pcglob__"), dict):
+            pmap["__pcglob__"] = _pcglob_from_keys(pmap)  # type: ignore[assignment]
         return pmap
     lower: dict[str, set[str]] = {}
     out: dict[str, set[str]] = {}
     for k, srcs in pmap.items():
-        if k == "__lower__":
+        if k in ("__lower__", "__pcglob__"):
             continue
         out[k] = set(srcs)
-        lower.setdefault(k.lower(), set()).update(srcs)
+        if not str(k).startswith("__"):
+            lower.setdefault(k.lower(), set()).update(srcs)
     out["__lower__"] = lower  # type: ignore[assignment]
+    out["__pcglob__"] = _pcglob_from_keys(out)  # type: ignore[assignment]
     return out
 
 
@@ -243,7 +302,9 @@ def merge_provider_maps(*maps: dict[str, set[str]] | None) -> dict[str, set[str]
         if not pmap:
             continue
         for cap, srcs in pmap.items():
-            if cap == "__lower__":
+            if cap in ("__lower__", "__pcglob__"):
+                continue
+            if not isinstance(srcs, (set, frozenset, list, tuple)):
                 continue
             out.setdefault(cap, set()).update(srcs)
     return index_provider_map(out)
@@ -255,7 +316,7 @@ def add_capability_providers(
     sources: set[str] | list[str] | tuple[str, ...],
 ) -> None:
     cap = (capability or "").strip()
-    if not cap or cap == "__lower__":
+    if not cap or cap in ("__lower__", "__pcglob__"):
         return
     srcs = {s for s in sources if s}
     if not srcs:
@@ -265,8 +326,20 @@ def add_capability_providers(
     lower = pmap.get("__lower__")
     if isinstance(lower, dict):
         lower.setdefault(cap.lower(), set()).update(srcs)
+        if cap.startswith("pkgconfig(") and "*" in cap:
+            globs = pmap.get("__pcglob__")
+            if not isinstance(globs, dict):
+                globs = _pcglob_from_keys(pmap)
+                pmap["__pcglob__"] = globs  # type: ignore[assignment]
+            inner = cap[len("pkgconfig(") : -1] if cap.endswith(")") else ""
+            if inner and inner != "*":
+                globs.setdefault(cap, set()).update(srcs)
         return
-    raw = {k: set(v) for k, v in pmap.items() if k != "__lower__"}
+    raw = {
+        k: set(v)
+        for k, v in pmap.items()
+        if k not in ("__lower__", "__pcglob__") and isinstance(v, (set, frozenset, list, tuple))
+    }
     pmap.clear()
     pmap.update(index_provider_map(raw))
 
