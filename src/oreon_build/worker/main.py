@@ -1854,6 +1854,37 @@ def _prepare_mock_sources_with_spectool(spec_path: Path, staging_dir: Path) -> t
 
     return True, "\n".join(log_parts)
 
+
+def _source_prep_failure_payload(spec_path: Path, git_dir: Path, detail: str) -> dict:
+    missing = re.findall(r"missing local files:\s*([^\n]+)", detail, flags=re.IGNORECASE)
+    files = sorted(
+        {
+            item.strip()
+            for group in missing
+            for item in group.split(",")
+            if item.strip()
+        }
+    )
+    if not files:
+        return {}
+    rc, revision = _run(["git", "-C", str(git_dir), "rev-parse", "HEAD"], timeout_s=30)
+    commit = revision.strip() if rc == 0 else ""
+    spec_hash = hashlib.sha256(spec_path.read_bytes()).hexdigest() if spec_path.is_file() else ""
+    payload = {
+        "commit": commit,
+        "spec_path": str(spec_path.relative_to(git_dir)),
+        "spec_sha256": spec_hash,
+        "missing_local_files": files,
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "failure_kind": "source_missing_local_file",
+        "failure_fingerprint": fingerprint,
+        "failure_details": payload,
+    }
+
 def _mock_build_srpm_from_spec(
     mock_config: str,
     spec_path: Path,
@@ -2596,11 +2627,17 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                 if not src_ok:
                     msg = "\n\n".join(build_log_parts).strip()
                     log_key = _upload_build_log_via_controller(session, controller_url, attempt_id, msg.encode("utf-8"))
+                    failure = _source_prep_failure_payload(spec_path, git_dir, src_log)
                     _post_worker_build_result(
                         session,
                         controller_url,
                         attempt_id,
-                        {"status": "failed", "log_r2_key": log_key, "error_message": msg},
+                        {
+                            "status": "failed",
+                            "log_r2_key": log_key,
+                            "error_message": msg,
+                            **failure,
+                        },
                     )
                     return
 
