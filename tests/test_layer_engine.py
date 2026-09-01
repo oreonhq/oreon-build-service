@@ -54,7 +54,11 @@ def test_cycle_peers_for_sat_miss():
 
 
 def test_bootstrap_defines_flip_spec_bcond():
-    from oreon_build.services.layer_engine import _bootstrap_rpmbuild_defines
+    from oreon_build.services.layer_engine import (
+        _bootstrap_rpmbuild_defines,
+        _manifest_build_requirements,
+    )
+    from oreon_build.services.distgit_order import _spec_parse_fn
 
     spec = "%bcond_with bootstrap\nName: ghc\n"
     defines = _bootstrap_rpmbuild_defines(spec, "oreon-11-rp1", "x86_64")
@@ -66,6 +70,72 @@ def test_bootstrap_defines_flip_spec_bcond():
         "x86_64",
     )
     assert cargo.get("with_check") == "0"
+    perl = _bootstrap_rpmbuild_defines(
+        "%bcond enables_optional_test 1\n"
+        "%bcond extra_test 1\n"
+        "%bcond_with docs\n"
+        "Name: perl-demo\n",
+        "oreon-11-rp1",
+        "x86_64",
+    )
+    assert perl["with_enables_optional_test"] == "0"
+    assert perl["with_extra_test"] == "0"
+    assert perl["with_docs"] == "0"
+    perl_spec = """
+%bcond enables_optional_test 1
+Name: perl-demo
+Version: 1
+Release: 1
+Summary: x
+License: MIT
+BuildRequires: perl(strict)
+%if %{with enables_optional_test}
+BuildRequires: perl(CPAN::Meta::Requirements::Range)
+%endif
+%description
+x
+"""
+    parsed = _spec_parse_fn(perl_spec, "perl-demo")
+    requirements = _manifest_build_requirements(
+        perl_spec,
+        parsed,
+        architecture="x86_64",
+        defines=_bootstrap_rpmbuild_defines(perl_spec, "oreon-11-rp1", "x86_64"),
+    )
+    assert "perl(CPAN::Meta::Requirements::Range)" not in requirements
+
+
+def test_bootstrap_pass_is_started_only_once():
+    from types import SimpleNamespace
+
+    from oreon_build.services.layer_engine import _start_bootstrap_pass
+
+    job = SimpleNamespace(
+        id=1,
+        layer_plan_id=2,
+        status=BuildStatus.BLOCKED,
+        completed_at=None,
+        job_options={
+            "build_profile": "full",
+            "bootstrap_attempted": True,
+        },
+    )
+
+    class DB:
+        pass
+
+    import asyncio
+
+    assert asyncio.run(
+        _start_bootstrap_pass(
+            DB(),
+            job,
+            {"dependency"},
+            spec_text="Name: demo\n",
+            releasename="oreon-11-rp1",
+            architecture="x86_64",
+        )
+    ) is False
 
 
 def test_skip_repeat_sat_holds_until_wait_inputs_move():
@@ -80,15 +150,19 @@ def test_skip_repeat_sat_holds_until_wait_inputs_move():
     )
     statuses = {("shake", "x86_64"): {BuildStatus.BLOCKED}}
     ready = {("shake", "x86_64"): False}
-    fp1 = _sat_eval_fingerprint(job, "x86_64", statuses, ready, 4)
-    fp2 = _sat_eval_fingerprint(job, "x86_64", statuses, ready, 9)
+    fp1 = _sat_eval_fingerprint(job, "x86_64", statuses, ready)
+    fp2 = _sat_eval_fingerprint(job, "x86_64", statuses, ready)
     assert fp1 == fp2
     statuses2 = {("shake", "x86_64"): {BuildStatus.SUCCESS}}
     ready2 = {("shake", "x86_64"): True}
-    assert _sat_eval_fingerprint(job, "x86_64", statuses2, ready2, 4) != fp1
+    assert _sat_eval_fingerprint(job, "x86_64", statuses2, ready2) != fp1
     empty = SimpleNamespace(blocking_sources=[], job_options={"build_profile": "full"})
-    assert _sat_eval_fingerprint(empty, "x86_64", {}, {}, 4) != _sat_eval_fingerprint(
-        empty, "x86_64", {}, {}, 5
+    assert _sat_eval_fingerprint(empty, "x86_64", {}, {}) == _sat_eval_fingerprint(
+        empty, "x86_64", {}, {}
+    )
+    dead_statuses = {("shake", "x86_64"): {BuildStatus.FAILED}}
+    assert _sat_eval_fingerprint(job, "x86_64", dead_statuses, ready) == _sat_eval_fingerprint(
+        job, "x86_64", {("shake", "x86_64"): {BuildStatus.SKIPPED}}, ready
     )
 
 
@@ -613,6 +687,47 @@ def test_schedule_layer_evaluation_coalesces(monkeypatch):
     assert 1256 in le._LAYER_EVAL_PENDING
     le._LAYER_EVAL_PENDING.clear()
     le._LAYER_EVAL_DRAINING.clear()
+
+
+def test_reconcile_does_not_reschedule_active_layers(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    from oreon_build.models import LayerPlanStatus
+    from oreon_build.services import layer_engine as le
+
+    class DB:
+        def __init__(self):
+            self.calls = 0
+
+        async def execute(self, statement):
+            self.calls += 1
+            if self.calls == 1:
+                return SimpleNamespace(
+                    scalars=lambda: SimpleNamespace(
+                        all=lambda: [SimpleNamespace(id=1256, status=LayerPlanStatus.RUNNING)]
+                    )
+                )
+            return SimpleNamespace(all=lambda: [(BuildStatus.RUNNING, 1)])
+
+        async def commit(self):
+            return None
+
+    class Session:
+        async def __aenter__(self):
+            return DB()
+
+        async def __aexit__(self, *args):
+            return None
+
+    scheduled = []
+    monkeypatch.setattr(
+        "oreon_build.db.session.async_session_maker",
+        lambda: Session(),
+    )
+    monkeypatch.setattr(le, "schedule_layer_evaluation", scheduled.append)
+    asyncio.run(le.reconcile_settled_layer_plans())
+    assert scheduled == []
 
 
 def test_pkgconfig_miss_waits_on_unpublished_layer_source():

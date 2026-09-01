@@ -40,10 +40,39 @@ def test_full_profile_without_handoff_is_unchanged():
     assert job.status == BuildStatus.SUCCESS
 
 
-def _job(status, name="pkg", reason="", blocking=None):
+def test_bootstrap_handoff_does_not_get_clobbered_to_blocked():
+    """on_package_published used to stomp a bootstrap-handoff PENDING back to
+    BLOCKED, which made success counts flicker as the job re-evaluated itself.
+    The function itself flips the status to PENDING; surrounding code must not
+    overwrite that."""
+    job = BuildJob(
+        package_id=1,
+        release_id=1,
+        status=BuildStatus.SUCCESS,
+        job_options={
+            "build_profile": "bootstrap",
+            "rpmbuild_defines": {"with_check": "0"},
+            "next_profile": "full",
+            "bootstrap_dropped": ["provider"],
+            "repo_published": True,
+        },
+    )
+    assert schedule_next_pass_after_publish(job) is True
+    assert job.status == BuildStatus.PENDING
+    opts = job_options_dict(job)
+    assert opts["build_profile"] == "full"
+    assert opts["repo_published"] is True
+
+
+def _job(status, name="pkg", reason="", blocking=None, options=None):
     pkg = SimpleNamespace(name=name)
     return SimpleNamespace(
-        id=1, status=status, package=pkg, blocked_reason=reason, blocking_sources=blocking or [],
+        id=1,
+        status=status,
+        package=pkg,
+        blocked_reason=reason,
+        blocking_sources=blocking or [],
+        job_options=options,
     )
 
 
@@ -56,13 +85,15 @@ def test_settlement_keeps_running_while_jobs_are_queued():
     assert layer_plan_settlement(jobs) == (None, None)
 
 
-def test_settlement_keeps_running_when_only_blocked_remain():
+def test_settlement_fails_when_only_blocked_remain():
     jobs = [
         _job(BuildStatus.SUCCESS, "a"),
         _job(BuildStatus.BLOCKED, "kde", "waiting on layer jobs: foo"),
         _job(BuildStatus.BLOCKED, "bar", "waiting on repository"),
     ]
-    assert layer_plan_settlement(jobs) == (None, None)
+    status, msg = layer_plan_settlement(jobs)
+    assert status == LayerPlanStatus.FAILED
+    assert "2 blocked" in (msg or "")
 
 
 def test_layer_job_prepare_skips_inflight_blockers():
@@ -88,16 +119,107 @@ def test_settlement_stops_plan_when_failures_leave_only_blocked():
     assert "Primary: blosc" in (msg or "")
 
 
-def test_settlement_keeps_running_when_blocked_are_not_failure_fallout():
+def test_settlement_fails_when_blocked_are_not_failure_fallout():
     jobs = [
         _job(BuildStatus.SUCCESS, "a"),
         _job(BuildStatus.FAILED, "hdf5", "mock failed"),
         _job(BuildStatus.BLOCKED, "kf6-ki18n", "waiting on layer jobs: qt6-qtwebengine", ["qt6-qtwebengine"]),
         _job(BuildStatus.BLOCKED, "qt6-qtwebengine", "waiting on layer jobs: python-zombie-imp", ["python-zombie-imp"]),
     ]
+    status, msg = layer_plan_settlement(jobs)
+    assert status == LayerPlanStatus.FAILED
+    assert "stalled" in (msg or "")
+
+
+def test_settlement_waits_for_unpublished_success():
+    jobs = [
+        _job(BuildStatus.SUCCESS, "provider", options={"repo_published": False}),
+        _job(BuildStatus.BLOCKED, "consumer", "waiting on layer jobs: provider", ["provider"]),
+    ]
     assert layer_plan_settlement(jobs) == (None, None)
+
+
+def test_settlement_treats_cancelled_upstream_as_terminal():
+    jobs = [
+        _job(BuildStatus.CANCELLED, "provider", "Build cancelled"),
+        _job(BuildStatus.BLOCKED, "consumer", "waiting on layer jobs: provider", ["provider"]),
+    ]
+    status, msg = layer_plan_settlement(jobs)
+    assert status == LayerPlanStatus.FAILED
+    assert "1 cancelled" in (msg or "")
+
+
+def test_deterministic_source_failure_is_not_safe_to_resume():
+    from oreon_build.services.layer_plan import _is_deterministic_source_failure
+
+    assert _is_deterministic_source_failure(
+        "## Source prep\nmissing local files: waitress-3.0.2-nodocs.tar.gz"
+    )
+    assert _is_deterministic_source_failure("spectool download failed (rc=0 but files missing): demo.tar.gz")
+    assert not _is_deterministic_source_failure("mock build failed: temporary network outage")
 
 
 def test_settlement_success_when_all_ok():
     jobs = [_job(BuildStatus.SUCCESS, "a"), _job(BuildStatus.SKIPPED, "b")]
     assert layer_plan_settlement(jobs) == (LayerPlanStatus.SUCCESS, None)
+
+
+def test_on_package_published_keeps_bootstrap_handoff_pending():
+    """End-to-end: when on_package_published runs against a bootstrap-handoff
+    job, the job must stay PENDING (so it can re-run with the full profile)
+    and must not be flipped to BLOCKED."""
+    from unittest.mock import AsyncMock, patch
+
+    from oreon_build.services.layer_engine import on_package_published
+
+    published_job = BuildJob(
+        package_id=1,
+        release_id=1,
+        target_id=1,
+        layer_plan_id=42,
+        status=BuildStatus.SUCCESS,
+        completed_at=None,
+        job_options={
+            "build_profile": "bootstrap",
+            "rpmbuild_defines": {"with_check": "0"},
+            "next_profile": "full",
+            "bootstrap_dropped": ["peer"],
+            "repo_published": True,
+        },
+    )
+    published_job.id = 7
+    fake_plan = SimpleNamespace(id=42, side_tag_id=None)
+
+    async def fake_execute(stmt):
+        class _R:
+            def all(self_inner):
+                return [(42,)]
+
+            def scalars(self_inner):
+                class _S:
+                    def all(self_inner2):
+                        return [published_job]
+                return _S()
+
+        return _R()
+
+    fake_session = AsyncMock()
+    fake_session.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session.__aexit__ = AsyncMock(return_value=None)
+    fake_session.execute = fake_execute
+    fake_session.get = AsyncMock(return_value=fake_plan)
+    fake_session.commit = AsyncMock()
+
+    with patch(
+        "oreon_build.db.session.async_session_maker",
+        return_value=fake_session,
+    ), patch(
+        "oreon_build.services.layer_engine.schedule_layer_evaluation",
+    ):
+        import asyncio
+        asyncio.run(on_package_published("pkg", "oreon-11-rp1", None, 7))
+
+    assert published_job.status == BuildStatus.PENDING
+    opts = job_options_dict(published_job)
+    assert opts["build_profile"] == "full"
+    assert opts["repo_published"] is True
