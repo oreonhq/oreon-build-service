@@ -139,6 +139,9 @@ class BuildAttempt(Base):
     signing_status: Mapped[str] = mapped_column(String(32), default="not_started", nullable=False)
     build_profile: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     rpmbuild_defines: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    failure_kind: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    failure_fingerprint: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    failure_details: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
     build_job: Mapped["BuildJob"] = relationship("BuildJob", back_populates="attempts")
     worker: Mapped[Optional["Worker"]] = relationship(
