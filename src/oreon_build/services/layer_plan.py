@@ -213,11 +213,36 @@ def _job_build_terminal_ok(status_: BuildStatus) -> bool:
 _IN_FLIGHT_STATUSES = (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.RUNNING)
 
 
-def _is_failure_fallout(job: Any, failed_names: set[str]) -> bool:
+def _is_deterministic_source_failure(
+    message: str | None,
+    failure_kind: str | None = None,
+) -> bool:
+    if failure_kind == "source_missing_local_file":
+        return True
+    text = (message or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "missing local files:",
+            "spec not found:",
+            "spectool not found.",
+            "spectool download failed (rc=0 but files missing):",
+        )
+    )
+
+
+def _job_waits_for_publish(job: Any) -> bool:
+    if getattr(job, "status", None) != BuildStatus.SUCCESS:
+        return False
+    options = getattr(job, "job_options", None)
+    return isinstance(options, dict) and options.get("repo_published") is False
+
+
+def _is_failure_fallout(job: Any, terminal_names: set[str]) -> bool:
     reason = (getattr(job, "blocked_reason", None) or "").strip()
     if reason.lower().startswith("upstream failure:"):
         return True
-    failed_l = {str(n).strip().lower() for n in failed_names if str(n).strip()}
+    terminal_l = {str(n).strip().lower() for n in terminal_names if str(n).strip()}
     sources: set[str] = set()
     for raw in getattr(job, "blocking_sources", None) or []:
         name = str(raw or "").strip().lower()
@@ -225,7 +250,7 @@ def _is_failure_fallout(job: Any, failed_names: set[str]) -> bool:
             name = name[:-5]
         if name:
             sources.add(name)
-    return bool(sources) and bool(failed_l) and sources <= failed_l
+    return bool(sources) and bool(terminal_l) and sources <= terminal_l
 
 
 def layer_plan_settlement(
@@ -233,13 +258,15 @@ def layer_plan_settlement(
 ) -> tuple[LayerPlanStatus | None, str | None]:
     """How a plan should look once nothing is in flight.
 
-    Blocked jobs are waiters, not work. Failures only stop the plan when
-    every remaining waiter is fallout of those failures. Other blocked
-    jobs can still SAT-queue.
+    A plan without work in flight cannot make progress unless an external
+    event changes one of its inputs. Terminalize it instead of retrying the
+    same blocked graph forever.
     """
     if not jobs:
         return None, None
     if any(j.status in _IN_FLIGHT_STATUSES for j in jobs):
+        return None, None
+    if any(_job_waits_for_publish(j) for j in jobs):
         return None, None
     n_ok = sum(1 for j in jobs if _job_build_terminal_ok(j.status))
     n_fail = sum(1 for j in jobs if j.status == BuildStatus.FAILED)
@@ -247,25 +274,17 @@ def layer_plan_settlement(
     n_block = sum(1 for j in jobs if j.status == BuildStatus.BLOCKED)
     if n_block == 0 and n_fail == 0 and n_cancel == 0:
         return LayerPlanStatus.SUCCESS, None
-    if n_fail == 0 and n_cancel == 0:
-        return None, None
-    failed_names = set()
+    terminal_names = set()
     for j in jobs:
-        if j.status != BuildStatus.FAILED:
+        if j.status not in (BuildStatus.FAILED, BuildStatus.CANCELLED):
             continue
         name = j.package.name if getattr(j, "package", None) else ""
         if name:
-            failed_names.add(str(name).strip())
-    if n_block > 0 and any(
-        not _is_failure_fallout(j, failed_names)
-        for j in jobs
-        if j.status == BuildStatus.BLOCKED
-    ):
-        return None, None
+            terminal_names.add(str(name).strip())
     primary: list[str] = []
     seen: set[str] = set()
     for j in jobs:
-        if j.status != BuildStatus.FAILED:
+        if j.status not in (BuildStatus.FAILED, BuildStatus.CANCELLED):
             continue
         name = j.package.name if getattr(j, "package", None) else f"job-{j.id}"
         if name in seen:
@@ -442,7 +461,20 @@ async def on_build_job_failed_for_layer(
 
 
 async def on_user_cancelled_layer_job(db: Any, job: BuildJob) -> None:
-    return
+    if job.layer_plan_id is None:
+        return
+    plan = await db.get(LayerPlan, job.layer_plan_id)
+    if plan is None or plan.status not in (LayerPlanStatus.PENDING, LayerPlanStatus.RUNNING):
+        return
+    job.status = BuildStatus.CANCELLED
+    job.completed_at = datetime.now(timezone.utc)
+    job.blocked_reason = "Build cancelled"
+    job.blocking_sources = []
+    await db.flush()
+    from oreon_build.services.layer_engine import evaluate_layer_buildability
+
+    await evaluate_layer_buildability(db, int(plan.id))
+    await maybe_settle_layer_plan(db, int(plan.id))
 
 
 async def cancel_layer_plan_by_user(
@@ -569,6 +601,35 @@ async def resume_layer_plan_by_user(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Nothing left to resume (no failed/cancelled/blocked jobs)",
         )
+    failed_ids = [int(job.id) for job in reopen if job.status == BuildStatus.FAILED]
+    deterministic_source_failures: set[int] = set()
+    if failed_ids:
+        attempts_r = await db.execute(
+            select(
+                BuildAttempt.build_job_id,
+                BuildAttempt.error_message,
+                BuildAttempt.failure_kind,
+            )
+            .where(BuildAttempt.build_job_id.in_(failed_ids))
+            .order_by(BuildAttempt.build_job_id, BuildAttempt.id.desc())
+        )
+        latest_errors: dict[int, tuple[str | None, str | None]] = {}
+        for build_job_id, error_message, failure_kind in attempts_r.all():
+            latest_errors.setdefault(int(build_job_id), (error_message, failure_kind))
+        deterministic_source_failures = {
+            job_id
+            for job_id, (error_message, failure_kind) in latest_errors.items()
+            if _is_deterministic_source_failure(error_message, failure_kind)
+        }
+    reopen = [job for job in reopen if int(job.id) not in deterministic_source_failures]
+    if not reopen:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Nothing safe to resume. Failed jobs have deterministic source-preparation "
+                "errors. Fix the source definition, then retry the affected job explicitly."
+            ),
+        )
     for job in reopen:
         job.status = BuildStatus.BLOCKED
         job.completed_at = None
@@ -580,7 +641,15 @@ async def resume_layer_plan_by_user(
     await db.flush()
     await log_audit(
         db, "build.layer_resume", account_id=user.id, resource_type="layer_plan",
-        resource_id=str(plan.id), details=f"reopened {len(reopen)} job(s)",
+        resource_id=str(plan.id),
+        details=(
+            f"reopened {len(reopen)} job(s)"
+            + (
+                f"; preserved {len(deterministic_source_failures)} deterministic source failure(s)"
+                if deterministic_source_failures
+                else ""
+            )
+        ),
         ip_address=get_client_ip(request), user_agent=get_user_agent(request),
     )
     return plan, [int(j.id) for j in reopen]

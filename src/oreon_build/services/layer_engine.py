@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from fastapi import HTTPException, Request, status
-from sqlalchemy import exists, select, update
+from sqlalchemy import exists, func, select, update
 
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
 from oreon_build.core.dnf_missing import parse_dnf_missing_provides
@@ -84,6 +84,7 @@ DEFAULT_ARCH = ["x86_64", "aarch64"]
 _REACTIVE_CACHE_TTL = 1800.0
 _REACTIVE_CACHE_LIMIT = 8192
 _REACTIVE_REQUIREMENTS_CACHE_VERSION = "sat-br-v16"
+_BOOTSTRAP_DEFINES_VERSION = "v2"
 _REACTIVE_CACHE_LOCK = threading.RLock()
 _LAYER_EVAL_POOL = concurrent.futures.ThreadPoolExecutor(
     max_workers=max(1, os.cpu_count() or 1),
@@ -216,7 +217,6 @@ def _sat_eval_fingerprint(
     architecture: str,
     layer_statuses: dict[tuple[str, str], set[BuildStatus]],
     layer_repo_ready: dict[tuple[str, str], bool] | None,
-    repo_gen: int,
 ) -> str:
     opts = job_options_dict(job)
     profile = str(opts.get("build_profile") or "full").strip().lower()
@@ -230,14 +230,20 @@ def _sat_eval_fingerprint(
         if str(value).strip()
     ]
     if not stored:
-        return "|".join(("empty", str(int(repo_gen)), profile, str(defines)))
+        return "|".join(("empty", profile, str(defines)))
     ready = layer_repo_ready or {}
     parts: list[str] = []
     for name in sorted(stored):
         statuses = layer_statuses.get((name, arch), set())
-        flags = ",".join(sorted(item.value for item in statuses)) if statuses else "absent"
+        live = statuses - _DEAD_BLOCKER_STATUSES if statuses else set()
+        flag = "absent"
+        if statuses:
+            if live:
+                flag = "live"
+            else:
+                flag = "dead"
         pub = "1" if ready.get((name, arch)) else "0"
-        parts.append(f"{name}={flags}:{pub}")
+        parts.append(f"{name}={flag}:{pub}")
     return "|".join(("wait", profile, str(defines), *parts))
 
 
@@ -1541,11 +1547,15 @@ async def _start_bootstrap_pass(
     opts = job_options_dict(job)
     if str(opts.get("build_profile") or "full").strip().lower() == "bootstrap":
         return False
+    if bool(opts.get("bootstrap_attempted") or opts.get("bootstrap_dropped")):
+        return False
     defines = _bootstrap_rpmbuild_defines(spec_text, releasename, architecture)
     opts["build_profile"] = "bootstrap"
     opts["rpmbuild_defines"] = defines
     opts["next_profile"] = "full"
     opts["bootstrap_dropped"] = dropped
+    opts["bootstrap_defines_version"] = _BOOTSTRAP_DEFINES_VERSION
+    opts["bootstrap_attempted"] = True
     opts.pop("bootstrap_stub_provides", None)
     await _update_layer_job_if_active(
         db,
@@ -1568,6 +1578,9 @@ def _bootstrap_rpmbuild_defines(spec_text: str, releasename: str, architecture: 
         target_arches={normalize_machine_arch(str(architecture or ""))} if architecture else None,
     )
     defines = dict(default_build_defines(info))
+    for name in info.defaults:
+        if name.startswith("with_") and name != "with_bootstrap":
+            defines[name] = "0"
     if "with_bootstrap" in info.defaults:
         defines["with_bootstrap"] = "1"
     defines["with_check"] = "0"
@@ -1959,14 +1972,29 @@ async def _evaluate_layer_buildability_locked(
         ):
             continue
         arch = normalize_machine_arch(str(architecture or ""))
+        stored_now = [
+            _canonical_layer_name(value)
+            for value in (job.blocking_sources or [])
+            if str(value).strip()
+        ]
+        if not stored_now:
+            work_list.append((job, architecture))
+            continue
+        opts = job_options_dict(job)
+        needs_bootstrap_define_upgrade = (
+            str(opts.get("build_profile") or "full").strip().lower() == "bootstrap"
+            and str(opts.get("bootstrap_defines_version") or "") != _BOOTSTRAP_DEFINES_VERSION
+        )
+        if needs_bootstrap_define_upgrade:
+            work_list.append((job, architecture))
+            continue
         fp = _sat_eval_fingerprint(
             job,
             architecture,
             layer_statuses,
             layer_repo_ready,
-            _solver_repo_gen(releasename, branch, arch),
         )
-        if str(job_options_dict(job).get("sat_eval_fp") or "") == fp:
+        if str(opts.get("sat_eval_fp") or "") == fp:
             continue
         work_list.append((job, architecture))
     logger.info(
@@ -1993,6 +2021,38 @@ async def _evaluate_layer_buildability_locked(
         if await _strip_bootstrap_stubs(db, job):
             cargo_cleared = True
     if cargo_cleared:
+        await db.flush()
+        await db.commit()
+    bootstrap_migrated = False
+    for job, architecture in work_list:
+        opts = job_options_dict(job)
+        if (
+            str(opts.get("build_profile") or "full").strip().lower() != "bootstrap"
+            or str(opts.get("bootstrap_defines_version") or "") == _BOOTSTRAP_DEFINES_VERSION
+        ):
+            continue
+        package = packages_by_id.get(int(job.package_id))
+        text = spec_by_name.get(package.name) if package is not None else None
+        if not text:
+            continue
+        opts["rpmbuild_defines"] = _bootstrap_rpmbuild_defines(
+            text,
+            releasename,
+            normalize_machine_arch(str(architecture or "")),
+        )
+        opts["bootstrap_defines_version"] = _BOOTSTRAP_DEFINES_VERSION
+        opts["bootstrap_attempted"] = True
+        opts.pop("sat_eval_fp", None)
+        opts.pop("sat_eval_arch", None)
+        await _update_layer_job_if_active(
+            db,
+            job.id,
+            plan.id,
+            job_options=opts,
+        )
+        job.job_options = opts
+        bootstrap_migrated = True
+    if bootstrap_migrated:
         await db.flush()
         await db.commit()
     prepared: dict[tuple[int, str], tuple[Package, str | None, Any | None, tuple[str, ...], bool]] = {}
@@ -2077,6 +2137,10 @@ async def _evaluate_layer_buildability_locked(
             graph = _blocked_wait_graph(row_list, packages_by_id, layer_statuses, arch)
             wait_graphs[arch] = graph
         peers = _cycle_peers_for_miss(consumer, live_blockers, graph)
+        if not peers:
+            cyclic = _cyclic_wait_names(graph)
+            if consumer in cyclic:
+                peers = {name for name in cyclic if name != consumer}
         dropped = peers or set(live_blockers) or {"check"}
         if text:
             started = await _start_bootstrap_pass(
@@ -2371,11 +2435,11 @@ async def _evaluate_layer_buildability_locked(
         opts = job_options_dict(job)
         fp = _sat_eval_fingerprint(
             job, architecture, layer_statuses, layer_repo_ready,
-            _solver_repo_gen(releasename, branch, arch),
         )
         if str(opts.get("sat_eval_fp") or "") == fp:
             continue
         opts["sat_eval_fp"] = fp
+        opts["sat_eval_arch"] = arch
         await _update_layer_job_if_active(
             db, job.id, plan.id, job_options=opts,
         )
@@ -2400,16 +2464,8 @@ async def evaluate_layer_buildability(
 ) -> list[BuildJob]:
     plan_id = int(layer_plan_id)
     plan = await db.get(LayerPlan, plan_id)
-    if plan is not None and plan.status == LayerPlanStatus.FAILED:
-        stall = (plan.error_message or "").strip().lower()
-        if (
-            stall.startswith("layer stalled")
-            or "unresolvable repository deadlock" in stall
-            or "upstream package failures" in stall
-        ):
-            plan.status = LayerPlanStatus.RUNNING
-            plan.error_message = None
-            await db.flush()
+    if plan is None or plan.status not in (LayerPlanStatus.PENDING, LayerPlanStatus.RUNNING):
+        return []
     changed = await _evaluate_layer_buildability(
         db,
         plan_id,
@@ -2456,7 +2512,6 @@ async def on_package_published(
                 LayerPlan.status.in_((
                     LayerPlanStatus.PENDING,
                     LayerPlanStatus.RUNNING,
-                    LayerPlanStatus.FAILED,
                 )),
             )
         )
@@ -2483,11 +2538,15 @@ async def on_package_published(
             )
             for published_job in transition.scalars().all():
                 opts = job_options_dict(published_job)
+                if opts.get("repo_published") and not str(opts.get("next_profile") or "").strip():
+                    continue
                 opts["repo_published"] = True
                 published_job.job_options = opts
                 if schedule_next_pass_after_publish(published_job):
-                    published_job.status = BuildStatus.BLOCKED
-                    published_job.blocked_reason = "waiting on repository"
+                    published_job.blocked_reason = ""
+                    published_job.blocking_sources = []
+                else:
+                    published_job.blocked_reason = ""
                     published_job.blocking_sources = []
             side_tag = await db.get(SideTag, plan.side_tag_id) if plan.side_tag_id else None
             branch = (side_tag.name if side_tag is not None else "").strip()
@@ -2509,38 +2568,12 @@ async def on_package_published(
 
 async def reconcile_settled_layer_plans() -> None:
     from oreon_build.db.session import async_session_maker
-    from sqlalchemy import func
 
     async with async_session_maker() as db:
-        stalled = await db.execute(
-            select(LayerPlan).where(
-                LayerPlan.status == LayerPlanStatus.FAILED,
-                LayerPlan.error_message.ilike("%blocked%"),
-            )
-        )
-        plan_ids: list[int] = []
-        for plan in stalled.scalars().all():
-            n_block = await db.scalar(
-                select(func.count())
-                .select_from(BuildJob)
-                .where(
-                    BuildJob.layer_plan_id == plan.id,
-                    BuildJob.status == BuildStatus.BLOCKED,
-                )
-            )
-            if int(n_block or 0) > 0:
-                plan.status = LayerPlanStatus.RUNNING
-                plan.error_message = None
-                plan_ids.append(int(plan.id))
-        kick_running: list[int] = list(plan_ids)
         idle = await db.execute(
             select(LayerPlan).where(LayerPlan.status == LayerPlanStatus.RUNNING)
         )
-        hot: list[int] = []
-        cold: list[int] = []
         for plan in idle.scalars().all():
-            if int(plan.id) in plan_ids:
-                continue
             if int(plan.id) in _LAYER_EVAL_DRAINING or int(plan.id) in _LAYER_EVAL_PENDING:
                 continue
             counts = await db.execute(
@@ -2555,15 +2588,9 @@ async def reconcile_settled_layer_plans() -> None:
                 + by_status.get(BuildStatus.PENDING, 0)
             )
             blocked_n = by_status.get(BuildStatus.BLOCKED, 0)
-            if inflight > 0:
-                hot.append(int(plan.id))
-            elif blocked_n > 0:
-                cold.append(int(plan.id))
-        kick_running.extend(hot)
-        kick_running.extend(cold)
+            if inflight == 0 and blocked_n > 0:
+                await _settle_layer_fixpoint(db, plan)
         await db.commit()
-    for pid in kick_running:
-        schedule_layer_evaluation(pid)
 
 
 async def reconcile_stuck_layer_blockers() -> None:
