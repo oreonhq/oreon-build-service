@@ -958,6 +958,7 @@ async def retry_build(
     request: Request,
     db: DbSession,
     user: CurrentUser,
+    force: bool = Query(False),
 ):
     result = await db.execute(select(BuildJob).where(BuildJob.id == job_id))
     job = result.scalar_one_or_none()
@@ -965,6 +966,29 @@ async def retry_build(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Build job not found")
     if job.status in (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.RUNNING, BuildStatus.BLOCKED):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Job is already active")
+    latest_attempt = await db.scalar(
+        select(BuildAttempt)
+        .where(BuildAttempt.build_job_id == job.id)
+        .order_by(BuildAttempt.id.desc())
+        .limit(1)
+    )
+    if (
+        latest_attempt is not None
+        and latest_attempt.failure_kind == "source_missing_local_file"
+        and not force
+    ):
+        files = []
+        details = latest_attempt.failure_details
+        if isinstance(details, dict):
+            files = [str(item) for item in details.get("missing_local_files") or []]
+        suffix = f": {', '.join(files)}" if files else ""
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This job failed because required distgit source files were missing"
+                f"{suffix}. Fix the source revision, then retry with force=true."
+            ),
+        )
 
     pkg_result = await db.execute(select(Package).where(Package.id == job.package_id))
     pkg = pkg_result.scalar_one_or_none()
@@ -1017,6 +1041,7 @@ async def retry_build(
         resource_id=str(job_id),
         ip_address=get_client_ip(request),
         user_agent=get_user_agent(request),
+        details="forced deterministic source retry" if force else "",
     )
     payload = await _job_to_response(db, job)
     return JSONResponse(status_code=200, content=payload.model_dump(mode="json"))
