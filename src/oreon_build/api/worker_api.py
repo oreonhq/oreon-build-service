@@ -15,7 +15,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Depends, File, Header, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import delete, exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -210,6 +210,9 @@ class ResultPayload(BaseModel):
     artifacts: list[ArtifactPayload] = []
     missing_provides: list[str] = []
     resolve_stage: str | None = None
+    failure_kind: str | None = Field(default=None, max_length=64)
+    failure_fingerprint: str | None = Field(default=None, max_length=64)
+    failure_details: dict[str, Any] | None = None
 
 class ArtifactPayload(BaseModel):
     kind: str
@@ -1790,6 +1793,10 @@ async def report_result(
         attempt.error_message = err_msg
     if payload.log_r2_key:
         attempt.log_r2_key = payload.log_r2_key
+    if terminal_st == "failed" and payload.failure_kind:
+        attempt.failure_kind = payload.failure_kind
+        attempt.failure_fingerprint = payload.failure_fingerprint
+        attempt.failure_details = payload.failure_details
     from oreon_build.services.build_pass import schedule_next_pass_after_publish
 
     # schedule_next_pass swaps the profile and clears the bootstrap defines. Only
