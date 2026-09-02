@@ -251,7 +251,9 @@ async def list_builds(
 
 @router.get("/jobs/{job_id}", response_model=BuildJobResponse)
 async def get_build_job(job_id: int, db: DbSession):
-    result = await db.execute(select(BuildJob).where(BuildJob.id == job_id))
+    result = await db.execute(
+        select(BuildJob).where(BuildJob.id == job_id).with_for_update()
+    )
     job = result.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Build job not found")
@@ -966,28 +968,36 @@ async def retry_build(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Build job not found")
     if job.status in (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.RUNNING, BuildStatus.BLOCKED):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Job is already active")
+    live_attempt = await db.scalar(
+        select(BuildAttempt.id)
+        .where(
+            BuildAttempt.build_job_id == job.id,
+            BuildAttempt.status.in_(
+                (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.RUNNING)
+            ),
+        )
+        .limit(1)
+    )
+    if live_attempt is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Job still has active attempt {live_attempt}",
+        )
     latest_attempt = await db.scalar(
         select(BuildAttempt)
         .where(BuildAttempt.build_job_id == job.id)
         .order_by(BuildAttempt.id.desc())
         .limit(1)
     )
-    if (
-        latest_attempt is not None
-        and latest_attempt.failure_kind == "source_missing_local_file"
-        and not force
-    ):
-        files = []
-        details = latest_attempt.failure_details
-        if isinstance(details, dict):
-            files = [str(item) for item in details.get("missing_local_files") or []]
-        suffix = f": {', '.join(files)}" if files else ""
+    from oreon_build.services.retry_eligibility import source_failure_can_retry
+
+    retryable, retry_detail = await source_failure_can_retry(
+        db, job, latest_attempt, force=force
+    )
+    if not retryable:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                "This job failed because required distgit source files were missing"
-                f"{suffix}. Fix the source revision, then retry with force=true."
-            ),
+            detail=f"This job cannot be retried unchanged because {retry_detail}.",
         )
 
     pkg_result = await db.execute(select(Package).where(Package.id == job.package_id))
@@ -1032,7 +1042,9 @@ async def retry_build(
             plan.error_message = None
         from oreon_build.services.build_trigger_bg import schedule_layer_resume_refresh
 
-        schedule_layer_resume_refresh(int(job.layer_plan_id), [int(job.id)])
+        resume_plan_id = int(job.layer_plan_id)
+    else:
+        resume_plan_id = None
     await log_audit(
         db,
         "build.retry",
@@ -1041,8 +1053,11 @@ async def retry_build(
         resource_id=str(job_id),
         ip_address=get_client_ip(request),
         user_agent=get_user_agent(request),
-        details="forced deterministic source retry" if force else "",
+        details=retry_detail or "",
     )
+    await db.commit()
+    if resume_plan_id is not None:
+        schedule_layer_resume_refresh(resume_plan_id, [int(job.id)])
     payload = await _job_to_response(db, job)
     return JSONResponse(status_code=200, content=payload.model_dump(mode="json"))
 
