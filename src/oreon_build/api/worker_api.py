@@ -456,7 +456,9 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
 
     releasename = None
     sources = []
-    mock_config = None
+    # Layer bridge/native routing is authoritative for this job. Build-target
+    # and release defaults are fallbacks only for jobs without an explicit root.
+    mock_config = (job.target_mock_config or "").strip() or None
     selected_mock_env: MockEnvironment | None = None
     target = None
     rel_result = await db.execute(select(Release).where(Release.id == job.release_id))
@@ -488,7 +490,8 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
         target = t_result.scalar_one_or_none()
         if target and target.mock_environment:
             selected_mock_env = target.mock_environment
-            mock_config = selected_mock_env.config_name
+            if not mock_config:
+                mock_config = selected_mock_env.config_name
     if not mock_config and job.package_id:
         pkg_result = await db.execute(
             select(Package).where(Package.id == job.package_id).options(

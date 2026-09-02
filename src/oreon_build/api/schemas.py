@@ -307,8 +307,8 @@ class LayerBuildTrigger(BaseModel):
         ...,
         min_length=1,
         description=(
-            "Root package names to build. Dependencies are discovered and queued automatically; "
-            "you never need to specify a dependency chain yourself."
+            "Package names to build through native triage, the selected fallback mock when needed, "
+            "and a final native purification pass."
         ),
     )
     release_id: int = Field(..., description="Release to build for")
@@ -319,6 +319,9 @@ class LayerBuildTrigger(BaseModel):
     )
     preferred_mock_environment_id: Optional[int] = Field(
         None, description="Mock env for this layer plan (must belong to the release)"
+    )
+    fallback_mock_environment_id: Optional[int] = Field(
+        None, description="Optional fallback Mock environment used when native dependencies are unavailable"
     )
     distgit_url: Optional[str] = Field(
         None,
