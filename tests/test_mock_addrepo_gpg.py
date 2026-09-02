@@ -3,7 +3,7 @@ from pathlib import Path
 from oreon_build.worker.main import _write_oreon_mock_mixed_repos_wrapper_cfg
 
 
-def test_addrepo_wrapper_pulls_gpgkey_from_mock_dnf_conf(tmp_path: Path):
+def test_addrepo_wrapper_appends_unsigned_sidetag_without_rerender(tmp_path: Path):
     cfg = _write_oreon_mock_mixed_repos_wrapper_cfg(
         "/etc/mock/oreon-11-rp1-x86_64.cfg",
         tmp_path,
@@ -13,11 +13,10 @@ def test_addrepo_wrapper_pulls_gpgkey_from_mock_dnf_conf(tmp_path: Path):
     )
     text = cfg.read_text(encoding="utf-8")
     assert "mirrors.oreonhq.com" not in text
-    assert '_oreon_re.search(r"(?m)^gpgkey\\s*=\\s*(\\S+)", _oreon_dcf)' in text
-    assert "_oreon_gpgkey" in text
-    assert 'if _oreon_gpgkey:' in text
-    assert 'gpgcheck=1\\n' in text or 'gpgcheck=1' in text
-    assert 'gpgkey=%s\\n" % (_oreon_gpgkey,)' in text
+    assert "_oreon_dcf" not in text
+    assert "_oreon_gpgkey" not in text
+    assert 'config_opts["dnf.conf"] += "\\n" + _oreon_extra' in text
+    assert "gpgcheck=0" in text
     assert 'etc/rpm/macros.oreon-sidetag-pkgverify"' in text
     assert "usr/lib/rpm/macros.d/macros.oreon-sidetag-pkgverify" in text
     assert "%_pkgverify_level none" in text
@@ -25,7 +24,7 @@ def test_addrepo_wrapper_pulls_gpgkey_from_mock_dnf_conf(tmp_path: Path):
     assert "oreon_addrepo_0_" in text
 
 
-def test_addrepo_wrapper_eval_uses_dnf_conf_gpgkey(tmp_path: Path):
+def test_addrepo_wrapper_preserves_upstream_gpg_and_disables_sidetag_gpg(tmp_path: Path):
     cfg = _write_oreon_mock_mixed_repos_wrapper_cfg(
         "/etc/mock/oreon-11-rp1-x86_64.cfg",
         tmp_path,
@@ -55,7 +54,7 @@ def test_addrepo_wrapper_eval_uses_dnf_conf_gpgkey(tmp_path: Path):
     dcf = ns["config_opts"]["dnf.conf"]
     assert "gpgkey=https://mirrors.example/RPM-GPG-KEY-oreon" in dcf
     assert "[oreon_addrepo_0_" in dcf
-    assert "gpgcheck=1" in dcf
+    assert "gpgcheck=0" in dcf.split("[oreon_addrepo_0_")[1]
 
 
 def test_addrepo_wrapper_eval_no_gpgkey_falls_back(tmp_path: Path):
