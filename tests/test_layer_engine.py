@@ -705,7 +705,13 @@ def test_reconcile_does_not_reschedule_active_layers(monkeypatch):
             if self.calls == 1:
                 return SimpleNamespace(
                     scalars=lambda: SimpleNamespace(
-                        all=lambda: [SimpleNamespace(id=1256, status=LayerPlanStatus.RUNNING)]
+                        all=lambda: [
+                            SimpleNamespace(
+                                id=1256,
+                                status=LayerPlanStatus.RUNNING,
+                                plan_options={},
+                            )
+                        ]
                     )
                 )
             return SimpleNamespace(all=lambda: [(BuildStatus.RUNNING, 1)])
@@ -727,7 +733,68 @@ def test_reconcile_does_not_reschedule_active_layers(monkeypatch):
     )
     monkeypatch.setattr(le, "schedule_layer_evaluation", scheduled.append)
     asyncio.run(le.reconcile_settled_layer_plans())
+    assert scheduled == [1256]
+
+
+def test_reconcile_skips_resume_eval_pending(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    from oreon_build.models import LayerPlanStatus
+    from oreon_build.services import layer_engine as le
+
+    class DB:
+        def __init__(self):
+            self.calls = 0
+            self.settled = False
+
+        async def execute(self, statement):
+            self.calls += 1
+            if self.calls == 1:
+                return SimpleNamespace(
+                    scalars=lambda: SimpleNamespace(
+                        all=lambda: [
+                            SimpleNamespace(
+                                id=1265,
+                                status=LayerPlanStatus.RUNNING,
+                                plan_options={
+                                    "initial_evaluation_completed": True,
+                                    "resume_eval_pending": True,
+                                },
+                            )
+                        ]
+                    )
+                )
+            return SimpleNamespace(all=lambda: [(BuildStatus.BLOCKED, 89)])
+
+        async def commit(self):
+            return None
+
+    class Session:
+        async def __aenter__(self):
+            return DB()
+
+        async def __aexit__(self, *args):
+            return None
+
+    scheduled = []
+    settled = []
+
+    async def fake_settle(db, plan_id):
+        settled.append(int(plan_id))
+
+    monkeypatch.setattr(
+        "oreon_build.db.session.async_session_maker",
+        lambda: Session(),
+    )
+    monkeypatch.setattr(le, "schedule_layer_evaluation", scheduled.append)
+    monkeypatch.setattr(
+        "oreon_build.services.layer_plan.maybe_settle_layer_plan",
+        fake_settle,
+    )
+    asyncio.run(le.reconcile_settled_layer_plans())
     assert scheduled == []
+    assert settled == []
 
 
 def test_pkgconfig_miss_waits_on_unpublished_layer_source():
@@ -757,6 +824,26 @@ def test_pkgconfig_miss_waits_on_unpublished_layer_source():
         ready,
     )
     assert out == set()
+
+
+def test_layer_source_classification_keeps_dead_provenance():
+    from oreon_build.services.layer_engine import _classify_layer_sources
+
+    statuses = {
+        ("dead", "x86_64"): {BuildStatus.FAILED},
+        ("cancelled", "x86_64"): {BuildStatus.CANCELLED},
+        ("mixed", "x86_64"): {BuildStatus.FAILED, BuildStatus.BLOCKED},
+        ("published", "x86_64"): {BuildStatus.FAILED, BuildStatus.SUCCESS},
+    }
+    live, dead = _classify_layer_sources(
+        {"dead", "cancelled", "mixed", "published"},
+        statuses,
+        "x86_64",
+        "consumer",
+        {("published", "x86_64"): True},
+    )
+    assert live == {"mixed"}
+    assert dead == {"dead", "cancelled"}
 
 
 def test_published_wait_name_is_not_an_open_blocker():

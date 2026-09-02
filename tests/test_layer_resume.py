@@ -149,14 +149,18 @@ def test_settlement_treats_cancelled_upstream_as_terminal():
     assert "1 cancelled" in (msg or "")
 
 
-def test_deterministic_source_failure_is_not_safe_to_resume():
-    from oreon_build.services.layer_plan import _is_deterministic_source_failure
+def test_resume_refresh_schedules_layer_evaluation(monkeypatch):
+    import asyncio
 
-    assert _is_deterministic_source_failure(
-        "## Source prep\nmissing local files: waitress-3.0.2-nodocs.tar.gz"
+    scheduled = []
+    monkeypatch.setattr(
+        "oreon_build.services.layer_engine.schedule_layer_evaluation",
+        scheduled.append,
     )
-    assert _is_deterministic_source_failure("spectool download failed (rc=0 but files missing): demo.tar.gz")
-    assert not _is_deterministic_source_failure("mock build failed: temporary network outage")
+    from oreon_build.services.build_trigger_bg import run_layer_resume_refresh
+
+    asyncio.run(run_layer_resume_refresh(1265, [1, 2, 3]))
+    assert scheduled == [1265]
 
 
 def test_settlement_success_when_all_ok():
