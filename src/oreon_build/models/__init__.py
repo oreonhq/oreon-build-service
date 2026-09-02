@@ -1,6 +1,6 @@
 from .account import Account, Role, RoleName
 from .audit import AuditLog
-from .build import BuildAttempt, BuildJob, BuildStatus, BuildTarget
+from .build import BuildAttempt, BuildJob, BuildPhase, BuildStatus, BuildTarget
 from .layer_plan import LayerPlan, LayerJobBlocker, LayerPlanStatus
 from .rpmbuild_plan import RpmbuildPlan, RpmbuildPlanStatus
 from .artifact import Artifact
@@ -29,6 +29,7 @@ __all__ = [
     "BuildAttempt",
     "BuildJob",
     "BuildStatus",
+    "BuildPhase",
     "BuildTarget",
     "LayerPlan",
     "LayerJobBlocker",

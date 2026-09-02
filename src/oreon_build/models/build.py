@@ -29,6 +29,13 @@ class BuildStatus(str, enum.Enum):
     SKIPPED = "skipped"
 
 
+class BuildPhase(str, enum.Enum):
+    """The toolchain provenance of a build job."""
+
+    PHASE1_BRIDGE = "phase1_bridge"
+    PHASE2_NATIVE = "phase2_native"
+
+
 class BuildTarget(Base):
     __tablename__ = "build_targets"
 
@@ -79,6 +86,11 @@ class BuildJob(Base):
     layer_plan_id: Mapped[Optional[int]] = mapped_column(ForeignKey("layer_plans.id"), nullable=True, index=True)
     layer_index: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     blocked_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    build_phase: Mapped[str] = mapped_column(
+        String(32), default=BuildPhase.PHASE1_BRIDGE.value,
+        server_default=BuildPhase.PHASE1_BRIDGE.value, nullable=False, index=True,
+    )
+    target_mock_config: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
     blocking_sources: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list, server_default="[]")
     rpmbuild_plan_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("rpmbuild_plans.id"), nullable=True, index=True
