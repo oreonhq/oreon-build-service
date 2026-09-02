@@ -1950,7 +1950,7 @@ async def report_result(
         from oreon_build.services.build_trigger_bg import schedule_layer_terminal_notify
 
         schedule_layer_terminal_notify(
-            job.id, st_l, err_msg, payload.resolve_stage, missing,
+            job.id, attempt.id, st_l, err_msg, payload.resolve_stage, missing,
         )
 
     return {"status": "ok"}
