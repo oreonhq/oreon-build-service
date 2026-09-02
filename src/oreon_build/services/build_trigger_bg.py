@@ -185,19 +185,15 @@ async def run_layer_seed(plan_id: int) -> None:
 
 
 async def run_layer_resume_refresh(plan_id: int, job_ids: list[int]) -> None:
-    from oreon_build.services.layer_engine import evaluate_layer_buildability
-    from oreon_build.services.layer_plan import maybe_settle_layer_plan
+    from oreon_build.services.layer_engine import schedule_layer_evaluation
 
     try:
-        async with async_session_maker() as db:
-            changed = await evaluate_layer_buildability(db, int(plan_id))
-            await maybe_settle_layer_plan(db, int(plan_id))
-            await db.commit()
-            logger.info(
-                "background layer resume evaluation complete layer_plan_id=%s queued=%s",
-                plan_id,
-                len(changed),
-            )
+        schedule_layer_evaluation(int(plan_id))
+        logger.info(
+            "background layer resume evaluation scheduled layer_plan_id=%s jobs=%s",
+            plan_id,
+            len(job_ids or []),
+        )
     except Exception:
         logger.exception("background layer resume evaluation failed layer_plan_id=%s", plan_id)
 
@@ -208,6 +204,7 @@ def schedule_layer_resume_refresh(plan_id: int, job_ids: list[int]) -> None:
 
 async def run_layer_terminal_notify(
     job_id: int,
+    attempt_id: int,
     status_str: str,
     error_message: str | None,
     resolve_stage: str | None = None,
@@ -220,6 +217,7 @@ async def run_layer_terminal_notify(
             int(job_id),
             status_str,
             error_message,
+            build_attempt_id=int(attempt_id),
             resolve_stage=resolve_stage,
             missing_provides=missing_provides,
         )
@@ -229,6 +227,7 @@ async def run_layer_terminal_notify(
 
 def schedule_layer_terminal_notify(
     job_id: int,
+    attempt_id: int,
     status_str: str,
     error_message: str | None,
     resolve_stage: str | None = None,
@@ -236,6 +235,6 @@ def schedule_layer_terminal_notify(
 ) -> None:
     spawn(
         run_layer_terminal_notify(
-            int(job_id), status_str, error_message, resolve_stage, missing_provides
+            int(job_id), int(attempt_id), status_str, error_message, resolve_stage, missing_provides
         )
     )

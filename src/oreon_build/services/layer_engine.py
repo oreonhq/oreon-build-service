@@ -603,6 +603,14 @@ async def _drain_scheduled_layer_evaluation(plan_id: int) -> None:
                 except Exception:
                     logger.exception("scheduled layer evaluation failed layer_plan_id=%s", pid)
                 if pid not in _LAYER_EVAL_PENDING:
+                    try:
+                        from oreon_build.services.layer_plan import maybe_settle_layer_plan
+
+                        async with async_session_maker() as settle_db:
+                            await maybe_settle_layer_plan(settle_db, pid)
+                            await settle_db.commit()
+                    except Exception:
+                        logger.exception("layer settle after eval failed layer_plan_id=%s", pid)
                     break
     finally:
         _LAYER_EVAL_DRAINING.discard(pid)
@@ -1767,18 +1775,29 @@ def _open_layer_blockers(
     return out
 
 
-def _failed_upstream_sources(
-    blockers: set[str],
+def _classify_layer_sources(
+    mapped: set[str],
     layer_statuses: dict[tuple[str, str], set[BuildStatus]],
     architecture: str,
-) -> list[str]:
+    consumer: str,
+    layer_repo_ready: dict[tuple[str, str], bool] | None = None,
+) -> tuple[set[str], set[str]]:
     arch = normalize_machine_arch(str(architecture or ""))
-    failed: list[str] = []
-    for source in sorted(blockers):
+    ready = layer_repo_ready or {}
+    live: set[str] = set()
+    dead: set[str] = set()
+    for source in sorted(mapped):
+        if source == _canonical_layer_name(consumer):
+            continue
         statuses = layer_statuses.get((source, arch), set())
-        if BuildStatus.FAILED in statuses or BuildStatus.CANCELED in statuses:
-            failed.append(source)
-    return failed
+        if not statuses or ready.get((source, arch), False):
+            continue
+        active = statuses - _DEAD_BLOCKER_STATUSES
+        if active:
+            live.add(source)
+        elif statuses & _DEAD_BLOCKER_STATUSES:
+            dead.add(source)
+    return live, dead
 
 
 async def _settle_layer_fixpoint(db: Any, plan: LayerPlan) -> None:
@@ -2141,6 +2160,27 @@ async def _evaluate_layer_buildability_locked(
             cyclic = _cyclic_wait_names(graph)
             if consumer in cyclic:
                 peers = {name for name in cyclic if name != consumer}
+        opts = job_options_dict(job)
+        if peers and opts.get("bootstrap_attempted"):
+            reason = (
+                "unresolvable build dependency cycle after bootstrap: "
+                + ", ".join(sorted({consumer, *peers}))
+            )
+            await _update_layer_job_if_active(
+                db,
+                job.id,
+                plan.id,
+                status=BuildStatus.FAILED,
+                blocked_reason=reason,
+                blocking_sources=[],
+                error_message=reason,
+                completed_at=datetime.now(timezone.utc),
+            )
+            job.status = BuildStatus.FAILED
+            job.blocked_reason = reason
+            job.blocking_sources = []
+            await _checkpoint()
+            return
         dropped = peers or set(live_blockers) or {"check"}
         if text:
             started = await _start_bootstrap_pass(
@@ -2263,12 +2303,16 @@ async def _evaluate_layer_buildability_locked(
         else:
             sat_ok = True
         if missing:
-            miss_blockers = _layer_blockers_for_caps(
-                missing, provider_map, layer_package_names, layer_statuses, arch, consumer,
+            mapped_sources = _mapped_sources_for_missing_caps(
+                missing, provider_map, layer_package_names, consumer
+            )
+            live_blockers, failed_sources = _classify_layer_sources(
+                mapped_sources,
+                layer_statuses,
+                arch,
+                consumer,
                 layer_repo_ready,
             )
-            failed_sources = _failed_upstream_sources(miss_blockers, layer_statuses, arch)
-            live_blockers = set(miss_blockers) - set(failed_sources)
             if live_blockers:
                 await _hold_or_bootstrap_cycle(
                     job=job,
@@ -2278,6 +2322,23 @@ async def _evaluate_layer_buildability_locked(
                     live_blockers=live_blockers,
                     text=text,
                 )
+                continue
+            if failed_sources:
+                reason = "upstream build failure: " + ", ".join(sorted(failed_sources))
+                await _update_layer_job_if_active(
+                    db,
+                    job.id,
+                    plan.id,
+                    status=BuildStatus.FAILED,
+                    blocked_reason=reason,
+                    blocking_sources=sorted(failed_sources),
+                    error_message=reason,
+                    completed_at=datetime.now(timezone.utc),
+                )
+                job.status = BuildStatus.FAILED
+                job.blocked_reason = reason
+                job.blocking_sources = sorted(failed_sources)
+                await _checkpoint()
                 continue
             if arch not in refreshed_solver_arch:
                 refreshed_solver_arch.add(arch)
@@ -2306,12 +2367,16 @@ async def _evaluate_layer_buildability_locked(
                 if not missing:
                     pass
                 else:
-                    miss_blockers = _layer_blockers_for_caps(
-                        missing, provider_map, layer_package_names, layer_statuses, arch, consumer,
+                    mapped_sources = _mapped_sources_for_missing_caps(
+                        missing, provider_map, layer_package_names, consumer
+                    )
+                    live_blockers, failed_sources = _classify_layer_sources(
+                        mapped_sources,
+                        layer_statuses,
+                        arch,
+                        consumer,
                         layer_repo_ready,
                     )
-                    failed_sources = _failed_upstream_sources(miss_blockers, layer_statuses, arch)
-                    live_blockers = set(miss_blockers) - set(failed_sources)
                     if live_blockers:
                         await _hold_or_bootstrap_cycle(
                             job=job,
@@ -2321,6 +2386,23 @@ async def _evaluate_layer_buildability_locked(
                             live_blockers=live_blockers,
                             text=text,
                         )
+                        continue
+                    if failed_sources:
+                        reason = "upstream build failure: " + ", ".join(sorted(failed_sources))
+                        await _update_layer_job_if_active(
+                            db,
+                            job.id,
+                            plan.id,
+                            status=BuildStatus.FAILED,
+                            blocked_reason=reason,
+                            blocking_sources=sorted(failed_sources),
+                            error_message=reason,
+                            completed_at=datetime.now(timezone.utc),
+                        )
+                        job.status = BuildStatus.FAILED
+                        job.blocked_reason = reason
+                        job.blocking_sources = sorted(failed_sources)
+                        await _checkpoint()
                         continue
             if missing:
                 added, heal_blockers = await _expand_missing_provider(
@@ -2444,6 +2526,12 @@ async def _evaluate_layer_buildability_locked(
             db, job.id, plan.id, job_options=opts,
         )
         job.job_options = opts
+    plan_options = _plan_options(plan)
+    if not plan_options.get("initial_evaluation_completed"):
+        plan_options["initial_evaluation_completed"] = True
+    if plan_options.get("resume_eval_pending"):
+        plan_options["resume_eval_pending"] = False
+    plan.plan_options = plan_options
     await db.flush()
     if plan.status not in (LayerPlanStatus.PENDING, LayerPlanStatus.RUNNING):
         logger.info("layer eval abort plan=%s status=%s queued=%s", plan.id, plan.status, len(changed))
@@ -2504,17 +2592,32 @@ async def on_package_published(
 
     touched: set[int] = set()
     async with async_session_maker() as db:
-        result = await db.execute(
+        plan_query = (
             select(LayerPlan.id)
             .join(Release, Release.id == LayerPlan.release_id)
             .where(
                 Release.releasename == releasename,
-                LayerPlan.status.in_((
-                    LayerPlanStatus.PENDING,
-                    LayerPlanStatus.RUNNING,
-                )),
+                LayerPlan.status.in_((LayerPlanStatus.PENDING, LayerPlanStatus.RUNNING)),
             )
         )
+        if job_id is not None:
+            plan_query = plan_query.join(
+                BuildJob, BuildJob.layer_plan_id == LayerPlan.id
+            ).where(BuildJob.id == int(job_id))
+        else:
+            plan_query = plan_query.where(
+                exists(
+                    select(1)
+                    .select_from(BuildJob)
+                    .join(Package, Package.id == BuildJob.package_id)
+                    .where(
+                        BuildJob.layer_plan_id == LayerPlan.id,
+                        (Package.name == source_name)
+                        | BuildJob.blocking_sources.contains([_canonical_layer_name(source_name)]),
+                    )
+                )
+            )
+        result = await db.execute(plan_query)
         plan_ids = [int(plan_id) for (plan_id,) in result.all()]
         for plan_id in plan_ids:
             plan = await db.get(LayerPlan, plan_id)
@@ -2568,12 +2671,19 @@ async def on_package_published(
 
 async def reconcile_settled_layer_plans() -> None:
     from oreon_build.db.session import async_session_maker
+    from oreon_build.services.layer_plan import maybe_settle_layer_plan
 
     async with async_session_maker() as db:
         idle = await db.execute(
             select(LayerPlan).where(LayerPlan.status == LayerPlanStatus.RUNNING)
         )
         for plan in idle.scalars().all():
+            options = _plan_options(plan)
+            if not options.get("initial_evaluation_completed"):
+                schedule_layer_evaluation(int(plan.id))
+                continue
+            if options.get("resume_eval_pending"):
+                continue
             if int(plan.id) in _LAYER_EVAL_DRAINING or int(plan.id) in _LAYER_EVAL_PENDING:
                 continue
             counts = await db.execute(
@@ -2589,7 +2699,7 @@ async def reconcile_settled_layer_plans() -> None:
             )
             blocked_n = by_status.get(BuildStatus.BLOCKED, 0)
             if inflight == 0 and blocked_n > 0:
-                await _settle_layer_fixpoint(db, plan)
+                await maybe_settle_layer_plan(db, int(plan.id))
         await db.commit()
 
 

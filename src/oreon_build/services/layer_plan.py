@@ -213,24 +213,6 @@ def _job_build_terminal_ok(status_: BuildStatus) -> bool:
 _IN_FLIGHT_STATUSES = (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.RUNNING)
 
 
-def _is_deterministic_source_failure(
-    message: str | None,
-    failure_kind: str | None = None,
-) -> bool:
-    if failure_kind == "source_missing_local_file":
-        return True
-    text = (message or "").lower()
-    return any(
-        marker in text
-        for marker in (
-            "missing local files:",
-            "spec not found:",
-            "spectool not found.",
-            "spectool download failed (rc=0 but files missing):",
-        )
-    )
-
-
 def _job_waits_for_publish(job: Any) -> bool:
     if getattr(job, "status", None) != BuildStatus.SUCCESS:
         return False
@@ -557,14 +539,10 @@ async def resume_layer_plan_by_user(
             detail="Layer plan already succeeded",
         )
     jobs_r = await db.execute(
-        select(BuildJob).where(BuildJob.layer_plan_id == plan.id)
+        select(BuildJob).where(BuildJob.layer_plan_id == plan.id).with_for_update()
     )
     jobs = list(jobs_r.scalars().all())
-    live_ids = [
-        int(j.id)
-        for j in jobs
-        if j.status in (BuildStatus.QUEUED, BuildStatus.PENDING, BuildStatus.RUNNING)
-    ]
+    live_ids = [int(j.id) for j in jobs]
     live_attempt_jobs: set[int] = set()
     if live_ids:
         att_r = await db.execute(
@@ -596,59 +574,62 @@ async def resume_layer_plan_by_user(
         if j.status not in (BuildStatus.SUCCESS, BuildStatus.SKIPPED)
         and not (j.status == BuildStatus.RUNNING and int(j.id) in live_attempt_jobs)
     ]
-    if not reopen:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Nothing left to resume (no failed/cancelled/blocked jobs)",
-        )
     failed_ids = [int(job.id) for job in reopen if job.status == BuildStatus.FAILED]
-    deterministic_source_failures: set[int] = set()
+    latest_attempts: dict[int, BuildAttempt] = {}
     if failed_ids:
-        attempts_r = await db.execute(
-            select(
-                BuildAttempt.build_job_id,
-                BuildAttempt.error_message,
-                BuildAttempt.failure_kind,
-            )
+        attempt_rows = await db.execute(
+            select(BuildAttempt)
             .where(BuildAttempt.build_job_id.in_(failed_ids))
             .order_by(BuildAttempt.build_job_id, BuildAttempt.id.desc())
         )
-        latest_errors: dict[int, tuple[str | None, str | None]] = {}
-        for build_job_id, error_message, failure_kind in attempts_r.all():
-            latest_errors.setdefault(int(build_job_id), (error_message, failure_kind))
-        deterministic_source_failures = {
-            job_id
-            for job_id, (error_message, failure_kind) in latest_errors.items()
-            if _is_deterministic_source_failure(error_message, failure_kind)
-        }
-    reopen = [job for job in reopen if int(job.id) not in deterministic_source_failures]
+        for attempt in attempt_rows.scalars().all():
+            latest_attempts.setdefault(int(attempt.build_job_id), attempt)
+    from oreon_build.services.retry_eligibility import source_failure_can_retry
+
+    eligible: list[BuildJob] = []
+    preserved: list[str] = []
+    for job in reopen:
+        allowed, reason = await source_failure_can_retry(
+            db, job, latest_attempts.get(int(job.id))
+        )
+        if allowed:
+            eligible.append(job)
+        else:
+            preserved.append(f"job {job.id}: {reason}")
+    reopen = eligible
     if not reopen:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=status.HTTP_409_CONFLICT if preserved else status.HTTP_400_BAD_REQUEST,
             detail=(
-                "Nothing safe to resume. Failed jobs have deterministic source-preparation "
-                "errors. Fix the source definition, then retry the affected job explicitly."
+                "Nothing can be resumed until source inputs change. " + "; ".join(preserved)
+                if preserved
+                else "Nothing left to resume (no failed/cancelled/blocked jobs)"
             ),
         )
+    from oreon_build.services.build_pass import job_options_dict
+
     for job in reopen:
         job.status = BuildStatus.BLOCKED
         job.completed_at = None
         job.blocked_reason = "waiting on repository"
         job.error_message = None
         job.blocking_sources = []
+        opts = dict(job_options_dict(job))
+        opts.pop("sat_eval_fp", None)
+        opts.pop("sat_eval_arch", None)
+        job.job_options = opts
     plan.status = LayerPlanStatus.RUNNING
     plan.error_message = None
+    plan_opts = dict(plan.plan_options) if isinstance(plan.plan_options, dict) else {}
+    plan_opts["resume_eval_pending"] = True
+    plan.plan_options = plan_opts
     await db.flush()
     await log_audit(
         db, "build.layer_resume", account_id=user.id, resource_type="layer_plan",
         resource_id=str(plan.id),
         details=(
             f"reopened {len(reopen)} job(s)"
-            + (
-                f"; preserved {len(deterministic_source_failures)} deterministic source failure(s)"
-                if deterministic_source_failures
-                else ""
-            )
+            + (f"; preserved {len(preserved)} unchanged source failure(s)" if preserved else "")
         ),
         ip_address=get_client_ip(request), user_agent=get_user_agent(request),
     )
@@ -717,6 +698,7 @@ async def notify_layer_job_terminal_after_result(
     build_job_id: int,
     status_str: str,
     error_message: str | None,
+    build_attempt_id: int | None = None,
     resolve_stage: str | None = None,
     missing_provides: list[str] | None = None,
 ) -> None:
@@ -729,12 +711,27 @@ async def notify_layer_job_terminal_after_result(
     reason = (error_message or "").strip() or f"Build {st}"
     stage = str(resolve_stage or "").strip().lower()
     async with async_session_maker() as db:
+        expected = BuildStatus.FAILED if st == "failed" else BuildStatus.CANCELLED
+        if build_attempt_id is not None:
+            latest_attempt_id = await db.scalar(
+                select(BuildAttempt.id)
+                .where(BuildAttempt.build_job_id == build_job_id)
+                .order_by(BuildAttempt.id.desc())
+                .limit(1)
+            )
+            if latest_attempt_id != int(build_attempt_id):
+                return
+            attempt = await db.get(BuildAttempt, int(build_attempt_id))
+            if attempt is None or attempt.status != expected:
+                return
         job = await db.get(
             BuildJob,
             build_job_id,
             options=[selectinload(BuildJob.package)],
         )
         if job is None or job.layer_plan_id is None:
+            return
+        if job.status != expected:
             return
         pkg_name = job.package.name if job.package else None
         if st == "failed" and stage in ("installdeps", "generate_buildrequires"):
