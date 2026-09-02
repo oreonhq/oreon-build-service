@@ -1030,11 +1030,6 @@ def _write_oreon_mock_mixed_repos_wrapper_cfg(
         'if "best=0" not in _oreon_d5.lower() and "best=false" not in _oreon_d5.lower():',
         '    config_opts["dnf5_common_opts"] = list(config_opts.get("dnf5_common_opts") or []) + ["--setopt=best=0"]',
         "",
-        '_oreon_dcf = config_opts.get("dnf.conf")',
-        '_oreon_pat = "\\nbest=1\\n"',
-        "if isinstance(_oreon_dcf, str) and _oreon_pat in _oreon_dcf:",
-        '    config_opts["dnf.conf"] = _oreon_dcf.replace(_oreon_pat, "\\nbest=0\\n", 1)',
-        "",
     ]
     urls = [str(u).strip() for u in (addrepo_baseurls or []) if str(u).strip()]
     arch_pref = (prefer_arch or "").strip()
@@ -1053,12 +1048,6 @@ def _write_oreon_mock_mixed_repos_wrapper_cfg(
             '_oreon_d5 = " ".join(str(x) for x in (config_opts.get("dnf5_common_opts") or []))',
             'if "--nogpgcheck" not in _oreon_d5.lower():',
             '    config_opts["dnf5_common_opts"] = list(config_opts.get("dnf5_common_opts") or []) + ["--nogpgcheck"]',
-            '_oreon_dcf = config_opts.get("dnf.conf") or ""',
-            'if not isinstance(_oreon_dcf, str):',
-            '    _oreon_dcf = ""',
-            'import re as _oreon_re',
-            '_oreon_gm = _oreon_re.search(r"(?m)^gpgkey\\s*=\\s*(\\S+)", _oreon_dcf)',
-            '_oreon_gpgkey = (_oreon_gm.group(1).strip() if _oreon_gm else "")',
             '_oreon_extra = ""',
         ]
         for i, url in enumerate(urls):
@@ -1075,11 +1064,7 @@ def _write_oreon_mock_mixed_repos_wrapper_cfg(
                 f'baseurl={base}',
                 'enabled=1',
                 '"""',
-                'if _oreon_gpgkey:',
-                '    _oreon_extra += "gpgcheck=1\\n"',
-                '    _oreon_extra += "gpgkey=%s\\n" % (_oreon_gpgkey,)',
-                'else:',
-                '    _oreon_extra += "gpgcheck=0\\n"',
+                'gpgcheck=0',
                 f'_oreon_extra += """',
                 'repo_gpgcheck=0',
                 'skip_if_unavailable=True',
@@ -1089,7 +1074,7 @@ def _write_oreon_mock_mixed_repos_wrapper_cfg(
                 '"""',
             ]
         lines += [
-            'config_opts["dnf.conf"] = (_oreon_dcf.rstrip() + "\\n" + _oreon_extra).strip() + "\\n"',
+            'config_opts["dnf.conf"] += "\\n" + _oreon_extra',
             "",
         ]
     out.write_text("\n".join(lines), encoding="utf-8")
