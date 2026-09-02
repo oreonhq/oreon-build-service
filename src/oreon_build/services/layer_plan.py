@@ -210,7 +210,12 @@ def _job_build_terminal_ok(status_: BuildStatus) -> bool:
     return status_ in (BuildStatus.SUCCESS, BuildStatus.SKIPPED)
 
 
-_IN_FLIGHT_STATUSES = (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.RUNNING)
+_IN_FLIGHT_STATUSES = (
+    BuildStatus.PENDING,
+    BuildStatus.QUEUED,
+    BuildStatus.BLOCKED,
+    BuildStatus.RUNNING,
+)
 
 
 def _job_waits_for_publish(job: Any) -> bool:
@@ -240,15 +245,18 @@ def layer_plan_settlement(
 ) -> tuple[LayerPlanStatus | None, str | None]:
     """How a plan should look once nothing is in flight.
 
-    A plan without work in flight cannot make progress unless an external
-    event changes one of its inputs. Terminalize it instead of retrying the
-    same blocked graph forever.
+    Blocked jobs remain live because publishing into the side tag can make
+    their real repository transaction resolvable.
     """
     if not jobs:
         return None, None
     if any(j.status in _IN_FLIGHT_STATUSES for j in jobs):
         return None, None
     if any(_job_waits_for_publish(j) for j in jobs):
+        return None, None
+    # Phase 1 is finalized only by the bridge engine after publication. This
+    # prevents generic settlement from skipping the required native rebuild.
+    if any(getattr(j, "build_phase", None) == "phase1_bridge" for j in jobs):
         return None, None
     n_ok = sum(1 for j in jobs if _job_build_terminal_ok(j.status))
     n_fail = sum(1 for j in jobs if j.status == BuildStatus.FAILED)
@@ -281,10 +289,7 @@ def layer_plan_settlement(
         seen.add(name)
         primary.append(name)
     bits = [f"{n_ok} success", f"{n_fail} failed", f"{n_block} blocked", f"{n_cancel} cancelled"]
-    if n_block > 0:
-        msg = "Layer stalled with no queued or running jobs (" + ", ".join(bits) + ")."
-    else:
-        msg = "Layer finished with failures (" + ", ".join(bits) + ")."
+    msg = "Layer finished with failures (" + ", ".join(bits) + ")."
     if primary:
         msg += " Primary: " + ", ".join(primary)
     return LayerPlanStatus.FAILED, msg
@@ -387,11 +392,6 @@ async def on_layer_resolve_failed(
     from oreon_build.core.dnf_missing import parse_dnf_missing_provides
     from oreon_build.core.rpm_requires import is_malformed_rpm_requirement
     from oreon_build.services.build_pass import job_options_dict
-    from oreon_build.services.layer_engine import (
-        evaluate_layer_buildability,
-        invalidate_reactive_requirements_for_package,
-    )
-
     caps: list[str] = []
     seen: set[str] = set()
     for item in list(missing_provides or []) + parse_dnf_missing_provides(reason or ""):
@@ -405,16 +405,24 @@ async def on_layer_resolve_failed(
             db, job, reason, package_name=package_name,
         )
         return
-    invalidate_reactive_requirements_for_package(package_name or "")
     opts = job_options_dict(job)
-    opts["sat_hold_caps"] = caps
+    opts["solver_requirements"] = caps
     job.job_options = opts
-    job.status = BuildStatus.BLOCKED
+    fallback_config = str(opts.get("fallback_mock_config") or "").strip()
+    native_config = str(opts.get("native_mock_config") or "").strip()
+    if fallback_config and str(job.target_mock_config or "") == native_config:
+        job.target_mock_config = fallback_config
+        job.status = BuildStatus.QUEUED
+        job.blocked_reason = (
+            "routed to selected fallback due to missing native deps: "
+            + ", ".join(caps)
+        )[:8000]
+    else:
+        job.status = BuildStatus.BLOCKED
+        job.blocked_reason = "waiting on repository: " + ", ".join(caps)[:480]
     job.completed_at = None
-    job.blocked_reason = "waiting on repository: " + ", ".join(caps)[:480]
     job.blocking_sources = []
     await db.flush()
-    await evaluate_layer_buildability(db, int(plan.id))
     await maybe_settle_layer_plan(db, int(plan.id))
 
 
