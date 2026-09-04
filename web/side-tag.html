@@ -134,6 +134,7 @@
               <button type="button" class="source-type-tab" data-type="upload">Upload</button>
               <button type="button" class="source-type-tab" data-type="scm">SCM</button>
               <button type="button" class="source-type-tab" data-type="distgit">DistGit</button>
+              <button type="button" class="source-type-tab" data-type="chainbuild">Chain build</button>
               <button type="button" class="source-type-tab" data-type="layerbuild">Layer build</button>
             </div>
             <div id="source-url-panel" class="source-panel">
@@ -172,6 +173,13 @@
                 Root package names only. Jobs use the primary Mock environment when resolvable, otherwise the manually selected fallback before a clean native rebuild.
               </p>
               <textarea id="layerbuild-packages" class="form-control" rows="4" placeholder="Example:&#10;firefox&#10;abseil-cpp"></textarea>
+            </div>
+            <div id="source-chainbuild-panel" class="source-panel" style="display:none;">
+              <label>Koji-style package chain</label>
+              <p style="color:var(--text-muted); font-size:0.85rem; margin-bottom:0.5rem;">
+                A colon starts the next sequential group. Packages within one group build in parallel.
+              </p>
+              <textarea id="chainbuild-spec" class="form-control" rows="4" placeholder="Example:&#10;pkg-a pkg-b : pkg-c : pkg-d pkg-e"></textarea>
             </div>
           </div>
           <div class="form-group">
@@ -427,6 +435,7 @@
       function escapeAttr(s) { return escapeHtml(s).replace(/"/g, '&quot;'); }
       var layerPollTimer = null;
       var watchedLayerId = null;
+      var watchedChainId = null;
       function stopLayerPoll() {
         if (layerPollTimer) { clearInterval(layerPollTimer); layerPollTimer = null; }
       }
@@ -436,6 +445,15 @@
         var resumeBtn = document.getElementById('layer-alert-resume');
         if (resumeBtn) {
           resumeBtn.onclick = function() {
+            if (opts.chainId) {
+              resumeBtn.disabled = true;
+              api.post('/builds/chain/' + opts.chainId + '/resume').then(function(data) {
+                renderChainAlertFromStatus(data);
+                pollChainStatus(opts.chainId);
+                render();
+              }).catch(function(e) { resumeBtn.disabled = false; alert(e.message || e); });
+              return;
+            }
             var lid = watchedLayerId || opts.layerId;
             if (!lid) return;
             if (!confirm('Resume layer ' + lid + '? Retries failed/cancelled jobs, keeps successes.')) return;
@@ -453,6 +471,15 @@
         var cancelBtn = document.getElementById('layer-alert-cancel');
         if (cancelBtn) {
           cancelBtn.onclick = function() {
+            if (opts.chainId) {
+              if (!confirm('Cancel chain ' + opts.chainId + '? Stops all open jobs in this chain.')) return;
+              cancelBtn.disabled = true;
+              api.post('/builds/chain/' + opts.chainId + '/cancel').then(function(data) {
+                renderChainAlertFromStatus(data);
+                render();
+              }).catch(function(e) { cancelBtn.disabled = false; alert(e.message || e); });
+              return;
+            }
             var lid = watchedLayerId || opts.layerId;
             if (!lid) return;
             if (!confirm('Cancel layer ' + lid + '? Stops all open jobs in this layer.')) return;
@@ -473,7 +500,7 @@
         if (!el) return;
         el.style.display = 'block';
         el.className = 'layer-alert-' + (kind || 'info');
-        var shellKey = [kind || 'info', opts.showResume ? '1' : '0', opts.showCancel ? '1' : '0', String(opts.layerId || '')].join('|');
+        var shellKey = [kind || 'info', opts.showResume ? '1' : '0', opts.showCancel ? '1' : '0', String(opts.layerId || opts.chainId || ''), opts.chainId ? 'chain' : 'layer'].join('|');
         var titleEl = el.querySelector('h3');
         var bodyEl = el.querySelector('.layer-alert-body');
         if (el.getAttribute('data-alert-shell') === shellKey && titleEl && bodyEl) {
@@ -484,10 +511,10 @@
         el.setAttribute('data-alert-shell', shellKey);
         var actions = '<div class="layer-alert-actions">';
         if (opts.showResume) {
-          actions += '<button type="button" class="btn" id="layer-alert-resume">Resume layer</button>';
+          actions += '<button type="button" class="btn" id="layer-alert-resume">Resume ' + (opts.chainId ? 'chain' : 'layer') + '</button>';
         }
         if (opts.showCancel) {
-          actions += '<button type="button" class="btn" id="layer-alert-cancel">Cancel layer</button>';
+          actions += '<button type="button" class="btn" id="layer-alert-cancel">Cancel ' + (opts.chainId ? 'chain' : 'layer') + '</button>';
         }
         actions += '<button type="button" class="btn" id="layer-alert-dismiss">Dismiss</button></div>';
         el.innerHTML = '<h3>' + escapeHtml(title) + '</h3><div class="layer-alert-body">' + bodyHtml + '</div>' + actions;
@@ -570,8 +597,60 @@
           window.history.replaceState({}, '', '/side-tag.html?id=' + sideTagId + '&layer_plan_id=' + lid);
         }
       }
+      function renderChainAlertFromStatus(data) {
+        if (!data) return;
+        watchedChainId = data.chain_plan_id;
+        var st = (data.status || '').toLowerCase();
+        var counts = data.counts || {};
+        var bits = ['pending', 'queued', 'blocked', 'running', 'success', 'failed', 'cancelled'].map(function(k) {
+          return counts[k] ? (counts[k] + ' ' + k) : null;
+        }).filter(Boolean).join(', ');
+        var progress = 'Group ' + data.current_group + ' of ' + data.total_groups;
+        var live = st === 'running' || st === 'waiting_settle' || st === 'pending';
+        if (st === 'failed' || st === 'cancelled') {
+          showLayerAlert('error', 'Chain ' + data.chain_plan_id + ' ' + st,
+            (data.error_message ? '<p style="margin:0 0 0.5rem 0;font-size:0.9rem;">' + escapeHtml(data.error_message) + '</p>' : '')
+            + renderLayerFailedJobs(data)
+            + '<p style="margin:0;color:var(--text-muted);font-size:0.88rem;">' + escapeHtml(progress + (bits ? ' — ' + bits : '')) + '</p>',
+            { showResume: true, chainId: data.chain_plan_id });
+          stopLayerPoll();
+          return;
+        }
+        if (st === 'success') {
+          showLayerAlert('success', 'Chain ' + data.chain_plan_id + ' finished',
+            '<p>' + escapeHtml(bits || 'All jobs completed.') + '</p>', { chainId: data.chain_plan_id });
+          stopLayerPoll();
+          return;
+        }
+        showLayerAlert('info', 'Chain ' + data.chain_plan_id + ': ' + st.replace('_', ' '),
+          '<p style="margin:0 0 0.35rem 0;">' + escapeHtml(progress) + '</p><p style="margin:0;color:var(--text-muted);font-size:0.88rem;">' + escapeHtml(bits || 'Jobs updating…') + '</p>',
+          { showCancel: live, chainId: data.chain_plan_id });
+      }
+      function pollChainStatus(chainId) {
+        watchedChainId = chainId;
+        stopLayerPoll();
+        function tick() {
+          api.get('/builds/chain/' + chainId + '/status?t=' + Date.now()).then(function(data) {
+            if (watchedChainId !== chainId) return;
+            renderChainAlertFromStatus(data);
+            if (data.status === 'failed' || data.status === 'cancelled' || data.status === 'success') render();
+          }).catch(function() {});
+        }
+        tick();
+        layerPollTimer = setInterval(tick, 2500);
+      }
+      function followNewChain(data) {
+        var cid = data && (data.chain_plan_id || data.id);
+        if (!cid) return;
+        pollChainStatus(cid);
+        if (window.history && window.history.replaceState) {
+          window.history.replaceState({}, '', '/side-tag.html?id=' + sideTagId + '&chain_plan_id=' + cid);
+        }
+      }
       function startWatchLayerFromUrl() {
         var params = new URLSearchParams(window.location.search);
+        var cid = parseInt(params.get('chain_plan_id') || '', 10);
+        if (cid > 0) { pollChainStatus(cid); return; }
         var lid = parseInt(params.get('layer_plan_id') || '', 10);
         if (lid > 0) pollLayerStatus(lid);
       }
@@ -862,6 +941,12 @@
               if (j.status === 'blocked' && j.blocked_reason) {
                 layerPart += ' <span style="color:var(--text-muted); font-size:0.82em;" title="' + escapeAttr(j.blocked_reason) + '">(blocked)</span>';
               }
+            } else if (j.rpmbuild_plan_id != null && j.rpmbuild_plan_id !== undefined) {
+              var chainGroup = (j.rpmbuild_layer_index != null && j.rpmbuild_layer_index !== undefined)
+                ? ' group ' + (Number(j.rpmbuild_layer_index) + 1)
+                : '';
+              layerPart = '<a href="#" class="watch-chain-id" data-chain-id="' + escapeAttr(String(j.rpmbuild_plan_id)) + '">Chain ' + escapeHtml(String(j.rpmbuild_plan_id)) + '</a>'
+                + '<span style="color:var(--text-muted); font-size:0.85em">' + escapeHtml(chainGroup) + '</span>';
             }
             return '<tr data-id="' + j.id + '" data-status="' + escapeAttr(j.status || '') + '"><td class="col-checkbox"><input type="checkbox" class="build-row-cb" data-id="' + j.id + '"></td><td>' + j.id + '</td><td>' + packageLabel(j) + '</td><td>' + releaseLabel(j) + '</td><td>' + arch + '</td><td><span class="' + statusClass(sd) + '">' + escapeHtml(sd) + '</span></td><td>' + signCell + '</td><td style="white-space:normal; max-width:16rem;">' + layerPart + '</td><td>' + (j.created_at || '').slice(0,19) + '</td><td><a href="/build.html?job_id=' + j.id + '">View</a>' + retryBtn + cancelBtn + '</td></tr>';
           }).join('') || '<tr><td colspan="10">No builds</td></tr>';
@@ -891,6 +976,13 @@
               ev.preventDefault();
               var lid = parseInt(a.getAttribute('data-layer-id'), 10);
               if (lid > 0) followNewLayer({ layer_plan_id: lid });
+            });
+          });
+          tbody.querySelectorAll('.watch-chain-id').forEach(function(a) {
+            a.addEventListener('click', function(ev) {
+              ev.preventDefault();
+              var cid = parseInt(a.getAttribute('data-chain-id'), 10);
+              if (cid > 0) followNewChain({ chain_plan_id: cid });
             });
           });
           var numPages = buildsTotal ? Math.ceil(buildsTotal / buildsPageSize) : 1;
@@ -1107,6 +1199,26 @@
                 var tip = buildAcceptedMessage(data, 'Layer started.');
                 if (lid) showLayerAlert('success', 'Layer ' + lid + ' started', '<p>' + escapeHtml(tip) + '</p>');
                 else alert(tip);
+              })
+              .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
+          });
+          return;
+        } else if (currentSourceType === 'chainbuild') {
+          var chainSpec = (document.getElementById('chainbuild-spec') && document.getElementById('chainbuild-spec').value || '').trim();
+          if (!chainSpec) { alert('Enter a package chain.'); return; }
+          var chainBody = {
+            chain: chainSpec,
+            release_id: selectedReleaseIdNew,
+            side_tag_id: sideTagId,
+            architectures: arches,
+            distgit_branch: getDistgitBranch()
+          };
+          if (mockIdVal) chainBody.preferred_mock_environment_id = parseInt(mockIdVal, 10);
+          oreonWithLoading(_btn, function() {
+            return api.post('/builds/chain-trigger', chainBody)
+              .then(function(data) {
+                render();
+                followNewChain(data);
               })
               .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
           });
