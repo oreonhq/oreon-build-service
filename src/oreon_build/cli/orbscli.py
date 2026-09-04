@@ -784,6 +784,61 @@ def cmd_build(
         for job in jobs_out:
             _wait_job_and_maybe_log(api_base, token, int(job["id"]), log_path)
 
+@cli.command("chain-build")
+@click.argument("chain")
+@click.option("--release", "release_ref", required=True, help="Release id or releasename")
+@click.option("--side-tag", "side_tag_ref", required=True, help="Side tag id to publish into")
+@click.option("--arch", default="x86_64,aarch64", help="Comma-separated architectures")
+@click.option(
+    "--mock-environment-id",
+    type=int,
+    default=None,
+    help="Manual Mock environment for every package in the chain",
+)
+@click.option(
+    "--distgit-url",
+    envvar="ORBSCLI_DISTGIT_URL",
+    default="https://github.com/oreonhq/rpm-specfiles.git",
+)
+@click.option("--distgit-branch", envvar="ORBSCLI_DISTGIT_BRANCH", default="main")
+def cmd_chain_build(
+    chain: str,
+    release_ref: str,
+    side_tag_ref: str,
+    arch: str,
+    mock_environment_id: int | None,
+    distgit_url: str,
+    distgit_branch: str,
+) -> None:
+    """Run an explicit Koji-style chain: 'a b : c : d e'."""
+    token = require_auth(get_token())
+    require_maintainer(token)
+    api_base = get_api_url()
+    rid = resolve_release_id(api_base, token, release_ref)
+    body: dict[str, Any] = {
+        "chain": chain,
+        "release_id": rid,
+        "side_tag_id": int(side_tag_ref),
+        "architectures": [a.strip() for a in arch.split(",") if a.strip()],
+        "distgit_url": distgit_url,
+        "distgit_branch": distgit_branch,
+    }
+    if mock_environment_id is not None:
+        body["preferred_mock_environment_id"] = mock_environment_id
+    data = http_json(
+        "POST",
+        api_base,
+        "/api/builds/chain-trigger",
+        token=token,
+        json_body=body,
+        timeout=300.0,
+    )
+    click.echo(
+        "chain_id=%s status=%s groups=%s queued_jobs=%s"
+        % (data.get("id"), data.get("status"), data.get("total_layers"), data.get("queued_jobs"))
+    )
+
+
 @cli.command("layer-build")
 @click.argument("spec_parts", nargs=-1, required=True)
 @click.option("--release", "release_ref", required=True, help="Release id or releasename (e.g. oreon-11-rp1)")
