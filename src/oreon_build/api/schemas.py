@@ -537,6 +537,17 @@ class RpmbuildPlanCreate(BaseModel):
     distgit_branch: Optional[str] = Field(None, max_length=128)
 
 
+class ChainBuildTrigger(BaseModel):
+    chain: str = Field(..., min_length=1, max_length=20000)
+    release_id: int = Field(..., ge=1)
+    side_tag_id: int = Field(..., ge=1)
+    architectures: List[str] = Field(default=["x86_64", "aarch64"])
+    priority: int = 0
+    preferred_mock_environment_id: Optional[int] = None
+    distgit_url: Optional[str] = Field(None, max_length=1024)
+    distgit_branch: Optional[str] = Field(None, max_length=128)
+
+
 class RpmbuildPlanResponse(BaseModel):
     id: int
     release_id: int
@@ -552,6 +563,21 @@ class RpmbuildPlanResponse(BaseModel):
     queued_jobs: int
     created_at: datetime
     updated_at: datetime
+
+
+class ChainPlanStatusResponse(BaseModel):
+    chain_plan_id: int
+    status: str
+    groups: List[List[str]] = Field(default_factory=list)
+    current_group: int
+    total_groups: int
+    jobs: List[LayerJobRow] = Field(default_factory=list)
+    counts: dict = Field(default_factory=dict)
+    error_message: Optional[str] = None
+    releasename: Optional[str] = None
+    side_tag_name: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
 
 class CurrentFailureItem(BaseModel):
