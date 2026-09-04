@@ -33,6 +33,7 @@ DEFAULT_ARCH = ["x86_64", "aarch64"]
 PHASE1_BRIDGE = "phase1_bridge"
 PHASE2_NATIVE = "phase2_native"
 ACTIVE = (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.BLOCKED, BuildStatus.RUNNING)
+EXECUTING = (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.RUNNING)
 _LAYER_JOB_WRITABLE = frozenset((BuildStatus.QUEUED, BuildStatus.BLOCKED))
 
 
@@ -52,12 +53,13 @@ def _options(plan: LayerPlan) -> dict[str, Any]:
     return dict(plan.plan_options) if isinstance(plan.plan_options, dict) else {}
 
 
-def _requirements(job: BuildJob) -> tuple[str, ...]:
+def _requirements(job: BuildJob) -> tuple[str, ...] | None:
     raw = getattr(job, "source_requirements", None)
     if raw is None:
         options = job_options_dict(job)
         raw = options.get("solver_requirements") or options.get("sat_hold_caps") or ()
-    return tuple(sorted({str(x).strip() for x in (raw or ()) if str(x).strip()}))
+    requirements = tuple(sorted({str(x).strip() for x in (raw or ()) if str(x).strip()}))
+    return requirements or None
 
 
 def _built_on_fallback(job: BuildJob) -> bool:
@@ -67,11 +69,13 @@ def _built_on_fallback(job: BuildJob) -> bool:
 
 def _arch_config(config_name: str, arch: str) -> str:
     base = str(config_name or "").strip()
+    if not base:
+        return ""
     for suffix in ("-x86_64", "-aarch64"):
         if base.endswith(suffix):
             base = base[:-len(suffix)]
             break
-    return f"{base}-{arch}" if base else ""
+    return f"{base}-{arch}"
 
 
 async def probe_job_target(job: BuildJob, releasename: str, side_tag_repo_path: str) -> str:
@@ -80,6 +84,16 @@ async def probe_job_target(job: BuildJob, releasename: str, side_tag_repo_path: 
     arch = normalize_machine_arch(str(options.get("architecture") or "x86_64"))
     branch = os.path.basename(os.path.normpath(side_tag_repo_path)) or str(job.branch or "dev")
     requirements = _requirements(job)
+
+    # Cold seeds do not have trustworthy BuildRequires yet. The worker's SRPM
+    # preparation/builddep result will populate solver_requirements and invoke
+    # the fallback transition; resolving an empty transaction would falsely
+    # classify every package as native-buildable.
+    if requirements is None:
+        job.target_mock_config = str(options.get("native_mock_config") or f"oreon-11-{arch}")
+        job.status = BuildStatus.QUEUED
+        job.blocked_reason = None
+        return job.target_mock_config
 
     def solve(release_name: str, branches: list[str]) -> Any:
         return get_repo_solver(
@@ -282,21 +296,33 @@ def schedule_layer_evaluation(plan_id: int) -> None:
 
 async def start_phase2_purification(db: Any, plan_id: int) -> list[BuildJob]:
     plan = await db.get(LayerPlan, int(plan_id))
-    if plan is None:
+    if plan is None or plan.status != LayerPlanStatus.RUNNING:
         return []
     phase1 = list((await db.execute(select(BuildJob).where(
         BuildJob.layer_plan_id == plan.id, BuildJob.build_phase == PHASE1_BRIDGE,
     ))).scalars().all())
-    if not phase1 or any(j.status in ACTIVE for j in phase1):
+    if not phase1:
         return []
-    if any(j.status != BuildStatus.SUCCESS for j in phase1):
-        plan.status, plan.error_message = LayerPlanStatus.FAILED, "Bridge pass failed"
+    # Do not fail the plan while work already dispatched in Phase 1 is still
+    # running. Preserve its results/publications before settling the phase.
+    if any(j.status in EXECUTING for j in phase1):
         return []
-    if any(job_options_dict(j).get("repo_published") is not True for j in phase1):
+    if any(j.status in (BuildStatus.FAILED, BuildStatus.CANCELLED) for j in phase1):
+        plan.status = LayerPlanStatus.FAILED
+        plan.error_message = "Bridge pass failed on one or more packages"
+        await db.flush()
+        return []
+    if any(j.status == BuildStatus.BLOCKED for j in phase1):
+        return []
+    if any(
+        job_options_dict(j).get("repo_published") is not True
+        for j in phase1 if j.status == BuildStatus.SUCCESS
+    ):
         return []
     bridge = [j for j in phase1 if _built_on_fallback(j)]
     if not bridge:
         plan.status, plan.error_message = LayerPlanStatus.SUCCESS, None
+        await db.flush()
         return []
     if await db.scalar(select(BuildJob.id).where(
         BuildJob.layer_plan_id == plan.id, BuildJob.build_phase == PHASE2_NATIVE).limit(1)):
@@ -343,6 +369,10 @@ async def on_package_published(source_name: str, releasename: str, published_arc
             schedule_next_pass_after_publish(job)
             job_arch = str(job_options_dict(job).get("architecture") or "x86_64")
             invalidate_repo_solver_cache(releasename, job.branch, [published_architecture or job_arch])
+        # Persist the specific publication event before reloading the complete
+        # plan in evaluate/start_phase2. Concurrent publisher callbacks can
+        # then observe one another's repo_published transitions reliably.
+        await db.flush()
         for plan_id in plan_ids:
             await evaluate_layer_buildability(db, plan_id, source_name, published_architecture)
             await start_phase2_purification(db, plan_id)

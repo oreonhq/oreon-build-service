@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -32,6 +33,28 @@ from oreon_build.services.build_target_util import (
 from oreon_build.services.distgit_order import compute_distgit_build_order
 
 logger = logging.getLogger(__name__)
+
+_CHAIN_PACKAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+_.-]*$")
+
+
+def parse_manual_chain(chain: str) -> list[list[str]]:
+    """Parse Koji-style ``a b : c : d e`` groups without graph expansion."""
+    raw_groups = chain.split(":")
+    if any(not group.strip() for group in raw_groups):
+        raise ValueError("Chain contains an empty group")
+    layers: list[list[str]] = []
+    seen: set[str] = set()
+    for raw_group in raw_groups:
+        group: list[str] = []
+        for name in raw_group.replace(",", " ").split():
+            if not _CHAIN_PACKAGE_RE.fullmatch(name):
+                raise ValueError(f"Invalid package name in chain: {name}")
+            if name in seen:
+                raise ValueError(f"Package appears more than once in chain: {name}")
+            seen.add(name)
+            group.append(name)
+        layers.append(group)
+    return layers
 
 
 def _plan_skip_jobs_not_before(plan: RpmbuildPlan) -> datetime | None:
@@ -113,6 +136,7 @@ async def enqueue_plan_layer_jobs(
     priority: int,
     skip_complete_arches: bool = True,
     triggered_by_id: int | None = None,
+    preferred_mock_environment_id: int | None = None,
 ) -> list[BuildJob]:
     layers = plan.layers_json if isinstance(plan.layers_json, list) else []
     if layer_index < 0 or layer_index >= len(layers):
@@ -154,7 +178,11 @@ async def enqueue_plan_layer_jobs(
         )
         for arch in architectures:
             canon = normalize_machine_arch(arch)
-            m_id = await _resolve_mock_for_pkg(db, release.id, pref)
+            m_id = await _resolve_mock_for_pkg(
+                db,
+                release.id,
+                preferred_mock_environment_id if preferred_mock_environment_id is not None else pref,
+            )
             target = await get_or_create_build_target(db, release.id, canon, m_id)
             pv_id = await latest_package_version_id(db, pkg.id)
             if skip_complete_arches and await has_successful_build_for_target(
@@ -198,6 +226,94 @@ async def enqueue_plan_layer_jobs(
             await db.flush()
             jobs.append(job)
     return jobs
+
+
+async def create_manual_chain_plan(
+    db: Any,
+    request: Any,
+    *,
+    chain: str,
+    release_id: int,
+    side_tag_id: int,
+    architectures: list[str],
+    priority: int = 0,
+    preferred_mock_environment_id: int | None = None,
+    distgit_url: str | None = None,
+    distgit_branch: str | None = None,
+    triggered_by_id: int | None = None,
+) -> RpmbuildCreateResult:
+    from oreon_build.models import SideTag
+
+    try:
+        layers = parse_manual_chain(chain)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    release = await db.get(Release, release_id)
+    if release is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Release not found")
+    if not release.is_active:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Release is inactive")
+    side_tag = await db.get(SideTag, side_tag_id)
+    if side_tag is None or side_tag.release_id != release_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Side tag does not belong to release")
+    workers = list((await db.execute(select(Worker))).scalars().all())
+    worker_arches = {normalize_machine_arch(w.architecture) for w in workers if (w.architecture or "").strip()}
+    selected_arches = list(dict.fromkeys(normalize_machine_arch(a) for a in architectures if (a or "").strip()))
+    unavailable = [a for a in selected_arches if a not in worker_arches]
+    if not selected_arches or unavailable:
+        detail = "No architectures selected" if not selected_arches else f"No enrolled worker for: {', '.join(unavailable)}"
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+    if preferred_mock_environment_id is not None:
+        mock = await db.get(MockEnvironment, preferred_mock_environment_id)
+        if mock is None or mock.release_id != release_id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Mock environment does not belong to release")
+
+    durl = (distgit_url or _default_distgit_url()).strip()
+    dbranch = (distgit_branch or "main").strip()
+    flat = [name for group in layers for name in group]
+    plan = RpmbuildPlan(
+        release_id=release.id,
+        releasename=release.releasename,
+        repo_branch=side_tag.name,
+        distgit_url=durl,
+        distgit_branch=dbranch,
+        seed_mode="manual_chain",
+        seed_packages_json=flat,
+        layers_json=layers,
+        options_json={
+            "architectures": selected_arches,
+            "priority": int(priority),
+            "preferred_mock_environment_id": preferred_mock_environment_id,
+        },
+        status=RpmbuildPlanStatus.RUNNING,
+        current_open_layer=0,
+    )
+    db.add(plan)
+    await db.flush()
+    from oreon_build.services.side_tags import bump_side_tag_activity
+
+    await bump_side_tag_activity(db, side_tag.id)
+    jobs = await enqueue_plan_layer_jobs(
+        db,
+        plan=plan,
+        layer_index=0,
+        architectures=selected_arches,
+        priority=priority,
+        skip_complete_arches=False,
+        triggered_by_id=triggered_by_id,
+        preferred_mock_environment_id=preferred_mock_environment_id,
+    )
+    await log_audit(
+        db,
+        "build.chain_trigger",
+        account_id=triggered_by_id,
+        resource_type="rpmbuild_plan",
+        resource_id=str(plan.id),
+        details=f"release_id={release_id} groups={len(layers)} packages={len(flat)} queued={len(jobs)}",
+        ip_address=get_client_ip(request) if request is not None else None,
+        user_agent=get_user_agent(request) if request is not None else "chain-build",
+    )
+    return RpmbuildCreateResult(plan=plan, jobs=jobs, layers=layers)
 
 
 async def create_rpmbuild_plan(

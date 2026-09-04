@@ -254,9 +254,10 @@ def layer_plan_settlement(
         return None, None
     if any(_job_waits_for_publish(j) for j in jobs):
         return None, None
-    # Phase 1 is finalized only by the bridge engine after publication. This
-    # prevents generic settlement from skipping the required native rebuild.
-    if any(getattr(j, "build_phase", None) == "phase1_bridge" for j in jobs):
+    phase1 = [j for j in jobs if getattr(j, "build_phase", None) == "phase1_bridge"]
+    if phase1 and all(_job_build_terminal_ok(j.status) for j in phase1):
+        # Successful Phase 1 is finalized by the engine after publication so
+        # it can create the required native purification jobs.
         return None, None
     n_ok = sum(1 for j in jobs if _job_build_terminal_ok(j.status))
     n_fail = sum(1 for j in jobs if j.status == BuildStatus.FAILED)

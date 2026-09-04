@@ -50,6 +50,10 @@ def _norm_arch(a: str) -> str:
     return x
 
 _EM_AARCH64 = 183
+_PESIGN_PAYLOADLESS_KERNEL_RE = re.compile(
+    r"^(?:kernel$|kernel(?:-cross)?-(?:headers|devel|debug-devel|doc)(?:$|-))",
+    re.IGNORECASE,
+)
 
 def _elf_is_aarch64(path: str | Path) -> bool:
     try:
@@ -179,6 +183,11 @@ def _parse_pesign_rules(settings: PesignConfig) -> list[dict[str, str]]:
 def resolve_pesign_nickname(package_name: str, arch: str, settings: PesignConfig) -> Optional[str]:
     if not settings.pesign_nss_dir:
         return None
+    # These kernel subpackages contain headers/metadata, not EFI executables or
+    # loadable kernel modules. A broad ^kernel.* policy must not force an RPM
+    # payload repack for them.
+    if _PESIGN_PAYLOADLESS_KERNEL_RE.match((package_name or "").strip()):
+        return None
     flags = re.IGNORECASE | re.DOTALL
     for rule in _parse_pesign_rules(settings):
         try:
@@ -223,31 +232,30 @@ _PESIGN_TREE_SCRIPT = r"""#!/usr/bin/env bash
 set -euo pipefail
 NSS_DEFAULT_DB_TYPE="${NSS_DEFAULT_DB_TYPE:-sql}"
 export NSS_DEFAULT_DB_TYPE
+: "${RPM_BUILD_ROOT:?rpmrebuild did not provide RPM_BUILD_ROOT}"
+cd "$RPM_BUILD_ROOT"
 _pesign_one() {
   local f="$1"
-  [[ -f "$f" && ! -L "$f" ]] || return 0
-  local do_sign=0
-  case "$f" in
-    *.ko)
-      if tail -c 64 -- "$f" 2>/dev/null | grep -q 'Module signature appended'; then
-        return 0
-      fi
-      do_sign=1
-      ;;
+  # rpmrebuild materializes RPM %ghost entries as empty placeholders. They
+  # are not payloads and pesign cannot parse them.
+  [[ -s "$f" && ! -L "$f" ]] || return 0
+  # pesign signs PE/COFF executables only. Kernel modules use the Linux
+  # module-signature format and must be signed during the kernel build with
+  # scripts/sign-file, before module compression. Treating a .ko as PE here
+  # corrupts it and cannot make its signer trusted by the built kernel.
+  local base="${f##*/}"
+  case "$base" in
+    *.ko|*.ko.*) return 0 ;;
+    vmlinuz|vmlinuz-*|*.efi|*.EFI) ;;
     *)
-      if file -b -- "$f" 2>/dev/null | grep -qE 'PE32\+? executable|MS Windows'; then
-        do_sign=1
+      if ! file -b -- "$f" 2>/dev/null | grep -qE 'PE32\+? executable|MS Windows'; then
+        return 0
       fi
       ;;
   esac
-  [[ "$do_sign" -eq 1 ]] || return 0
-  if [[ "$f" != *.ko ]]; then
-    local sigs
-    sigs="$(pesign -S -i "$f" 2>/dev/null || true)"
-    if [[ -n "$sigs" ]] && ! grep -qi 'no signatures' <<<"$sigs"; then
-      return 0
-    fi
-  fi
+  # Build-time kernels commonly carry a distribution test signature. Do not
+  # mistake that for the configured Oreon production signature: pesign must
+  # append the selected NSS certificate here.
   local tmp="${f}.pesign.$$"
   local -a args=( -s -n "${PESIGN_NSS_DIR}" -c "${PESIGN_CERT_NICK}" -i "$f" -o "$tmp" )
   if [[ -n "${PESIGN_TOKEN:-}" ]]; then
@@ -289,6 +297,9 @@ def pesign_rpm_if_configured(rpm_path: Path, settings: Optional[PesignConfig] = 
     tmp_root = tempfile.mkdtemp(prefix="oreon-pesign-")
     script_path = Path(tmp_root) / "pesign-tree.sh"
     setarch_wrapper = Path(tmp_root) / "setarch"
+    cross_rpmrc = Path(tmp_root) / "rpmrc"
+    rpm_wrapper = Path(tmp_root) / "rpm"
+    rpmbuild_wrapper = Path(tmp_root) / "rpmbuild"
     out_dir = Path(tmp_root) / "out"
     rb_tmp = Path(tmp_root) / "rpmrebuild"
     try:
@@ -307,23 +318,19 @@ def pesign_rpm_if_configured(rpm_path: Path, settings: Optional[PesignConfig] = 
         env["RPMREBUILD_TMPDIR"] = str(rb_tmp)
         env["RPM_BUILD_ARCH"] = pkg_arch
         real_setarch = shutil.which("setarch") or "/usr/bin/setarch"
+        real_rpm = shutil.which("rpm") or "/usr/bin/rpm"
+        real_rpmbuild = shutil.which("rpmbuild") or "/usr/bin/rpmbuild"
         setarch_wrapper.write_text(
             "\n".join(
                 [
                     "#!/usr/bin/env bash",
                     "set -euo pipefail",
-                    'arch="${1:-}"',
-                    "shift || true",
-                    'if [[ "$arch" == "aarch64" ]]; then',
-                    '  if [[ -z "${PESIGN_AARCH64_QEMU_PREFIX:-}" ]]; then',
-                    '    echo "PESIGN_AARCH64_QEMU_PREFIX is required for aarch64 repack" >&2',
-                    "    exit 97",
-                    "  fi",
-                    '  bin="$(command -v "${1:-}" || true)"',
-                    '  if [[ -n "$bin" ]] && file -Lb -- "$bin" 2>/dev/null | grep -qi "aarch64"; then',
-                    "    exec \"$@\"",
-                    "  fi",
-                    '  exec "$@"',
+                        'arch="${1:-}"',
+                        "shift || true",
+                        'if [[ "$arch" == "aarch64" ]]; then',
+                        "  # rpmrebuild and pesign are host tools; target architecture is",
+                        "  # supplied through RPMREBUILD_rpm_defines.",
+                        '  exec "$@"',
                     "fi",
                     f'exec "{real_setarch}" "$arch" "$@"',
                     "",
@@ -335,27 +342,27 @@ def pesign_rpm_if_configured(rpm_path: Path, settings: Optional[PesignConfig] = 
         env["PATH"] = f"{tmp_root}:{env.get('PATH', '')}"
         if cross_aarch64:
             qemu_prefix = (s.pesign_aarch64_qemu_prefix or "").strip()
-            if not qemu_prefix:
-                msg = (
-                    f"Cross-arch aarch64 pesign repack requires PESIGN_AARCH64_QEMU_PREFIX "
-                    f"(rpm={rpm_path.name}, host_arch={host_arch})"
-                )
-                logger.error(msg)
-                raise PesignRepackError(msg) from None
-            env["PESIGN_AARCH64_QEMU_PREFIX"] = qemu_prefix
-            extra_defines = " ".join(
-                [
-                    '--define "_target_cpu aarch64"',
-                    '--define "_target aarch64-redhat-linux"',
-                    '--define "_host_cpu aarch64"',
-                    '--define "_host aarch64-redhat-linux"',
-                    '--define "_build_cpu aarch64"',
-                    '--define "_build aarch64-redhat-linux"',
-                    '--define "_arch aarch64"',
-                    '--define "_build_arch aarch64"',
-                ]
+            if qemu_prefix:
+                env["PESIGN_AARCH64_QEMU_PREFIX"] = qemu_prefix
+            # Every rpm command issued by rpmrebuild (including its generated
+            # spec query) must see this compatibility override, not only the
+            # final rpmbuild command.
+            cross_rpmrc.write_text(
+                "include: /usr/lib/rpm/rpmrc\n"
+                "buildarch_compat: x86_64: aarch64 noarch\n",
+                encoding="utf-8",
             )
-            env["RPMREBUILD_rpm_defines"] = f'{env.get("RPMREBUILD_rpm_defines", "").strip()} {extra_defines}'.strip()
+            for wrapper, executable in (
+                (rpm_wrapper, real_rpm),
+                (rpmbuild_wrapper, real_rpmbuild),
+            ):
+                wrapper.write_text(
+                    "#!/usr/bin/env bash\n"
+                    "set -euo pipefail\n"
+                    f'exec "{executable}" --rcfile "{cross_rpmrc}" "$@"\n',
+                    encoding="utf-8",
+                )
+                wrapper.chmod(0o755)
 
         cmd = [
             "rpmrebuild",
@@ -368,6 +375,10 @@ def pesign_rpm_if_configured(rpm_path: Path, settings: Optional[PesignConfig] = 
             str(rpm_path),
         ]
         if cross_aarch64:
+            # RPM's compatibility check is driven by rpmbuild --target, not by
+            # _target_cpu macro overrides alone.
+            cmd.insert(-1, "--additional=--target aarch64")
+        if cross_aarch64 and (s.pesign_aarch64_qemu_prefix or "").strip():
             inner_cmd = " ".join(shlex.quote(x) for x in cmd)
             try:
                 qemu_argv = _qemu_bash_argv(
@@ -386,6 +397,12 @@ def pesign_rpm_if_configured(rpm_path: Path, settings: Optional[PesignConfig] = 
                 env=env,
             )
         else:
+            if cross_aarch64:
+                logger.info(
+                    "cross-arch aarch64 pesign repack using host rpmrebuild/pesign "
+                    "with explicit target macros (rpm=%s)",
+                    rpm_path.name,
+                )
             result = subprocess.run(cmd, capture_output=True, text=True, env=env)
         if result.returncode != 0:
             stderr = (result.stderr or "").strip()
@@ -406,7 +423,9 @@ def pesign_rpm_if_configured(rpm_path: Path, settings: Optional[PesignConfig] = 
                 raise PesignRepackError(msg) from None
             return False
 
-        built = sorted(out_dir.glob("*.rpm"), key=lambda p: p.stat().st_mtime, reverse=True)
+        # rpmrebuild normally places target-specific packages in an arch
+        # subdirectory (for example out/x86_64/), not directly in out/.
+        built = sorted(out_dir.rglob("*.rpm"), key=lambda p: p.stat().st_mtime, reverse=True)
         if not built:
             msg = f"rpmrebuild produced no .rpm in {out_dir} for {rpm_path.name}"
             logger.error(msg)

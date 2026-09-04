@@ -9,14 +9,79 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from oreon_build.config import get_settings
-from oreon_build.models import BuildJob, BuildStatus, BuildTarget, Package, PublishTask, Release, RpmbuildPlan, RpmbuildPlanStatus
+from oreon_build.models import BuildAttempt, BuildJob, BuildStatus, BuildTarget, Package, PublishTask, Release, RpmbuildPlan, RpmbuildPlanStatus
+from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
 from oreon_build.services.r2 import get_r2_client
 from oreon_build.services.rpmbuild_order import enqueue_plan_layer_jobs
 
 logger = logging.getLogger(__name__)
+
+
+async def _manual_chain_for_user(db: Any, user: Any, chain_plan_id: int) -> RpmbuildPlan:
+    from fastapi import HTTPException, status
+    from oreon_build.models import SideTag
+    from oreon_build.services.side_tags import get_side_tag_by_name, require_side_tag_access
+
+    plan = await db.get(RpmbuildPlan, chain_plan_id)
+    if plan is None or plan.seed_mode != "manual_chain":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chain build not found")
+    tag: SideTag | None = await get_side_tag_by_name(db, plan.release_id, plan.repo_branch)
+    if tag is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chain side tag not found")
+    require_side_tag_access(user, tag)
+    return plan
+
+
+async def cancel_chain_plan_by_user(db: Any, request: Any, user: Any, chain_plan_id: int) -> RpmbuildPlan:
+    from fastapi import HTTPException, status
+
+    plan = await _manual_chain_for_user(db, user, chain_plan_id)
+    if plan.status not in (RpmbuildPlanStatus.RUNNING, RpmbuildPlanStatus.WAITING_SETTLE):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Chain is already {plan.status.value}")
+    plan.status = RpmbuildPlanStatus.CANCELLED
+    plan.error_message = "Cancelled by user"
+    open_statuses = (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.BLOCKED, BuildStatus.RUNNING)
+    await db.execute(
+        update(BuildJob)
+        .where(BuildJob.rpmbuild_plan_id == plan.id, BuildJob.status.in_(open_statuses))
+        .values(status=BuildStatus.CANCELLED, completed_at=datetime.now(timezone.utc), blocked_reason="Chain cancelled by user")
+    )
+    await db.execute(
+        update(BuildAttempt)
+        .where(
+            BuildAttempt.build_job_id.in_(select(BuildJob.id).where(BuildJob.rpmbuild_plan_id == plan.id)),
+            BuildAttempt.status.in_(open_statuses),
+        )
+        .values(status=BuildStatus.CANCELLED, finished_at=datetime.now(timezone.utc), error_message="Chain cancelled by user")
+    )
+    await log_audit(db, "build.chain_cancel", account_id=user.id, resource_type="rpmbuild_plan", resource_id=str(plan.id), ip_address=get_client_ip(request), user_agent=get_user_agent(request))
+    return plan
+
+
+async def resume_chain_plan_by_user(db: Any, request: Any, user: Any, chain_plan_id: int) -> RpmbuildPlan:
+    from fastapi import HTTPException, status
+
+    plan = await _manual_chain_for_user(db, user, chain_plan_id)
+    if plan.status == RpmbuildPlanStatus.SUCCESS:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Chain already succeeded")
+    cur = int(plan.current_open_layer or 0)
+    jobs = list((await db.execute(select(BuildJob).where(BuildJob.rpmbuild_plan_id == plan.id, BuildJob.rpmbuild_layer_index == cur).with_for_update())).scalars().all())
+    reopen = [j for j in jobs if j.status in (BuildStatus.FAILED, BuildStatus.CANCELLED, BuildStatus.BLOCKED)]
+    if not reopen:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No failed or cancelled jobs in the current chain group")
+    for job in reopen:
+        job.status = BuildStatus.PENDING
+        job.completed_at = None
+        job.blocked_reason = None
+        job.error_message = None
+    plan.status = RpmbuildPlanStatus.RUNNING
+    plan.error_message = None
+    plan.settle_deadline_at = None
+    await log_audit(db, "build.chain_resume", account_id=user.id, resource_type="rpmbuild_plan", resource_id=str(plan.id), details=f"reopened {len(reopen)} job(s) in group {cur + 1}", ip_address=get_client_ip(request), user_agent=get_user_agent(request))
+    return plan
 
 
 def _decompress_if_needed(raw: bytes, key: str) -> bytes:
@@ -133,6 +198,10 @@ async def advance_rpmbuild_plans_once(db: Any) -> None:
         return
 
     for plan in plans:
+        options = plan.options_json if isinstance(plan.options_json, dict) else {}
+        plan_arches = options.get("architectures") or []
+        plan_priority = int(options.get("priority") or 0)
+        plan_mock_id = options.get("preferred_mock_environment_id")
         layers = plan.layers_json if isinstance(plan.layers_json, list) else []
         if not layers:
             plan.status = RpmbuildPlanStatus.FAILED
@@ -141,8 +210,14 @@ async def advance_rpmbuild_plans_once(db: Any) -> None:
         cur = int(plan.current_open_layer or 0)
         jobs, any_failed, publish_ready = await _layer_status(db, plan, cur)
         if any_failed:
+            # Let other packages in the same parallel group finish before the
+            # chain becomes terminal. Later groups remain unopened.
+            if any(j.status in (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.BLOCKED, BuildStatus.RUNNING) for j in jobs):
+                plan.status = RpmbuildPlanStatus.RUNNING
+                continue
             plan.status = RpmbuildPlanStatus.FAILED
-            plan.error_message = f"Layer {cur} contains failed job(s)"
+            label = "Group" if plan.seed_mode == "manual_chain" else "Layer"
+            plan.error_message = f"{label} {cur + 1 if plan.seed_mode == 'manual_chain' else cur} contains failed job(s)"
             continue
         if not jobs:
             rel = await db.get(Release, plan.release_id)
@@ -154,9 +229,10 @@ async def advance_rpmbuild_plans_once(db: Any) -> None:
                 db,
                 plan=plan,
                 layer_index=cur,
-                architectures=rel.arch_list() or ["x86_64", "aarch64"],
-                priority=0,
+                architectures=plan_arches or rel.arch_list() or ["x86_64", "aarch64"],
+                priority=plan_priority,
                 triggered_by_id=None,
+                preferred_mock_environment_id=plan_mock_id,
             )
             continue
         if not publish_ready:
@@ -214,9 +290,10 @@ async def advance_rpmbuild_plans_once(db: Any) -> None:
             db,
             plan=plan,
             layer_index=next_layer,
-            architectures=rel.arch_list() or ["x86_64", "aarch64"],
-            priority=0,
+            architectures=plan_arches or rel.arch_list() or ["x86_64", "aarch64"],
+            priority=plan_priority,
             triggered_by_id=None,
+            preferred_mock_environment_id=plan_mock_id,
         )
         logger.info("rpmbuild plan advanced id=%s layer=%s", plan.id, next_layer)
 
