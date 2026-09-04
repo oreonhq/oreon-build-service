@@ -64,7 +64,7 @@ def test_bootstrap_handoff_does_not_get_clobbered_to_blocked():
     assert opts["repo_published"] is True
 
 
-def _job(status, name="pkg", reason="", blocking=None, options=None):
+def _job(status, name="pkg", reason="", blocking=None, options=None, phase=None):
     pkg = SimpleNamespace(name=name)
     return SimpleNamespace(
         id=1,
@@ -73,6 +73,7 @@ def _job(status, name="pkg", reason="", blocking=None, options=None):
         blocked_reason=reason,
         blocking_sources=blocking or [],
         job_options=options,
+        build_phase=phase,
     )
 
 
@@ -85,40 +86,32 @@ def test_settlement_keeps_running_while_jobs_are_queued():
     assert layer_plan_settlement(jobs) == (None, None)
 
 
-def test_settlement_fails_when_only_blocked_remain():
+def test_settlement_waits_when_only_blocked_remain():
     jobs = [
         _job(BuildStatus.SUCCESS, "a"),
         _job(BuildStatus.BLOCKED, "kde", "waiting on layer jobs: foo"),
         _job(BuildStatus.BLOCKED, "bar", "waiting on repository"),
     ]
-    status, msg = layer_plan_settlement(jobs)
-    assert status == LayerPlanStatus.FAILED
-    assert "2 blocked" in (msg or "")
+    assert layer_plan_settlement(jobs) == (None, None)
 
 
-def test_settlement_stops_plan_when_failures_leave_only_blocked():
+def test_settlement_waits_while_repository_jobs_are_blocked():
     jobs = [
         _job(BuildStatus.SUCCESS, "a"),
         _job(BuildStatus.FAILED, "blosc", "mock failed"),
         _job(BuildStatus.BLOCKED, "kde", "waiting on layer jobs: blosc", ["blosc"]),
     ]
-    status, msg = layer_plan_settlement(jobs)
-    assert status == LayerPlanStatus.FAILED
-    assert "stalled" in (msg or "")
-    assert "blocked" in (msg or "")
-    assert "Primary: blosc" in (msg or "")
+    assert layer_plan_settlement(jobs) == (None, None)
 
 
-def test_settlement_fails_when_blocked_are_not_failure_fallout():
+def test_settlement_waits_when_unrelated_jobs_are_blocked():
     jobs = [
         _job(BuildStatus.SUCCESS, "a"),
         _job(BuildStatus.FAILED, "hdf5", "mock failed"),
         _job(BuildStatus.BLOCKED, "kf6-ki18n", "waiting on layer jobs: qt6-qtwebengine", ["qt6-qtwebengine"]),
         _job(BuildStatus.BLOCKED, "qt6-qtwebengine", "waiting on layer jobs: python-zombie-imp", ["python-zombie-imp"]),
     ]
-    status, msg = layer_plan_settlement(jobs)
-    assert status == LayerPlanStatus.FAILED
-    assert "stalled" in (msg or "")
+    assert layer_plan_settlement(jobs) == (None, None)
 
 
 def test_settlement_waits_for_unpublished_success():
@@ -129,14 +122,30 @@ def test_settlement_waits_for_unpublished_success():
     assert layer_plan_settlement(jobs) == (None, None)
 
 
-def test_settlement_treats_cancelled_upstream_as_terminal():
+def test_settlement_waits_for_blocked_after_cancelled_job():
     jobs = [
         _job(BuildStatus.CANCELLED, "provider", "Build cancelled"),
         _job(BuildStatus.BLOCKED, "consumer", "waiting on layer jobs: provider", ["provider"]),
     ]
+    assert layer_plan_settlement(jobs) == (None, None)
+
+
+def test_phase1_failure_settles_when_every_job_is_terminal():
+    jobs = [
+        _job(BuildStatus.SUCCESS, "provider", phase="phase1_bridge"),
+        _job(BuildStatus.FAILED, "consumer", "mock failed", phase="phase1_bridge"),
+    ]
     status, msg = layer_plan_settlement(jobs)
     assert status == LayerPlanStatus.FAILED
-    assert "1 cancelled" in (msg or "")
+    assert "consumer" in (msg or "")
+
+
+def test_successful_phase1_waits_for_engine_handoff():
+    jobs = [
+        _job(BuildStatus.SUCCESS, "provider", phase="phase1_bridge"),
+        _job(BuildStatus.SUCCESS, "consumer", phase="phase1_bridge"),
+    ]
+    assert layer_plan_settlement(jobs) == (None, None)
 
 
 def test_resume_refresh_schedules_layer_evaluation(monkeypatch):

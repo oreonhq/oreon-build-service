@@ -34,6 +34,21 @@ def test_probe_routes_native(monkeypatch):
     assert asyncio.run(layer_engine.probe_job_target(candidate, "oreon-11-rp1", "side-tag")) == "oreon-11-x86_64"
 
 
+def test_cold_seed_does_not_solve_empty_requirements(monkeypatch):
+    monkeypatch.setattr(
+        layer_engine,
+        "get_repo_solver",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("empty solve")),
+    )
+    candidate = job()
+    candidate.job_options["solver_requirements"] = []
+    target = asyncio.run(
+        layer_engine.probe_job_target(candidate, "oreon-11-rp1", "side-tag")
+    )
+    assert target == "oreon-11-x86_64"
+    assert candidate.status == BuildStatus.QUEUED
+
+
 def test_probe_routes_selected_fallback(monkeypatch):
     calls = 0
     def factory(*args, **kwargs):
@@ -61,6 +76,14 @@ def test_legacy_graph_scheduler_is_absent():
     assert not hasattr(layer_engine, "_evaluate_layer_buildability")
     assert not hasattr(layer_engine, "_strongly_connected_components")
     assert not hasattr(layer_engine, "_REACTIVE_REQUIREMENTS_CACHE")
+
+
+def test_running_phase1_work_prevents_early_failure_settlement():
+    assert BuildStatus.RUNNING in layer_engine.EXECUTING
+    assert BuildStatus.QUEUED in layer_engine.EXECUTING
+    assert BuildStatus.PENDING in layer_engine.EXECUTING
+    assert BuildStatus.FAILED not in layer_engine.EXECUTING
+    assert BuildStatus.BLOCKED not in layer_engine.EXECUTING
 
 
 def test_fallback_build_is_selected_for_native_purification():

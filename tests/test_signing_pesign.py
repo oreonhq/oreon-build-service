@@ -1,12 +1,29 @@
 from __future__ import annotations
 
 import json
+import pytest
 
 from oreon_build.config import Settings
 from oreon_build.services.signing import (
+    _PESIGN_TREE_SCRIPT,
     package_name_matches_pesign_pattern,
+    PesignRepackError,
+    pesign_rpm_if_configured,
     resolve_pesign_nickname,
 )
+
+
+def test_pesign_tree_never_treats_kernel_modules_as_pe_images() -> None:
+    assert "*.ko)" not in _PESIGN_TREE_SCRIPT
+    assert "scripts/sign-file" in _PESIGN_TREE_SCRIPT
+
+
+def test_pesign_tree_does_not_skip_pre_signed_pe_images() -> None:
+    assert 'cd "$RPM_BUILD_ROOT"' in _PESIGN_TREE_SCRIPT
+    assert "pesign -S" not in _PESIGN_TREE_SCRIPT
+    assert 'pesign "${args[@]}"' in _PESIGN_TREE_SCRIPT
+    assert "vmlinuz-*" in _PESIGN_TREE_SCRIPT
+
 
 OREON_LIKE_RULES = json.dumps(
     [
@@ -36,6 +53,10 @@ def test_pesign_pattern_kernel_matches_global() -> None:
         pesign_package_name_regex=r"^(kernel.*|shim.*)$",
     )
     assert package_name_matches_pesign_pattern("kernel-core", s) is True
+    assert package_name_matches_pesign_pattern("kernel", s) is False
+    assert package_name_matches_pesign_pattern("kernel-headers", s) is False
+    assert package_name_matches_pesign_pattern("kernel-cross-headers", s) is False
+    assert package_name_matches_pesign_pattern("kernel-devel", s) is False
     assert package_name_matches_pesign_pattern("shim-x64", s) is True
     assert package_name_matches_pesign_pattern("bash", s) is False
 
@@ -79,7 +100,36 @@ def test_pesign_expected_for_filename(monkeypatch) -> None:
     )
     monkeypatch.setattr(worker_api, "get_settings", lambda: s)
     assert worker_api._pesign_expected_for_filename("kernel-core-6.15.9-100.oreon.x86_64.rpm") is True
+    assert worker_api._pesign_expected_for_filename("kernel-cross-headers-7.2.3-200.or11.aarch64.rpm") is False
     assert worker_api._pesign_expected_for_filename("kernel-6.15.9-100.oreon.src.rpm") is False
     assert worker_api._pesign_expected_for_filename("grub2-efi-x64-2.12-5.oreon.x86_64.rpm") is True
     assert worker_api._pesign_expected_for_filename("bash-5.2.32-1.oreon.x86_64.rpm") is False
     assert worker_api._pesign_expected_for_filename("not-an-rpm.txt") is False
+
+
+def test_cross_arch_pesign_uses_host_tools_without_qemu_root(monkeypatch, tmp_path) -> None:
+    from oreon_build.services import signing
+
+    rpm = tmp_path / "kernel-core.rpm"
+    rpm.write_bytes(b"rpm")
+    settings = Settings(
+        pesign_certificate_nickname="signer",
+        pesign_nss_dir="/etc/pki/pesign",
+        pesign_package_name_regex=r"^kernel.*$",
+        pesign_strict=False,
+        pesign_aarch64_qemu_prefix=None,
+    )
+    monkeypatch.setattr(signing, "_rpm_query", lambda *a: "kernel-core\naarch64")
+    monkeypatch.setattr(signing.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(signing.shutil, "which", lambda name: f"/usr/bin/{name}")
+    calls = []
+    monkeypatch.setattr(
+        signing.subprocess,
+        "run",
+        lambda cmd, **kwargs: calls.append(cmd) or type("Result", (), {"returncode": 1, "stderr": "test", "stdout": ""})(),
+    )
+    with pytest.raises(PesignRepackError):
+        pesign_rpm_if_configured(rpm, settings)
+    assert calls and calls[0][0] == "rpmrebuild"
+    additional = next(arg for arg in calls[0] if arg.startswith("--additional="))
+    assert "--target aarch64" in additional
