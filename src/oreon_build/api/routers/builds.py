@@ -17,6 +17,8 @@ from oreon_build.api.schemas import (
     BuildTriggerAccepted,
     CILayerTrigger,
     CILayerTriggerResponse,
+    ChainBuildTrigger,
+    ChainPlanStatusResponse,
     LayerBuildTrigger,
     LayerBuildTriggerResponse,
     LayerJobRow,
@@ -644,6 +646,135 @@ async def mass_rebuild_run_once(
     from oreon_build.services.mass_rebuild import run_mass_rebuild_pass
 
     return await run_mass_rebuild_pass(db)
+
+
+@router.post("/chain-trigger", response_model=RpmbuildPlanResponse, status_code=status.HTTP_201_CREATED)
+async def trigger_chain_build_endpoint(
+    data: ChainBuildTrigger,
+    request: Request,
+    db: DbSession,
+    user: CurrentUser,
+):
+    from oreon_build.services.rpmbuild_order import create_manual_chain_plan
+    from oreon_build.services.side_tags import get_side_tag, require_side_tag_access
+
+    tag = await get_side_tag(db, data.side_tag_id)
+    if tag is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Side tag not found")
+    require_side_tag_access(user, tag)
+    out = await create_manual_chain_plan(
+        db,
+        request,
+        chain=data.chain,
+        release_id=data.release_id,
+        side_tag_id=data.side_tag_id,
+        architectures=data.architectures,
+        priority=data.priority,
+        preferred_mock_environment_id=data.preferred_mock_environment_id,
+        distgit_url=data.distgit_url,
+        distgit_branch=data.distgit_branch,
+        triggered_by_id=user.id,
+    )
+    await db.commit()
+    await db.refresh(out.plan)
+    return RpmbuildPlanResponse(
+        id=out.plan.id,
+        release_id=out.plan.release_id,
+        releasename=out.plan.releasename,
+        repo_branch=out.plan.repo_branch,
+        distgit_url=out.plan.distgit_url,
+        distgit_branch=out.plan.distgit_branch,
+        seed_mode=out.plan.seed_mode,
+        seed_packages=list(out.plan.seed_packages_json or []),
+        status=out.plan.status.value,
+        current_open_layer=int(out.plan.current_open_layer or 0),
+        total_layers=len(out.layers),
+        queued_jobs=len(out.jobs),
+        created_at=out.plan.created_at,
+        updated_at=out.plan.updated_at,
+    )
+
+
+async def _chain_plan_to_status_response(db: DbSession, plan: RpmbuildPlan) -> ChainPlanStatusResponse:
+    from oreon_build.models import SideTag
+
+    groups = plan.layers_json if isinstance(plan.layers_json, list) else []
+    counts_r = await db.execute(
+        select(BuildJob.status, func.count(BuildJob.id))
+        .where(BuildJob.rpmbuild_plan_id == plan.id)
+        .group_by(BuildJob.status)
+    )
+    counts = {st.value: int(n) for st, n in counts_r.all()}
+    jobs_r = await db.execute(
+        select(BuildJob)
+        .options(selectinload(BuildJob.package), selectinload(BuildJob.build_target))
+        .where(
+            BuildJob.rpmbuild_plan_id == plan.id,
+            BuildJob.status == BuildStatus.FAILED,
+        )
+        .order_by(BuildJob.rpmbuild_layer_index.asc().nulls_last(), BuildJob.id.asc())
+        .limit(100)
+    )
+    rows = [
+        LayerJobRow(
+            job_id=j.id,
+            package_name=j.package.name if j.package else "?",
+            status=j.status.value,
+            layer_index=j.rpmbuild_layer_index,
+            architecture=j.build_target.architecture if j.build_target else None,
+            blocked_reason=j.error_message,
+            blocked_on=[],
+        )
+        for j in jobs_r.scalars().all()
+    ]
+    rel = await db.get(Release, plan.release_id)
+    tag = await db.scalar(select(SideTag).where(SideTag.release_id == plan.release_id, SideTag.name == plan.repo_branch))
+    return ChainPlanStatusResponse(
+        chain_plan_id=plan.id,
+        status=plan.status.value,
+        groups=groups,
+        current_group=int(plan.current_open_layer or 0) + 1,
+        total_groups=len(groups),
+        jobs=rows,
+        counts=counts,
+        error_message=plan.error_message,
+        releasename=rel.releasename if rel else None,
+        side_tag_name=tag.name if tag else None,
+        created_at=plan.created_at,
+        updated_at=plan.updated_at,
+    )
+
+
+@router.get("/chain/{chain_plan_id}/status", response_model=ChainPlanStatusResponse)
+async def get_chain_build_status(chain_plan_id: int, db: DbSession):
+    plan = await db.get(RpmbuildPlan, chain_plan_id)
+    if plan is None or plan.seed_mode != "manual_chain":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chain build not found")
+    return await _chain_plan_to_status_response(db, plan)
+
+
+@router.post("/chain/{chain_plan_id}/cancel", response_model=ChainPlanStatusResponse)
+async def cancel_chain_build_endpoint(
+    chain_plan_id: int, request: Request, db: DbSession, user: CurrentUser,
+):
+    from oreon_build.services.rpmbuild_settle import cancel_chain_plan_by_user
+
+    plan = await cancel_chain_plan_by_user(db, request, user, chain_plan_id)
+    await db.commit()
+    await db.refresh(plan)
+    return await _chain_plan_to_status_response(db, plan)
+
+
+@router.post("/chain/{chain_plan_id}/resume", response_model=ChainPlanStatusResponse)
+async def resume_chain_build_endpoint(
+    chain_plan_id: int, request: Request, db: DbSession, user: CurrentUser,
+):
+    from oreon_build.services.rpmbuild_settle import resume_chain_plan_by_user
+
+    plan = await resume_chain_plan_by_user(db, request, user, chain_plan_id)
+    await db.commit()
+    await db.refresh(plan)
+    return await _chain_plan_to_status_response(db, plan)
 
 
 @router.post("/rpmbuild-plan", response_model=RpmbuildPlanResponse, status_code=status.HTTP_201_CREATED)
