@@ -35,6 +35,7 @@ class RpmbuildPlan(Base):
     seed_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="minimal_seed")
     seed_packages_json: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     layers_json: Mapped[list[Any]] = mapped_column(JSON, nullable=False, default=list)
+    options_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     status: Mapped[RpmbuildPlanStatus] = mapped_column(
         Enum(RpmbuildPlanStatus, values_callable=lambda x: [e.value for e in x]),
         default=RpmbuildPlanStatus.PENDING,
