@@ -209,7 +209,10 @@
               .then(async function(ok) {
                 if (!ok) return;
                 await deleteAccount(id);
+                setEditSelected(null);
                 await loadAccounts();
+              }).catch(function(e) {
+                alert('Delete failed: ' + (e.message || e));
               });
           });
         });
@@ -328,4 +331,3 @@
   </script>
 </body>
 </html>
-
