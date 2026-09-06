@@ -196,6 +196,7 @@ async def list_builds(
     release_id: int | None = None,
     package_id: int | None = None,
     layer_plan_id: int | None = None,
+    rpmbuild_plan_id: int | None = None,
     side_tag_id: int | None = None,
     status: str | None = None,
     search: str | None = Query(None, max_length=200, description="Filter by job id, package name, release name, arch, status"),
@@ -236,6 +237,9 @@ async def list_builds(
     if layer_plan_id is not None:
         q = q.where(BuildJob.layer_plan_id == layer_plan_id)
         count_q = count_q.where(BuildJob.layer_plan_id == layer_plan_id)
+    if rpmbuild_plan_id is not None:
+        q = q.where(BuildJob.rpmbuild_plan_id == rpmbuild_plan_id)
+        count_q = count_q.where(BuildJob.rpmbuild_plan_id == rpmbuild_plan_id)
     if side_tag_id is not None:
         q = q.where(BuildJob.side_tag_id == side_tag_id)
         count_q = count_q.where(BuildJob.side_tag_id == side_tag_id)
@@ -695,7 +699,7 @@ async def trigger_chain_build_endpoint(
     )
 
 
-async def _chain_plan_to_status_response(db: DbSession, plan: RpmbuildPlan) -> ChainPlanStatusResponse:
+async def _chain_plan_to_status_response(db: DbSession, plan: RpmbuildPlan, offset: int = 0) -> ChainPlanStatusResponse:
     from oreon_build.models import SideTag
 
     groups = plan.layers_json if isinstance(plan.layers_json, list) else []
@@ -713,6 +717,7 @@ async def _chain_plan_to_status_response(db: DbSession, plan: RpmbuildPlan) -> C
             BuildJob.status == BuildStatus.FAILED,
         )
         .order_by(BuildJob.rpmbuild_layer_index.asc().nulls_last(), BuildJob.id.asc())
+        .offset(offset)
         .limit(100)
     )
     rows = [
@@ -722,7 +727,7 @@ async def _chain_plan_to_status_response(db: DbSession, plan: RpmbuildPlan) -> C
             status=j.status.value,
             layer_index=j.rpmbuild_layer_index,
             architecture=j.build_target.architecture if j.build_target else None,
-            blocked_reason=j.error_message,
+            blocked_reason=j.blocked_reason,
             blocked_on=[],
         )
         for j in jobs_r.scalars().all()
@@ -746,11 +751,11 @@ async def _chain_plan_to_status_response(db: DbSession, plan: RpmbuildPlan) -> C
 
 
 @router.get("/chain/{chain_plan_id}/status", response_model=ChainPlanStatusResponse)
-async def get_chain_build_status(chain_plan_id: int, db: DbSession):
+async def get_chain_build_status(chain_plan_id: int, db: DbSession, offset: int = Query(0, ge=0)):
     plan = await db.get(RpmbuildPlan, chain_plan_id)
     if plan is None or plan.seed_mode != "manual_chain":
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chain build not found")
-    return await _chain_plan_to_status_response(db, plan)
+    return await _chain_plan_to_status_response(db, plan, offset=offset)
 
 
 @router.post("/chain/{chain_plan_id}/cancel", response_model=ChainPlanStatusResponse)
