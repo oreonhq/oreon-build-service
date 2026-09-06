@@ -23,7 +23,7 @@
   </header>
   <main class="main">
     <section class="card">
-      <h2>Build <span id="job-id">—</span></h2>
+      <h2>Build <span id="job-id">---</span></h2>
       <div id="build-loading" class="build-meta">Loading</div>
       <div id="build-meta" class="build-meta" style="display:none;"></div>
       <div id="build-error" style="display:none; color: var(--danger, #c00);"></div>
@@ -48,7 +48,7 @@
         return 'badge pending';
       }
       function formatElapsed(ms) {
-        if (ms == null || ms < 0 || !isFinite(ms)) return '—';
+        if (ms == null || ms < 0 || !isFinite(ms)) return '---';
         var sec = Math.floor(ms / 1000);
         var h = Math.floor(sec / 3600);
         var m = Math.floor((sec % 3600) / 60);
@@ -142,8 +142,8 @@
           var rel = releases.find(function(r) { return r.id === job.release_id; });
           var pkgName = (job.package_name || '').trim() || ((pkg && pkg.name) ? String(pkg.name).trim() : '');
           var relName = (job.release_name || '').trim() || ((rel && rel.releasename) ? String(rel.releasename).trim() : '');
-          var pkgLabel = pkgName ? escapeHtml(pkgName) + ' (' + job.package_id + ')' : ('#' + (job.package_id || '—'));
-          var relLabel = relName ? escapeHtml(relName) + ' (' + job.release_id + ')' : ('#' + (job.release_id || '—'));
+          var pkgLabel = pkgName ? escapeHtml(pkgName) + ' (' + job.package_id + ')' : ('#' + (job.package_id || '---'));
+          var relLabel = relName ? escapeHtml(relName) + ' (' + job.release_id + ')' : ('#' + (job.release_id || '---'));
           var jobDisp = window.oreonJobDisplayStatus ? window.oreonJobDisplayStatus(job) : String(job.status || '');
           var meta = document.getElementById('build-meta');
           var signingRow = window.oreonSigningKeyHtml
@@ -151,11 +151,11 @@
             : '';
           meta.innerHTML = '<dl><dt>Package</dt><dd>' + pkgLabel + '</dd>' +
             '<dt>Release</dt><dd>' + relLabel + '</dd>' +
-            '<dt>Architecture</dt><dd>' + escapeHtml(job.architecture || '—') + '</dd>' +
+            '<dt>Architecture</dt><dd>' + escapeHtml(job.architecture || '---') + '</dd>' +
             '<dt>Status</dt><dd><span class="' + statusClass(jobDisp) + '">' + escapeHtml(jobDisp) + '</span></dd>' +
             signingRow +
             '<dt>Created</dt><dd>' + (job.created_at || '').slice(0, 19) + '</dd>' +
-            '<dt>Completed</dt><dd>' + (job.completed_at ? job.completed_at.slice(0, 19) : '—') + '</dd></dl>';
+            '<dt>Completed</dt><dd>' + (job.completed_at ? job.completed_at.slice(0, 19) : '---') + '</dd></dl>';
           return api.get('/builds/jobs/' + jobId + '/attempts');
         }).then(function(attempts) {
           var list = Array.isArray(attempts) ? attempts : [];
@@ -176,7 +176,7 @@
             var workerLine = '';
             if (a.worker_name || a.worker_id) {
               var who = a.worker_name ? escapeHtml(a.worker_name) : ('#' + a.worker_id);
-              var hb = a.worker_last_heartbeat ? a.worker_last_heartbeat.slice(0, 19) : '—';
+              var hb = a.worker_last_heartbeat ? a.worker_last_heartbeat.slice(0, 19) : '---';
               workerLine = '<div><small>Worker: ' + who + ' &nbsp; Last heartbeat (UTC): ' + hb + '</small></div>';
             }
             return '<div class="attempt-card" data-attempt-id="' + a.id + '" data-attempt-status="' + escapeAttr(st) + '" data-started-at="' + escapeAttr(a.started_at || '') + '">' +
@@ -184,7 +184,7 @@
               signingLine +
               workerLine +
               '<div class="attempt-elapsed-live" style="color:var(--text-muted);"></div>' +
-              '<div><small>Started: ' + (a.started_at ? a.started_at.slice(0, 19) : '—') + ' &nbsp; Finished: ' + (a.finished_at ? a.finished_at.slice(0, 19) : '—') + '</small></div>' +
+              '<div><small>Started: ' + (a.started_at ? a.started_at.slice(0, 19) : '---') + ' &nbsp; Finished: ' + (a.finished_at ? a.finished_at.slice(0, 19) : '---') + '</small></div>' +
               '<div class="artifacts" id="artifacts-' + a.id + '" style="margin-top:0.5rem; font-size:0.9rem; color:var(--text-muted);">Artifacts: loading</div>' +
               '<div style="margin-top:0.5rem;display:flex;gap:0.35rem;flex-wrap:wrap;align-items:center;">' +
               '<button type="button" class="btn load-log" data-attempt-id="' + a.id + '">View log</button>' +
