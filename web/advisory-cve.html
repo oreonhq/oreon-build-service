@@ -83,13 +83,13 @@
         var upstream = ad.upstream_url ? '<a href="' + esc(ad.upstream_url) + '" target="_blank" rel="noreferrer">Upstream</a>' : '-';
         var fix = esc(ad.recommended_fix || '-');
         var summary = ad.summary ? esc(ad.summary) : '-';
-        var osvFixed = ad.osv_fixed_version ? esc(ad.osv_fixed_version) : '—';
+        var osvFixed = ad.osv_fixed_version ? esc(ad.osv_fixed_version) : '---';
         var shipped = esc(ad.package_version || '-');
         var resolutionBlock = '';
         if (handled) {
           resolutionBlock =
             '<div style="margin-top:0.75rem;" class="form-group">' +
-            '<div><span style="font-weight:600;">Handled as</span>: ' + esc(ad.handled_reason || '—') + '</div>' +
+            '<div><span style="font-weight:600;">Handled as</span>: ' + esc(ad.handled_reason || '---') + '</div>' +
             (ad.handled_notes ? '<div style="margin-top:0.35rem;"><span style="font-weight:600;">Notes</span><div style="color:var(--text-muted); white-space:pre-wrap;">' + esc(ad.handled_notes) + '</div></div>' : '') +
             '</div>';
         }
