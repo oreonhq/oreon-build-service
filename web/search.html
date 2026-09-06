@@ -51,7 +51,7 @@
           html += '<h3>Builds</h3><ul>';
           data.builds.forEach(function(b) {
             var label = 'Build #' + b.id;
-            if (b.package_name) label += ' — ' + b.package_name;
+            if (b.package_name) label += ' - ' + b.package_name;
             if (b.release_name) label += ' @ ' + b.release_name;
             if (b.architecture) label += ' (' + b.architecture + ')';
             if (b.status) label += ' [' + b.status + ']';
@@ -79,7 +79,7 @@
           out.innerHTML = '<p style="color:var(--text-muted);">Enter a query and press Search, or use the search box in the navbar.</p>';
           return;
         }
-        out.innerHTML = '<p style="color:var(--text-muted);">Searching…</p>';
+        out.innerHTML = '<p style="color:var(--text-muted);">Searching--</p>';
         api.get('/search?q=' + encodeURIComponent(q) + '&limit=25').then(function(data) {
           renderResults(data || {}, q);
         }).catch(function(e) {
