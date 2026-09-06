@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Depends, File, Header, HTTPException, Query, UploadFile, status
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
@@ -782,13 +782,78 @@ async def upload_worker_rpm_presign(
         "expires_in": expires,
     }
 
+# Retain finalization tasks across proxy disconnects.
+_rpm_finalize_tasks: dict[tuple[int, str], asyncio.Task] = {}
+
+
 @router.post("/upload-rpm/complete/{attempt_id}")
 async def upload_worker_rpm_complete(
     attempt_id: int,
     db: DbSession,
     worker: Annotated[Worker, Depends(_require_worker)],
     body: WorkerRpmCompleteBody,
+    prefer: Annotated[str | None, Header()] = None,
 ):
+    await _resolve_worker_rpm_upload_context(db, worker, attempt_id, body.filename)
+    want_sha = body.checksum_sha256.strip().lower()
+    if len(want_sha) != 64 or any(c not in "0123456789abcdef" for c in want_sha):
+        raise HTTPException(status_code=400, detail="Invalid checksum_sha256")
+    if body.size_bytes < 0:
+        raise HTTPException(status_code=400, detail="Invalid size_bytes")
+    if body.size_bytes > get_settings().max_worker_rpm_upload_mib * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="RPM exceeds max upload size")
+    key = (attempt_id, Path(body.filename.strip()).name)
+    task = _rpm_finalize_tasks.get(key)
+    if task is None:
+        worker_id = worker.id
+
+        async def run() -> dict:
+            from oreon_build.db import async_session_maker
+
+            async with async_session_maker() as task_db:
+                task_worker = await task_db.get(Worker, worker_id)
+                if task_worker is None:
+                    raise RuntimeError("Worker removed during RPM finalization")
+                result = await _finalize_worker_rpm(attempt_id, task_db, task_worker, body)
+                await task_db.commit()
+                return result
+
+        def finished(completed: asyncio.Task) -> None:
+            if _rpm_finalize_tasks.get(key) is completed:
+                _rpm_finalize_tasks.pop(key, None)
+            if not completed.cancelled() and completed.exception() is not None:
+                logger.error("Background RPM finalize failed attempt_id=%s: %s", attempt_id, completed.exception())
+
+        task = asyncio.create_task(run())
+        _rpm_finalize_tasks[key] = task
+        task.add_done_callback(finished)
+
+    # Do not hold the request's read transaction while a separate session signs.
+    await db.rollback()
+    if prefer == "respond-async":
+        return JSONResponse(status_code=202, content={"finalized": False}, headers={"Retry-After": "5"})
+
+    async def stream_result():
+        # Legacy workers expect one JSON document. JSON whitespace keeps the
+        # proxy read connection alive without changing that document. A failed
+        # task aborts the stream, so it cannot be mistaken for upload success.
+        yield b" "
+        while not task.done():
+            await asyncio.wait({task}, timeout=10.0)
+            if not task.done():
+                yield b" "
+        yield json.dumps(task.result()).encode("utf-8")
+
+    return StreamingResponse(
+        stream_result(), media_type="application/json",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-store"},
+    )
+
+
+async def _finalize_worker_rpm(
+    attempt_id: int, db: Any, worker: Worker, body: WorkerRpmCompleteBody,
+):
+
     try:
         worker_id = int(worker.id)
     except Exception:
@@ -819,7 +884,10 @@ async def upload_worker_rpm_complete(
         fname = Path(body.filename.strip()).name
 
         def _one_attempt() -> tuple[bool, bool, str, int, str]:
-            fd, tmp_path = tempfile.mkstemp(suffix=".rpm")
+            # Kernel debuginfo exceeds the per-user quota on /tmp's tmpfs.
+            fd, tmp_path = tempfile.mkstemp(
+                suffix=".rpm", dir=os.environ.get("OREON_RPM_TMPDIR") or "/var/tmp"
+            )
             os.close(fd)
             path = Path(tmp_path)
             try:
@@ -990,6 +1058,10 @@ async def upload_worker_rpm_complete(
             await db.rollback()
             await asyncio.sleep(2)
 
+        existing = await upload_worker_rpm_status(attempt_id, db, worker, body.filename)
+        if existing.get("finalized"):
+            return existing
+        await db.rollback()
         try:
             signed, pesigned, rk, signed_size, signed_sha = await asyncio.to_thread(_finalize)
         except FileNotFoundError as e:
@@ -1015,6 +1087,36 @@ async def upload_worker_rpm_complete(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="RPM finalize busy, retry" if busy else f"RPM finalize failed: {e}",
             ) from e
+        digest = signed_sha
+        fname = Path(body.filename.strip()).name
+        await _upsert_attempt_artifact(
+            db,
+            attempt_id=attempt_id,
+            kind="rpm",
+            filename=fname,
+            r2_key=rk,
+            size_bytes=signed_size,
+            checksum_sha256=digest,
+            is_signed=bool(signed),
+        )
+        await log_audit(
+            db,
+            action="worker.rpm_upload_presigned_complete",
+            resource_type="build_attempt",
+            resource_id=str(attempt_id),
+            details=f"worker_id={worker_id} {fname} {rk}",
+            emit_discord=False,
+        )
+        await db.commit()
+        return {
+            "filename": fname,
+            "r2_key": rk,
+            "signed": signed,
+            "pesign_applied": pesigned,
+            "size_bytes": signed_size,
+            "checksum_sha256": digest,
+        }
+
     finally:
         if lock_acquired:
             try:
@@ -1029,34 +1131,6 @@ async def upload_worker_rpm_complete(
             except Exception:
                 pass
 
-    digest = signed_sha
-    fname = Path(body.filename.strip()).name
-    await _upsert_attempt_artifact(
-        db,
-        attempt_id=attempt_id,
-        kind="rpm",
-        filename=fname,
-        r2_key=rk,
-        size_bytes=signed_size,
-        checksum_sha256=digest,
-        is_signed=bool(signed),
-    )
-    await log_audit(
-        db,
-        action="worker.rpm_upload_presigned_complete",
-        resource_type="build_attempt",
-        resource_id=str(attempt_id),
-        details=f"worker_id={worker_id} {fname} {rk}",
-        emit_discord=False,
-    )
-    return {
-        "filename": fname,
-        "r2_key": rk,
-        "signed": signed,
-        "pesign_applied": pesigned,
-        "size_bytes": signed_size,
-        "checksum_sha256": digest,
-    }
 
 @router.get("/upload-rpm/status/{attempt_id}")
 async def upload_worker_rpm_status(
@@ -1080,7 +1154,14 @@ async def upload_worker_rpm_status(
         )
     ).scalar_one_or_none()
     if row is None:
-        return {"finalized": False}
+        active = await db.scalar(
+            select(RpmCompleteLock.owner).where(
+                RpmCompleteLock.attempt_id == attempt_id,
+                RpmCompleteLock.r2_key == r2_key,
+                RpmCompleteLock.expires_at > datetime.now(timezone.utc),
+            )
+        )
+        return {"finalized": False, "finalizing": bool(active) or (attempt_id, fname) in _rpm_finalize_tasks}
     return {
         "finalized": True,
         "filename": fname,
@@ -1510,7 +1591,9 @@ async def upload_worker_rpm(
     )
     fname = Path(fname_raw.strip()).name
 
-    fd, tmp_path = tempfile.mkstemp(suffix=".rpm")
+    fd, tmp_path = tempfile.mkstemp(
+        suffix=".rpm", dir=os.environ.get("OREON_RPM_TMPDIR") or "/var/tmp"
+    )
     os.close(fd)
     path = Path(tmp_path)
     raw: bytes = b""
