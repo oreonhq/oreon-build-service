@@ -321,9 +321,9 @@
             '</div>' +
             '<div class="side-tag-meta-grid">' +
               '<div class="side-tag-meta-item"><label>Release</label><div class="val">' + escapeHtml(sideTag.releasename || ('#' + sideTag.release_id)) + '</div></div>' +
-              '<div class="side-tag-meta-item"><label>Owner</label><div class="val">' + escapeHtml(sideTag.owner_username || '—') + '</div></div>' +
-              '<div class="side-tag-meta-item"><label>Created from</label><div class="val">' + escapeHtml(sideTag.created_from || '—') + '</div></div>' +
-              '<div class="side-tag-meta-item"><label>Last activity</label><div class="val">' + escapeHtml((sideTag.last_activity_at || '').toString().slice(0, 19) || '—') + '</div></div>' +
+              '<div class="side-tag-meta-item"><label>Owner</label><div class="val">' + escapeHtml(sideTag.owner_username || '-') + '</div></div>' +
+              '<div class="side-tag-meta-item"><label>Created from</label><div class="val">' + escapeHtml(sideTag.created_from || '-') + '</div></div>' +
+              '<div class="side-tag-meta-item"><label>Last activity</label><div class="val">' + escapeHtml((sideTag.last_activity_at || '').toString().slice(0, 19) || '') + '</div></div>' +
               '<div class="side-tag-meta-item" style="grid-column:1 / -1"><label>Members</label><div class="val">' + membersHtml + '</div></div>' +
             '</div>';
         }
@@ -339,9 +339,9 @@
           html += '</div>';
         }
         html += '<div class="action-row"><span class="action-label">Promote</span>';
-        html += '<button type="button" class="btn promo-testing" id="btn-promo-dev">→ dev</button>';
-        html += '<button type="button" class="btn promo-testing" id="btn-promo-testing">→ testing</button>';
-        html += '<button type="button" class="btn promo-stable" id="btn-promo-stable">→ stable</button>';
+        html += '<button type="button" class="btn promo-testing" id="btn-promo-dev">- dev</button>';
+        html += '<button type="button" class="btn promo-testing" id="btn-promo-testing">- testing</button>';
+        html += '<button type="button" class="btn promo-stable" id="btn-promo-stable">- stable</button>';
         html += '</div>';
         html += '<div id="side-tag-promo-status" style="margin-top:0.5rem;color:var(--text-muted);font-size:0.9rem;"></div>';
         actions.innerHTML = html;
@@ -375,7 +375,7 @@
             tries += 1;
             api.get('/promotions/jobs/' + encodeURIComponent(jobId)).then(function(job) {
               var st = (job && job.status) || '?';
-              setPromoStatus('Promote → ' + to + ': ' + st + (job.error ? (' — ' + job.error) : ''));
+              setPromoStatus('Promote - ' + to + ': ' + st + (job.error ? (' - ' + job.error) : ''));
               if (st === 'ok') {
                 window.location.href = '/side-tags.html';
                 return;
@@ -390,10 +390,10 @@
         }
         function doPromote(to) {
           if (!confirm('Promote entire side tag to ' + to + '? Tag will be DELETED after copy finishes in the background.')) return Promise.reject(new Error('cancelled'));
-          if (!confirm('Confirm queue promote ' + sideTag.name + ' → ' + to + '.')) return Promise.reject(new Error('cancelled'));
+          if (!confirm('Confirm queue promote ' + sideTag.name + ' - ' + to + '.')) return Promise.reject(new Error('cancelled'));
           return api.post('/side-tags/' + sideTagId + '/promote', { to_branch: to })
             .then(function(data) {
-              setPromoStatus('Queued promote → ' + to + ' (job ' + (data.job_id || '?') + '). You can leave this page.');
+              setPromoStatus('Queued promote - ' + to + ' (job ' + (data.job_id || '?') + '). You can leave this page.');
               if (data.job_id) pollPromoteJob(data.job_id, to);
               return data;
             });
@@ -569,7 +569,7 @@
           return;
         }
         showLayerAlert('info', 'Layer ' + data.layer_plan_id + ': ' + st,
-          '<p>' + (bits || 'Jobs updating…') + '</p>',
+          '<p>' + (bits || 'Jobs updating...') + '</p>',
           { showCancel: live, layerId: data.layer_plan_id });
       }
       function pollLayerStatus(layerId) {
@@ -611,7 +611,7 @@
           showLayerAlert('error', 'Chain ' + data.chain_plan_id + ' ' + st,
             (data.error_message ? '<p style="margin:0 0 0.5rem 0;font-size:0.9rem;">' + escapeHtml(data.error_message) + '</p>' : '')
             + renderLayerFailedJobs(data)
-            + '<p style="margin:0;color:var(--text-muted);font-size:0.88rem;">' + escapeHtml(progress + (bits ? ' — ' + bits : '')) + '</p>',
+            + '<p style="margin:0;color:var(--text-muted);font-size:0.88rem;">' + escapeHtml(progress + (bits ? ' - ' + bits : '')) + '</p>',
             { showResume: true, chainId: data.chain_plan_id });
           stopLayerPoll();
           return;
@@ -623,7 +623,7 @@
           return;
         }
         showLayerAlert('info', 'Chain ' + data.chain_plan_id + ': ' + st.replace('_', ' '),
-          '<p style="margin:0 0 0.35rem 0;">' + escapeHtml(progress) + '</p><p style="margin:0;color:var(--text-muted);font-size:0.88rem;">' + escapeHtml(bits || 'Jobs updating…') + '</p>',
+          '<p style="margin:0 0 0.35rem 0;">' + escapeHtml(progress) + '</p><p style="margin:0;color:var(--text-muted);font-size:0.88rem;">' + escapeHtml(bits || 'Jobs updating...') + '</p>',
           { showCancel: live, chainId: data.chain_plan_id });
       }
       function pollChainStatus(chainId) {
@@ -736,7 +736,7 @@
       }
       function getDistgitBranch() {
         var el = document.getElementById('distgit-branch-input');
-        var v = el && el.value ? el.value.trim() : '';
+        var v = el && el.value ? el.value.trim()  : '-';
         if (v) return v;
         var rel = releaseById(selectedReleaseIdNew);
         return rel ? String(rel.default_distgit_branch || 'main').trim() : 'main';
@@ -745,7 +745,7 @@
         var el = document.getElementById('distgit-branch-input');
         if (!el) return;
         var rel = releaseById(selectedReleaseIdNew);
-        el.value = rel ? String(rel.default_distgit_branch || 'main').trim() : '';
+        el.value = rel ? String(rel.default_distgit_branch || 'main').trim()  : '-';
       }
 
       (function initBuildModeTabs() {
@@ -850,7 +850,7 @@
             ids.forEach(function(id) {
               var sid = String(id);
               var tr = tbody.querySelector('tr[data-id="' + sid + '"]');
-              var st = tr ? (tr.getAttribute('data-status') || '') : '';
+              var st = tr ? (tr.getAttribute('data-status') || '')  : '-';
               if (st === 'pending' || st === 'queued' || st === 'running') return;
               if (isBuildJobRetried(sid)) {
                 sawAlreadyRetried = true;
@@ -874,7 +874,7 @@
             var chain = Promise.resolve();
             ids.forEach(function(id) {
               var tr = tbody.querySelector('tr[data-id="' + id + '"]');
-              var st = tr ? (tr.getAttribute('data-status') || '') : '';
+              var st = tr ? (tr.getAttribute('data-status') || '')  : '-';
               if (st !== 'pending' && st !== 'queued' && st !== 'running') return;
               chain = chain.then(function() { return api.post('/builds/jobs/' + id + '/cancel'); });
             });
@@ -886,7 +886,7 @@
       function render() {
         var offset = buildsPage * buildsPageSize;
         var bf = document.getElementById('builds-filter');
-        var bq = (bf && bf.value) ? String(bf.value).trim() : '';
+        var bq = (bf && bf.value) ? String(bf.value).trim()  : '-';
         var buildsUrl = '/builds?limit=' + buildsPageSize + '&offset=' + offset + (sideTagId ? ('&side_tag_id=' + sideTagId) : '');
         if (bq) buildsUrl += '&search=' + encodeURIComponent(bq);
         Promise.all([
@@ -905,19 +905,19 @@
             var fromJob = (j.package_name || '').trim();
             if (fromJob) return escapeHtml(fromJob) + ' (' + j.package_id + ')';
             var pkg = packagesList.find(function(p) { return p.id === j.package_id; });
-            var name = pkg ? (pkg.name || '').trim() : '';
+            var name = pkg ? (pkg.name || '').trim()  : '-';
             return name ? escapeHtml(name) + ' (' + j.package_id + ')' : ('#' + j.package_id);
           }
           function releaseLabel(j) {
             var fromJob = (j.release_name || '').trim();
             if (fromJob) return escapeHtml(fromJob) + ' (' + j.release_id + ')';
             var rel = releasesList.find(function(r) { return r.id === j.release_id; });
-            var name = rel ? (rel.releasename || '').trim() : '';
+            var name = rel ? (rel.releasename || '').trim()  : '-';
             return name ? escapeHtml(name) + ' (' + j.release_id + ')' : ('#' + j.release_id);
           }
           tbody.innerHTML = jobs.map(function(j) {
             const canAct = api.token;
-            var cancelBtn = (canAct && (j.status === 'pending' || j.status === 'queued' || j.status === 'running')) ? ' <button type="button" class="btn cancel-build" data-id="' + j.id + '">Cancel</button>' : '';
+            var cancelBtn = (canAct && (j.status === 'pending' || j.status === 'queued' || j.status === 'running')) ? ' <button type="button" class="btn cancel-build" data-id="' + j.id + '">Cancel</button>'  : '';
             var retryEligible = canAct && j.status !== 'pending' && j.status !== 'queued' && j.status !== 'running';
             var retryUsed = retryEligible && isBuildJobRetried(j.id);
             var retryBtn = '';
@@ -928,15 +928,15 @@
                 retryBtn = ' <button type="button" class="btn retry" data-id="' + j.id + '">Retry</button>';
               }
             }
-            var arch = (j.architecture != null && j.architecture !== '') ? j.architecture : '—';
+            var arch = (j.architecture != null && j.architecture !== '') ? j.architecture  : '-';
             var sd = window.oreonJobDisplayStatus ? window.oreonJobDisplayStatus(j) : String(j.status || '');
-            var signCell = window.oreonSigningKeyHtml ? window.oreonSigningKeyHtml(j.signing_status) : '—';
-            var layerPart = '—';
+            var signCell = window.oreonSigningKeyHtml ? window.oreonSigningKeyHtml(j.signing_status)  : '-';
+            var layerPart = '-';
             if (j.layer_plan_id != null && j.layer_plan_id !== undefined) {
               var layerIdStr = String(j.layer_plan_id);
               var idxNote = (j.layer_index != null && j.layer_index !== undefined)
                 ? ' <span style="color:var(--text-muted); font-size:0.85em" title="Layer index">(L' + j.layer_index + ')</span>'
-                : '';
+                 : '';
               layerPart = '<a href="#" class="watch-layer-id" data-layer-id="' + escapeAttr(layerIdStr) + '">' + layerIdStr + '</a>' + idxNote;
               if (j.status === 'blocked' && j.blocked_reason) {
                 layerPart += ' <span style="color:var(--text-muted); font-size:0.82em;" title="' + escapeAttr(j.blocked_reason) + '">(blocked)</span>';
@@ -944,7 +944,7 @@
             } else if (j.rpmbuild_plan_id != null && j.rpmbuild_plan_id !== undefined) {
               var chainGroup = (j.rpmbuild_layer_index != null && j.rpmbuild_layer_index !== undefined)
                 ? ' group ' + (Number(j.rpmbuild_layer_index) + 1)
-                : '';
+                 : '-';
               layerPart = '<a href="#" class="watch-chain-id" data-chain-id="' + escapeAttr(String(j.rpmbuild_plan_id)) + '">Chain ' + escapeHtml(String(j.rpmbuild_plan_id)) + '</a>'
                 + '<span style="color:var(--text-muted); font-size:0.85em">' + escapeHtml(chainGroup) + '</span>';
             }
@@ -1152,7 +1152,7 @@
             .filter(function(s) { return !!s; });
           if (!pkgNames.length) { alert('Enter at least one package name.'); return; }
           var rel = releaseById(selectedReleaseIdNew);
-          var releasename = rel && rel.releasename ? rel.releasename.trim() : '';
+          var releasename = rel && rel.releasename ? rel.releasename.trim()  : '-';
           if (!releasename) { alert('Selected release is missing a releasename.'); return; }
         var batchBody = {
           release_id: selectedReleaseIdNew,
