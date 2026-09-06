@@ -48,8 +48,8 @@
           <button type="button" class="btn primary" id="btn-promote">Promote whole branch</button>
         </div>
         <div style="margin-top:1rem; display:flex; gap:0.5rem; flex-wrap:wrap;">
-          <button type="button" class="btn promo-testing" id="btn-dev-testing">dev → testing</button>
-          <button type="button" class="btn promo-stable" id="btn-testing-stable">testing → stable</button>
+          <button type="button" class="btn promo-testing" id="btn-dev-testing">dev - testing</button>
+          <button type="button" class="btn promo-stable" id="btn-testing-stable">testing - stable</button>
         </div>
         <div id="promo-status"></div>
       </div>
@@ -99,8 +99,8 @@
         var st = (job && job.status) || 'unknown';
         var lines = [];
         if (kickoff) {
-          lines.push('<div class="line"><strong>Queued</strong> ' + escapeHtml(kickoff.from_branch) + ' → ' + escapeHtml(kickoff.to_branch) + ' (' + escapeHtml(kickoff.releasename || '') + ')</div>');
-          lines.push('<div class="line" style="color:var(--text-muted)">job ' + escapeHtml(kickoff.job_id) + ' — you can leave this page</div>');
+          lines.push('<div class="line"><strong>Queued</strong> ' + escapeHtml(kickoff.from_branch) + ' - ' + escapeHtml(kickoff.to_branch) + ' (' + escapeHtml(kickoff.releasename || '') + ')</div>');
+          lines.push('<div class="line" style="color:var(--text-muted)">job ' + escapeHtml(kickoff.job_id) + ' - you can leave this page</div>');
         }
         lines.push('<div class="line">Status: <span class="badge ' + (st === 'ok' ? 'success' : (st === 'failed' ? 'failed' : 'running')) + '">' + escapeHtml(st) + '</span></div>');
         if (job && job.message) lines.push('<div class="line">' + escapeHtml(job.message) + '</div>');
@@ -126,10 +126,10 @@
         var rid = parseInt(document.getElementById('release-id').value, 10);
         if (!rid) { alert('Pick a release'); return Promise.reject(new Error('no release')); }
         if (fromB === toB) { alert('from and to must differ'); return Promise.reject(new Error('same')); }
-        if (!confirm('Promote ALL of ' + fromB + ' → ' + toB + ' for this release?\n\nSource branch will be emptied when the job finishes.')) {
+        if (!confirm('Promote ALL of ' + fromB + ' - ' + toB + ' for this release?\n\nSource branch will be emptied when the job finishes.')) {
           return Promise.reject(new Error('cancelled'));
         }
-        if (!confirm('Final confirm: queue whole-tree promote ' + fromB + ' → ' + toB + '.')) {
+        if (!confirm('Final confirm: queue whole-tree promote ' + fromB + ' - ' + toB + '.')) {
           return Promise.reject(new Error('cancelled'));
         }
         return api.post('/promotions/branch', {
