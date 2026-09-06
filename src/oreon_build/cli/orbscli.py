@@ -976,6 +976,7 @@ def _list_all_layer_jobs(
     token: str | None,
     layer_id: int,
     status: str,
+    plan_filter: str = "layer_plan_id",
 ) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     offset = 0
@@ -987,7 +988,7 @@ def _list_all_layer_jobs(
             "/api/builds",
             token=token,
             params={
-                "layer_plan_id": layer_id,
+                plan_filter: layer_id,
                 "status": status,
                 "limit": limit,
                 "offset": offset,
@@ -1007,6 +1008,27 @@ def _list_all_layer_jobs(
 def _safe_log_name(value: str) -> str:
     s = re.sub(r"[^A-Za-z0-9._+-]+", "_", (value or "").strip())
     return s.strip("._") or "unknown"
+
+
+def _list_failed_chain_jobs(api_base: str, token: str | None, chain_id: int) -> list[dict[str, Any]]:
+    jobs: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    while True:
+        data = http_json("GET", api_base, f"/api/builds/chain/{chain_id}/status",
+                         token=token, params={"offset": len(jobs)}, timeout=30.0)
+        page = data.get("jobs") or []
+        total = int((data.get("counts") or {}).get("failed") or 0)
+        for job in page:
+            jid = int(job["job_id"])
+            if jid in seen:
+                raise click.ClickException("Server does not support chain log pagination; update the API.")
+            seen.add(jid)
+            jobs.append(dict(job, id=jid))
+        click.echo(f"Found {len(jobs)}/{total} failed chain jobs", err=True)
+        if len(jobs) >= total:
+            return jobs
+        if not page:
+            raise click.ClickException("Server returned an incomplete chain job list.")
 
 @cli.group("builds")
 def grp_builds() -> None:
@@ -1358,18 +1380,36 @@ def logs_view(attempt_id: int, out: str | None, tail: int | None) -> None:
     help="Directory to write logs into (default ./layer-<id>-failed-logs)",
 )
 def logs_layer_fail(layer_id: int, out_dir: str | None) -> None:
+    _download_failed_plan_logs(layer_id, out_dir, "layer")
+
+
+@grp_logs.command("chain-fail")
+@click.argument("chain_id", type=int)
+@click.option("--out", "out_dir", type=click.Path(), default=None,
+              help="Directory to write logs into (default ./chain-<id>-failed-logs)")
+def logs_chain_fail(chain_id: int, out_dir: str | None) -> None:
+    _download_failed_plan_logs(chain_id, out_dir, "chain")
+
+
+def _download_failed_plan_logs(layer_id: int, out_dir: str | None, kind: str) -> None:
     token = get_token()
     api_base = get_api_url()
-    dest = Path(out_dir) if out_dir else Path("layer-%s-failed-logs" % layer_id)
+    dest = Path(out_dir) if out_dir else Path("%s-%s-failed-logs" % (kind, layer_id))
     dest.mkdir(parents=True, exist_ok=True)
-    jobs = _list_all_layer_jobs(api_base, token, layer_id, "failed")
+    click.echo(f"Fetching failed jobs for {kind} {layer_id}...", err=True)
+    try:
+        jobs = (_list_failed_chain_jobs(api_base, token, layer_id) if kind == "chain"
+                else _list_all_layer_jobs(api_base, token, layer_id, "failed"))
+    except httpx.RequestError as exc:
+        raise click.ClickException(f"Could not fetch failed jobs: {exc}") from exc
     if not jobs:
-        click.echo("no failed jobs in layer %s" % layer_id)
+        click.echo("no failed jobs in %s %s" % (kind, layer_id))
         return
     wrote = 0
     missing = 0
-    for job in jobs:
+    for index, job in enumerate(jobs, 1):
         jid = int(job["id"])
+        click.echo(f"[{index}/{len(jobs)}] Fetching attempts and log for job {jid}...", err=True)
         pkg = _safe_log_name(str(job.get("package_name") or "pkg-%s" % (job.get("package_id") or jid)))
         arch = _safe_log_name(str(job.get("architecture") or "noarch"))
         attempts = http_json("GET", api_base, f"/api/builds/jobs/{jid}/attempts", token=token)
@@ -1388,7 +1428,8 @@ def logs_layer_fail(layer_id: int, out_dir: str | None) -> None:
             wrote += 1
         else:
             missing += 1
-    click.echo("layer %s failed jobs=%s logs written=%s missing=%s dir=%s" % (
+    click.echo("%s %s failed jobs=%s logs written=%s missing=%s dir=%s" % (
+        kind,
         layer_id,
         len(jobs),
         wrote,
