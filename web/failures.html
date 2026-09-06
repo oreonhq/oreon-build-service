@@ -58,7 +58,7 @@
       }
       function renderFailureRows(rows, tbody) {
         tbody.innerHTML = rows.map(function(r) {
-          var completed = r.completed_at ? r.completed_at.slice(0, 19).replace('T', ' ') : '—';
+          var completed = r.completed_at ? r.completed_at.slice(0, 19).replace('T', ' ') : '---';
           var aid = r.last_attempt_id;
           var logBtn = aid
             ? '<button type="button" class="btn failure-log-btn" data-attempt-id="' + encodeURIComponent(aid) + '">Log</button>'
@@ -67,7 +67,7 @@
             '<td>' + escapeHtml(String(r.id)) + '</td>' +
             '<td>' + escapeHtml(r.package_name || '') + ' <span class="failures-hint">(' + r.package_id + ')</span></td>' +
             '<td>' + escapeHtml(r.release_name || '') + ' <span class="failures-hint">(' + r.release_id + ')</span></td>' +
-            '<td>' + escapeHtml(r.architecture || '—') + '</td>' +
+            '<td>' + escapeHtml(r.architecture || '---') + '</td>' +
             '<td>' + escapeHtml(completed) + '</td>' +
             '<td><div class="failure-actions"><a href="/build.html?job_id=' + encodeURIComponent(r.id) + '">View</a>' + logBtn + '</div></td>' +
             '</tr>' +
