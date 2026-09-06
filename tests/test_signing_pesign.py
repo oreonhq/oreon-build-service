@@ -133,3 +133,27 @@ def test_cross_arch_pesign_uses_host_tools_without_qemu_root(monkeypatch, tmp_pa
     assert calls and calls[0][0] == "rpmrebuild"
     additional = next(arg for arg in calls[0] if arg.startswith("--additional="))
     assert "--target aarch64" in additional
+
+
+@pytest.mark.parametrize("arch", ["aarch64", "x86_64"])
+@pytest.mark.parametrize("name", [
+    "kernel-debug-debuginfo", "kernel-debuginfo", "kernel-debuginfo-common-aarch64",
+    "kernel-debugsource", "kernel-modules", "kernel-modules-core",
+    "kernel-debug-modules-extra", "kernel-tools", "kernel-tools-libs", "kernel-debug",
+])
+def test_kernel_without_efi_payload_skips_repack(monkeypatch, tmp_path, name, arch):
+    from oreon_build.services import signing
+
+    settings = Settings(pesign_rules_json=OREON_LIKE_RULES, pesign_nss_dir="/etc/pki/pesign")
+    rpm = tmp_path / f"{name}.rpm"
+    rpm.write_bytes(b"rpm")
+    monkeypatch.setattr(signing, "_rpm_query", lambda *args: f"{name}\n{arch}")
+    monkeypatch.setattr(signing.tempfile, "mkdtemp", lambda **kwargs: pytest.fail("unnecessary payload repack"))
+    assert resolve_pesign_nickname(name, arch, settings) is None
+    assert pesign_rpm_if_configured(rpm, settings) is False
+
+
+@pytest.mark.parametrize("name", ["kernel-core", "kernel-debug-core", "kernel-uki-virt", "kernel-debug-uki-dtbloader"])
+def test_kernel_efi_payload_still_requires_signing(name):
+    settings = Settings(pesign_rules_json=OREON_LIKE_RULES, pesign_nss_dir="/etc/pki/pesign")
+    assert resolve_pesign_nickname(name, "aarch64", settings) == "oreonsecureboot501"

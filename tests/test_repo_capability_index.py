@@ -365,7 +365,7 @@ def test_multi_arch_merge_requires_capability_on_every_arch() -> None:
     assert merged.satisfies_requirement("x86-only") is False
     assert merged.satisfies_requirement("aarch-only") is False
     # present on aarch only in this fixture's binary_names intersection sense:
-    # x86 listed it in provides but not binary_names consistently — force the real case
+    # x86 listed it in provides but not binary_names consistently --- force the real case
     x862 = RepoCapabilityIndex(
         binary_names={"common"},
         provides={"common"},
