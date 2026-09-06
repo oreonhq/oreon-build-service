@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Request, status
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 from sqlalchemy.orm import selectinload
 
 from oreon_build.api.deps import CurrentAdmin, DbSession
@@ -7,6 +7,10 @@ from oreon_build.api.schemas import AccountCreate, AccountResponse, AccountUpdat
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
 from oreon_build.core.security import hash_password
 from oreon_build.models import Account, Role, RoleName
+from oreon_build.models import (
+    AuditLog, BuildJob, LayerPlan, Promotion, SideTag, SideTagMember,
+    CveMatch, SecurityAdvisory, ReleaseMonitorScan,
+)
 
 router = APIRouter(prefix="/accounts", tags=["accounts"])
 
@@ -139,6 +143,18 @@ async def delete_account(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Account not found")
     if account.id == admin.id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot delete self")
+    # Preserve build/security history while removing references to the login.
+    # Memberships are permissions and must disappear with the account.
+    await db.execute(delete(SideTagMember).where(SideTagMember.account_id == account_id))
+    for column in (
+        AuditLog.account_id, BuildJob.triggered_by_id, LayerPlan.triggered_by_id,
+        Promotion.promoted_by_id, SideTag.owner_account_id,
+        CveMatch.handled_by_account_id, SecurityAdvisory.handled_by_account_id,
+        SecurityAdvisory.created_by_account_id, ReleaseMonitorScan.created_by_account_id,
+    ):
+        await db.execute(
+            update(column.class_).where(column == account_id).values({column: None})
+        )
     await db.delete(account)
     await log_audit(
         db,
