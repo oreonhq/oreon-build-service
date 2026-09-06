@@ -107,7 +107,7 @@
             ids.forEach(function(id) {
               var sid = String(id);
               var tr = tbody.querySelector('tr[data-id="' + sid + '"]');
-              var st = tr ? (tr.getAttribute('data-status') || '') : '';
+              var st = tr ? (tr.getAttribute('data-status') || '')  : '-';
               if (st === 'pending' || st === 'queued' || st === 'running') return;
               if (isBuildJobRetried(sid)) { sawAlreadyRetried = true; return; }
               chain = chain.then(function() {
@@ -126,7 +126,7 @@
             var chain = Promise.resolve();
             ids.forEach(function(id) {
               var tr = tbody.querySelector('tr[data-id="' + id + '"]');
-              var st = tr ? (tr.getAttribute('data-status') || '') : '';
+              var st = tr ? (tr.getAttribute('data-status') || '')  : '-';
               if (st !== 'pending' && st !== 'queued' && st !== 'running') return;
               chain = chain.then(function() { return api.post('/builds/jobs/' + id + '/cancel'); });
             });
@@ -139,7 +139,7 @@
       function render() {
         var offset = buildsPage * buildsPageSize;
         var bf = document.getElementById('builds-filter');
-        var bq = (bf && bf.value) ? String(bf.value).trim() : '';
+        var bq = (bf && bf.value) ? String(bf.value).trim()  : '-';
         var buildsUrl = '/builds?limit=' + buildsPageSize + '&offset=' + offset;
         if (bq) buildsUrl += '&search=' + encodeURIComponent(bq);
         api.get(buildsUrl).then(function(data) {
@@ -150,7 +150,7 @@
           tbody.innerHTML = jobs.map(function(j) {
             const canAct = api.token;
             var cancelBtn = (canAct && (j.status === 'pending' || j.status === 'queued' || j.status === 'running'))
-              ? ' <button type="button" class="btn cancel-build" data-id="' + j.id + '">Cancel</button>' : '';
+              ? ' <button type="button" class="btn cancel-build" data-id="' + j.id + '">Cancel</button>'  : '';
             var retryEligible = canAct && j.status !== 'pending' && j.status !== 'queued' && j.status !== 'running';
             var retryUsed = retryEligible && isBuildJobRetried(j.id);
             var retryBtn = '';
@@ -159,22 +159,22 @@
                 ? ' <button type="button" class="btn retry" data-id="' + j.id + '" disabled title="Reload the page to retry again">Retried</button>'
                 : ' <button type="button" class="btn retry" data-id="' + j.id + '">Retry</button>';
             }
-            var arch = (j.architecture != null && j.architecture !== '') ? j.architecture : '—';
+            var arch = (j.architecture != null && j.architecture !== '') ? j.architecture  : '-';
             var sd = window.oreonJobDisplayStatus ? window.oreonJobDisplayStatus(j) : String(j.status || '');
-            var signCell = window.oreonSigningKeyHtml ? window.oreonSigningKeyHtml(j.signing_status) : '—';
+            var signCell = window.oreonSigningKeyHtml ? window.oreonSigningKeyHtml(j.signing_status)  : '-';
             var pkg = escapeHtml(j.package_name || '') + (j.package_id != null ? ' <span style="color:var(--text-muted)">(' + j.package_id + ')</span>' : '');
             var rel = escapeHtml(j.release_name || '') + (j.release_id != null ? ' <span style="color:var(--text-muted)">(' + j.release_id + ')</span>' : '');
-            var sideTag = '—';
+            var sideTag = '-';
             if (j.side_tag_id != null) {
               sideTag = '<a href="/side-tag.html?id=' + j.side_tag_id + '">' + escapeHtml(j.side_tag_name || ('#' + j.side_tag_id)) + '</a>';
             } else if (j.branch) {
               sideTag = '<span style="color:var(--text-muted)">' + escapeHtml(j.branch) + '</span>';
             }
-            var layerPart = '—';
+            var layerPart = '-';
             if (j.layer_plan_id != null && j.layer_plan_id !== undefined) {
               var layerIdStr = String(j.layer_plan_id);
               var idxNote = (j.layer_index != null && j.layer_index !== undefined)
-                ? ' <span style="color:var(--text-muted); font-size:0.85em">(L' + j.layer_index + ')</span>' : '';
+                ? ' <span style="color:var(--text-muted); font-size:0.85em">(L' + j.layer_index + ')</span>'  : '-';
               if (j.side_tag_id != null) {
                 layerPart = '<a href="/side-tag.html?id=' + j.side_tag_id + '&layer_plan_id=' + layerIdStr + '">' + layerIdStr + '</a>' + idxNote;
               } else {
