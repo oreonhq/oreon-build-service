@@ -66,7 +66,7 @@
       function fillReleases(sel, withAll) {
         return api.get('/releases?limit=500&active_only=true').then(function(r) {
           var items = (r && r.items) ? r.items : [];
-          var html = withAll ? '<option value="">All releases</option>' : '';
+          var html = withAll ? '<option value="">All releases</option>'  : '-';
           html += items.map(function(x) {
             return '<option value="' + x.id + '">' + escapeHtml(x.releasename || ('#' + x.id)) + '</option>';
           }).join('');
@@ -101,7 +101,7 @@
             return '<tr>' +
               '<td><a href="/side-tag.html?id=' + t.id + '">' + escapeHtml(t.name) + '</a></td>' +
               '<td>' + escapeHtml(t.releasename || ('#' + t.release_id)) + '</td>' +
-              '<td>' + escapeHtml(t.owner_username || '—') + '</td>' +
+              '<td>' + escapeHtml(t.owner_username || '-') + '</td>' +
               '<td><span class="' + chip + '">' + escapeHtml(st) + '</span></td>' +
               '<td>' + (t.last_activity_at || '').toString().slice(0, 19) + '</td>' +
               '<td>' + acts + '</td>' +
