@@ -384,9 +384,9 @@ def _read_inprogress_mock_build_log_snippet(
             pass
         if len(data) > max_bytes:
             data = data[-max_bytes:]
-            head = f"## build.log (newest, tail only) — {rel}\n\n[truncated first bytes]\n\n"
+            head = f"## build.log (newest, tail only) - {rel}\n\n[truncated first bytes]\n\n"
         else:
-            head = f"## build.log (newest) — {rel}\n\n"
+            head = f"## build.log (newest) - {rel}\n\n"
         chunks.append(head + data.decode("utf-8", errors="replace"))
 
     root_logs = list({p.resolve(): p for p in root_logs}.values())
@@ -796,6 +796,25 @@ def _upload_rpm_via_presigned_r2(
     size_bytes = rpm_path.stat().st_size
     digest = _rpm_file_sha256(rpm_path)
 
+    # Preserve a signed artifact when a worker retries after losing the response.
+    def _existing_artifact() -> dict | None:
+        response = session.get(
+            f"{controller_url}/api/worker/upload-rpm/status/{attempt_id}",
+            params={"filename": fname},
+            timeout=httpx.Timeout(30.0, connect=10.0),
+        )
+        if response.status_code == 404:
+            return None  # Older controllers may not expose status.
+        response.raise_for_status()
+        meta = response.json()
+        if isinstance(meta, dict) and (meta.get("finalized") or meta.get("finalizing")):
+            return meta
+        return None
+
+    existing = _with_http_retries(f"rpm status attempt_id={attempt_id} {fname}", _existing_artifact)
+    if existing is not None and existing.get("finalized"):
+        return existing
+
     put_timeout = httpx.Timeout(7200.0, connect=120.0)
     complete_timeout = _rpm_complete_post_timeout()
     extra = _rpm_complete_extra_retries()
@@ -803,31 +822,32 @@ def _upload_rpm_via_presigned_r2(
     cycles = 4
     last_exc: BaseException | None = None
     for cycle in range(cycles):
-        def _presign() -> dict:
-            r = session.post(
-                f"{controller_url}/api/worker/upload-rpm/presign/{attempt_id}",
-                json={"filename": fname},
-                timeout=httpx.Timeout(120.0, connect=60.0),
+        if not (existing and existing.get("finalizing")):
+            def _presign() -> dict:
+                r = session.post(
+                    f"{controller_url}/api/worker/upload-rpm/presign/{attempt_id}",
+                    json={"filename": fname},
+                    timeout=httpx.Timeout(120.0, connect=60.0),
+                )
+                r.raise_for_status()
+                return r.json()
+
+            pres = _with_http_retries(
+                f"rpm presign attempt_id={attempt_id} {fname} cycle={cycle + 1}/{cycles}",
+                _presign,
             )
-            r.raise_for_status()
-            return r.json()
+            put_url = str(pres["put_url"])
+            hdrs = dict(pres.get("headers") or {})
 
-        pres = _with_http_retries(
-            f"rpm presign attempt_id={attempt_id} {fname} cycle={cycle + 1}/{cycles}",
-            _presign,
-        )
-        put_url = str(pres["put_url"])
-        hdrs = dict(pres.get("headers") or {})
+            def _put() -> None:
+                with rpm_path.open("rb") as fp:
+                    pr = session.put(put_url, headers=hdrs, content=fp, timeout=put_timeout)
+                pr.raise_for_status()
 
-        def _put() -> None:
-            with rpm_path.open("rb") as fp:
-                pr = session.put(put_url, headers=hdrs, content=fp, timeout=put_timeout)
-            pr.raise_for_status()
-
-        _with_http_retries(
-            f"rpm R2 PUT attempt_id={attempt_id} {fname} cycle={cycle + 1}/{cycles}",
-            _put,
-        )
+            _with_http_retries(
+                f"rpm R2 PUT attempt_id={attempt_id} {fname} cycle={cycle + 1}/{cycles}",
+                _put,
+            )
 
         saw_400 = False
         for ci in range(max_pass):
@@ -857,17 +877,37 @@ def _upload_rpm_via_presigned_r2(
                 return None
 
             def _complete() -> dict:
-                r = session.post(
-                    f"{controller_url}/api/worker/upload-rpm/complete/{attempt_id}",
-                    json={
-                        "filename": fname,
-                        "checksum_sha256": digest,
-                        "size_bytes": size_bytes,
-                    },
-                    timeout=complete_timeout,
+                # A proxy timeout does not cancel controller signing. Keep polling
+                # and retry only completion, never overwrite its object with a new PUT.
+                deadline = time.monotonic() + _env_float(
+                    "OREON_WORKER_RPM_UPLOAD_OUTAGE_WINDOW_SEC",
+                    12 * 60 * 60, min_v=60.0, max_v=7 * 24 * 60 * 60,
                 )
-                r.raise_for_status()
-                return r.json()
+                while time.monotonic() < deadline:
+                    try:
+                        r = session.post(
+                            f"{controller_url}/api/worker/upload-rpm/complete/{attempt_id}",
+                            headers={"Prefer": "respond-async"},
+                            json={
+                                "filename": fname,
+                                "checksum_sha256": digest,
+                                "size_bytes": size_bytes,
+                            },
+                            timeout=complete_timeout,
+                        )
+                        r.raise_for_status()
+                        if r.status_code != 202:
+                            return r.json()
+                    except Exception as exc:
+                        if not _is_transient_http_error(exc):
+                            raise
+                        logger.warning("RPM finalization pending for %s: %s", fname, exc)
+                    recovered = _probe_complete_status(
+                        wait_s=min(30.0, max(0.0, deadline - time.monotonic()))
+                    )
+                    if recovered is not None:
+                        return recovered
+                raise RuntimeError(f"RPM finalization deadline exceeded for {fname}")
 
             try:
                 return _with_http_retries(
@@ -962,6 +1002,43 @@ def _upload_rpm_to_controller(
             )
             return _upload_rpm_via_presigned_r2(session, controller_url, attempt_id, rpm_path)
         raise
+
+
+def _upload_rpm_to_controller_resilient(
+    session: httpx.Client,
+    controller_url: str,
+    attempt_id: int,
+    rpm_path: Path,
+) -> dict:
+    """Keep a completed RPM staged while the controller is temporarily unavailable."""
+    outage_window = _env_float(
+        "OREON_WORKER_RPM_UPLOAD_OUTAGE_WINDOW_SEC",
+        12 * 60 * 60,
+        min_v=60.0,
+        max_v=7 * 24 * 60 * 60,
+    )
+    deadline = time.monotonic() + outage_window
+    retry_no = 0
+    while True:
+        try:
+            return _upload_rpm_to_controller(
+                session, controller_url, attempt_id, rpm_path
+            )
+        except Exception as exc:
+            if not _is_transient_http_error(exc) or time.monotonic() >= deadline:
+                raise
+            retry_no += 1
+            delay = min(15.0 * (1.5 ** min(retry_no - 1, 6)), 120.0)
+            logger.warning(
+                "RPM upload paused for transient controller outage: attempt_id=%s "
+                "file=%s retry=%s sleep=%.1fs error=%s",
+                attempt_id,
+                rpm_path.name,
+                retry_no,
+                delay,
+                exc,
+            )
+            _sleep_with_jitter(delay)
 
 def _truthy_env(name: str) -> bool:
     v = (os.environ.get(name) or "").strip().lower()
@@ -1540,7 +1617,7 @@ def _mock_stage_log_sections(
 
     if cancelled:
         if wrapper_clean:
-            sections.append(f"## {stage_title} — cancelled\n{wrapper_clean}")
+            sections.append(f"## {stage_title} - cancelled\n{wrapper_clean}")
         return sections
 
     if not mock_rc_ok:
@@ -1549,10 +1626,10 @@ def _mock_stage_log_sections(
             root_tail = _sanitize_mock_output(root_raw) if root_raw else ""
             if root_tail:
                 sections.append(
-                    f"## {stage_title} — setup failed before rpmbuild (root.log tail)\n{root_tail}"
+                    f"## {stage_title} - setup failed before rpmbuild (root.log tail)\n{root_tail}"
                 )
         if wrapper_clean:
-            sections.append(f"## {stage_title} — mock\n{wrapper_clean}")
+            sections.append(f"## {stage_title} - mock\n{wrapper_clean}")
     elif not build_txt and wrapper_clean:
         sections.append(f"## {stage_title}\n{wrapper_clean}")
 
@@ -1728,7 +1805,7 @@ def _copy_local_spec_sources_listed_by_spectool(spec_path: Path, staging_dir: Pa
             return False, f"copy failed for {rel}: {e}"
 
     shown = copied[:8]
-    suffix = " …" if len(copied) > 8 else ""
+    suffix = " ..." if len(copied) > 8 else ""
     parts = [f"Local Source/Patch: {len(copied)} file(s){(': ' + ', '.join(shown) + suffix) if copied else ''}"]
     if missing:
         parts.append("missing local files: " + ", ".join(missing[:30]))
@@ -3014,7 +3091,9 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                         )
                         return
                     try:
-                        meta = _upload_rpm_to_controller(session, controller_url, attempt_id, staged)
+                        meta = _upload_rpm_to_controller_resilient(
+                            session, controller_url, attempt_id, staged
+                        )
                     except OSError as pe:
                         if isinstance(pe, FileNotFoundError):
                             err_msg = f"RPM disappeared during upload ({fname}): {pe}"
