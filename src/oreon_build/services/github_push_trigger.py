@@ -346,7 +346,7 @@ async def apply_github_push(
                 packages = narrowed
             else:
                 logger.warning(
-                    "GitHub push repo=%s changed_paths=%s names=%s — none registered in Oreon, no builds triggered "
+                    "GitHub push repo=%s changed_paths=%s names=%s --- none registered in Oreon, no builds triggered "
                     "(register the package via DistGit trigger first, then future pushes will auto-build it)",
                     fn or "?",
                     len(changed_paths),

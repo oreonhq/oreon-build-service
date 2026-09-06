@@ -51,7 +51,8 @@ def _norm_arch(a: str) -> str:
 
 _EM_AARCH64 = 183
 _PESIGN_PAYLOADLESS_KERNEL_RE = re.compile(
-    r"^(?:kernel$|kernel(?:-cross)?-(?:headers|devel|debug-devel|doc)(?:$|-))",
+    r"^(?:kernel(?:-debug)?$|kernel(?:-cross)?-(?:headers|devel|debug-devel|doc)(?:$|-)"
+    r"|kernel(?:-debug)?-(?:debuginfo|debugsource|modules|tools)(?:$|-))",
     re.IGNORECASE,
 )
 
@@ -183,9 +184,9 @@ def _parse_pesign_rules(settings: PesignConfig) -> list[dict[str, str]]:
 def resolve_pesign_nickname(package_name: str, arch: str, settings: PesignConfig) -> Optional[str]:
     if not settings.pesign_nss_dir:
         return None
-    # These kernel subpackages contain headers/metadata, not EFI executables or
-    # loadable kernel modules. A broad ^kernel.* policy must not force an RPM
-    # payload repack for them.
+    # These kernel subpackages contain metadata, debug symbols, tools, or
+    # modules, not EFI executables. Modules are signed during the build.
+    # Repacking multi-GiB debuginfo here wastes disk and hours of CPU time.
     if _PESIGN_PAYLOADLESS_KERNEL_RE.match((package_name or "").strip()):
         return None
     flags = re.IGNORECASE | re.DOTALL
@@ -294,7 +295,9 @@ def pesign_rpm_if_configured(rpm_path: Path, settings: Optional[PesignConfig] = 
                 raise PesignRepackError(msg) from None
             return False
 
-    tmp_root = tempfile.mkdtemp(prefix="oreon-pesign-")
+    tmp_root = tempfile.mkdtemp(
+        prefix="oreon-pesign-", dir=os.environ.get("OREON_RPM_TMPDIR") or "/var/tmp"
+    )
     script_path = Path(tmp_root) / "pesign-tree.sh"
     setarch_wrapper = Path(tmp_root) / "setarch"
     cross_rpmrc = Path(tmp_root) / "rpmrc"
@@ -316,6 +319,7 @@ def pesign_rpm_if_configured(rpm_path: Path, settings: Optional[PesignConfig] = 
         if s.pesign_token:
             env["PESIGN_TOKEN"] = s.pesign_token
         env["RPMREBUILD_TMPDIR"] = str(rb_tmp)
+        env["TMPDIR"] = str(tmp_root)
         env["RPM_BUILD_ARCH"] = pkg_arch
         real_setarch = shutil.which("setarch") or "/usr/bin/setarch"
         real_rpm = shutil.which("rpm") or "/usr/bin/rpm"

@@ -36,7 +36,7 @@ async def reconcile_queue_inconsistencies(
 
     Returns (workers_fixed, jobs_fixed, attempts_fixed, chain_terminal_jobs)
     where chain_terminal_jobs is a list of (build_job_id, reason) for jobs
-    that were marked terminal and belong to a chain — so the caller can fire
+    that were marked terminal and belong to a chain --- so the caller can fire
     chain callbacks after the DB commit.
     """
     now = datetime.now(timezone.utc)

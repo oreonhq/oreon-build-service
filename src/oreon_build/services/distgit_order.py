@@ -23,7 +23,7 @@ from urllib.parse import urlparse
 import httpx
 
 try:
-    from specfile import Specfile  # noqa: F401 — optional, used for deep parse
+    from specfile import Specfile  # noqa: F401 --- optional, used for deep parse
 except ImportError:
     Specfile = None  # type: ignore[assignment, misc]
 
@@ -848,10 +848,10 @@ def _python_dist_provides_from_package_name(pkg: str) -> set[str]:
 def _rust_crate_name_from_package(pkg: str, version: str | None = None) -> str | None:
     """Map rust2rpm source dir to crate name.
 
-    rust-itertools0.13 + Version 0.13.0 → itertools
-    rust-nom7 + Version 7.1.3 → nom
-    rust-sha1 + Version 0.10.1 → sha1 (digit crate name, no false strip)
-    rust-serde_json → serde_json
+    rust-itertools0.13 + Version 0.13.0 - itertools
+    rust-nom7 + Version 7.1.3 - nom
+    rust-sha1 + Version 0.10.1 - sha1 (digit crate name, no false strip)
+    rust-serde_json - serde_json
     """
     n = (pkg or "").strip()
     if not n.startswith("rust-") or len(n) <= 5:
@@ -900,7 +900,7 @@ def _rust_crate_name_from_package(pkg: str, version: str | None = None) -> str |
 def _crate_provides_from_package_name(
     pkg: str, *, version: str | None = None
 ) -> set[str]:
-    """rust-foo_bar / rust-foo0.13 (rust2rpm) → crate(foo_bar) / crate(foo)."""
+    """rust-foo_bar / rust-foo0.13 (rust2rpm) - crate(foo_bar) / crate(foo)."""
     crate = _rust_crate_name_from_package(pkg, version=version)
     if not crate:
         return set()
