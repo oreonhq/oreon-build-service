@@ -367,7 +367,7 @@ def _gating_bconds_from_expr(expr: str) -> set[str]:
             out.add(f"with_{with_name}")
         if without_name:
             out.add(f"with_{without_name}")
-    # only simple feature toggles like %if 0%{?hal:1} — not complex !0%{?bootstrap} && ...
+    # only simple feature toggles like %if 0%{?hal:1} --- not complex !0%{?bootstrap} && ...
     simple = (expr or "").strip()
     m = re.fullmatch(
         r"0?\s*%\{\?([A-Za-z0-9_]+)(?::1)?\}\s*",
