@@ -465,20 +465,28 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
     release = rel_result.scalar_one_or_none()
     if release:
         releasename = release.releasename
+    force_distgit = job.rpmbuild_plan_id is not None or job.layer_plan_id is not None
     if job.package_version_id:
-        src_result = await db.execute(
-            select(Source).where(Source.package_version_id == job.package_version_id)
-        )
+        source_query = select(Source).where(Source.package_version_id == job.package_version_id)
+        if force_distgit:
+            source_query = source_query.where(Source.kind == "distgit")
+        src_result = await db.execute(source_query)
         for src in src_result.scalars().all():
             sources.append({"kind": src.kind, "r2_key": src.r2_key, "url": src.url})
     elif job.package_id:
         from oreon_build.models import PackageVersion as PV
 
-        src_result = await db.execute(
+        source_query = (
             select(Source)
             .join(PV, Source.package_version_id == PV.id)
             .where(PV.package_id == job.package_id)
         )
+        # Chain jobs intentionally have no pinned package_version_id. Do not
+        # expose historical uploaded SRPMs to the worker; they can otherwise
+        # mask the current DistGit source during resume.
+        if force_distgit:
+            source_query = source_query.where(Source.kind == "distgit")
+        src_result = await db.execute(source_query.order_by(PV.id.desc(), Source.id.desc()))
         for src in src_result.scalars().all():
             sources.append({"kind": src.kind, "r2_key": src.r2_key, "url": src.url})
     if job.target_id:
