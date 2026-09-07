@@ -2036,6 +2036,73 @@ def _mock_rebuild_srpm(
     return rc == 0, out, False
 
 
+def _rpm_query_value(rpm_path: Path, query_format: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["rpm", "-qp", "--qf", query_format, str(rpm_path)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    value = (result.stdout or "").strip()
+    return value or None
+
+
+def _is_kernel_srpm(srpm_path: Path) -> bool:
+    name = _rpm_query_value(srpm_path, "%{NAME}")
+    return bool(name and re.fullmatch(r"kernel(?:-.*)?", name, flags=re.IGNORECASE))
+
+
+def _kernel_module_vermagic_errors(rpm_path: Path) -> list[str]:
+    name = _rpm_query_value(rpm_path, "%{NAME}")
+    if not name or not re.fullmatch(r"kernel(?:-.*)?", name, flags=re.IGNORECASE):
+        return []
+    expected = _rpm_query_value(rpm_path, "%{VERSION}-%{RELEASE}.%{ARCH}")
+    if not expected:
+        return [f"could not determine kernel release from {rpm_path.name}"]
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="oreon-kernel-vermagic-") as raw:
+            root = Path(raw)
+            archive = subprocess.run(
+                ["rpm2cpio", str(rpm_path)], capture_output=True, timeout=300, check=False
+            )
+            if archive.returncode != 0:
+                return [f"rpm2cpio failed for {rpm_path.name}"]
+            unpack = subprocess.run(
+                ["cpio", "-idm", "--quiet"], input=archive.stdout, cwd=root,
+                capture_output=True, timeout=300, check=False,
+            )
+            if unpack.returncode != 0:
+                return [f"cpio extraction failed for {rpm_path.name}"]
+            modules = sorted(root.glob("usr/lib/modules/**/*.ko*"))
+            errors: list[str] = []
+            for module in modules:
+                try:
+                    info = subprocess.run(
+                        ["modinfo", "-F", "vermagic", str(module)], capture_output=True,
+                        text=True, timeout=60, check=False,
+                    )
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    return [f"modinfo failed for {module.name}: {exc}"]
+                vermagic = (info.stdout or "").strip()
+                if info.returncode != 0 or not vermagic:
+                    errors.append(f"{module.name}: unreadable vermagic")
+                elif not vermagic.startswith(expected):
+                    errors.append(f"{module.name}: vermagic {vermagic!r}, expected {expected!r}")
+                if len(errors) >= 20:
+                    errors.append("additional mismatched modules omitted")
+                    break
+            return errors
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return [f"could not inspect kernel modules in {rpm_path.name}: {exc}"]
+
+
 def _mock_resolve_timeout_sec() -> int:
     raw = os.environ.get(
         "OREON_WORKER_MOCK_RESOLVE_TIMEOUT_SEC", str(_MOCK_STAGE_TIMEOUT_DEFAULT_SEC)
@@ -2815,7 +2882,6 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                 mock_config=mock_config,
                 mock_unique_ext=mock_unique_ext,
             )
-            keep_root = False
             try:
                 resolve_ok = False
                 resolve_out = ""
@@ -2835,9 +2901,8 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                             live_out=resolve_live,
                             rpmbuild_defines=rpmbuild_defines,
                             prefer_arch=build_arch,
-                            no_clean=keep_root or round_i > 0,
+                            no_clean=False,
                         )
-                        keep_root = True
                         if resolve_ok or resolve_cancelled or not resolve_missing:
                             break
                         if round_i < 2:
@@ -2892,6 +2957,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
 
             result_dir = tmp / "result"
             result_dir.mkdir()
+            kernel_build = _is_kernel_srpm(srpm_path)
             live_rebuild_stop = threading.Event()
             rebuild_live = MockLiveOutput()
 
@@ -2922,7 +2988,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                     live_out=rebuild_live,
                     rpmbuild_defines=rpmbuild_defines,
                     prefer_arch=build_arch,
-                    no_clean=True,
+                    no_clean=False,
                 )
             finally:
                 _stop_live_build_log_snapshot_thread(live_rebuild_stop, live_rebuild_thread)
@@ -2972,6 +3038,34 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                     },
                 )
                 return
+            if kernel_build:
+                vermagic_errors: list[str] = []
+                for candidate in sorted(result_dir.rglob("kernel*.rpm")):
+                    if candidate.name.endswith(".src.rpm"):
+                        continue
+                    vermagic_errors.extend(_kernel_module_vermagic_errors(candidate))
+                if vermagic_errors:
+                    msg = (
+                        "Kernel module vermagic validation failed; refusing to publish a boot-unsafe "
+                        "kernel RPM:\n" + "\n".join(vermagic_errors)
+                    )
+                    build_log_parts.append("## Kernel validation\n" + msg)
+                    full_log = "\n\n".join([p for p in build_log_parts if p]).strip() + "\n"
+                    log_key = _upload_build_log_via_controller(
+                        session, controller_url, attempt_id, full_log.encode("utf-8")
+                    )
+                    _post_worker_build_result(
+                        session,
+                        controller_url,
+                        attempt_id,
+                        {
+                            "status": "failed",
+                            "log_r2_key": log_key,
+                            "error_message": msg,
+                            "artifacts": [],
+                        },
+                    )
+                    return
             try:
                 _post_mock_complete(session, controller_url, attempt_id)
             except Exception:

@@ -122,6 +122,7 @@ def test_cross_arch_pesign_uses_host_tools_without_qemu_root(monkeypatch, tmp_pa
     monkeypatch.setattr(signing, "_rpm_query", lambda *a: "kernel-core\naarch64")
     monkeypatch.setattr(signing.platform, "machine", lambda: "x86_64")
     monkeypatch.setattr(signing.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setenv("OREON_RPM_TMPDIR", str(tmp_path))
     calls = []
     monkeypatch.setattr(
         signing.subprocess,
