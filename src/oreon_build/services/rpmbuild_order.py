@@ -25,6 +25,7 @@ from oreon_build.models import (
     Worker,
 )
 from oreon_build.services.layer_plan import distgit_new_package_dict
+from oreon_build.core.repo_branch import release_distgit_branch
 from oreon_build.services.build_target_util import (
     get_or_create_build_target,
     has_successful_build_for_target,
@@ -101,6 +102,29 @@ async def _get_or_create_distgit_package(
     ex = await db.execute(select(Package).where(Package.name == package_name))
     pkg = ex.scalar_one_or_none()
     if pkg is not None:
+        # Reused packages must follow the current chain inputs. Previously
+        # this early return left an old DistGit URL/source association in place.
+        pv_id = await latest_package_version_id(db, pkg.id)
+        if pv_id is not None:
+            want = distgit_new_package_dict(
+                package_name,
+                releasename,
+                distgit_url=distgit_url,
+                distgit_branch=distgit_branch,
+                preferred_mock_environment_id=preferred_mock_environment_id,
+            )["source_url"]
+            src_r = await db.execute(
+                select(Source).where(
+                    Source.package_version_id == pv_id,
+                    Source.kind == "distgit",
+                ).limit(1)
+            )
+            src = src_r.scalar_one_or_none()
+            if src is None:
+                db.add(Source(package_version_id=pv_id, kind="distgit", url=want))
+            else:
+                src.url = want
+            await db.flush()
         return pkg, pkg.preferred_mock_environment_id
 
     npd = distgit_new_package_dict(
@@ -269,7 +293,7 @@ async def create_manual_chain_plan(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Mock environment does not belong to release")
 
     durl = (distgit_url or _default_distgit_url()).strip()
-    dbranch = (distgit_branch or "main").strip()
+    dbranch = (distgit_branch or release_distgit_branch(release)).strip()
     flat = [name for group in layers for name in group]
     plan = RpmbuildPlan(
         release_id=release.id,

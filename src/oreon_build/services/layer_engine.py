@@ -79,7 +79,7 @@ def _arch_config(config_name: str, arch: str) -> str:
 
 
 async def probe_job_target(job: BuildJob, releasename: str, side_tag_repo_path: str) -> str:
-    """Route a Phase-1 job by querying real repository metadata with libsolv."""
+    """Route bridge jobs; keep purification jobs strictly on native repositories."""
     options = job_options_dict(job)
     arch = normalize_machine_arch(str(options.get("architecture") or "x86_64"))
     branch = os.path.basename(os.path.normpath(side_tag_repo_path)) or str(job.branch or "dev")
@@ -109,7 +109,8 @@ async def probe_job_target(job: BuildJob, releasename: str, side_tag_repo_path: 
 
     missing = sorted(native.missing_provides or ())
     fallback_config = str(options.get("fallback_mock_config") or "").strip()
-    if not fallback_config:
+    if not fallback_config or getattr(job, "build_phase", None) == PHASE2_NATIVE:
+        job.target_mock_config = str(options.get("native_mock_config") or f"oreon-11-{arch}")
         job.status = BuildStatus.BLOCKED
         job.blocked_reason = "waiting on repository: " + ", ".join(missing)
         return str(options.get("native_mock_config") or f"oreon-11-{arch}")

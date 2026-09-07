@@ -411,7 +411,10 @@ async def on_layer_resolve_failed(
     job.job_options = opts
     fallback_config = str(opts.get("fallback_mock_config") or "").strip()
     native_config = str(opts.get("native_mock_config") or "").strip()
-    if fallback_config and str(job.target_mock_config or "") == native_config:
+    native_only = getattr(job, "build_phase", None) == "phase2_native"
+    if native_only and native_config:
+        job.target_mock_config = native_config
+    if not native_only and fallback_config and str(job.target_mock_config or "") == native_config:
         job.target_mock_config = fallback_config
         job.status = BuildStatus.QUEUED
         job.blocked_reason = (
@@ -616,8 +619,16 @@ async def resume_layer_plan_by_user(
             ),
         )
     from oreon_build.services.build_pass import job_options_dict
+    from oreon_build.services.build_target_util import latest_package_version_id
 
     for job in reopen:
+        # A layer resume reuses the BuildJob row, but its source may have
+        # advanced since the original attempt (for example a bumped spec
+        # release). Refresh the pinned package version before reopening it;
+        # otherwise the worker receives the old SRPM/source association.
+        current_version_id = await latest_package_version_id(db, int(job.package_id))
+        if current_version_id is not None:
+            job.package_version_id = current_version_id
         job.status = BuildStatus.BLOCKED
         job.completed_at = None
         job.blocked_reason = "waiting on repository"

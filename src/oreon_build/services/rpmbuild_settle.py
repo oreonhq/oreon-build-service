@@ -72,7 +72,28 @@ async def resume_chain_plan_by_user(db: Any, request: Any, user: Any, chain_plan
     reopen = [j for j in jobs if j.status in (BuildStatus.FAILED, BuildStatus.CANCELLED, BuildStatus.BLOCKED)]
     if not reopen:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No failed or cancelled jobs in the current chain group")
+    from oreon_build.services.build_target_util import latest_package_version_id
+    from oreon_build.models import PackageVersion, Source
+
     for job in reopen:
+        # Chain resume reuses the existing job row. Refresh its pinned source
+        # version so a spec release bump is picked up by the next attempt.
+        current_version_id = await latest_package_version_id(db, int(job.package_id))
+        if current_version_id is not None:
+            job.package_version_id = current_version_id
+        # Keep the package's DistGit source aligned with this chain's inputs.
+        # Existing packages may retain a source URL from an older chain.
+        if plan.distgit_url and plan.distgit_branch:
+            rows = await db.execute(
+                select(Source)
+                .join(PackageVersion, Source.package_version_id == PackageVersion.id)
+                .where(PackageVersion.package_id == job.package_id, Source.kind == "distgit")
+            )
+            for src in rows.scalars().all():
+                old = (src.url or "").strip()
+                path = old.split(":", 1)[1] if "#" in old and ":" in old.split("#", 1)[1] else ""
+                if path:
+                    src.url = f"{plan.distgit_url.rstrip('/')}#{plan.distgit_branch}:{path}"
         job.status = BuildStatus.PENDING
         job.completed_at = None
         job.blocked_reason = None
