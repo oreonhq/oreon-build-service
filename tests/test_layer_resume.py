@@ -226,3 +226,57 @@ def test_on_package_published_keeps_bootstrap_handoff_pending():
     opts = job_options_dict(published_job)
     assert opts["build_profile"] == "full"
     assert opts["repo_published"] is True
+
+
+def test_native_builddep_failure_waits_instead_of_repeating_fallback(monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock
+    from oreon_build.services import layer_plan
+
+    job = BuildJob(
+        id=1, package_id=1, release_id=1, layer_plan_id=1275,
+        status=BuildStatus.FAILED, build_phase="phase2_native",
+        target_mock_config="oreon-11-rp1-aarch64",
+        job_options={"native_mock_config": "oreon-11-rp1-aarch64", "fallback_mock_config": "fedora-44-aarch64"},
+    )
+    db = AsyncMock()
+    db.get.return_value = SimpleNamespace(id=1275, status=LayerPlanStatus.RUNNING)
+    monkeypatch.setattr(layer_plan, "maybe_settle_layer_plan", AsyncMock())
+    asyncio.run(layer_plan.on_layer_resolve_failed(db, job, "missing dependencies", missing_provides=["qt6-devel"]))
+    assert job.status == BuildStatus.BLOCKED
+    assert job.target_mock_config == "oreon-11-rp1-aarch64"
+    assert "qt6-devel" in job.blocked_reason
+
+
+def test_resume_preserves_success_after_earlier_failed_attempt(monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock
+    from oreon_build.services import layer_plan, retry_eligibility
+    from oreon_build.models import BuildAttempt
+
+    plan = SimpleNamespace(id=1275, status=LayerPlanStatus.FAILED, plan_options={})
+    succeeded = BuildJob(id=1, package_id=1, release_id=1, status=BuildStatus.SUCCESS)
+    succeeded.attempts = [
+        BuildAttempt(id=12, build_job_id=1, attempt_number=2, status=BuildStatus.SUCCESS),
+        BuildAttempt(id=11, build_job_id=1, attempt_number=1, status=BuildStatus.FAILED),
+    ]
+    failed = BuildJob(id=2, package_id=2, release_id=1, status=BuildStatus.FAILED)
+
+    class Rows:
+        def __init__(self, values): self.values = values
+        def scalar_one_or_none(self): return self.values[0]
+        def scalars(self): return self
+        def all(self): return self.values
+
+    db = AsyncMock()
+    db.execute.side_effect = [Rows([plan]), Rows([succeeded, failed]), Rows([]), Rows([])]
+    eligibility = AsyncMock(return_value=(True, None))
+    monkeypatch.setattr(retry_eligibility, "source_failure_can_retry", eligibility)
+    monkeypatch.setattr(layer_plan, "log_audit", AsyncMock())
+    monkeypatch.setattr(layer_plan, "get_client_ip", lambda request: None)
+    monkeypatch.setattr(layer_plan, "get_user_agent", lambda request: None)
+    _, reopened = asyncio.run(layer_plan.resume_layer_plan_by_user(db, None, SimpleNamespace(id=1), layer_plan_id=1275))
+    assert reopened == [2]
+    assert succeeded.status == BuildStatus.SUCCESS
+    assert failed.status == BuildStatus.BLOCKED
+    eligibility.assert_awaited_once_with(db, failed, None)

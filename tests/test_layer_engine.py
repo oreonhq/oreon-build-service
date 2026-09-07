@@ -92,3 +92,18 @@ def test_fallback_build_is_selected_for_native_purification():
     assert layer_engine._built_on_fallback(candidate)
     candidate.target_mock_config = "oreon-11-x86_64"
     assert not layer_engine._built_on_fallback(candidate)
+
+
+def test_native_purification_never_routes_back_to_fallback(monkeypatch):
+    monkeypatch.setattr(layer_engine, "get_repo_solver", lambda *a, **k: Solver(result(False, ["qt6-devel"])))
+    candidate = job()
+    candidate.build_phase = layer_engine.PHASE2_NATIVE
+    candidate.target_mock_config = "bootstrap-custom-x86_64"
+    target = asyncio.run(layer_engine.probe_job_target(candidate, "oreon-11-rp1", "side-tag"))
+    assert target == candidate.target_mock_config == "oreon-11-x86_64"
+    assert candidate.status == BuildStatus.BLOCKED
+    assert "qt6-devel" in candidate.blocked_reason
+    monkeypatch.setattr(layer_engine, "get_repo_solver", lambda *a, **k: Solver(result(True)))
+    asyncio.run(layer_engine.probe_job_target(candidate, "oreon-11-rp1", "side-tag"))
+    assert candidate.status == BuildStatus.QUEUED
+    assert candidate.target_mock_config == "oreon-11-x86_64"
