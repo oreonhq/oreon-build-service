@@ -1,4 +1,8 @@
-from oreon_build.services.rpmbuild_settle import _known_sources_from_primary, _resolve_primary_key
+from oreon_build.services.rpmbuild_settle import (
+    _known_sources_from_primary,
+    _resolve_primary_key,
+    rewrite_distgit_source_url,
+)
 
 
 def test_resolve_primary_key_from_repomd() -> None:
@@ -28,3 +32,27 @@ def test_known_sources_from_primary_xml() -> None:
 """
     out = _known_sources_from_primary(primary)
     assert "foo" in out
+
+
+def test_rewrite_distgit_source_url_keeps_spec_path() -> None:
+    repo = "https://github.com/oreonhq/rpm-specfiles.git"
+    old = f"{repo}#testing/post-beta:oreon-11-rp1/gstreamer1/gstreamer1.spec"
+    got = rewrite_distgit_source_url(old, repo, "testing/post-beta")
+    assert got == old
+
+
+def test_rewrite_distgit_source_url_does_not_split_https_scheme() -> None:
+    repo = "https://github.com/oreonhq/rpm-specfiles.git"
+    old = f"{repo}#testing/post-beta:oreon-11-rp1/gstreamer1/gstreamer1.spec"
+    got = rewrite_distgit_source_url(old, repo, "main")
+    assert got == f"{repo}#main:oreon-11-rp1/gstreamer1/gstreamer1.spec"
+
+
+def test_rewrite_distgit_source_url_repairs_already_doubled() -> None:
+    repo = "https://github.com/oreonhq/rpm-specfiles.git"
+    doubled = (
+        f"{repo}#testing/post-beta:"
+        f"{repo}#testing/post-beta:oreon-11-rp1/gstreamer1/gstreamer1.spec"
+    )
+    got = rewrite_distgit_source_url(doubled, repo, "testing/post-beta")
+    assert got == f"{repo}#testing/post-beta:oreon-11-rp1/gstreamer1/gstreamer1.spec"

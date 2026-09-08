@@ -20,6 +20,17 @@ from oreon_build.services.rpmbuild_order import enqueue_plan_layer_jobs
 logger = logging.getLogger(__name__)
 
 
+def rewrite_distgit_source_url(old: str, distgit_url: str, distgit_branch: str) -> str | None:
+    raw = (old or "").strip()
+    if not distgit_url or not distgit_branch:
+        return None
+    frag = raw.rsplit("#", 1)[-1] if "#" in raw else ""
+    path = frag.split(":", 1)[1].strip().lstrip("/") if ":" in frag else ""
+    if not path:
+        return None
+    return f"{distgit_url.rstrip('/')}#{distgit_branch}:{path}"
+
+
 async def _manual_chain_for_user(db: Any, user: Any, chain_plan_id: int) -> RpmbuildPlan:
     from fastapi import HTTPException, status
     from oreon_build.models import SideTag
@@ -90,10 +101,11 @@ async def resume_chain_plan_by_user(db: Any, request: Any, user: Any, chain_plan
                 .where(PackageVersion.package_id == job.package_id, Source.kind == "distgit")
             )
             for src in rows.scalars().all():
-                old = (src.url or "").strip()
-                path = old.split(":", 1)[1] if "#" in old and ":" in old.split("#", 1)[1] else ""
-                if path:
-                    src.url = f"{plan.distgit_url.rstrip('/')}#{plan.distgit_branch}:{path}"
+                rewritten = rewrite_distgit_source_url(
+                    src.url or "", plan.distgit_url, plan.distgit_branch
+                )
+                if rewritten:
+                    src.url = rewritten
         job.status = BuildStatus.PENDING
         job.completed_at = None
         job.blocked_reason = None
