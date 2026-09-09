@@ -2114,10 +2114,44 @@ def _mock_resolve_timeout_sec() -> int:
     return max(_MOCK_STAGE_TIMEOUT_MIN_SEC, min(v, _MOCK_STAGE_TIMEOUT_MAX_SEC))
 
 
-def _missing_provides_from_mock(result_dir: Path, wrapper_out: str) -> list[str]:
-    from oreon_build.core.dnf_missing import parse_dnf_missing_provides
+def _srpm_requires(path: Path) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
 
-    return parse_dnf_missing_provides(wrapper_out or "")
+    def _keep(raw: str) -> None:
+        br = (raw or "").strip()
+        if br.startswith("R "):
+            br = br[2:].strip()
+        if not br or br.lower().startswith("rpmlib(") or br in seen:
+            return
+        seen.add(br)
+        names.append(br)
+
+    try:
+        import rpm
+
+        ts = rpm.TransactionSet()
+        try:
+            ts.setVSFlags(rpm._RPMVSF_NOSIGNATURES)
+        except Exception:
+            pass
+        fdno = os.open(str(path), os.O_RDONLY)
+        try:
+            hdr = ts.hdrFromFdno(fdno)
+            for dep in rpm.ds(hdr, "requires"):
+                _keep((dep.DNEVR() or "").strip())
+        finally:
+            os.close(fdno)
+        if names:
+            return names
+    except Exception:
+        logger.debug("rpm header requires failed for %s", path, exc_info=True)
+    rc, out = _run(["rpm", "-qp", "--requires", str(path)], timeout_s=30)
+    if rc != 0:
+        return names
+    for line in (out or "").splitlines():
+        _keep(line)
+    return names
 
 
 def _mock_installdeps_srpm(
@@ -2133,7 +2167,7 @@ def _mock_installdeps_srpm(
     rpmbuild_defines: dict | None = None,
     prefer_arch: str | None = None,
     no_clean: bool = False,
-) -> tuple[bool, str, bool, list[str]]:
+) -> tuple[bool, str, bool]:
     eff_mock_config = _mock_config_for_mixed_addrepos(
         mock_config,
         addrepo_baseurls or [],
@@ -2154,10 +2188,9 @@ def _mock_installdeps_srpm(
     rc, out = _run_with_abort(
         cmd, timeout_s=_mock_resolve_timeout_sec(), abort_event=abort_event, live_out=live_out
     )
-    missing = _missing_provides_from_mock(result_dir, out)
     if rc == _RC_MOCK_CANCELLED:
-        return False, out, True, missing
-    return rc == 0, out, False, missing
+        return False, out, True
+    return rc == 0, out, False
 
 
 def _rpm_stub_provide_line(cap: str) -> str | None:
@@ -2883,30 +2916,20 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                 mock_unique_ext=mock_unique_ext,
             )
             try:
-                resolve_ok = False
-                resolve_out = ""
-                resolve_cancelled = False
-                resolve_missing = []
-                if not resolve_cancelled:
-                    for round_i in range(3):
-                        resolve_ok, resolve_out, resolve_cancelled, resolve_missing = _mock_installdeps_srpm(
-                            mock_config=mock_config,
-                            srpm_path=srpm_path,
-                            result_dir=resolve_dir,
-                            abort_event=abort_event,
-                            mock_unique_ext=mock_unique_ext,
-                            addrepo_baseurls=mock_addrepos,
-                            rpm_dist=rpm_dist,
-                            attempt_id=attempt_id,
-                            live_out=resolve_live,
-                            rpmbuild_defines=rpmbuild_defines,
-                            prefer_arch=build_arch,
-                            no_clean=False,
-                        )
-                        if resolve_ok or resolve_cancelled or not resolve_missing:
-                            break
-                        if round_i < 2:
-                            time.sleep(5)
+                resolve_ok, resolve_out, resolve_cancelled = _mock_installdeps_srpm(
+                    mock_config=mock_config,
+                    srpm_path=srpm_path,
+                    result_dir=resolve_dir,
+                    abort_event=abort_event,
+                    mock_unique_ext=mock_unique_ext,
+                    addrepo_baseurls=mock_addrepos,
+                    rpm_dist=rpm_dist,
+                    attempt_id=attempt_id,
+                    live_out=resolve_live,
+                    rpmbuild_defines=rpmbuild_defines,
+                    prefer_arch=build_arch,
+                    no_clean=False,
+                )
             finally:
                 _stop_live_build_log_snapshot_thread(live_resolve_stop, live_resolve_thread)
             _make_mock_resultdir_world_readable(resolve_dir)
@@ -2949,7 +2972,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                         "log_r2_key": log_key,
                         "error_message": (full_log if full_log else "mock --installdeps failed"),
                         "artifacts": [],
-                        "missing_provides": resolve_missing,
+                        "source_requirements": _srpm_requires(srpm_path),
                         "resolve_stage": "installdeps",
                     },
                 )
@@ -3019,7 +3042,6 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                 )
                 return
             if not ok:
-                rebuild_missing = _missing_provides_from_mock(result_dir, rebuild_out)
                 full_log = "\n\n".join([p for p in build_log_parts if p]).strip() + "\n"
                 log_key = _upload_build_log_via_controller(
                     session, controller_url, attempt_id, full_log.encode("utf-8")
@@ -3033,7 +3055,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                         "log_r2_key": log_key,
                         "error_message": (full_log if full_log else "mock --rebuild failed"),
                         "artifacts": [],
-                        "missing_provides": rebuild_missing,
+                        "source_requirements": _srpm_requires(srpm_path),
                         "resolve_stage": "generate_buildrequires",
                     },
                 )
