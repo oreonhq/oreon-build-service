@@ -15,15 +15,9 @@ from oreon_build.api.schemas import (
     BuildJobResponse,
     BuildTrigger,
     BuildTriggerAccepted,
-    CILayerTrigger,
-    CILayerTriggerResponse,
     ChainBuildTrigger,
     ChainPlanStatusResponse,
-    LayerBuildTrigger,
-    LayerBuildTriggerResponse,
     LayerJobRow,
-    LayerPlanStatusResponse,
-    LayerPlanSummary,
     CurrentFailureItem,
     DistgitBatchTrigger,
     PaginatedResponse,
@@ -33,7 +27,7 @@ from oreon_build.api.schemas import (
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
 from oreon_build.core.machine_arch import normalize_machine_arch
 from oreon_build.core.repo_branch import r2_publish_branch
-from oreon_build.models import BuildAttempt, LayerPlan, LayerPlanStatus, BuildJob, BuildStatus, BuildTarget, Package, Release, RpmbuildPlan, Worker
+from oreon_build.models import BuildAttempt, BuildJob, BuildStatus, BuildTarget, Package, Release, RpmbuildPlan, Worker
 from oreon_build.services.build_target_util import (
     get_or_create_build_target,
     has_successful_build_for_target,
@@ -159,11 +153,10 @@ def _build_job_search_clause(search_trim: str):
 @router.get("/current-failures", response_model=list[CurrentFailureItem])
 async def list_current_failures(
     db: DbSession,
-    layer_plan_only: bool = Query(False, description="Only jobs that were part of a layer plan"),
 ):
     from oreon_build.services.current_build_failures import fetch_current_failure_rows
 
-    rows = await fetch_current_failure_rows(db, layer_plan_only=layer_plan_only)
+    rows = await fetch_current_failure_rows(db)
     out: list[CurrentFailureItem] = []
     for row in rows:
         job = row.job
@@ -381,263 +374,6 @@ async def trigger_distgit_batch(
         message="DistGit batch accepted. Packages are being queued in the background.",
         package_count=len(data.packages),
     )
-
-
-@router.post("/layer-trigger", response_model=LayerBuildTriggerResponse, status_code=status.HTTP_202_ACCEPTED)
-async def trigger_layer_build_endpoint(
-    data: LayerBuildTrigger,
-    request: Request,
-    db: DbSession,
-    user: CurrentUser,
-):
-    from oreon_build.services.build_trigger_bg import run_layer_seed, spawn
-    from oreon_build.services.layer_engine import create_pending_layer_plan
-
-    roots = [str(p).strip() for p in data.packages if str(p).strip()]
-    if not roots:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No packages given")
-
-    plan = await create_pending_layer_plan(
-        db,
-        request,
-        user,
-        root_packages=roots,
-        release_id=int(data.release_id),
-        side_tag_id=int(data.side_tag_id),
-        architectures=list(data.architectures or ["x86_64", "aarch64"]),
-        preferred_mock_environment_id=data.preferred_mock_environment_id,
-        distgit_url=data.distgit_url,
-        distgit_branch=data.distgit_branch,
-        priority=int(data.priority or 0),
-    )
-    await db.commit()
-    spawn(run_layer_seed(plan.id))
-    return LayerBuildTriggerResponse(
-        layer_plan_id=plan.id,
-        layer_plan_status=plan.status.value,
-        root_packages=roots,
-        jobs=[],
-        message=(
-            f"Layer {plan.id} accepted. Dependency seeding is running in the background "
-            "and jobs will appear as soon as it's done."
-        ),
-    )
-
-
-@router.post("/ci-layer-trigger", response_model=CILayerTriggerResponse, status_code=status.HTTP_202_ACCEPTED)
-async def ci_layer_trigger_endpoint(
-    data: CILayerTrigger,
-    request: Request,
-    db: DbSession,
-    user: CurrentUser,
-):
-    from oreon_build.core.repo_branch import release_distgit_branch
-    from oreon_build.services.build_trigger_bg import run_layer_seed, spawn
-    from oreon_build.services.layer_engine import create_pending_layer_plan
-
-    rel_result = await db.execute(select(Release).where(Release.id == data.release_id))
-    release = rel_result.scalar_one_or_none()
-    if not release:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Release not found")
-
-    distgit_url = data.distgit_url or "https://github.com/oreonhq/rpm-specfiles.git"
-    distgit_branch = (data.distgit_branch or release_distgit_branch(release)).strip()
-    architectures = list(data.architectures or ["x86_64", "aarch64"])
-    root_packages = [str(p).strip() for p in data.packages if str(p).strip()]
-    release_id = int(data.release_id)
-    priority = int(data.priority or 0)
-
-    if not root_packages:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No packages provided")
-
-    from oreon_build.models import SideTagCreatedFrom
-    from oreon_build.services.side_tags import ensure_side_tag
-
-    if data.side_tag_id is not None:
-        side_tag_id = int(data.side_tag_id)
-    else:
-        tag = await ensure_side_tag(
-            db,
-            release_id=release_id,
-            name=distgit_branch,
-            owner_account_id=user.id,
-            created_from=SideTagCreatedFrom.GITHUB_PR,
-        )
-        side_tag_id = tag.id
-
-    plan = await create_pending_layer_plan(
-        db,
-        request,
-        user,
-        root_packages=root_packages,
-        release_id=release_id,
-        side_tag_id=side_tag_id,
-        architectures=architectures,
-        preferred_mock_environment_id=None,
-        distgit_url=distgit_url,
-        distgit_branch=distgit_branch,
-        priority=priority,
-    )
-    await db.commit()
-    spawn(run_layer_seed(plan.id))
-    return CILayerTriggerResponse(
-        layer_plan_id=plan.id,
-        layer_plan_status=plan.status.value,
-        root_packages=root_packages,
-        accepted=True,
-        message=f"CI layer {plan.id} accepted. Seeding dependencies in the background.",
-    )
-
-
-@router.get("/layer", response_model=list[LayerPlanSummary])
-async def list_layer_plans(
-    db: DbSession,
-    release_id: int | None = Query(None),
-    limit: int = Query(50, ge=1, le=200),
-):
-    from oreon_build.models import SideTag
-
-    stmt = select(LayerPlan).order_by(LayerPlan.id.desc()).limit(limit)
-    if release_id is not None:
-        stmt = stmt.where(LayerPlan.release_id == release_id)
-    plans = list((await db.execute(stmt)).scalars().all())
-    if not plans:
-        return []
-    plan_ids = [p.id for p in plans]
-    counts_r = await db.execute(
-        select(BuildJob.layer_plan_id, BuildJob.status, func.count(BuildJob.id))
-        .where(BuildJob.layer_plan_id.in_(plan_ids))
-        .group_by(BuildJob.layer_plan_id, BuildJob.status)
-    )
-    counts_by_plan: dict[int, dict[str, int]] = {}
-    for pid, st, n in counts_r.all():
-        counts_by_plan.setdefault(int(pid), {})[st.value] = int(n)
-
-    release_ids = {p.release_id for p in plans}
-    releases_r = await db.execute(select(Release).where(Release.id.in_(release_ids)))
-    releases_by_id = {r.id: r for r in releases_r.scalars().all()}
-    side_tag_ids = {p.side_tag_id for p in plans if p.side_tag_id}
-    side_tags_by_id = {}
-    if side_tag_ids:
-        st_r = await db.execute(select(SideTag).where(SideTag.id.in_(side_tag_ids)))
-        side_tags_by_id = {t.id: t for t in st_r.scalars().all()}
-
-    out = []
-    for p in plans:
-        rel = releases_by_id.get(p.release_id)
-        tag = side_tags_by_id.get(p.side_tag_id) if p.side_tag_id else None
-        out.append(
-            LayerPlanSummary(
-                layer_plan_id=p.id,
-                status=p.status.value,
-                root_packages=list(p.root_packages or []),
-                releasename=(rel.releasename if rel else None),
-                side_tag_name=(tag.name if tag else None),
-                counts=counts_by_plan.get(p.id, {}),
-                created_at=p.created_at,
-                updated_at=p.updated_at,
-            )
-        )
-    return out
-
-
-async def _layer_plan_to_status_response(db: DbSession, plan) -> LayerPlanStatusResponse:
-    expired = sa_inspect(plan).expired_attributes
-    if expired:
-        await db.refresh(plan)
-    rel = await db.get(Release, plan.release_id)
-    from oreon_build.models import SideTag
-    from sqlalchemy import func
-
-    counts_r = await db.execute(
-        select(BuildJob.status, func.count(BuildJob.id))
-        .where(BuildJob.layer_plan_id == plan.id)
-        .group_by(BuildJob.status)
-    )
-    counts: dict[str, int] = {st.value: int(n) for st, n in counts_r.all()}
-
-    rows: list[LayerJobRow] = []
-    if plan.status in (LayerPlanStatus.FAILED, LayerPlanStatus.CANCELLED, LayerPlanStatus.SUCCESS):
-        jobs_r = await db.execute(
-            select(BuildJob)
-            .options(selectinload(BuildJob.package), selectinload(BuildJob.build_target))
-            .where(
-                BuildJob.layer_plan_id == plan.id,
-                BuildJob.status == BuildStatus.FAILED,
-            )
-            .order_by(BuildJob.layer_index.asc().nulls_last(), BuildJob.id.asc())
-            .limit(50)
-        )
-        jobs = list(jobs_r.scalars().all())
-        rows = [
-            LayerJobRow(
-                job_id=j.id,
-                package_name=j.package.name if j.package else "?",
-                status=j.status.value,
-                layer_index=j.layer_index,
-                blocked_reason=None,
-                architecture=j.build_target.architecture if j.build_target else None,
-                blocked_on=[],
-            )
-            for j in jobs
-        ]
-
-    side_tag = await db.get(SideTag, plan.side_tag_id) if plan.side_tag_id else None
-    return LayerPlanStatusResponse(
-        layer_plan_id=plan.id,
-        status=plan.status.value,
-        root_packages=list(plan.root_packages or []),
-        jobs=rows,
-        counts=counts,
-        error_message=plan.error_message,
-        releasename=(rel.releasename if rel else None),
-        side_tag_name=(side_tag.name if side_tag else None),
-        created_at=plan.created_at,
-        updated_at=plan.updated_at,
-    )
-
-
-@router.get("/layer/{layer_plan_id}/status", response_model=LayerPlanStatusResponse)
-async def get_layer_plan_status(layer_plan_id: int, db: DbSession):
-    plan = await db.get(LayerPlan, layer_plan_id)
-    if not plan:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Layer plan not found")
-    return await _layer_plan_to_status_response(db, plan)
-
-
-@router.post("/layer/{layer_plan_id}/cancel", response_model=LayerPlanStatusResponse)
-async def cancel_layer_build_endpoint(
-    layer_plan_id: int,
-    request: Request,
-    db: DbSession,
-    user: CurrentUser,
-):
-    from oreon_build.services.layer_plan import cancel_layer_plan_by_user
-
-    plan = await cancel_layer_plan_by_user(db, request, user, layer_plan_id=layer_plan_id)
-    await db.commit()
-    await db.refresh(plan)
-    return await _layer_plan_to_status_response(db, plan)
-
-
-@router.post("/layer/{layer_plan_id}/resume", response_model=LayerPlanStatusResponse)
-async def resume_layer_build_endpoint(
-    layer_plan_id: int,
-    request: Request,
-    db: DbSession,
-    user: CurrentUser,
-):
-    from oreon_build.services.build_trigger_bg import schedule_layer_resume_refresh
-    from oreon_build.services.layer_plan import resume_layer_plan_by_user
-
-    plan, reopen_ids = await resume_layer_plan_by_user(
-        db, request, user, layer_plan_id=layer_plan_id
-    )
-    await db.commit()
-    await db.refresh(plan)
-    response = await _layer_plan_to_status_response(db, plan)
-    schedule_layer_resume_refresh(int(plan.id), reopen_ids)
-    return response
 
 
 @router.post("/mass-rebuild/run", response_model=dict)
@@ -1146,41 +882,25 @@ async def retry_build(
             )
             target_arch = t_result.scalars().one_or_none()
         if target_arch:
-            preferred_env_id = pkg.preferred_mock_environment_id
-            if preferred_env_id is not None:
-                from oreon_build.models import MockEnvironment
-
-                me_result = await db.execute(
-                    select(MockEnvironment.id).where(
-                        MockEnvironment.id == preferred_env_id,
-                        MockEnvironment.release_id == job.release_id,
-                    )
+            mock_id = None
+            if job.target_id:
+                t_row = await db.execute(
+                    select(BuildTarget.mock_environment_id).where(BuildTarget.id == job.target_id)
                 )
-                if me_result.scalar_one_or_none() is None:
-                    preferred_env_id = None
+                mock_id = t_row.scalar_one_or_none()
+            if mock_id is None:
+                from oreon_build.services.build_target_util import pick_mock_environment_id_for_release
+
+                mock_id = await pick_mock_environment_id_for_release(db, job.release_id)
             target = await get_or_create_build_target(
                 db,
                 job.release_id,
                 normalize_machine_arch(target_arch),
-                preferred_env_id,
+                mock_id,
             )
             job.target_id = target.id
     job.status = BuildStatus.PENDING
     job.completed_at = None
-    if job.layer_plan_id is not None:
-        job.status = BuildStatus.BLOCKED
-        job.blocked_reason = "waiting on repository"
-        job.blocking_sources = []
-        job.error_message = None
-        plan = await db.get(LayerPlan, job.layer_plan_id)
-        if plan is not None and plan.status in (LayerPlanStatus.FAILED, LayerPlanStatus.CANCELLED):
-            plan.status = LayerPlanStatus.RUNNING
-            plan.error_message = None
-        from oreon_build.services.build_trigger_bg import schedule_layer_resume_refresh
-
-        resume_plan_id = int(job.layer_plan_id)
-    else:
-        resume_plan_id = None
     await log_audit(
         db,
         "build.retry",
@@ -1192,8 +912,6 @@ async def retry_build(
         details=retry_detail or "",
     )
     await db.commit()
-    if resume_plan_id is not None:
-        schedule_layer_resume_refresh(resume_plan_id, [int(job.id)])
     payload = await _job_to_response(db, job)
     return JSONResponse(status_code=200, content=payload.model_dump(mode="json"))
 
@@ -1249,11 +967,5 @@ async def cancel_build(
         ip_address=get_client_ip(request),
         user_agent=get_user_agent(request),
     )
-    from oreon_build.services.layer_plan import on_user_cancelled_layer_job
-
-    try:
-        await on_user_cancelled_layer_job(db, job)
-    except Exception:
-        logger.exception("layer cancel side effect job_id=%s", job_id)
     payload = await _job_to_response(db, job)
     return JSONResponse(status_code=200, content=payload.model_dump(mode="json"))
