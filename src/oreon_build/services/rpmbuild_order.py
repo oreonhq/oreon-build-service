@@ -24,18 +24,43 @@ from oreon_build.models import (
     Source,
     Worker,
 )
-from oreon_build.services.layer_plan import distgit_new_package_dict
+from oreon_build.services.distgit_order import compute_distgit_build_order, db_safe_spec_evr
 from oreon_build.core.repo_branch import release_distgit_branch
 from oreon_build.services.build_target_util import (
     get_or_create_build_target,
     has_successful_build_for_target,
     latest_package_version_id,
 )
-from oreon_build.services.distgit_order import compute_distgit_build_order
 
 logger = logging.getLogger(__name__)
 
 _CHAIN_PACKAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+_.-]*$")
+
+
+def distgit_new_package_dict(
+    pkg: str,
+    releasename: str,
+    *,
+    distgit_url: str,
+    distgit_branch: str,
+    preferred_mock_environment_id: int | None,
+    spec_version: str | None = None,
+) -> dict[str, Any]:
+    spec_rel = f"{releasename}/{pkg}/{pkg}.spec"
+    url = f"{distgit_url.rstrip('/')}#{distgit_branch}:{spec_rel}"
+    return {
+        "name": pkg,
+        "description": None,
+        "preferred_mock_environment_id": preferred_mock_environment_id,
+        "github_repository_id": None,
+        "github_html_url": "https://github.com/oreonhq/rpm-specfiles",
+        "source_type": "distgit",
+        "source_url": url,
+        "source_urls": None,
+        "source_branch": distgit_branch,
+        "source_path": spec_rel,
+        "version": db_safe_spec_evr((spec_version or "0.0.1").strip() or "0.0.1"),
+    }
 
 
 def parse_manual_chain(chain: str) -> list[list[str]]:
@@ -79,15 +104,11 @@ def _default_distgit_url() -> str:
 
 
 async def _resolve_mock_for_pkg(db: Any, release_id: int, preferred_mock_environment_id: int | None) -> int | None:
-    if preferred_mock_environment_id is not None:
-        me = await db.get(MockEnvironment, int(preferred_mock_environment_id))
-        if me is not None and me.release_id == release_id:
-            return int(preferred_mock_environment_id)
-    fb = await db.execute(
-        select(MockEnvironment).where(MockEnvironment.release_id == release_id).order_by(MockEnvironment.id.asc()).limit(1)
+    from oreon_build.services.build_target_util import pick_mock_environment_id_for_release
+
+    return await pick_mock_environment_id_for_release(
+        db, release_id, preferred_id=preferred_mock_environment_id
     )
-    one = fb.scalar_one_or_none()
-    return int(one.id) if one is not None else None
 
 
 async def _get_or_create_distgit_package(
@@ -192,7 +213,7 @@ async def enqueue_plan_layer_jobs(
     layer_pkgs = [str(x) for x in layers[layer_index] if str(x).strip()]
     plan_not_before = _plan_skip_jobs_not_before(plan)
     for pkg_name in layer_pkgs:
-        pkg, pref = await _get_or_create_distgit_package(
+        pkg, _pref = await _get_or_create_distgit_package(
             db,
             releasename=plan.releasename,
             package_name=pkg_name,
@@ -205,7 +226,7 @@ async def enqueue_plan_layer_jobs(
             m_id = await _resolve_mock_for_pkg(
                 db,
                 release.id,
-                preferred_mock_environment_id if preferred_mock_environment_id is not None else pref,
+                preferred_mock_environment_id,
             )
             target = await get_or_create_build_target(db, release.id, canon, m_id)
             pv_id = await latest_package_version_id(db, pkg.id)
@@ -432,7 +453,7 @@ async def create_rpmbuild_plan(
     for pkg_name in clean_seed:
         if layer_map[pkg_name] != start_layer:
             continue
-        pkg, pref = await _get_or_create_distgit_package(
+        pkg, _pref = await _get_or_create_distgit_package(
             db,
             releasename=releasename,
             package_name=pkg_name,
@@ -445,7 +466,7 @@ async def create_rpmbuild_plan(
                 db,
                 release.id,
                 normalize_machine_arch(arch),
-                await _resolve_mock_for_pkg(db, release.id, pref),
+                await _resolve_mock_for_pkg(db, release.id, None),
             )
             pv_id = await latest_package_version_id(db, pkg.id)
             if await has_successful_build_for_target(

@@ -693,12 +693,6 @@ def get_repo_solver(
             sol.close()
         except Exception:
             pass
-        try:
-            from oreon_build.services.layer_engine import clear_reactive_solver_cache
-
-            clear_reactive_solver_cache()
-        except Exception:
-            pass
     multi.warm()
     return multi
 

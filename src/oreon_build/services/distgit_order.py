@@ -911,6 +911,7 @@ def _crate_provides_from_package_name(
 class DistgitProvidesIndex:
     package_names: frozenset[str]
     capability_providers: dict[str, frozenset[str]]
+    source_requires: dict[str, tuple[str, ...]] = field(default_factory=dict)
     _indexed: dict[str, set[str]] | None = field(default=None, repr=False, compare=False)
 
     def indexed_providers(self) -> dict[str, set[str]]:
@@ -932,7 +933,7 @@ _PROVIDES_INDEX_CACHE: dict[tuple[str, str, str, str, str], tuple[float, Distgit
 _provides_index_tasks: dict[tuple[str, str, str, str, str], asyncio.Task[DistgitProvidesIndex | None]] = {}
 _PACKAGE_NAMES_CACHE: dict[tuple[str, str, str, str], tuple[float, frozenset[str]]] = {}
 _PACKAGE_NAMES_CACHE_TTL_SEC = 1800.0
-_PROVIDES_INDEX_DISK_VERSION = "v16"
+_PROVIDES_INDEX_DISK_VERSION = "v17"
 
 
 def _so_file_provides(libstem: str) -> set[str]:
@@ -1143,9 +1144,26 @@ def _lightweight_provides_from_spec_text(pkg: str, spec_text: str) -> set[str]:
         provided.update(_python_dist_provides_from_package_name(name))
     return provided
 
+
+def _lightweight_brs_from_spec_text(pkg: str, spec_text: str) -> tuple[str, ...]:
+    macros = dict(default_distro_macros(""))
+    bcond = parse_spec_bconds(spec_text, distro_macros=macros)
+    defines = {k: str(v) for k, v in bcond.defaults.items()}
+    out: list[str] = []
+    seen: set[str] = set()
+    for tok in sorted(active_build_brs(bcond, defines)):
+        cap = str(tok or "").strip()
+        if not cap or "%" in cap or cap in seen:
+            continue
+        seen.add(cap)
+        out.append(cap)
+    return tuple(out)
+
+
 def _build_provides_index_from_tarball_sync(tarball: bytes, releasename: str) -> DistgitProvidesIndex:
     """One sequential gzip pass. Dont seek extractfile per package (that re-decompresses forever)."""
     provider_map: dict[str, set[str]] = {}
+    requires_map: dict[str, tuple[str, ...]] = {}
     names: set[str] = set()
     with tarfile.open(fileobj=io.BytesIO(tarball), mode="r|gz") as tf:
         for m in tf:
@@ -1165,9 +1183,13 @@ def _build_provides_index_from_tarball_sync(tarball: bytes, releasename: str) ->
             names.add(pkg)
             for cap in _lightweight_provides_from_spec_text(pkg, text):
                 provider_map.setdefault(cap, set()).add(pkg)
+            brs = _lightweight_brs_from_spec_text(pkg, text)
+            if brs:
+                requires_map[pkg] = brs
     return DistgitProvidesIndex(
         package_names=frozenset(names),
         capability_providers={k: frozenset(v) for k, v in provider_map.items()},
+        source_requires=requires_map,
     )
 
 
@@ -1188,8 +1210,14 @@ def _load_provides_index_disk(path: Path) -> DistgitProvidesIndex | None:
         return None
     pkgs = raw.get("package_names") or []
     caps = raw.get("capability_providers") or {}
+    reqs = raw.get("source_requires") or {}
     if not isinstance(pkgs, list) or not isinstance(caps, dict):
         return None
+    source_requires: dict[str, tuple[str, ...]] = {}
+    if isinstance(reqs, dict):
+        for k, v in reqs.items():
+            if isinstance(v, list) and v:
+                source_requires[str(k)] = tuple(str(x) for x in v if str(x).strip())
     return DistgitProvidesIndex(
         package_names=frozenset(str(p) for p in pkgs),
         capability_providers={
@@ -1197,6 +1225,7 @@ def _load_provides_index_disk(path: Path) -> DistgitProvidesIndex | None:
             for k, v in caps.items()
             if isinstance(v, list)
         },
+        source_requires=source_requires,
     )
 
 
@@ -1206,6 +1235,9 @@ def _store_provides_index_disk(path: Path, index: DistgitProvidesIndex) -> None:
         "package_names": sorted(index.package_names),
         "capability_providers": {
             k: sorted(v) for k, v in sorted(index.capability_providers.items())
+        },
+        "source_requires": {
+            k: list(v) for k, v in sorted(index.source_requires.items())
         },
     }
     tmp = path.with_suffix(".tmp")
@@ -1242,9 +1274,15 @@ def _build_provides_index_from_specs_sync(
     for pkg, text in specs_by_pkg.items():
         for cap in _lightweight_provides_from_spec_text(pkg, text):
             provider_map.setdefault(cap, set()).add(pkg)
+    requires_map: dict[str, tuple[str, ...]] = {}
+    for pkg, text in specs_by_pkg.items():
+        brs = _lightweight_brs_from_spec_text(pkg, text)
+        if brs:
+            requires_map[pkg] = brs
     return DistgitProvidesIndex(
         package_names=frozenset(specs_by_pkg),
         capability_providers={k: frozenset(v) for k, v in provider_map.items()},
+        source_requires=requires_map,
     )
 
 

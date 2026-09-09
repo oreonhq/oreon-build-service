@@ -2,12 +2,20 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Iterable
+from typing import Any, Iterable
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
-from oreon_build.models import BuildJob, BuildStatus, BuildTarget, MockEnvironment, Package, PackageVersion
+from oreon_build.models import (
+    BuildJob,
+    BuildStatus,
+    BuildTarget,
+    MockEnvironment,
+    Package,
+    PackageVersion,
+    Release,
+)
 
 
 def is_bootstrap_mock_environment(
@@ -41,12 +49,64 @@ def resolve_mock_environment_id(
     return None
 
 
+def choose_mock_environment_id(
+    *,
+    preferred_id: int | None,
+    release_id: int,
+    release_default_id: int | None,
+    environments: Iterable[Any],
+) -> int | None:
+    by_id: dict[int, Any] = {}
+    for me in environments:
+        if int(getattr(me, "release_id")) != int(release_id):
+            continue
+        by_id[int(me.id)] = me
+    if preferred_id is not None and int(preferred_id) in by_id:
+        return int(preferred_id)
+    if release_default_id is not None and int(release_default_id) in by_id:
+        return int(release_default_id)
+    native = [
+        me
+        for me in by_id.values()
+        if not is_bootstrap_mock_environment(
+            name=getattr(me, "name", None),
+            config_name=getattr(me, "config_name", None),
+        )
+    ]
+    if native:
+        native.sort(key=lambda m: int(m.id))
+        return int(native[0].id)
+    if by_id:
+        return int(min(by_id))
+    return None
+
+
+async def pick_mock_environment_id_for_release(
+    db,
+    release_id: int,
+    preferred_id: int | None = None,
+) -> int | None:
+    rel = await db.get(Release, release_id)
+    rows = list(
+        (
+            await db.execute(
+                select(MockEnvironment).where(MockEnvironment.release_id == release_id)
+            )
+        ).scalars().all()
+    )
+    return choose_mock_environment_id(
+        preferred_id=preferred_id,
+        release_id=release_id,
+        release_default_id=rel.default_mock_environment_id if rel is not None else None,
+        environments=rows,
+    )
+
+
 async def resolve_package_by_name(
     db,
     name: str,
     *,
     release_id: int | None = None,
-    layer_plan_ids: list[int] | None = None,
 ) -> Package | None:
     pkg_name = (name or "").strip()
     if not pkg_name:
@@ -61,14 +121,6 @@ async def resolve_package_by_name(
         return rows[0]
 
     prefer_ids: list[int] = []
-    if layer_plan_ids:
-        layer_r = await db.execute(
-            select(BuildJob.package_id)
-            .join(Package, Package.id == BuildJob.package_id)
-            .where(Package.name == pkg_name, BuildJob.layer_plan_id.in_(layer_plan_ids))
-            .order_by(BuildJob.id.desc())
-        )
-        prefer_ids.extend(int(x) for x in layer_r.scalars().all() if x is not None)
     if release_id is not None:
         rel_r = await db.execute(
             select(BuildJob.package_id)
@@ -98,15 +150,7 @@ async def get_or_create_build_target(
 ) -> BuildTarget:
     mock_env_id = mock_environment_id
     if mock_env_id is None:
-        fb = await db.execute(
-            select(MockEnvironment)
-            .where(MockEnvironment.release_id == release_id)
-            .order_by(MockEnvironment.id.asc())
-            .limit(1)
-        )
-        me = fb.scalar_one_or_none()
-        if me:
-            mock_env_id = me.id
+        mock_env_id = await pick_mock_environment_id_for_release(db, release_id)
 
     q = (
         select(BuildTarget)
