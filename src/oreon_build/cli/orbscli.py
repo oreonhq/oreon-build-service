@@ -272,6 +272,216 @@ def bump_spec_to_version(text: str, latest: str) -> tuple[str, str, str] | None:
         pre = pre.replace("v%s.x" % old_maj, "v%s.x" % new_maj)
     return pre + log, old, latest
 
+_RE_SPEC_SOURCE = re.compile(
+    r"(?im)^(?P<pre>\s*Source(?P<num>\d*)\s*:\s*)(?P<val>\S+)(?P<post>.*)$"
+)
+_RE_CUT_MACRO = re.compile(r"^%\(echo\s+(.*?)\s*\|\s*cut\s+-d\.\s+-f([\d,\-]+)\)$")
+_RE_NUMERIC_CONDITION = re.compile(r"^(-?\d+)\s*(>=|<=|>|<|==|!=)\s*(-?\d+)$")
+
+
+def _select_dot_fields(value: str, fields: str) -> str | None:
+    """Implement ``cut -d. -f`` field selection (1-based) for macro snippets."""
+    token = (value or "").strip().split()[0] if (value or "").strip() else ""
+    parts = token.split(".") if token else []
+    if not parts:
+        return None
+    selected: list[str] = []
+    for chunk in fields.split(","):
+        chunk = chunk.strip()
+        if "-" in chunk:
+            try:
+                start, end = (int(item) for item in chunk.split("-", 1))
+            except ValueError:
+                return None
+            selected.extend(parts[start - 1 : end])
+        else:
+            try:
+                selected.append(parts[int(chunk) - 1])
+            except (ValueError, IndexError):
+                return None
+    return ".".join(selected)
+
+
+def _eval_cut_macro(raw: str, values: dict[str, str]) -> str | None:
+    """Evaluate ``%(echo %{version} | cut -d. -f...)`` snippets offline."""
+    match = _RE_CUT_MACRO.match((raw or "").strip())
+    if match is None:
+        return None
+    inner = re.sub(
+        r"%\{([^}?]+)\}",
+        lambda item: values.get(item.group(1), item.group(0)),
+        match.group(1),
+    )
+    if "%{" in inner or "%(" in inner:
+        return None
+    return _select_dot_fields(inner, match.group(2))
+
+
+def _eval_numeric_condition(raw: str) -> bool | None:
+    """Evaluate a substituted ``%if`` numeric comparison, if possible."""
+    match = _RE_NUMERIC_CONDITION.match((raw or "").strip())
+    if match is None:
+        return None
+    left, operator, right = int(match.group(1)), match.group(2), int(match.group(3))
+    return {
+        ">=": left >= right,
+        "<=": left <= right,
+        ">": left > right,
+        "<": left < right,
+        "==": left == right,
+        "!=": left != right,
+    }[operator]
+
+
+def _collect_spec_macros(text: str, base: dict[str, str]) -> dict[str, str]:
+    """Collect ``%global``/``%define`` values honoring ``%if`` branches.
+
+    Plain scanning misses shell ``cut`` snippets (used by specs such as
+    ``kwin-x11`` for parts of ``Source0``) and takes the wrong side of
+    ``%if %{revision} >= 50`` blocks. Unknown conditions stay active so
+    behavior degrades to the old last-wins collection.
+    """
+    macros: dict[str, str] = {}
+    active: list[bool] = [True]
+
+    def substitute(raw: str) -> str:
+        for _ in range(10):
+            expanded = re.sub(
+                r"%\{([^}?]+)\}",
+                lambda item: {**base, **macros}.get(item.group(1), item.group(0)),
+                raw,
+            )
+            if expanded == raw:
+                break
+            raw = expanded
+        return raw
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("%if "):
+            decided = _eval_numeric_condition(substitute(stripped[4:]))
+            active.append(bool(decided) if decided is not None else True)
+        elif stripped == "%else":
+            if len(active) > 1:
+                active[-1] = not active[-1]
+        elif stripped == "%endif":
+            if len(active) > 1:
+                active.pop()
+        elif all(active) and re.match(r"^%(?:global|define)\s", stripped):
+            words = stripped.split(None, 2)
+            if len(words) != 3:
+                continue
+            evaluated = _eval_cut_macro(words[2], {**base, **macros})
+            macros[words[1]] = evaluated if evaluated is not None else substitute(words[2])
+    return macros
+
+
+def _spec_source_macros(text: str, version: str, name: str) -> dict[str, str]:
+    """Return macro values usable for expanding ``Source`` URLs."""
+    preamble, _ = _split_spec_changelog(text)
+    macros: dict[str, str] = {"version": version, "name": name}
+    url_match = re.search(r"(?im)^\s*URL\s*:\s*(\S+)", preamble)
+    if url_match is not None:
+        macros["url"] = url_match.group(1).strip()
+    macros.update(_collect_spec_macros(preamble, macros))
+    macros["version"] = version
+    macros["name"] = name
+    return macros
+
+
+def _expand_source_macros(raw: str, macros: dict[str, str]) -> str:
+    """Expand ``%{macro}`` tokens in a Source value with collected macros."""
+    expanded = raw
+    for _ in range(10):
+        nxt = re.sub(
+            r"%\{([^}?]+)\}",
+            lambda item: macros.get(item.group(1), item.group(0)),
+            expanded,
+        )
+        if nxt == expanded:
+            break
+        expanded = nxt
+    return expanded
+
+
+def _spec_http_sources(text: str, macros: dict[str, str]) -> list[tuple[str, str, str]]:
+    """Return ``(number, raw, expanded)`` for each remote HTTP(S) Source."""
+    preamble, _ = _split_spec_changelog(text)
+    out: list[tuple[str, str, str]] = []
+    for match in _RE_SPEC_SOURCE.finditer(preamble):
+        raw = match.group("val").strip()
+        if not raw.lower().startswith(("http://", "https://")):
+            continue
+        out.append((match.group("num") or "0", raw, _expand_source_macros(raw, macros)))
+    return out
+
+
+def _verify_source_url(client: "httpx.Client", url: str) -> bool:
+    """Return whether a Source URL is downloadable (HEAD, then ranged GET)."""
+    try:
+        response = client.head(url, follow_redirects=True)
+        if response.status_code < 400:
+            return True
+        if response.status_code not in (403, 405):
+            return False
+        with client.stream(
+            "GET", url, follow_redirects=True, headers={"Range": "bytes=0-0"}
+        ) as streamed:
+            return streamed.status_code < 400
+    except Exception:
+        return False
+
+
+def _fetch_source_sha256(client: "httpx.Client", url: str) -> str | None:
+    """Stream a Source URL and return its hex SHA-256 digest, if fetchable."""
+    import hashlib as _hashlib
+
+    try:
+        digest = _hashlib.sha256()
+        with client.stream("GET", url, follow_redirects=True) as response:
+            if response.status_code >= 400:
+                return None
+            for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+                if chunk:
+                    digest.update(chunk)
+        return digest.hexdigest()
+    except Exception:
+        return None
+
+
+def _macroize_url(raw_url: str, macros: dict[str, str], version: str) -> str:
+    """Turn a user-supplied raw URL into a macro-based Source template.
+
+    Known macro values (longest first) and the new version become
+    ``%{name}``-style tokens so the next update of the same layout keeps
+    working. Anything unrecognized stays literal.
+    """
+    url = (raw_url or "").strip()
+    if version and "%" not in version and version in url:
+        url = url.replace(version, "%{version}")
+    for macro_name, value in sorted(macros.items(), key=lambda item: -len(item[1] or "")):
+        if macro_name in ("version", "name") or len(value or "") < 3:
+            continue
+        if "%" in value or value not in url:
+            continue
+        url = url.replace(value, "%{" + macro_name + "}")
+    return url
+
+
+def _set_source_hash_guard(text: str, digest: str, number: str = "0") -> str:
+    """Keep exactly one ``sourceN_hash`` guard line for the fetched digest."""
+    macro = "source" + str(number or "0") + "_hash"
+    preamble, changelog = _split_spec_changelog(text)
+    body, _ = re.subn(
+        r"(?im)^[ \t]*%(?:global|define)\s+" + re.escape(macro) + r"(?:[ \t]+\S+)?.*\n?",
+        "",
+        preamble,
+    )
+    body = body.lstrip("\n")
+    guard = "%%global %s %s\n" % (macro, digest)
+    return (guard + "\n" + body if body else guard) + changelog
+
+
 def find_pkg_specs(root: Path, pkg: str) -> list[Path]:
     root = root.expanduser().resolve()
     direct = root / pkg / f"{pkg}.spec"
@@ -289,6 +499,180 @@ def find_pkg_specs(root: Path, pkg: str) -> list[Path]:
         if p.is_file():
             hits.append(p)
     return hits
+
+
+_RE_SPEC_NAME = re.compile(r"(?im)^Name\s*:\s*(\S+)")
+_RE_SPEC_BR = re.compile(r"(?im)^BuildRequires\s*:\s*(.+)$")
+
+
+def _spec_package_name(path: Path) -> str | None:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    match = _RE_SPEC_NAME.search(text)
+    name = match.group(1).strip() if match else path.stem
+    return name if "%" not in name else path.parent.name
+
+
+def _spec_buildrequires(path: Path) -> set[str]:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return set()
+    deps: set[str] = set()
+    for match in _RE_SPEC_BR.finditer(text):
+        value = re.sub(r"%\{[^}]*\}", "", match.group(1).split("#", 1)[0])
+        # Only the requirement atom matters; versions and prose after it must
+        # never become fake package dependencies.
+        atom = re.search(r"(?:cmake|pkgconfig)\([^)]*\)|[A-Za-z0-9][A-Za-z0-9+._-]*", value)
+        if not atom:
+            continue
+        token = atom.group(0)
+        cap = re.fullmatch(r"(?:cmake|pkgconfig)\(([^)]+)\)", token)
+        deps.add(cap.group(1) if cap else token)
+    return deps
+
+
+def _git_changed_spec_paths(repo_root: Path, spec_root: Path, pushed: bool) -> list[Path]:
+    import subprocess
+
+    if pushed:
+        commands = [("git", "diff", "--name-only", "origin/HEAD...HEAD", "--")]
+    else:
+        commands = [("git", "status", "--porcelain", "--")]
+    try:
+        proc = subprocess.run(
+            commands[0], cwd=repo_root, check=True, capture_output=True, text=True
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    names: list[str] = []
+    for line in proc.stdout.splitlines():
+        raw = line[3:] if not pushed and len(line) >= 3 else line
+        if pushed:
+            raw = line.strip()
+        if raw.endswith(".spec"):
+            names.append(raw)
+    out: list[Path] = []
+    for name in names:
+        path = (repo_root / name).resolve()
+        try:
+            path.relative_to(spec_root.resolve())
+        except ValueError:
+            continue
+        if path.is_file():
+            out.append(path)
+    return sorted(set(out))
+
+
+def _generate_chain(spec_root: Path, changed: list[Path]) -> tuple[str, bool, list[str], list[str]]:
+    # Resolve package directories lazily; recursively indexing the full Fedora
+    # tree makes this command appear hung before it can print anything.
+    by_name: dict[str, Path] = {}
+    for p in changed:
+        name = _spec_package_name(p)
+        if name:
+            by_name[name] = p
+
+    def locate(name: str) -> Path | None:
+        if name in by_name:
+            return by_name[name]
+        direct = spec_root / name / (name + ".spec")
+        if direct.is_file():
+            by_name[name] = direct
+            return direct
+        return None
+    selected = {_spec_package_name(p): p for p in changed if _spec_package_name(p)}
+    names = set(selected)
+    explicit_gcc = any(name in {"gcc", "gcc-c++"} for name in selected)
+    unresolved: set[str] = set()
+    ignored_toolchain = {"gcc", "gcc-c++", "gcc-g++", "cmake", "make", "pkgconfig", "pkgconf"}
+
+    def provider(dep: str) -> str | None:
+        if dep in ignored_toolchain:
+            return None
+        if locate(dep):
+            return dep
+        if dep.endswith("-devel") and locate(dep[:-6]):
+            return dep[:-6]
+        if dep.startswith("KF") or dep.startswith("KPim") or dep.startswith("Qt"):
+            guessed = _fastfix_config_provider_guess(dep)
+            if guessed and locate(guessed):
+                return guessed
+        return None
+
+    # A raw package list names roots, not a complete chain. Add every local
+    # provider reachable through BuildRequires so each Koji group is buildable.
+    pending = list(names)
+    while pending:
+        name = pending.pop()
+        path = locate(name)
+        if not path:
+            continue
+        for dep in _spec_buildrequires(path):
+            if dep in ignored_toolchain:
+                continue
+            resolved = provider(dep)
+            if resolved:
+                if resolved not in names:
+                    names.add(resolved)
+                    selected[resolved] = locate(resolved)  # type: ignore[assignment]
+            elif not (dep.startswith("KF") or dep.startswith("KPim") or dep.startswith("Qt")):
+                unresolved.add(dep)
+    # A compiler BuildRequires is present in nearly every native package and
+    # must not turn every ordinary chain into a whole-repo rebuild. The ABI
+    # expansion is reserved for an explicitly changed/requested GCC package.
+    gcc_hit = explicit_gcc
+    seen_deps: set[str] = set()
+    pending = list(selected)
+    while pending:
+        name = pending.pop()
+        if name in seen_deps:
+            continue
+        seen_deps.add(name)
+        path = by_name.get(name) or selected.get(name)
+        if not path:
+            continue
+        required = _spec_buildrequires(path)
+        pending.extend(
+            dep for dep in required
+            if dep in by_name and dep not in ignored_toolchain and dep not in seen_deps
+        )
+    deps: dict[str, set[str]] = {}
+    for name, path in selected.items():
+        edges: set[str] = set()
+        for dep in _spec_buildrequires(path):
+            resolved = provider(dep)
+            if resolved and resolved in names and resolved != name:
+                edges.add(resolved)
+            elif dep in names and dep != name:
+                edges.add(dep)
+        deps[name] = edges
+    if gcc_hit:
+        for path in spec_root.rglob("*.spec"):
+            if path.is_file():
+                pkg = _spec_package_name(path)
+                if pkg:
+                    by_name[pkg] = path
+        selected = by_name
+        names = set(selected)
+        deps = {}
+        for name, path in selected.items():
+            deps[name] = {
+                dep for dep in _spec_buildrequires(path)
+                if dep in names and dep != name
+            }
+    groups: list[list[str]] = []
+    remaining = set(names)
+    while remaining:
+        ready = sorted(name for name in remaining if not (deps.get(name, set()) & remaining))
+        if not ready:
+            ready = [sorted(remaining)[0]]
+        groups.append(ready)
+        remaining.difference_update(ready)
+    chain = " : ".join(" ".join(group) for group in groups)
+    return chain, gcc_hit, sorted(selected), sorted(unresolved)
 
 def _prompt_packages() -> list[str]:
     click.echo("packages")
@@ -500,7 +884,37 @@ def cmd_whoami() -> None:
     default=None,
     help="rpm-specfiles tree. Skip the directory prompt.",
 )
-def cmd_spec_bump(packages_blob: str | None, spec_root: Path | None) -> None:
+@click.option(
+    "--all",
+    "bump_all",
+    is_flag=True,
+    default=False,
+    help="Bump every package directory with a spec under --spec-root.",
+)
+@click.option(
+    "--verify-sources/--no-verify-sources",
+    default=True,
+    help="HEAD-check every remote Source URL after the version bump.",
+)
+@click.option(
+    "--refresh-hashes/--no-refresh-hashes",
+    default=True,
+    help="Download Source0 and refresh the source0_hash guard.",
+)
+@click.option(
+    "--non-interactive",
+    is_flag=True,
+    default=False,
+    help="Never prompt; unfixable sources fail instead of asking for a URL.",
+)
+def cmd_spec_bump(
+    packages_blob: str | None,
+    spec_root: Path | None,
+    bump_all: bool,
+    verify_sources: bool,
+    refresh_hashes: bool,
+    non_interactive: bool,
+) -> None:
     token = get_token()
     wd = get_watchdog_url()
     if packages_blob is None:
@@ -523,6 +937,15 @@ def cmd_spec_bump(packages_blob: str | None, spec_root: Path | None) -> None:
     if not root.is_dir():
         click.echo("not a directory  %s" % root, err=True)
         sys.exit(2)
+    if bump_all:
+        names = sorted(
+            child.name
+            for child in root.iterdir()
+            if child.is_dir() and list(child.glob("*.spec"))
+        )
+        if not names:
+            click.echo("no spec directories under %s" % root, err=True)
+            sys.exit(2)
 
     cached: dict[str, str] = {}
     rr = http_request_raw("GET", wd, "/api/release-monitoring/results", token=token, timeout=60.0)
@@ -579,6 +1002,86 @@ def cmd_spec_bump(packages_blob: str | None, spec_root: Path | None) -> None:
             click.echo("%s  %s -> %s but spec text unchanged" % (pkg, old, new), err=True)
             fail += 1
             continue
+        if verify_sources or refresh_hashes:
+            macros = _spec_source_macros(new_text, new, pkg)
+            pending = [
+                (number, raw, expanded)
+                for number, raw, expanded in _spec_http_sources(new_text, macros)
+                if "%{" in expanded or "%(" in expanded
+            ]
+            if pending:
+                for number, raw, expanded in pending:
+                    click.echo(
+                        "%s  Source%s has unexpandable macros: %s" % (pkg, number, raw),
+                        err=True,
+                    )
+                fail += 1
+                continue
+        source_failures: list[str] = []
+        if verify_sources or refresh_hashes:
+            import httpx as _httpx
+
+            with _httpx.Client(timeout=60.0) as web:
+                sources = _spec_http_sources(new_text, macros)
+                for number, raw, expanded in sources:
+                    if _verify_source_url(web, expanded):
+                        continue
+                    fixed = False
+                    if not non_interactive and sys.stdin.isatty():
+                        given = click.prompt(
+                            "%s  Source%s 404: %s\nupstream URL (empty to skip)"
+                            % (pkg, number, expanded),
+                            default="",
+                            show_default=False,
+                        ).strip()
+                        if given:
+                            templated = _macroize_url(given, macros, new)
+                            new_text = _RE_SPEC_SOURCE.sub(
+                                lambda m: (
+                                    m.group("pre") + templated + m.group("post")
+                                    if (m.group("num") or "0") == number
+                                    and m.group("val").strip() == raw
+                                    else m.group(0)
+                                ),
+                                new_text,
+                            )
+                            macros = _spec_source_macros(new_text, new, pkg)
+                            rechecked = dict(
+                                (num, exp)
+                                for num, _, exp in _spec_http_sources(new_text, macros)
+                            )
+                            if number in rechecked and _verify_source_url(
+                                web, rechecked[number]
+                            ):
+                                click.echo(
+                                    "%s  Source%s now resolves via manual URL" % (pkg, number)
+                                )
+                                fixed = True
+                    if not fixed:
+                        source_failures.append(
+                            "Source%s %s" % (number, expanded)
+                        )
+                if source_failures:
+                    for item in source_failures:
+                        click.echo("%s  cannot fetch %s" % (pkg, item), err=True)
+                    fail += 1
+                    continue
+                if refresh_hashes:
+                    primaries = [
+                        (number, expanded)
+                        for number, _, expanded in _spec_http_sources(new_text, macros)
+                        if number == "0"
+                    ]
+                    if primaries:
+                        digest = _fetch_source_sha256(web, primaries[0][1])
+                        if not digest:
+                            click.echo(
+                                "%s  Source0 download failed, not writing bump" % pkg,
+                                err=True,
+                            )
+                            fail += 1
+                            continue
+                        new_text = _set_source_hash_guard(new_text, digest)
         spec_path.write_text(new_text, encoding="utf-8")
         click.echo("%s  %s -> %s  %s" % (pkg, old, new, spec_path))
         ok += 1
@@ -653,6 +1156,438 @@ def cmd_iso_dnf_log(
         click.echo("No local spec dir for (%d): %s" % (len(uncovered), " ".join(head)))
         if tail:
             click.echo("  … (%d more)" % len(tail))
+
+_RE_LOG_PKG_NAME = re.compile(
+    r"^(?P<pkg>.+?)-(?:x86_64|aarch64|noarch|i686|ppc64le|s390x)-job\d+\.log$"
+)
+_RE_NO_MATCH_PKG = re.compile(r"No matching package to install:\s*'([^']+)'")
+_RE_UNPACKAGED_MARKER = re.compile(r"Installed \(but unpackaged\) file\(s\) found:")
+_RE_PATH_LINE = re.compile(r"^(/\S+)\s*$")
+_RE_FILES_SECTION = re.compile(r"(?im)^%files(?:\s+[^\n]*)?$")
+_RE_BUILDREQUIRES_LINE = re.compile(r"(?im)^BuildRequires:.*$")
+_RE_SPEC_SECTION = re.compile(r"(?im)^%(?:files|changelog|description|prep|build|install|check|clean|pre|post|preun|postun)\b")
+
+
+def _fastfix_pkg_name(log_path: Path) -> str | None:
+    """Derive the package name from a ``<pkg>-<arch>-job<id>.log`` filename."""
+    match = _RE_LOG_PKG_NAME.match(log_path.name)
+    return match.group("pkg") if match else None
+
+
+def _fastfix_unpackaged_files(log_text: str) -> list[str]:
+    """Collect installed-but-unpackaged paths listed around the rpm marker."""
+    lines = log_text.splitlines()
+    found: list[str] = []
+    for index, line in enumerate(lines):
+        if not _RE_UNPACKAGED_MARKER.search(line):
+            continue
+        for probe in lines[index + 1 : index + 201]:
+            match = _RE_PATH_LINE.match(probe.strip())
+            if match:
+                candidate = match.group(1)
+                if candidate not in found:
+                    found.append(candidate)
+                continue
+            if probe.strip():
+                break
+    return found
+
+
+def _fastfix_cmake_missing_python3(log_text: str) -> bool:
+    """Detect the deterministic ``Could NOT find Python3`` devel failure."""
+    return bool(
+        re.search(
+            r"Could NOT find Python3 \(missing:[\s\S]*?Development",
+            log_text,
+        )
+    )
+
+
+def _fastfix_no_match_packages(log_text: str) -> list[str]:
+    """Return ``No matching package to install`` payloads, de-duplicated."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for match in _RE_NO_MATCH_PKG.finditer(log_text):
+        item = match.group(1).strip()
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def _fastfix_is_plain_rpm_name(dep: str) -> bool:
+    """Return whether a missing payload is a plain package name (not a capability)."""
+    return bool(re.fullmatch(r"[A-Za-z0-9_+.\-]+", dep))
+
+
+_RE_CMAKE_MISSING_CONFIG = re.compile(
+    r'Could not find a package configuration file provided by\s+"([^"]+)"',
+    re.IGNORECASE,
+)
+_RE_CMAKE_MISSING_MODULE = re.compile(
+    r'By not providing "Find([^"]+)\.cmake" in CMAKE_MODULE_PATH', re.IGNORECASE
+)
+_RE_CMAKE_MISSING_CONFIG_ALT = re.compile(
+    r'Could not find a configuration file for package "([^"]+)"', re.IGNORECASE
+)
+_RE_CMAKE_VERSION_SKEW = re.compile(
+    r"Could NOT find (\S+) \(found version \"([^\"]+)\"[^)]*\)", re.IGNORECASE
+)
+_RE_CMAKE_REQUESTED_VERSION = re.compile(
+    r'\(requested version ([0-9][0-9A-Za-z.]*)\)', re.IGNORECASE
+)
+
+
+def _fastfix_missing_cmake_configs(log_text: str) -> list[str]:
+    """Return CMake config/module names the build could not find, de-duplicated."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for match in _RE_CMAKE_MISSING_CONFIG.finditer(log_text):
+        item = match.group(1).strip()
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    for match in _RE_CMAKE_MISSING_MODULE.finditer(log_text):
+        item = match.group(1).strip()
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    for match in _RE_CMAKE_MISSING_CONFIG_ALT.finditer(log_text):
+        item = match.group(1).strip()
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def _fastfix_cmake_version_skews(log_text: str) -> list[str]:
+    """Return ``Found X but requested Y`` config version skews, de-duplicated."""
+    requested = _RE_CMAKE_REQUESTED_VERSION.search(log_text)
+    wanted = requested.group(1) if requested else None
+    seen: set[str] = set()
+    out: list[str] = []
+    for match in _RE_CMAKE_VERSION_SKEW.finditer(log_text):
+        item = "%s found %s%s" % (
+            match.group(1).strip(),
+            match.group(2).strip(),
+            (" wants %s" % wanted) if wanted else "",
+        )
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def _fastfix_config_provider_guess(config: str) -> str | None:
+    """Guess the in-stack provider package for a CMake config name."""
+    normalized = re.sub(r"[^a-z0-9]", "", config.lower())
+    for prefix, pkg_prefix in (("kf6", "kf6-"), ("kf5", "kf5-"), ("qt6", "qt6-"), ("qt5", "qt5-")):
+        if normalized.startswith(prefix) and len(normalized) > len(prefix):
+            return pkg_prefix + normalized[len(prefix):]
+    return None
+
+
+def _fastfix_patch_failure(log_text: str) -> bool:
+    """Detect %prep patch application failures (manual review required)."""
+    return bool(
+        re.search(
+            r"hunk FAILED|can'?t find file to patch|Patch .* failed|Bad exit status from \S+ \(%prep\)",
+            log_text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _fastfix_source_hash_failure(log_text: str) -> bool:
+    """Detect source checksum verification failures (manual review required)."""
+    return bool(
+        re.search(r"hash mismatch|Bad source|does not match expected", log_text, re.IGNORECASE)
+    )
+
+
+def _fastfix_apply_unpackaged(spec_text: str, files: list[str]) -> tuple[str, list[str]]:
+    """Append unpackaged files to the best-matching ``%files`` section."""
+    todo: list[str] = [
+        path
+        for path in files
+        if not path.startswith(("/usr/lib/debug", "/usr/lib/.build-id", "/usr/src/debug"))
+        and path not in spec_text
+    ]
+    if not todo:
+        return spec_text, []
+    sections = list(_RE_FILES_SECTION.finditer(spec_text))
+    if not sections:
+        return spec_text, []
+    entries = re.findall(r"(?m)^(/\S+)\s*$", spec_text)
+
+    def section_score(section: re.Match[str]) -> int:
+        start = section.end()
+        nxt = _RE_SPEC_SECTION.search(spec_text, start)
+        body = spec_text[start : nxt.start() if nxt else len(spec_text)]
+        return sum(1 for entry in entries if entry in body and any(
+            path.startswith(entry.rsplit("/", 1)[0] + "/") for path in todo
+        ))
+
+    best = max(sections, key=section_score)
+    start = best.end()
+    nxt = _RE_SPEC_SECTION.search(spec_text, start)
+    end = nxt.start() if nxt else len(spec_text)
+    insertion = "".join(path + "\n" for path in sorted(todo))
+    return spec_text[:end].rstrip("\n") + "\n" + insertion + spec_text[end:], todo
+
+
+def _fastfix_apply_buildrequires(spec_text: str, deps: list[str]) -> tuple[str, list[str]]:
+    """Insert missing plain ``BuildRequires`` after the last such line."""
+    missing = [
+        dep
+        for dep in deps
+        if not re.search(
+            r"(?im)^BuildRequires:\s*%s\s*$" % re.escape(dep), spec_text
+        )
+    ]
+    if not missing:
+        return spec_text, []
+    anchors = list(_RE_BUILDREQUIRES_LINE.finditer(spec_text))
+    lines = "".join("BuildRequires:\t%s\n" % dep for dep in missing)
+    if anchors:
+        at = anchors[-1].end()
+        return spec_text[:at] + "\n" + lines.rstrip("\n") + spec_text[at:], missing
+    anchor = re.search(r"(?im)^Name\s*:.*\n", spec_text)
+    if anchor:
+        at = anchor.end()
+        return spec_text[:at] + lines + spec_text[at:], missing
+    return lines + spec_text, missing
+
+
+@cli.command("generate-chain")
+@click.option("--release", "release_ref", required=True, help="Oreon release directory/name, e.g. oreon-11-rp1")
+@click.option("--pushed", is_flag=True, help="Use specs changed in origin/HEAD...HEAD instead of the working tree")
+@click.option("--spec-root", type=click.Path(file_okay=False, path_type=Path), default=None)
+@click.option("--packages", "packages_blob", default=None, help="Raw package names (whitespace, commas, or newlines)")
+@click.option("--packages-file", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None,
+              help="File containing one or more raw package names")
+def cmd_generate_chain(
+    release_ref: str,
+    pushed: bool,
+    spec_root: Path | None,
+    packages_blob: str | None,
+    packages_file: Path | None,
+) -> None:
+    """Generate a Koji chain from changed specs and their local dependency DAG."""
+    repo_root = Path(__file__).resolve().parent.parent
+    root = (spec_root.expanduser().resolve() if spec_root else repo_root / "fedora-rpms" / release_ref)
+    if not root.is_dir():
+        raise click.ClickException("spec root is not a directory: %s" % root)
+    git_root = repo_root
+    try:
+        import subprocess
+        found_root = subprocess.run(
+            ("git", "rev-parse", "--show-toplevel"), cwd=root, check=True,
+            capture_output=True, text=True
+        ).stdout.strip()
+        if found_root:
+            git_root = Path(found_root).resolve()
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    if packages_blob is not None and packages_file is not None:
+        raise click.UsageError("use only one of --packages and --packages-file")
+    raw_names: list[str] = []
+    if packages_file is not None:
+        raw_names = parse_package_blob(packages_file.read_text(encoding="utf-8"))
+    elif packages_blob is not None:
+        raw_names = parse_package_blob(packages_blob)
+    if raw_names:
+        changed = []
+        for name in raw_names:
+            hits = find_pkg_specs(root, name)
+            if len(hits) == 1:
+                changed.append(hits[0])
+            else:
+                click.echo("%s: no unique spec" % name, err=True)
+    else:
+        changed = _git_changed_spec_paths(git_root, root, pushed)
+    if not changed:
+        click.echo("no changed specs found")
+        return
+    chain, gcc_hit, selected, unresolved = _generate_chain(root, changed)
+    if gcc_hit:
+        click.echo("GCC detected: including every package for ABI rebuild", err=True)
+    click.echo(chain)
+    click.echo("packages=%d source=%s" % (len(selected), "pushed" if pushed else "unpushed"), err=True)
+
+
+@cli.command("fast-fix")
+@click.option(
+    "--log-dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    required=True,
+    help="Directory of build logs (see: logs chain-fail --out).",
+)
+@click.option(
+    "-d",
+    "--spec-root",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="rpm-specfiles tree (default: fedora-rpms/oreon-11-rp1 next to the repo).",
+)
+@click.option(
+    "-p",
+    "--packages",
+    "packages_blob",
+    default=None,
+    help="Only fix these packages (spaces, commas, or newlines).",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Report what would change without writing specs.",
+)
+def cmd_fast_fix(
+    log_dir: Path, spec_root: Path | None, packages_blob: str | None, dry_run: bool
+) -> None:
+    """Auto-fix deterministic build failures from downloaded build logs.
+
+    Applies only safe, mechanical repairs: appending installed-but-unpackaged
+    files to ``%files``, adding ``BuildRequires: python3-devel`` for the
+    ``Could NOT find Python3`` CMake failure, and adding plain missing
+    ``BuildRequires`` names. Dependency-chain problems (``cmake(...)`` /
+    ``pkgconfig(...)`` capabilities, ``nothing provides``) and ``%prep``
+    patch or checksum failures are reported for manual handling.
+    """
+    root = (
+        spec_root.expanduser().resolve()
+        if spec_root is not None
+        else (Path(__file__).resolve().parent.parent / "fedora-rpms" / "oreon-11-rp1")
+    )
+    if not root.is_dir():
+        click.echo("not a directory  %s" % root, err=True)
+        sys.exit(2)
+    only = set(parse_package_blob(packages_blob)) if packages_blob else None
+    logs = sorted(log_dir.glob("*.log"))
+    if not logs:
+        click.echo("no .log files under %s" % log_dir, err=True)
+        sys.exit(2)
+    by_package: dict[str, list[Path]] = {}
+    for log_path in logs:
+        pkg = _fastfix_pkg_name(log_path)
+        if pkg is None or (only is not None and pkg not in only):
+            continue
+        by_package.setdefault(pkg, []).append(log_path)
+    if not by_package:
+        click.echo("no logs matched known package names", err=True)
+        sys.exit(2)
+    fixed = 0
+    need_chain: dict[str, list[str]] = {}
+    need_manual: dict[str, list[str]] = {}
+    for pkg in sorted(by_package):
+        specs = find_pkg_specs(root, pkg)
+        if len(specs) != 1:
+            need_manual.setdefault(pkg, []).append(
+                "no unique spec under %s" % root if not specs else "multiple specs, refine --spec-root"
+            )
+            continue
+        spec_path = specs[0]
+        try:
+            spec_text = spec_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            need_manual.setdefault(pkg, []).append("cannot read spec (%s)" % exc)
+            continue
+        combined = "\n".join(
+            log.read_text(encoding="utf-8", errors="replace") for log in by_package[pkg]
+        )
+        actions: list[str] = []
+        unpackaged = _fastfix_unpackaged_files(combined)
+        if unpackaged:
+            spec_text, added = _fastfix_apply_unpackaged(spec_text, unpackaged)
+            if added:
+                actions.append("packaged %d file(s): %s" % (len(added), ", ".join(added[:5])))
+            skipped = [path for path in unpackaged if path not in spec_text]
+            if skipped:
+                need_manual.setdefault(pkg, []).append(
+                    "unpackaged debug paths need review: %s" % ", ".join(skipped[:5])
+                )
+        if _fastfix_cmake_missing_python3(combined):
+            spec_text, added = _fastfix_apply_buildrequires(spec_text, ["python3-devel"])
+            if added:
+                actions.append("added BuildRequires: python3-devel")
+        plain_missing = sorted(
+            {
+                dep
+                for dep in _fastfix_no_match_packages(combined)
+                if _fastfix_is_plain_rpm_name(dep)
+            }
+        )
+        if plain_missing:
+            spec_text, added = _fastfix_apply_buildrequires(spec_text, plain_missing)
+            if added:
+                actions.append("added BuildRequires: %s" % ", ".join(added))
+        capabilities = sorted(
+            {
+                dep
+                for dep in _fastfix_no_match_packages(combined)
+                if not _fastfix_is_plain_rpm_name(dep)
+            }
+        )
+        if capabilities:
+            need_chain.setdefault(pkg, []).extend(
+                "build provider for %s first" % dep for dep in capabilities
+            )
+        for skew in _fastfix_cmake_version_skews(combined):
+            need_chain.setdefault(pkg, []).append(
+                "CMake version skew %s: rebuild providers at one version" % skew
+            )
+        for config in _fastfix_missing_cmake_configs(combined):
+            guess = _fastfix_config_provider_guess(config)
+            if guess:
+                need_chain.setdefault(pkg, []).append(
+                    "missing CMake config %s: build %s first" % (config, guess)
+                )
+            else:
+                need_chain.setdefault(pkg, []).append(
+                    "missing CMake config %s: build its provider first" % config
+                )
+        if "nothing provides" in combined:
+            providers = sorted(
+                {
+                    match.group(1).strip()
+                    for match in re.finditer(
+                        r"nothing provides ([^\n]+?) needed by", combined
+                    )
+                }
+            )
+            if providers:
+                need_chain.setdefault(pkg, []).extend(
+                    "missing provider: %s" % item for item in providers[:10]
+                )
+        if _fastfix_patch_failure(combined):
+            need_manual.setdefault(pkg, []).append("%prep patch failure needs review")
+        if _fastfix_source_hash_failure(combined):
+            need_manual.setdefault(pkg, []).append("source checksum failure needs review")
+        if actions and not dry_run:
+            spec_path.write_text(spec_text, encoding="utf-8")
+        if actions:
+            fixed += 1
+            click.echo("%s  %s%s" % (pkg, "would fix: " if dry_run else "fixed: ", "; ".join(actions)))
+        elif pkg not in need_chain and pkg not in need_manual:
+            click.echo("%s  note: no actionable failure signature in logs" % pkg)
+    for pkg in sorted(need_chain):
+        for note in need_chain[pkg]:
+            click.echo("%s  chain: %s" % (pkg, note))
+    for pkg in sorted(need_manual):
+        for note in need_manual[pkg]:
+            click.echo("%s  manual: %s" % (pkg, note), err=True)
+    click.echo(
+        "packages=%d %s=%d need-chain=%d need-manual=%d"
+        % (
+            len(by_package),
+            "would-fix" if dry_run else "fixed",
+            fixed,
+            len(need_chain),
+            len(need_manual),
+        )
+    )
+
 
 @cli.command("build")
 @click.argument("packages", nargs=-1, required=True)
@@ -839,110 +1774,6 @@ def cmd_chain_build(
     )
 
 
-@cli.command("layer-build")
-@click.argument("spec_parts", nargs=-1, required=True)
-@click.option("--release", "release_ref", required=True, help="Release id or releasename (e.g. oreon-11-rp1)")
-@click.option("--side-tag", "side_tag_ref", required=True, help="Side tag id to publish into")
-@click.option(
-    "--arch",
-    default="x86_64,aarch64",
-    help="Comma-separated arches (default x86_64,aarch64)",
-)
-@click.option(
-    "--log",
-    "log_dir",
-    type=click.Path(),
-    default=None,
-    help="Directory for per-job logs for immediately-queued jobs only",
-)
-@click.option(
-    "--wait/--no-wait",
-    default=False,
-    help="Poll until each immediately-queued job reaches a terminal state",
-)
-@click.option(
-    "--distgit-url",
-    envvar="ORBSCLI_DISTGIT_URL",
-    default="https://github.com/oreonhq/rpm-specfiles.git",
-    help="Git URL for distgit sources",
-)
-@click.option(
-    "--distgit-branch",
-    envvar="ORBSCLI_DISTGIT_BRANCH",
-    default="main",
-    help="Branch fragment in distgit URL",
-)
-@click.option(
-    "--skip-already-built/--no-skip-already-built",
-    default=False,
-    help="Omit packages already at distgit EVR in the side tag and linked repos",
-)
-def cmd_layer_build(
-    spec_parts: tuple[str, ...],
-    release_ref: str,
-    side_tag_ref: str,
-    arch: str,
-    log_dir: str | None,
-    wait: bool,
-    distgit_url: str,
-    distgit_branch: str,
-    skip_already_built: bool,
-) -> None:
-    """Queue root package(s); dependencies are discovered and built reactively."""
-    token = require_auth(get_token())
-    require_maintainer(token)
-    api_base = get_api_url()
-    rid = resolve_release_id(api_base, token, release_ref)
-    packages = [p.strip() for p in spec_parts if p.strip()]
-    if not packages:
-        click.echo("No package names given.", err=True)
-        sys.exit(2)
-    arches = [a.strip() for a in arch.split(",") if a.strip()]
-    log_path = Path(log_dir) if log_dir else None
-    if log_path:
-        log_path.mkdir(parents=True, exist_ok=True)
-
-    body: dict[str, Any] = {
-        "packages": packages,
-        "release_id": rid,
-        "side_tag_id": int(side_tag_ref),
-        "architectures": arches,
-        "distgit_url": distgit_url,
-        "distgit_branch": distgit_branch,
-        "skip_already_built": bool(skip_already_built),
-    }
-    data = http_json("POST", api_base, "/api/builds/layer-trigger", token=token, json_body=body, timeout=300.0)
-    if not isinstance(data, dict):
-        click.echo("Unexpected layer-trigger response", err=True)
-        sys.exit(1)
-    lid = data.get("layer_plan_id")
-    click.echo("layer_plan_id=%s status=%s" % (lid, data.get("layer_plan_status") or ""))
-    click.echo(data.get("message") or "Layer accepted.")
-    jobs = data.get("jobs") or []
-    if not isinstance(jobs, list):
-        jobs = []
-    jobs_out: list[dict[str, Any]] = []
-    for job in jobs:
-        if not isinstance(job, dict):
-            continue
-        jid = int(job["id"])
-        click.echo(
-            "job %s arch=%s status=%s layer_index=%s"
-            % (
-                jid,
-                job.get("architecture") or "",
-                job.get("status") or "",
-                job.get("layer_index") if job.get("layer_index") is not None else "",
-            )
-        )
-        if job.get("status") == "queued":
-            jobs_out.append(job)
-
-    need_poll = wait or log_path is not None
-    if need_poll and jobs_out:
-        for job in jobs_out:
-            _wait_job_and_maybe_log(api_base, token, int(job["id"]), log_path)
-
 def _wait_job_and_maybe_log(api_base: str, token: str, job_id: int, log_dir: Path | None) -> None:
     terminal = {"success", "failed", "cancelled", "skipped"}
     attempt_id: int | None = None
@@ -969,40 +1800,6 @@ def _fetch_attempt_log(api_base: str, attempt_id: int, dest: Path) -> bool:
     dest.write_bytes(r.content)
     click.echo("wrote %s" % dest)
     return True
-
-
-def _list_all_layer_jobs(
-    api_base: str,
-    token: str | None,
-    layer_id: int,
-    status: str,
-    plan_filter: str = "layer_plan_id",
-) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
-    offset = 0
-    limit = 1000
-    while True:
-        out = http_json(
-            "GET",
-            api_base,
-            "/api/builds",
-            token=token,
-            params={
-                plan_filter: layer_id,
-                "status": status,
-                "limit": limit,
-                "offset": offset,
-            },
-        )
-        page = out.get("items") or []
-        if not isinstance(page, list):
-            break
-        items.extend(j for j in page if isinstance(j, dict))
-        total = int(out.get("total") or 0)
-        offset += len(page)
-        if not page or offset >= total:
-            break
-    return items
 
 
 def _safe_log_name(value: str) -> str:
@@ -1370,40 +2167,26 @@ def logs_view(attempt_id: int, out: str | None, tail: int | None) -> None:
     else:
         click.echo(r.text, nl=False)
 
-@grp_logs.command("layer-fail")
-@click.argument("layer_id", type=int)
-@click.option(
-    "--out",
-    "out_dir",
-    type=click.Path(),
-    default=None,
-    help="Directory to write logs into (default ./layer-<id>-failed-logs)",
-)
-def logs_layer_fail(layer_id: int, out_dir: str | None) -> None:
-    _download_failed_plan_logs(layer_id, out_dir, "layer")
-
-
 @grp_logs.command("chain-fail")
 @click.argument("chain_id", type=int)
 @click.option("--out", "out_dir", type=click.Path(), default=None,
               help="Directory to write logs into (default ./chain-<id>-failed-logs)")
 def logs_chain_fail(chain_id: int, out_dir: str | None) -> None:
-    _download_failed_plan_logs(chain_id, out_dir, "chain")
+    _download_failed_plan_logs(chain_id, out_dir)
 
 
-def _download_failed_plan_logs(layer_id: int, out_dir: str | None, kind: str) -> None:
+def _download_failed_plan_logs(chain_id: int, out_dir: str | None) -> None:
     token = get_token()
     api_base = get_api_url()
-    dest = Path(out_dir) if out_dir else Path("%s-%s-failed-logs" % (kind, layer_id))
+    dest = Path(out_dir) if out_dir else Path("chain-%s-failed-logs" % chain_id)
     dest.mkdir(parents=True, exist_ok=True)
-    click.echo(f"Fetching failed jobs for {kind} {layer_id}...", err=True)
+    click.echo("Fetching failed jobs for chain %s..." % chain_id, err=True)
     try:
-        jobs = (_list_failed_chain_jobs(api_base, token, layer_id) if kind == "chain"
-                else _list_all_layer_jobs(api_base, token, layer_id, "failed"))
+        jobs = _list_failed_chain_jobs(api_base, token, chain_id)
     except httpx.RequestError as exc:
         raise click.ClickException(f"Could not fetch failed jobs: {exc}") from exc
     if not jobs:
-        click.echo("no failed jobs in %s %s" % (kind, layer_id))
+        click.echo("no failed jobs in chain %s" % chain_id)
         return
     wrote = 0
     missing = 0
@@ -1428,9 +2211,8 @@ def _download_failed_plan_logs(layer_id: int, out_dir: str | None, kind: str) ->
             wrote += 1
         else:
             missing += 1
-    click.echo("%s %s failed jobs=%s logs written=%s missing=%s dir=%s" % (
-        kind,
-        layer_id,
+    click.echo("chain %s failed jobs=%s logs written=%s missing=%s dir=%s" % (
+        chain_id,
         len(jobs),
         wrote,
         missing,
