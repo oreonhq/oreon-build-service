@@ -50,7 +50,7 @@
             <th>Arch</th>
             <th>Status</th>
             <th>Signing</th>
-            <th>Layer</th>
+            <th>Chain</th>
             <th>Created</th>
             <th>Actions</th>
           </tr>
@@ -170,25 +170,22 @@
             } else if (j.branch) {
               sideTag = '<span style="color:var(--text-muted)">' + escapeHtml(j.branch) + '</span>';
             }
-            var layerPart = '-';
-            if (j.layer_plan_id != null && j.layer_plan_id !== undefined) {
-              var layerIdStr = String(j.layer_plan_id);
-              var idxNote = (j.layer_index != null && j.layer_index !== undefined)
-                ? ' <span style="color:var(--text-muted); font-size:0.85em">(L' + j.layer_index + ')</span>'  : '-';
+            var chainPart = '-';
+            if (j.rpmbuild_plan_id != null && j.rpmbuild_plan_id !== undefined) {
+              var chainIdStr = String(j.rpmbuild_plan_id);
+              var idxNote = (j.rpmbuild_layer_index != null && j.rpmbuild_layer_index !== undefined)
+                ? ' <span style="color:var(--text-muted); font-size:0.85em">(G' + (Number(j.rpmbuild_layer_index) + 1) + ')</span>'  : '';
               if (j.side_tag_id != null) {
-                layerPart = '<a href="/side-tag.html?id=' + j.side_tag_id + '&layer_plan_id=' + layerIdStr + '">' + layerIdStr + '</a>' + idxNote;
+                chainPart = '<a href="/side-tag.html?id=' + j.side_tag_id + '&chain_plan_id=' + chainIdStr + '">' + chainIdStr + '</a>' + idxNote;
               } else {
-                layerPart = layerIdStr + idxNote;
-              }
-              if (j.status === 'blocked' && j.blocked_reason) {
-                layerPart += ' <span style="color:var(--text-muted); font-size:0.82em;" title="' + escapeAttr(j.blocked_reason) + '">(blocked)</span>';
+                chainPart = chainIdStr + idxNote;
               }
             }
             return '<tr data-id="' + j.id + '" data-status="' + escapeAttr(j.status || '') + '">' +
               '<td class="col-checkbox"><input type="checkbox" class="build-row-cb" data-id="' + j.id + '"></td>' +
               '<td>' + j.id + '</td><td>' + pkg + '</td><td>' + rel + '</td><td>' + sideTag + '</td><td>' + arch + '</td>' +
               '<td><span class="' + statusClass(sd) + '">' + escapeHtml(sd) + '</span></td>' +
-              '<td>' + signCell + '</td><td style="white-space:normal; max-width:16rem;">' + layerPart + '</td>' +
+              '<td>' + signCell + '</td><td style="white-space:normal; max-width:16rem;">' + chainPart + '</td>' +
               '<td>' + (j.created_at || '').slice(0, 19) + '</td>' +
               '<td><a href="/build.html?job_id=' + j.id + '">View</a>' + retryBtn + cancelBtn + '</td></tr>';
           }).join('') || '<tr><td colspan="11">No builds</td></tr>';
