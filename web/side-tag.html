@@ -170,7 +170,7 @@
             <div id="source-layerbuild-panel" class="source-panel" style="display:none;">
               <label>Layer build</label>
               <p style="color:var(--text-muted); font-size:0.85rem; margin-bottom:0.5rem;">
-                Root package names only. Jobs use the primary Mock environment when resolvable, otherwise the manually selected fallback before a clean native rebuild.
+                Root package names. Missing native deps enqueue provider sources into this plan.
               </p>
               <textarea id="layerbuild-packages" class="form-control" rows="4" placeholder="Example:&#10;firefox&#10;abseil-cpp"></textarea>
             </div>
@@ -203,13 +203,6 @@
               <option value="">Use release default</option>
             </select>
             <p style="color:var(--text-muted); font-size:0.85rem; margin-top:0.25rem;">Select a release first; mock envs apply to both x86_64 and aarch64.</p>
-          </div>
-          <div class="form-group" id="layerbuild-fallback-group" style="display:none;">
-            <label>Fallback Mock environment (optional)</label>
-            <select id="layerbuild-fallback-mock-env" class="form-control">
-              <option value="">No fallback; block unresolved jobs</option>
-            </select>
-            <p style="color:var(--text-muted); font-size:0.85rem; margin-top:0.25rem;">Used only when the primary repository pool cannot resolve the build.</p>
           </div>
           <div class="form-group">
             <label>Architectures</label>
@@ -716,16 +709,13 @@
       }
       function fillMockEnvsForRelease(releaseId) {
         var sel = document.getElementById('new-package-mock-env');
-        var fallbackSel = document.getElementById('layerbuild-fallback-mock-env');
         if (!sel) return;
         sel.innerHTML = '<option value="">Use release default</option>';
-        if (fallbackSel) fallbackSel.innerHTML = '<option value="">No fallback; block unresolved jobs</option>';
         if (!releaseId) return;
         api.get('/mock-environments?release_id=' + releaseId + '&limit=500').then(function(res) {
           var arr = (res && res.items) ? res.items : [];
           arr.forEach(function(m) {
             sel.appendChild(new Option(m.name + ' (' + (m.config_name || '') + ')', m.id));
-            if (fallbackSel) fallbackSel.appendChild(new Option(m.name + ' (' + (m.config_name || '') + ')', m.id));
           });
         }).catch(function() {});
       }
@@ -766,8 +756,6 @@
           document.querySelectorAll('.source-panel').forEach(function(p) { p.style.display = 'none'; });
           var panel = document.getElementById('source-' + type + '-panel');
           if (panel) panel.style.display = 'block';
-          var fallbackGroup = document.getElementById('layerbuild-fallback-group');
-          if (fallbackGroup) fallbackGroup.style.display = type === 'layerbuild' ? 'block' : 'none';
         }
         document.querySelectorAll('.source-type-tab').forEach(function(tab) {
           tab.addEventListener('click', function() {
@@ -1188,8 +1176,6 @@
             distgit_branch: getDistgitBranch()
           };
           if (mockIdVal) layerBody.preferred_mock_environment_id = parseInt(mockIdVal, 10);
-          var fallbackMockId = (document.getElementById('layerbuild-fallback-mock-env') && document.getElementById('layerbuild-fallback-mock-env').value || '').trim();
-          if (fallbackMockId) layerBody.fallback_mock_environment_id = parseInt(fallbackMockId, 10);
           oreonWithLoading(_btn, function() {
             return api.post('/builds/layer-trigger', layerBody)
               .then(function(data) {
