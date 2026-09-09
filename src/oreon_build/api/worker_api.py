@@ -333,10 +333,6 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
     q = (
         select(BuildJob)
         .where(
-            or_(
-                BuildJob.layer_plan_id.is_(None),
-                BuildJob.status == BuildStatus.QUEUED,
-            ),
             BuildJob.status.in_([BuildStatus.PENDING, BuildStatus.QUEUED]),
             ~exists(
                 select(1).where(
@@ -349,8 +345,7 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
     )
     if get_settings().rpmbuild_strict_gate_enabled:
         q = q.outerjoin(RpmbuildPlan, BuildJob.rpmbuild_plan_id == RpmbuildPlan.id).where(
-            (BuildJob.layer_plan_id.isnot(None))
-            | (BuildJob.rpmbuild_plan_id.is_(None))
+            (BuildJob.rpmbuild_plan_id.is_(None))
             | (
                 RpmbuildPlan.status.in_((RpmbuildPlanStatus.RUNNING, RpmbuildPlanStatus.WAITING_SETTLE))
                 & (
@@ -402,7 +397,7 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
     candidates = list(result.scalars().all())
     job = None
     for candidate in candidates:
-        claim_states = (BuildStatus.QUEUED,) if candidate.layer_plan_id is not None else (
+        claim_states = (
             BuildStatus.PENDING,
             BuildStatus.QUEUED,
         )
@@ -457,8 +452,6 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
 
     releasename = None
     sources = []
-    # Layer bridge/native routing is authoritative for this job. Build-target
-    # and release defaults are fallbacks only for jobs without an explicit root.
     mock_config = (job.target_mock_config or "").strip() or None
     selected_mock_env: MockEnvironment | None = None
     target = None
@@ -466,7 +459,7 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
     release = rel_result.scalar_one_or_none()
     if release:
         releasename = release.releasename
-    force_distgit = job.rpmbuild_plan_id is not None or job.layer_plan_id is not None
+    force_distgit = job.rpmbuild_plan_id is not None
     if job.package_version_id:
         source_query = select(Source).where(Source.package_version_id == job.package_version_id)
         if force_distgit:
@@ -501,24 +494,46 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
             selected_mock_env = target.mock_environment
             if not mock_config:
                 mock_config = selected_mock_env.config_name
-    if not mock_config and job.package_id:
-        pkg_result = await db.execute(
-            select(Package).where(Package.id == job.package_id).options(
-                selectinload(Package.preferred_mock_environment)
-            )
+    from oreon_build.services.build_target_util import (
+        get_or_create_build_target,
+        is_bootstrap_mock_environment,
+        pick_mock_environment_id_for_release,
+    )
+
+    plan_pin: int | None = None
+    if job.rpmbuild_plan_id is not None:
+        plan = await db.get(RpmbuildPlan, job.rpmbuild_plan_id)
+        opts = plan.options_json if plan is not None and isinstance(plan.options_json, dict) else {}
+        raw_pin = opts.get("preferred_mock_environment_id")
+        if raw_pin is not None:
+            try:
+                plan_pin = int(raw_pin)
+            except (TypeError, ValueError):
+                plan_pin = None
+        sticky_bootstrap = selected_mock_env is not None and is_bootstrap_mock_environment(
+            name=selected_mock_env.name,
+            config_name=selected_mock_env.config_name,
         )
-        pkg = pkg_result.scalar_one_or_none()
-        if pkg and pkg.preferred_mock_environment and pkg.preferred_mock_environment.release_id == job.release_id:
-            selected_mock_env = pkg.preferred_mock_environment
-            mock_config = selected_mock_env.config_name
-    if not mock_config and release:
-        fallback = await db.execute(
-            select(MockEnvironment).where(MockEnvironment.release_id == job.release_id).limit(1)
-        )
-        me = fallback.scalar_one_or_none()
-        if me:
+        if plan_pin is None and sticky_bootstrap:
+            selected_mock_env = None
+            mock_config = None
+
+    fallback_id = await pick_mock_environment_id_for_release(
+        db, job.release_id, preferred_id=plan_pin
+    )
+    if selected_mock_env is None and fallback_id is not None:
+        me = await db.get(MockEnvironment, fallback_id)
+        if me is not None:
             selected_mock_env = me
             mock_config = me.config_name
+            arch_for_target = (target.architecture if target else None) or (worker.architecture or "").strip() or "x86_64"
+            new_target = await get_or_create_build_target(
+                db, job.release_id, arch_for_target, fallback_id
+            )
+            if job.target_id != new_target.id:
+                job.target_id = new_target.id
+                await db.flush()
+            target = new_target
 
     build_arch = (target.architecture if target else None) or (worker.architecture or "").strip() or "x86_64"
     branch = job_publish_branch(job.branch, release)
@@ -1901,18 +1916,11 @@ async def report_result(
     # flipping status here would rerun the same pass with tests still off forever.
     queued_next_pass = (
         terminal_st == "success"
-        and job.layer_plan_id is None
         and schedule_next_pass_after_publish(job)
     )
     if not queued_next_pass:
         job.status = BuildStatus(terminal_st)
         job.completed_at = attempt.finished_at
-        if terminal_st == "success" and job.layer_plan_id is not None:
-            from oreon_build.services.build_pass import job_options_dict
-
-            opts = job_options_dict(job)
-            opts["repo_published"] = False
-            job.job_options = opts
     await db.flush()
     await sync_worker_state_after_attempt_finished(db, worker)
     await db.commit()
@@ -2042,14 +2050,7 @@ async def report_result(
     )
     await db.commit()
 
-    # layer autofix locks the plan row and can run for minutes, keep it off the
-    # request so the worker post cant time out and lose the result
-    if st_l in ("failed", "cancelled"):
-        from oreon_build.services.build_trigger_bg import schedule_layer_terminal_notify
-
-        schedule_layer_terminal_notify(
-            job.id, attempt.id, st_l, err_msg, payload.resolve_stage, missing, source_requirements,
-        )
+    await db.commit()
 
     return {"status": "ok"}
 

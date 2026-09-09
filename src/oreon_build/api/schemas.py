@@ -301,71 +301,6 @@ class BuildTrigger(BaseModel):
         return self
 
 
-class LayerBuildTrigger(BaseModel):
-
-    packages: List[str] = Field(
-        ...,
-        min_length=1,
-        description=(
-            "Package names to seed. Missing native deps enqueue provider sources into the same plan."
-        ),
-    )
-    release_id: int = Field(..., description="Release to build for")
-    side_tag_id: int = Field(..., description="Side tag to publish into (required)")
-    architectures: List[str] = Field(
-        default=["x86_64", "aarch64"],
-        description="Architectures to build for (same as single trigger)",
-    )
-    preferred_mock_environment_id: Optional[int] = Field(
-        None, description="Mock env for this layer plan (must belong to the release)"
-    )
-    distgit_url: Optional[str] = Field(
-        None,
-        max_length=1024,
-        description="Git URL for distgit spec repo (default oreonhq/rpm-specfiles)",
-    )
-    distgit_branch: Optional[str] = Field(None, max_length=128, description="Branch fragment in distgit URL")
-    priority: int = 0
-
-
-class CILayerTrigger(BaseModel):
-
-    packages: List[str] = Field(
-        ...,
-        min_length=1,
-        description="Package names whose spec files changed in the PR. Dependencies are auto-resolved.",
-    )
-    distgit_branch: str = Field(
-        ...,
-        min_length=1,
-        max_length=128,
-        description="Git branch to build from (the PR head branch). Also names the auto side tag.",
-    )
-    release_id: int = Field(..., description="Release to build for")
-    architectures: List[str] = Field(
-        default=["x86_64", "aarch64"],
-        description="Architectures to build for",
-    )
-    distgit_url: Optional[str] = Field(
-        None,
-        max_length=1024,
-        description="Git URL for distgit spec repo (default oreonhq/rpm-specfiles)",
-    )
-    priority: int = 0
-    side_tag_id: Optional[int] = Field(
-        None, description="Optional existing side tag; otherwise created from distgit_branch"
-    )
-
-
-class CILayerTriggerResponse(BaseModel):
-
-    layer_plan_id: int
-    layer_plan_status: str
-    root_packages: List[str]
-    accepted: bool = True
-    message: Optional[str] = None
-
-
 class BuildJobResponse(BaseModel):
     id: int
     package_id: int
@@ -393,18 +328,9 @@ class BuildJobResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-class LayerBuildTriggerResponse(BaseModel):
-    layer_plan_id: int
-    layer_plan_status: str
-    root_packages: List[str]
-    jobs: List[BuildJobResponse] = Field(default_factory=list)
-    message: Optional[str] = None
-
-
 class BuildTriggerAccepted(BaseModel):
     status: str = "accepted"
     message: str
-    layer_plan_id: Optional[int] = None
     package_count: Optional[int] = None
 
 
@@ -483,12 +409,6 @@ class SideTagPackageRow(BaseModel):
     updated_at: Optional[datetime] = None
 
 
-class LayerJobBlockerRow(BaseModel):
-    build_job_id: int
-    package_name: Optional[str] = None
-    blocking_source: str
-
-
 class LayerJobRow(BaseModel):
     job_id: int
     package_name: str
@@ -497,30 +417,6 @@ class LayerJobRow(BaseModel):
     blocked_reason: Optional[str] = None
     architecture: Optional[str] = None
     blocked_on: List[str] = Field(default_factory=list)
-
-
-class LayerPlanSummary(BaseModel):
-    layer_plan_id: int
-    status: str
-    root_packages: List[str]
-    releasename: Optional[str] = None
-    side_tag_name: Optional[str] = None
-    counts: dict = Field(default_factory=dict)
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
-
-
-class LayerPlanStatusResponse(BaseModel):
-    layer_plan_id: int
-    status: str
-    root_packages: List[str]
-    jobs: List[LayerJobRow] = Field(default_factory=list)
-    counts: dict = Field(default_factory=dict)
-    error_message: Optional[str] = None
-    releasename: Optional[str] = None
-    side_tag_name: Optional[str] = None
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
 
 
 class RpmbuildPlanCreate(BaseModel):

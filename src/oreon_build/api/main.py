@@ -139,23 +139,6 @@ async def lifespan(app: FastAPI):
             logger.exception("Skipping role/admin startup bootstrap due to startup DB error")
 
     try:
-        from oreon_build.services.layer_plan import cancel_interrupted_layer_planning
-
-        async with async_session_maker() as db:
-            try:
-                cancelled_ids = await cancel_interrupted_layer_planning(db)
-                await db.commit()
-            except Exception:
-                await db.rollback()
-                raise
-        if cancelled_ids:
-            logger.info(
-                "Cancelled layer plan seeding interrupted by restart layer_plan_ids=%s", cancelled_ids
-            )
-    except Exception:
-        logger.exception("Failed cancelling interrupted layer plan seeding on startup")
-
-    try:
         from oreon_build.services.distgit_warmup import spawn_distgit_warmup
 
         spawn_distgit_warmup()
@@ -178,30 +161,18 @@ async def lifespan(app: FastAPI):
             try:
                 s = get_settings()
                 interval = max(60, s.stale_build_sweep_interval_seconds)
-                layer_terminal_jobs: list[tuple[int, str]] = []
                 async with async_session_maker() as db:
                     try:
-                        _, _, _, cj1 = await reconcile_queue_inconsistencies(db)
-                        layer_terminal_jobs.extend(cj1)
+                        await reconcile_queue_inconsistencies(db)
                         await reclaim_publish_tasks_stuck_running(db, s)
                         if s.build_stale_running_minutes > 0 or s.build_stale_worker_heartbeat_minutes > 0:
-                            _, cj2 = await sweep_stale_running_builds(db, s)
-                            layer_terminal_jobs.extend(cj2)
+                            await sweep_stale_running_builds(db, s)
                         if s.build_stale_pending_minutes > 0:
-                            _, cj3 = await sweep_stale_pending_builds(db, s)
-                            layer_terminal_jobs.extend(cj3)
+                            await sweep_stale_pending_builds(db, s)
                         await db.commit()
                     except Exception:
                         await db.rollback()
                         raise
-                for job_id, reason in layer_terminal_jobs:
-                    try:
-                        from oreon_build.services.layer_plan import (
-                            notify_layer_job_terminal_after_result,
-                        )
-                        await notify_layer_job_terminal_after_result(job_id, "failed", reason)
-                    except Exception:
-                        logger.exception("layer notify after stale sweep job_id=%s", job_id)
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 break
@@ -272,7 +243,7 @@ async def lifespan(app: FastAPI):
 
     async def _publish_tasks_loop() -> None:
         from oreon_build.db.session import async_session_maker
-        from oreon_build.models import BuildJob, PublishTask
+        from oreon_build.models import PublishTask
         from oreon_build.services.repo_publish import run_repo_publish_tasks_batch
 
         while True:
@@ -286,12 +257,8 @@ async def lifespan(app: FastAPI):
                 async with async_session_maker() as db:
                     q = (
                         select(PublishTask)
-                        .join(BuildJob, BuildJob.id == PublishTask.build_job_id, isouter=True)
                         .where(PublishTask.status == "pending")
-                        .order_by(
-                            BuildJob.layer_plan_id.isnot(None).desc(),
-                            PublishTask.created_at.asc(),
-                        )
+                        .order_by(PublishTask.created_at.asc())
                         .with_for_update(of=PublishTask, skip_locked=True)
                     )
                     result = await db.execute(q)
@@ -320,24 +287,6 @@ async def lifespan(app: FastAPI):
                     break
 
     publish_task = asyncio.create_task(_publish_tasks_loop(), name="publish-tasks")
-
-    async def _layer_reconcile_loop() -> None:
-        from oreon_build.services.layer_engine import reconcile_settled_layer_plans
-
-        while True:
-            try:
-                await reconcile_settled_layer_plans()
-                await asyncio.sleep(15)
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                logger.exception("Layer plan reconcile sweep error")
-                try:
-                    await asyncio.sleep(30)
-                except asyncio.CancelledError:
-                    break
-
-    chain_settle_task = asyncio.create_task(_layer_reconcile_loop(), name="layer-reconcile")
 
     async def _mass_rebuild_loop() -> None:
         from oreon_build.db.session import async_session_maker
@@ -493,7 +442,6 @@ async def lifespan(app: FastAPI):
         (sweep_task, "stale-build-sweep"),
         (catchup_task, "github-push-catchup"),
         (publish_task, "publish-tasks"),
-        (chain_settle_task, "layer-reconcile"),
         (mass_rebuild_task, "mass-rebuild"),
         (rpmbuild_settle_task, "rpmbuild-settle"),
         (burst_vm_task, "burst-vm-watcher"),
