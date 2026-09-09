@@ -421,8 +421,29 @@ class Settings(BaseSettings):
         le=300,
         description="Settle loop poll interval for rpmbuild plans. OREON_RPMBUILD_SETTLE_POLL_SECONDS.",
     )
+    layer_provides_catalog: str = Field(
+        default="fedora",
+        description="Who owns missing caps. fedora until Oreon 11 is full, then oreon. Native builds stay Oreon. LAYER_PROVIDES_CATALOG.",
+    )
+    layer_provides_fedora_release: int = Field(
+        default=44,
+        ge=1,
+        description="Fedora release used for Provides phonebook. LAYER_PROVIDES_FEDORA_RELEASE.",
+    )
+    layer_provides_fedora_base: str = Field(
+        default="https://dl.fedoraproject.org/pub/fedora/linux",
+        description="Fedora linux tree root for repodata. LAYER_PROVIDES_FEDORA_BASE.",
+    )
 
     log_level: str = Field(default="INFO")
+
+    @field_validator("layer_provides_catalog", mode="before")
+    @classmethod
+    def _catalog_mode(cls, v: object) -> str:
+        s = str(v or "fedora").strip().lower()
+        if s in ("oreon", "native"):
+            return "oreon"
+        return "fedora"
 
     @field_validator("github_token", mode="before")
     @classmethod
