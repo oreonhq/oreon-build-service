@@ -209,6 +209,7 @@ class ResultPayload(BaseModel):
     log_r2_key: str | None = None
     artifacts: list[ArtifactPayload] = []
     missing_provides: list[str] = []
+    source_requirements: list[str] = []
     resolve_stage: str | None = None
     failure_kind: str | None = Field(default=None, max_length=64)
     failure_fingerprint: str | None = Field(default=None, max_length=64)
@@ -1787,6 +1788,9 @@ async def report_result(
 
     err_msg = payload.error_message
     missing = [str(item).strip() for item in (payload.missing_provides or []) if str(item).strip()]
+    source_requirements = [
+        str(item).strip() for item in (payload.source_requirements or []) if str(item).strip()
+    ]
     if isinstance(err_msg, str) and err_msg.strip():
         err_msg = prepare_build_error_message(err_msg)
     if missing:
@@ -2044,7 +2048,7 @@ async def report_result(
         from oreon_build.services.build_trigger_bg import schedule_layer_terminal_notify
 
         schedule_layer_terminal_notify(
-            job.id, attempt.id, st_l, err_msg, payload.resolve_stage, missing,
+            job.id, attempt.id, st_l, err_msg, payload.resolve_stage, missing, source_requirements,
         )
 
     return {"status": "ok"}
