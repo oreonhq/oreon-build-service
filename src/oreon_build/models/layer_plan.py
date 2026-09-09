@@ -28,9 +28,8 @@ class LayerPlan(Base):
     """A reactive multi-package build request.
 
     Unlike the old chain/stage model, this has no precomputed stage batches.
-    Root packages are seeded once (static BR resolution only), everything
-    buildable now goes straight to `queued`, everything else goes `blocked`
-    and is pulled forward reactively as repo publish events land.
+    Roots are seeded once. Native solv queues what can build. Missing caps
+    enqueue provider sources. Publish events re-probe waiters.
     """
 
     __tablename__ = "layer_plans"
