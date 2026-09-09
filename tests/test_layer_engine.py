@@ -8,8 +8,18 @@ from oreon_build.services import layer_engine
 
 
 class Solver:
-    def __init__(self, value): self.value = value
-    def resolve(self, requirements): return self.value
+    def __init__(self, value, sources=None):
+        self.value = value
+        self._sources = sources or {}
+
+    def resolve(self, requirements):
+        return self.value
+
+    def has_provider(self, cap):
+        return bool(self.value.ok)
+
+    def source_rpms_providing(self, cap):
+        return set(self._sources.get(cap) or ())
 
 
 def result(ok, missing=()):
@@ -19,7 +29,7 @@ def result(ok, missing=()):
 def job():
     return SimpleNamespace(
         architecture="x86_64", branch="side-tag", status=BuildStatus.QUEUED,
-        target_mock_config=None, blocked_reason=None,
+        target_mock_config=None, blocked_reason=None, blocking_sources=[],
         job_options={
             "solver_requirements": ["cmake"], "architecture": "x86_64",
             "native_mock_config": "oreon-11-x86_64",
@@ -49,18 +59,13 @@ def test_cold_seed_does_not_solve_empty_requirements(monkeypatch):
     assert candidate.status == BuildStatus.QUEUED
 
 
-def test_probe_routes_selected_fallback(monkeypatch):
-    calls = 0
-    def factory(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        return Solver(result(False, ["snappy-devel >= 1.1"]))
-    monkeypatch.setattr(layer_engine, "get_repo_solver", factory)
+def test_probe_never_uses_fallback_mock(monkeypatch):
+    monkeypatch.setattr(layer_engine, "get_repo_solver", lambda *a, **k: Solver(result(False, ["snappy-devel >= 1.1"])))
     candidate = job()
-    assert asyncio.run(layer_engine.probe_job_target(candidate, "oreon-11-rp1", "side-tag")) == "bootstrap-custom-x86_64"
-    assert calls == 1
+    assert asyncio.run(layer_engine.probe_job_target(candidate, "oreon-11-rp1", "side-tag")) == "oreon-11-x86_64"
+    assert candidate.status == BuildStatus.BLOCKED
+    assert candidate.target_mock_config == "oreon-11-x86_64"
     assert "snappy-devel >= 1.1" in candidate.blocked_reason
-    assert candidate.status == BuildStatus.QUEUED
 
 
 def test_probe_blocks_when_bridge_has_hole(monkeypatch):
@@ -86,15 +91,13 @@ def test_running_phase1_work_prevents_early_failure_settlement():
     assert BuildStatus.BLOCKED not in layer_engine.EXECUTING
 
 
-def test_fallback_build_is_selected_for_native_purification():
+def test_fallback_builds_are_gone():
     candidate = job()
     candidate.target_mock_config = "bootstrap-custom-x86_64"
-    assert layer_engine._built_on_fallback(candidate)
-    candidate.target_mock_config = "oreon-11-x86_64"
     assert not layer_engine._built_on_fallback(candidate)
 
 
-def test_native_purification_never_routes_back_to_fallback(monkeypatch):
+def test_missing_native_stays_on_native(monkeypatch):
     monkeypatch.setattr(layer_engine, "get_repo_solver", lambda *a, **k: Solver(result(False, ["qt6-devel"])))
     candidate = job()
     candidate.build_phase = layer_engine.PHASE2_NATIVE
@@ -107,3 +110,14 @@ def test_native_purification_never_routes_back_to_fallback(monkeypatch):
     asyncio.run(layer_engine.probe_job_target(candidate, "oreon-11-rp1", "side-tag"))
     assert candidate.status == BuildStatus.QUEUED
     assert candidate.target_mock_config == "oreon-11-x86_64"
+
+
+def test_pick_provider_sources_prefers_exact_name():
+    picked = layer_engine.pick_provider_sources("cmake >= 3", ["extra-cmake-modules", "cmake", "cmake-gui"])
+    assert picked == ["cmake"]
+
+
+def test_pick_provider_sources_caps_fanout():
+    names = [f"pkg{i}" for i in range(20)]
+    picked = layer_engine.pick_provider_sources("virtual(foo)", names)
+    assert len(picked) == layer_engine._MAX_SOURCES_PER_CAP

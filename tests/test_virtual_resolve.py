@@ -266,6 +266,23 @@ def test_cmake_versioned_module_resolves_from_provider_data() -> None:
         assert "mongo-c-driver" in hits, f"{cap} -> {hits}"
 
 
+def test_cmake_module_maps_to_lowercase_distgit_source() -> None:
+    known = {"kquickimageeditor", "opencv"}
+    provider_map = {
+        "cmake(KQuickImageEditor)": {"kquickimageeditor"},
+        "cmake(OpenCV)": {"opencv"},
+    }
+    assert "kquickimageeditor" in distgit_sources_for_virtual_cap(
+        "cmake(KQuickImageEditor)", package_names=known, provider_map=provider_map
+    )
+    assert "opencv" in distgit_sources_for_virtual_cap(
+        "cmake(OpenCV)", package_names=known, provider_map=provider_map
+    )
+    assert "kquickimageeditor" in distgit_sources_for_virtual_cap(
+        "cmake(KQuickImageEditor)", package_names=known, provider_map={}
+    )
+
+
 def test_mozjs_and_ghc_libhs_map_to_existing_sources() -> None:
     known = {
         "mozjs140",

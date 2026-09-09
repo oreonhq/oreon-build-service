@@ -140,12 +140,12 @@ def test_phase1_failure_settles_when_every_job_is_terminal():
     assert "consumer" in (msg or "")
 
 
-def test_successful_phase1_waits_for_engine_handoff():
+def test_successful_native_plan_settles():
     jobs = [
         _job(BuildStatus.SUCCESS, "provider", phase="phase1_bridge"),
         _job(BuildStatus.SUCCESS, "consumer", phase="phase1_bridge"),
     ]
-    assert layer_plan_settlement(jobs) == (None, None)
+    assert layer_plan_settlement(jobs) == (LayerPlanStatus.SUCCESS, None)
 
 
 def test_resume_refresh_schedules_layer_evaluation(monkeypatch):
@@ -246,6 +246,34 @@ def test_native_builddep_failure_waits_instead_of_repeating_fallback(monkeypatch
     assert job.status == BuildStatus.BLOCKED
     assert job.target_mock_config == "oreon-11-rp1-aarch64"
     assert "qt6-devel" in job.blocked_reason
+
+
+def test_installdeps_uses_srpm_requires_not_log_text(monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock
+    from oreon_build.services import layer_plan
+
+    job = BuildJob(
+        id=1, package_id=1, release_id=1, layer_plan_id=1275,
+        status=BuildStatus.FAILED,
+        target_mock_config="oreon-11-x86_64",
+        job_options={"native_mock_config": "oreon-11-x86_64"},
+    )
+    db = AsyncMock()
+    db.get.return_value = SimpleNamespace(id=1275, status=LayerPlanStatus.RUNNING)
+    monkeypatch.setattr(layer_plan, "maybe_settle_layer_plan", AsyncMock())
+    reason = "mock --installdeps failed\nNo matching package to install: 'cmake(OpenCV)'\n"
+    asyncio.run(
+        layer_plan.on_layer_resolve_failed(
+            db,
+            job,
+            reason,
+            source_requirements=["cmake(KQuickImageEditor)", "cmake(OpenCV)", "rpmlib(CompressedFileNames)"],
+        )
+    )
+    assert job.status == BuildStatus.BLOCKED
+    assert "cmake(OpenCV)" in job.blocked_reason
+    assert "cmake(KQuickImageEditor)" in job.blocked_reason
 
 
 def test_resume_preserves_success_after_earlier_failed_attempt(monkeypatch):

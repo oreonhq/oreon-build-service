@@ -216,3 +216,41 @@ def test_providers_map_crate_to_rust() -> None:
         package_names={"rust-serde"},
     )
     assert "rust-serde" in got
+
+
+def test_fedora_provides_repo_urls(monkeypatch):
+    from oreon_build import config
+    from oreon_build.services.repo_solver import fedora_provides_repo_urls
+
+    fake = config.Settings.model_construct(
+        layer_provides_catalog="fedora",
+        layer_provides_fedora_release=44,
+        layer_provides_fedora_base="https://dl.fedoraproject.org/pub/fedora/linux",
+    )
+    monkeypatch.setattr(config, "get_settings", lambda: fake)
+    urls = dict(fedora_provides_repo_urls("x86_64"))
+    assert "fedora-44-everything" in urls
+    assert urls["fedora-44-everything"].endswith("/releases/44/Everything/x86_64/os")
+    assert urls["fedora-44-updates"].endswith("/updates/44/Everything/x86_64")
+
+
+def test_catalog_oreon_mode_skips_fedora_urls(monkeypatch):
+    from oreon_build import config
+    from oreon_build.services import repo_solver
+
+    fake = config.Settings.model_construct(
+        layer_provides_catalog="oreon",
+        layer_provides_fedora_release=44,
+        layer_provides_fedora_base="https://dl.fedoraproject.org/pub/fedora/linux",
+    )
+    monkeypatch.setattr(config, "get_settings", lambda: fake)
+    seen = {}
+
+    def fake_get(*args, **kwargs):
+        seen["kwargs"] = kwargs
+        seen["args"] = args
+        return "ok"
+
+    monkeypatch.setattr(repo_solver, "get_repo_solver", fake_get)
+    assert repo_solver.get_provides_catalog_solver("oreon-11-rp1", "sidetag", "x86_64") == "ok"
+    assert not seen["kwargs"].get("repo_urls")

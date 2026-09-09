@@ -17,6 +17,17 @@ def test_parse_requested_and_needed_by():
     assert "/usr/bin/msgfmt" in got
 
 
+def test_parse_cmake_virtual_from_mock_installdeps():
+    text = (
+        "No matching package to install: 'cmake(KQuickImageEditor)'\n"
+        "No matching package to install: 'cmake(OpenCV)'\n"
+        "Not all dependencies satisfied\n"
+    )
+    got = parse_dnf_missing_provides(text)
+    assert "cmake(KQuickImageEditor)" in got
+    assert "cmake(OpenCV)" in got
+
+
 def test_parse_ignores_noise():
     assert parse_dnf_missing_provides("Transaction failed") == []
 
