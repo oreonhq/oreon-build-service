@@ -211,10 +211,16 @@ class OreonRepoSolver:
         branches: list[str],
         arch: str,
         work_dir: str | None = None,
+        repo_urls: list[tuple[str, str]] | None = None,
     ) -> None:
         self.releasename = (releasename or "").strip()
         self.branches = [b for b in branches if b]
         self.arch = (arch or "x86_64").strip()
+        self.repo_urls = [
+            (str(n).strip(), str(u).rstrip("/"))
+            for n, u in (repo_urls or [])
+            if str(n).strip() and str(u).strip()
+        ]
         self._td = work_dir or tempfile.mkdtemp(prefix="oreon-solv-")
         self._owned_td = work_dir is None
         self._overlay_dir = Path(self._td) / "overlay"
@@ -233,6 +239,7 @@ class OreonRepoSolver:
             "releasename": self.releasename,
             "branches": list(self.branches),
             "arch": self.arch,
+            "repo_urls": [list(x) for x in self.repo_urls],
         }
 
     def _use_rpc(self) -> bool:
@@ -276,6 +283,7 @@ class OreonRepoSolver:
             releasename=self.releasename,
             branches=self.branches,
             arch=self.arch,
+            repo_urls=self.repo_urls or None,
         )
         eng.load()
         self._solv_engine = eng
@@ -463,6 +471,14 @@ class OreonRepoSolver:
         with _SOLV_LOCK:
             return set(self._get_solv_engine().sources_providing(requirement))
 
+    def source_rpms_providing(self, requirement: str) -> set[str]:
+        if self._use_rpc():
+            from oreon_build.services.solv_process import rpc_source_rpms_providing
+
+            return rpc_source_rpms_providing(self._rpc_spec(), requirement)
+        with _SOLV_LOCK:
+            return set(self._get_solv_engine().source_rpms_providing(requirement))
+
     def capability_index(self) -> Any:
         with _SOLV_LOCK:
             return self._get_solv_engine().capability_index()
@@ -507,6 +523,12 @@ class MultiArchRepoSolver:
         out: set[str] = set()
         for s in self.solvers:
             out |= s.sources_providing(requirement)
+        return out
+
+    def source_rpms_providing(self, requirement: str) -> set[str]:
+        out: set[str] = set()
+        for s in self.solvers:
+            out |= s.source_rpms_providing(requirement)
         return out
 
     def capability_index(self) -> Any:
@@ -571,12 +593,47 @@ class MultiArchRepoSolver:
         return set(self.resolve(requirements).missing_provides)
 
 
+def fedora_provides_repo_urls(arch: str) -> list[tuple[str, str]]:
+    from oreon_build.config import get_settings
+
+    s = get_settings()
+    ver = int(s.layer_provides_fedora_release)
+    root = (s.layer_provides_fedora_base or "").rstrip("/")
+    a = "aarch64" if (arch or "").strip() in {"aarch64", "arm64"} else "x86_64"
+    return [
+        (f"fedora-{ver}-everything", f"{root}/releases/{ver}/Everything/{a}/os"),
+        (f"fedora-{ver}-updates", f"{root}/updates/{ver}/Everything/{a}"),
+    ]
+
+
+def get_provides_catalog_solver(
+    releasename: str,
+    branch: str,
+    arch: str,
+) -> MultiArchRepoSolver:
+    from oreon_build.config import get_settings
+
+    mode = str(get_settings().layer_provides_catalog or "fedora").strip().lower()
+    if mode == "oreon":
+        from oreon_build.services.repo_capability_index import default_capability_extra_branches
+
+        extra = default_capability_extra_branches(branch)
+        return get_repo_solver(releasename, branch, [arch], extra_branches=extra)
+    return get_repo_solver(
+        f"fedora-catalog-{get_settings().layer_provides_fedora_release}",
+        "everything",
+        [arch],
+        repo_urls=fedora_provides_repo_urls(arch),
+    )
+
+
 def get_repo_solver(
     releasename: str,
     branch: str,
     architectures: list[str],
     *,
     extra_branches: list[str] | None = None,
+    repo_urls: list[tuple[str, str]] | None = None,
 ) -> MultiArchRepoSolver:
     from oreon_build.services.solv_engine import solv_available
 
@@ -594,7 +651,12 @@ def get_repo_solver(
     arches = sorted({(a or "").strip() for a in architectures if (a or "").strip()}) or [
         "x86_64"
     ]
-    key = (releasename, tuple(branches), tuple(arches))
+    urls = [
+        (str(n).strip(), str(u).rstrip("/"))
+        for n, u in (repo_urls or [])
+        if str(n).strip() and str(u).strip()
+    ]
+    key = (releasename, tuple(branches), tuple(arches), tuple(urls))
     now = time.monotonic()
     to_close: list[MultiArchRepoSolver] = []
     with _SOLV_LOCK:
@@ -616,7 +678,12 @@ def get_repo_solver(
             _queue_close(sol)
 
         solvers = [
-            OreonRepoSolver(releasename=releasename, branches=branches, arch=a)
+            OreonRepoSolver(
+                releasename=releasename,
+                branches=branches,
+                arch=a,
+                repo_urls=urls or None,
+            )
             for a in arches
         ]
         multi = MultiArchRepoSolver(solvers)
@@ -650,7 +717,7 @@ def invalidate_repo_solver_cache(
     }
     with _SOLV_LOCK:
         for key, (_timestamp, solver) in list(_SOLVER_CACHE.items()):
-            key_rel, key_branches, key_arches = key
+            key_rel, key_branches, key_arches = key[0], key[1], key[2]
             if key_rel != rel or target_branch not in key_branches:
                 continue
             if arch_set and not arch_set.intersection(key_arches):

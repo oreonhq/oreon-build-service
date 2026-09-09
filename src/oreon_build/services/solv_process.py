@@ -32,10 +32,13 @@ def rpc_enabled() -> bool:
 
 
 def _spec_key(spec: dict[str, Any]) -> tuple[Any, ...]:
+    urls = spec.get("repo_urls") or ()
+    flat = tuple((str(x[0]), str(x[1])) for x in urls if x)
     return (
         str(spec.get("releasename") or ""),
         tuple(spec.get("branches") or ()),
         str(spec.get("arch") or "x86_64"),
+        flat,
     )
 
 
@@ -64,10 +67,13 @@ def _solv_worker_main(in_q: Any, out_q: Any) -> None:
                     old.close()
                 except Exception:
                     pass
+        raw_urls = spec.get("repo_urls") or []
+        urls = [(str(x[0]), str(x[1])) for x in raw_urls if x]
         eng = OreonRepoSolver(
             releasename=str(spec.get("releasename") or ""),
             branches=list(spec.get("branches") or []),
             arch=str(spec.get("arch") or "x86_64"),
+            repo_urls=urls or None,
         )
         eng._get_base()
         engines[key] = eng
@@ -124,6 +130,15 @@ def _solv_worker_main(in_q: Any, out_q: Any) -> None:
                         req_id,
                         "ok",
                         set(eng.sources_providing(str((payload or {}).get("requirement") or ""))),
+                    )
+                )
+            elif op == "source_rpms_providing":
+                eng = _get_engine(spec)
+                out_q.put(
+                    (
+                        req_id,
+                        "ok",
+                        set(eng.source_rpms_providing(str((payload or {}).get("requirement") or ""))),
                     )
                 )
             elif op == "close":
@@ -220,6 +235,10 @@ def rpc_has_provider(spec: dict[str, Any], requirement: str) -> bool:
 
 def rpc_sources_providing(spec: dict[str, Any], requirement: str) -> set[str]:
     return set(_rpc("sources_providing", {"spec": spec, "requirement": requirement}) or ())
+
+
+def rpc_source_rpms_providing(spec: dict[str, Any], requirement: str) -> set[str]:
+    return set(_rpc("source_rpms_providing", {"spec": spec, "requirement": requirement}) or ())
 
 
 def rpc_close(spec: dict[str, Any]) -> None:

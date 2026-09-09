@@ -296,11 +296,13 @@ class SolvArchEngine:
         branches: list[str],
         arch: str,
         cache_root: Path | None = None,
+        repo_urls: list[tuple[str, str]] | None = None,
     ) -> None:
         self.releasename = (releasename or "").strip()
         self.branches = [b for b in branches if (b or "").strip()]
         self.arch = (arch or "x86_64").strip()
         self.cache_root = cache_root or _solv_cache_root()
+        self.repo_urls = [(str(n).strip(), str(u).rstrip("/")) for n, u in (repo_urls or []) if str(n).strip() and str(u).strip()]
         self._solv = _ensure_solv()
         self._pool: Any | None = None
         self._overlay_repo: Any | None = None
@@ -325,14 +327,24 @@ class SolvArchEngine:
         solv = self._solv
         pool = solv.Pool()
         pool.setarch(self.arch)
-        for branch in self.branches:
-            meta = self._ensure_branch_meta(branch)
-            repo = pool.add_repo(f"oreon-{branch}-{self.arch}".replace("/", "-"))
-            if meta.solv_path.exists() and meta.solv_path.stat().st_size > 64:
-                repo.add_solv(str(meta.solv_path))
-            else:
-                self._fill_repo_from_xml(repo, meta)
-                self._write_solv(repo, meta.solv_path)
+        if self.repo_urls:
+            for name, base in self.repo_urls:
+                meta = self._ensure_repo_meta(self.cache_root / "url" / name / self.arch, base, name)
+                repo = pool.add_repo(name.replace("/", "-"))
+                if meta.solv_path.exists() and meta.solv_path.stat().st_size > 64:
+                    repo.add_solv(str(meta.solv_path))
+                else:
+                    self._fill_repo_from_xml(repo, meta)
+                    self._write_solv(repo, meta.solv_path)
+        else:
+            for branch in self.branches:
+                meta = self._ensure_branch_meta(branch)
+                repo = pool.add_repo(f"oreon-{branch}-{self.arch}".replace("/", "-"))
+                if meta.solv_path.exists() and meta.solv_path.stat().st_size > 64:
+                    repo.add_solv(str(meta.solv_path))
+                else:
+                    self._fill_repo_from_xml(repo, meta)
+                    self._write_solv(repo, meta.solv_path)
         pool.addfileprovides()
         pool.createwhatprovides()
         self._pool = pool
@@ -423,6 +435,14 @@ class SolvArchEngine:
             name = (getattr(sol, "name", None) or "").strip()
             if name:
                 out.add(name)
+        return out
+
+    def source_rpms_providing(self, requirement: str) -> set[str]:
+        out: set[str] = set()
+        for sol in self._iter_providers(requirement):
+            src = _source_name_from_solvable(sol, self._solv)
+            if src:
+                out.add(src)
         return out
 
     def capability_index(self) -> Any:
@@ -635,19 +655,23 @@ class SolvArchEngine:
         pool.createwhatprovides()
 
     def _ensure_branch_meta(self, branch: str) -> _RepoMetaFiles:
-        arch_dir = self.cache_root / self.releasename / branch / self.arch
-        arch_dir.mkdir(parents=True, exist_ok=True)
         base = f"{_public_repo_base()}{self.releasename}/{branch}/{self.arch}"
-        repomd_path = arch_dir / "repomd.xml"
+        cache_dir = self.cache_root / self.releasename / branch / self.arch
+        return self._ensure_repo_meta(cache_dir, base, f"{self.releasename}/{branch}/{self.arch}")
+
+    def _ensure_repo_meta(self, cache_dir: Path, base: str, label: str) -> _RepoMetaFiles:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        base = (base or "").rstrip("/")
+        repomd_path = cache_dir / "repomd.xml"
         try:
             _http_get(f"{base}/repodata/repomd.xml", repomd_path)
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 empty = _RepoMetaFiles(
                     checksum="empty",
-                    primary_xml=arch_dir / "primary-empty.xml",
+                    primary_xml=cache_dir / "primary-empty.xml",
                     filelists_xml=None,
-                    solv_path=arch_dir / "repo.empty.solv",
+                    solv_path=cache_dir / "repo.empty.solv",
                 )
                 if not empty.primary_xml.exists():
                     empty.primary_xml.write_text(
@@ -685,29 +709,23 @@ class SolvArchEngine:
                 f"{primary_sum}:{filelists_sum}".encode()
             ).hexdigest()[:40]
 
-        primary_dl = arch_dir / Path(primary_href).name
-        primary_xml = arch_dir / f"primary.{checksum}.xml"
+        primary_dl = cache_dir / Path(primary_href).name
+        primary_xml = cache_dir / f"primary.{checksum}.xml"
         if not primary_xml.exists():
             _http_get(f"{base}/{primary_href}", primary_dl)
             _decompress_metadata(primary_dl, primary_xml)
 
         filelists_xml = None
         if filelists_href:
-            fl_dl = arch_dir / Path(filelists_href).name
-            fl_xml = arch_dir / f"filelists.{checksum}.xml"
+            fl_dl = cache_dir / Path(filelists_href).name
+            fl_xml = cache_dir / f"filelists.{checksum}.xml"
             if not fl_xml.exists():
                 try:
                     _http_get(f"{base}/{filelists_href}", fl_dl)
                     _decompress_metadata(fl_dl, fl_xml)
                     filelists_xml = fl_xml
                 except Exception:
-                    logger.warning(
-                        "filelists fetch failed for %s/%s/%s",
-                        self.releasename,
-                        branch,
-                        self.arch,
-                        exc_info=True,
-                    )
+                    logger.warning("filelists fetch failed for %s", label, exc_info=True)
             else:
                 filelists_xml = fl_xml
 
@@ -715,7 +733,7 @@ class SolvArchEngine:
             checksum=checksum,
             primary_xml=primary_xml,
             filelists_xml=filelists_xml,
-            solv_path=arch_dir / f"repo.{checksum}.solv",
+            solv_path=cache_dir / f"repo.{checksum}.solv",
         )
 
     def _fill_repo_from_xml(self, repo: Any, meta: _RepoMetaFiles) -> None:

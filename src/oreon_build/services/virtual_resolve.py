@@ -373,6 +373,10 @@ def cmake_to_sources(cap: str, package_names: set[str], provider_map: dict) -> s
         f"{base}-devel",
         f"lib{base}",
         f"lib{base}-devel",
+        base.lower(),
+        f"{base.lower()}-devel",
+        f"lib{base.lower()}",
+        f"lib{base.lower()}-devel",
     )
     if inner.startswith("KF") and len(inner) > 3 and inner[2].isdigit():
         ver = inner[2]
@@ -705,8 +709,13 @@ def subpkg_to_sources(cap: str, package_names: set[str], provider_map: dict) -> 
 
 def _pmap_sources(provider_map: dict, *keys: str) -> set[str]:
     out: set[str] = set()
+    lower = provider_map.get("__lower__") if isinstance(provider_map.get("__lower__"), dict) else None
     for key in keys:
-        raw = provider_map.get(key) or provider_map.get((key or "").lower()) or ()
+        raw = provider_map.get(key)
+        if not raw and lower is not None:
+            raw = lower.get((key or "").lower())
+        if not raw:
+            raw = provider_map.get((key or "").lower())
         if isinstance(raw, (set, frozenset)):
             out.update(s for s in raw if s)
         elif isinstance(raw, (list, tuple)):

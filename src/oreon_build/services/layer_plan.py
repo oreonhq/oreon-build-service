@@ -18,6 +18,8 @@ from oreon_build.models import (
     LayerPlanStatus,
     Package,
     PackageVersion,
+    Release,
+    SideTag,
     Source,
 )
 from oreon_build.services.distgit_order import db_safe_spec_evr
@@ -254,11 +256,6 @@ def layer_plan_settlement(
         return None, None
     if any(_job_waits_for_publish(j) for j in jobs):
         return None, None
-    phase1 = [j for j in jobs if getattr(j, "build_phase", None) == "phase1_bridge"]
-    if phase1 and all(_job_build_terminal_ok(j.status) for j in phase1):
-        # Successful Phase 1 is finalized by the engine after publication so
-        # it can create the required native purification jobs.
-        return None, None
     n_ok = sum(1 for j in jobs if _job_build_terminal_ok(j.status))
     n_fail = sum(1 for j in jobs if j.status == BuildStatus.FAILED)
     n_cancel = sum(1 for j in jobs if j.status == BuildStatus.CANCELLED)
@@ -384,49 +381,69 @@ async def on_layer_resolve_failed(
     *,
     package_name: str | None = None,
     missing_provides: list[str] | None = None,
+    source_requirements: list[str] | None = None,
 ) -> None:
     if job.layer_plan_id is None:
         return
     plan = await db.get(LayerPlan, job.layer_plan_id)
     if plan is None or plan.status in (LayerPlanStatus.SUCCESS, LayerPlanStatus.FAILED, LayerPlanStatus.CANCELLED):
         return
-    from oreon_build.core.dnf_missing import parse_dnf_missing_provides
-    from oreon_build.core.rpm_requires import is_malformed_rpm_requirement
+    from oreon_build.core.rpm_requires import (
+        is_low_level_runtime_requirement,
+        is_malformed_rpm_requirement,
+        is_spurious_solver_miss,
+    )
     from oreon_build.services.build_pass import job_options_dict
-    caps: list[str] = []
-    seen: set[str] = set()
-    for item in list(missing_provides or []) + parse_dnf_missing_provides(reason or ""):
-        cap = str(item or "").strip()
-        if not cap or cap in seen:
-            continue
-        seen.add(cap)
-        caps.append(cap)
-    if not caps or any(is_malformed_rpm_requirement(cap) for cap in caps):
+    from oreon_build.services.layer_engine import native_missing_caps
+
+    def _clean(items: list[str] | None) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in items or []:
+            cap = str(item or "").strip()
+            if not cap or cap in seen:
+                continue
+            if is_malformed_rpm_requirement(cap) or is_spurious_solver_miss(cap):
+                continue
+            if is_low_level_runtime_requirement(cap):
+                continue
+            seen.add(cap)
+            out.append(cap)
+        return out
+
+    reqs = _clean(source_requirements) or _clean(missing_provides)
+    if not reqs:
         await on_build_job_failed_for_layer(
             db, job, reason, package_name=package_name,
         )
         return
     opts = job_options_dict(job)
-    opts["solver_requirements"] = caps
-    job.job_options = opts
-    fallback_config = str(opts.get("fallback_mock_config") or "").strip()
+    opts["solver_requirements"] = reqs
     native_config = str(opts.get("native_mock_config") or "").strip()
-    native_only = getattr(job, "build_phase", None) == "phase2_native"
-    if native_only and native_config:
+    if native_config:
         job.target_mock_config = native_config
-    if not native_only and fallback_config and str(job.target_mock_config or "") == native_config:
-        job.target_mock_config = fallback_config
-        job.status = BuildStatus.QUEUED
-        job.blocked_reason = (
-            "routed to selected fallback due to missing native deps: "
-            + ", ".join(caps)
-        )[:8000]
-    else:
-        job.status = BuildStatus.BLOCKED
-        job.blocked_reason = "waiting on repository: " + ", ".join(caps)[:480]
+    release = await db.get(Release, plan.release_id) if getattr(plan, "release_id", None) else None
+    tag = await db.get(SideTag, plan.side_tag_id) if getattr(plan, "side_tag_id", None) else None
+    missing = _clean(missing_provides)
+    if release is not None and tag is not None:
+        missing = await native_missing_caps(job, release.releasename, tag.name, reqs)
+    elif not missing:
+        missing = reqs
+    if not missing:
+        await on_build_job_failed_for_layer(
+            db, job, reason, package_name=package_name,
+        )
+        return
+    opts["missing_caps"] = missing
+    job.job_options = opts
+    job.status = BuildStatus.BLOCKED
+    job.blocked_reason = "waiting on repository: " + ", ".join(missing)[:480]
     job.completed_at = None
     job.blocking_sources = []
     await db.flush()
+    from oreon_build.services.layer_engine import expand_blocked_jobs
+    if release is not None and tag is not None:
+        await expand_blocked_jobs(db, plan, release, tag, [job])
     await maybe_settle_layer_plan(db, int(plan.id))
 
 
@@ -659,7 +676,7 @@ async def resume_layer_plan_by_user(
 async def maybe_settle_layer_plan(db: Any, layer_plan_id: int) -> None:
     """Mark a plan terminal once every job it owns has reached a terminal state."""
     plan = await db.get(LayerPlan, layer_plan_id)
-    if not plan or plan.status not in (LayerPlanStatus.PENDING, LayerPlanStatus.RUNNING):
+    if not plan or getattr(plan, "status", None) not in (LayerPlanStatus.PENDING, LayerPlanStatus.RUNNING):
         return
     jobs_r = await db.execute(
         select(BuildJob)
@@ -721,6 +738,7 @@ async def notify_layer_job_terminal_after_result(
     build_attempt_id: int | None = None,
     resolve_stage: str | None = None,
     missing_provides: list[str] | None = None,
+    source_requirements: list[str] | None = None,
 ) -> None:
     st = (status_str or "").lower()
     if st not in ("failed", "cancelled"):
@@ -754,9 +772,15 @@ async def notify_layer_job_terminal_after_result(
         if job.status != expected:
             return
         pkg_name = job.package.name if job.package else None
-        if st == "failed" and stage in ("installdeps", "generate_buildrequires"):
+        if st == "failed" and (
+            stage in ("installdeps", "generate_buildrequires")
+            or missing_provides
+            or source_requirements
+        ):
             await on_layer_resolve_failed(
-                db, job, reason, package_name=pkg_name, missing_provides=missing_provides,
+                db, job, reason, package_name=pkg_name,
+                missing_provides=missing_provides,
+                source_requirements=source_requirements,
             )
         elif st == "failed":
             await on_build_job_failed_for_layer(db, job, reason, package_name=pkg_name)
