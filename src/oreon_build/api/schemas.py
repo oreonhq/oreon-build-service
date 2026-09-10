@@ -430,7 +430,7 @@ class RpmbuildPlanCreate(BaseModel):
 
 
 class ChainBuildTrigger(BaseModel):
-    chain: str = Field(..., min_length=1, max_length=20000)
+    chain: str = Field(..., min_length=1, max_length=200000)
     release_id: int = Field(..., ge=1)
     side_tag_id: int = Field(..., ge=1)
     architectures: List[str] = Field(default=["x86_64", "aarch64"])

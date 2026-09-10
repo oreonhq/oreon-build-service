@@ -30,6 +30,7 @@ from oreon_build.services.build_target_util import (
     get_or_create_build_target,
     has_successful_build_for_target,
     latest_package_version_id,
+    resolve_package_by_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -119,9 +120,9 @@ async def _get_or_create_distgit_package(
     distgit_url: str,
     distgit_branch: str,
     preferred_mock_environment_id: int | None,
+    release_id: int | None = None,
 ) -> tuple[Package, int | None]:
-    ex = await db.execute(select(Package).where(Package.name == package_name))
-    pkg = ex.scalar_one_or_none()
+    pkg = await resolve_package_by_name(db, package_name, release_id=release_id)
     if pkg is not None:
         # Reused packages must follow the current chain inputs. Previously
         # this early return left an old DistGit URL/source association in place.
@@ -220,6 +221,7 @@ async def enqueue_plan_layer_jobs(
             distgit_url=plan.distgit_url,
             distgit_branch=plan.distgit_branch,
             preferred_mock_environment_id=None,
+            release_id=release.id,
         )
         for arch in architectures:
             canon = normalize_machine_arch(arch)
@@ -460,6 +462,7 @@ async def create_rpmbuild_plan(
             distgit_url=durl,
             distgit_branch=dbranch,
             preferred_mock_environment_id=None,
+            release_id=release.id,
         )
         for arch in selected_arches:
             target = await get_or_create_build_target(

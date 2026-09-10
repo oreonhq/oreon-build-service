@@ -97,6 +97,13 @@
           });
           btns.appendChild(clear);
           if (!api.token) return;
+          var canRetryAny = ids.some(function(id) {
+            var tr = tbody.querySelector('tr[data-id="' + id + '"]');
+            if (!tr || tr.getAttribute('data-side-tag') !== '1') return false;
+            var st = tr.getAttribute('data-status') || '';
+            return st !== 'pending' && st !== 'queued' && st !== 'running';
+          });
+          if (canRetryAny) {
           var retryBulk = document.createElement('button');
           retryBulk.type = 'button';
           retryBulk.className = 'btn';
@@ -109,6 +116,7 @@
               var tr = tbody.querySelector('tr[data-id="' + sid + '"]');
               var st = tr ? (tr.getAttribute('data-status') || '')  : '-';
               if (st === 'pending' || st === 'queued' || st === 'running') return;
+              if (tr && tr.getAttribute('data-side-tag') !== '1') return;
               if (isBuildJobRetried(sid)) { sawAlreadyRetried = true; return; }
               chain = chain.then(function() {
                 return api.post('/builds/jobs/' + sid + '/retry').then(function() { markBuildJobRetried(sid); });
@@ -118,6 +126,7 @@
             chain.then(function() { render(); }).catch(function(e) { alert(e.message); });
           });
           btns.appendChild(retryBulk);
+          }
           var cancelBulk = document.createElement('button');
           cancelBulk.type = 'button';
           cancelBulk.className = 'btn';
@@ -151,7 +160,7 @@
             const canAct = api.token;
             var cancelBtn = (canAct && (j.status === 'pending' || j.status === 'queued' || j.status === 'running'))
               ? ' <button type="button" class="btn cancel-build" data-id="' + j.id + '">Cancel</button>'  : '';
-            var retryEligible = canAct && j.status !== 'pending' && j.status !== 'queued' && j.status !== 'running';
+            var retryEligible = canAct && j.side_tag_id != null && j.side_tag_id !== undefined && j.status !== 'pending' && j.status !== 'queued' && j.status !== 'running';
             var retryUsed = retryEligible && isBuildJobRetried(j.id);
             var retryBtn = '';
             if (retryEligible) {
@@ -181,7 +190,7 @@
                 chainPart = chainIdStr + idxNote;
               }
             }
-            return '<tr data-id="' + j.id + '" data-status="' + escapeAttr(j.status || '') + '">' +
+            return '<tr data-id="' + j.id + '" data-status="' + escapeAttr(j.status || '') + '" data-side-tag="' + (j.side_tag_id != null ? '1' : '0') + '">' +
               '<td class="col-checkbox"><input type="checkbox" class="build-row-cb" data-id="' + j.id + '"></td>' +
               '<td>' + j.id + '</td><td>' + pkg + '</td><td>' + rel + '</td><td>' + sideTag + '</td><td>' + arch + '</td>' +
               '<td><span class="' + statusClass(sd) + '">' + escapeHtml(sd) + '</span></td>' +

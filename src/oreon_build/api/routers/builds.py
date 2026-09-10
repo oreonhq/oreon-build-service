@@ -855,6 +855,19 @@ async def retry_build(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Job still has active attempt {live_attempt}",
         )
+    from oreon_build.models import SideTag
+
+    if not job.side_tag_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Side tag no longer exists",
+        )
+    live_tag = await db.get(SideTag, job.side_tag_id)
+    if live_tag is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Side tag no longer exists",
+        )
     latest_attempt = await db.scalar(
         select(BuildAttempt)
         .where(BuildAttempt.build_job_id == job.id)
