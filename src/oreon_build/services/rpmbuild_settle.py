@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import bz2
 import gzip
 import io
@@ -18,6 +19,20 @@ from oreon_build.services.r2 import get_r2_client
 from oreon_build.services.rpmbuild_order import enqueue_plan_layer_jobs
 
 logger = logging.getLogger(__name__)
+
+
+def rebuild_side_tag_repodata_sync(releasename: str, tag_name: str, arches: list[str]) -> None:
+    from oreon_build.services.publisher import prefix_publish_lock, update_repodata_at_prefix
+    from oreon_build.services.r2 import repo_r2_prefix
+
+    for arch in arches:
+        a = (arch or "").strip()
+        if not a:
+            continue
+        prefix = repo_r2_prefix(releasename, tag_name, a)
+        logger.info("rebuilding side tag repodata prefix=%s", prefix)
+        with prefix_publish_lock(prefix):
+            update_repodata_at_prefix(prefix, force_full=True)
 
 
 def rewrite_distgit_source_url(old: str, distgit_url: str, distgit_branch: str) -> str | None:
@@ -68,8 +83,38 @@ async def cancel_chain_plan_by_user(db: Any, request: Any, user: Any, chain_plan
         )
         .values(status=BuildStatus.CANCELLED, finished_at=datetime.now(timezone.utc), error_message="Chain cancelled by user")
     )
+    now = datetime.now(timezone.utc)
+    await db.execute(
+        update(PublishTask)
+        .where(
+            PublishTask.build_job_id.in_(select(BuildJob.id).where(BuildJob.rpmbuild_plan_id == plan.id)),
+            PublishTask.status == "pending",
+        )
+        .values(status="cancelled", finished_at=now, error_message="Chain cancelled by user")
+    )
     await log_audit(db, "build.chain_cancel", account_id=user.id, resource_type="rpmbuild_plan", resource_id=str(plan.id), ip_address=get_client_ip(request), user_agent=get_user_agent(request))
     return plan
+
+
+def schedule_side_tag_repodata_rebuild(releasename: str, tag_name: str, arches: list[str]) -> None:
+    task = asyncio.create_task(
+        asyncio.to_thread(
+            rebuild_side_tag_repodata_sync,
+            releasename,
+            tag_name,
+            [str(a) for a in arches],
+        )
+    )
+
+    def _done(t: asyncio.Task[None]) -> None:
+        try:
+            exc = t.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            logger.exception("background side tag repodata rebuild failed tag=%s", tag_name, exc_info=exc)
+
+    task.add_done_callback(_done)
 
 
 async def resume_chain_plan_by_user(db: Any, request: Any, user: Any, chain_plan_id: int) -> RpmbuildPlan:
@@ -79,7 +124,7 @@ async def resume_chain_plan_by_user(db: Any, request: Any, user: Any, chain_plan
     if plan.status == RpmbuildPlanStatus.SUCCESS:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Chain already succeeded")
     cur = int(plan.current_open_layer or 0)
-    jobs = list((await db.execute(select(BuildJob).where(BuildJob.rpmbuild_plan_id == plan.id, BuildJob.rpmbuild_layer_index == cur).with_for_update())).scalars().all())
+    jobs = list((await db.execute(select(BuildJob).where(BuildJob.rpmbuild_plan_id == plan.id, BuildJob.rpmbuild_layer_index == cur))).scalars().all())
     reopen = [j for j in jobs if j.status in (BuildStatus.FAILED, BuildStatus.CANCELLED, BuildStatus.BLOCKED)]
     if not reopen:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No failed or cancelled jobs in the current chain group")

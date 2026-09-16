@@ -496,11 +496,18 @@ async def get_chain_build_status(chain_plan_id: int, db: DbSession, offset: int 
 async def cancel_chain_build_endpoint(
     chain_plan_id: int, request: Request, db: DbSession, user: CurrentUser,
 ):
-    from oreon_build.services.rpmbuild_settle import cancel_chain_plan_by_user
+    from oreon_build.services.rpmbuild_settle import cancel_chain_plan_by_user, schedule_side_tag_repodata_rebuild
 
     plan = await cancel_chain_plan_by_user(db, request, user, chain_plan_id)
+    release = await db.get(Release, plan.release_id)
+    options = plan.options_json if isinstance(plan.options_json, dict) else {}
+    arches = (options.get("architectures") if isinstance(options, dict) else None) or (release.arch_list() if release else None) or ["x86_64", "aarch64"]
+    releasename = release.releasename if release else ""
+    tag_name = plan.repo_branch
     await db.commit()
     await db.refresh(plan)
+    if releasename and tag_name:
+        schedule_side_tag_repodata_rebuild(releasename, tag_name, [str(a) for a in arches])
     return await _chain_plan_to_status_response(db, plan)
 
 
