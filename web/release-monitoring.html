@@ -46,9 +46,7 @@
       </div>
       <h1 style="margin:0 0 0.35rem; font-size:1.35rem;">Release Monitoring</h1>
       <p class="errata-lead">
-        Checks our published package versions in R2 against the latest upstream stable on
-        release-monitoring.org (Anitya). Only outdated packages are listed. Rescan after updating and
-        the ones you fixed drop off.
+        Checks published source RPM versions in the repository against upstream.
       </p>
 
       <div class="errata-filters">
@@ -142,7 +140,7 @@
           var total = active.total_packages || 0;
           var checked = active.checked_packages || 0;
           var frac = total ? (' ' + checked + ' / ' + total) : '';
-          progressEl.textContent = 'Scanning against Anitya...' + frac + ' (' + (active.matched_packages || 0) + ' tracked upstream)';
+          progressEl.textContent = 'Scanning upstream...' + frac + ' (' + (active.matched_packages || 0) + ' tracked)';
           return;
         }
         if (latest) {

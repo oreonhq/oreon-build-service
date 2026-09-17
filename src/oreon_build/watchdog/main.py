@@ -18,6 +18,7 @@ from oreon_build.api.routers.auth import router as auth_router
 from oreon_build.models import (
     CveMatch,
     CveMatchRelease,
+    Package,
     Release,
     ReleaseMonitorOutdated,
     ReleaseMonitorScan,
@@ -346,7 +347,7 @@ def create_app() -> FastAPI:
     async def release_monitoring_latest(package_name: str):
         import httpx
         from sqlalchemy import select as sa_select
-        from oreon_build.services.release_monitor import _anitya_latest
+        from oreon_build.services.release_monitor import lookup_upstream_latest
 
         name = (package_name or "").strip()
         if not name or len(name) > 256:
@@ -377,15 +378,23 @@ def create_app() -> FastAPI:
                     }
                 )
 
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            hit = await _anitya_latest(client, name)
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, headers={"User-Agent": "oreon-watchdog-release-monitor/1.0"}) as client:
+            gh = None
+            async with async_session_maker() as db:
+                pkg = (
+                    await db.execute(
+                        sa_select(Package.github_html_url).where(Package.name == name).limit(1)
+                    )
+                ).scalar_one_or_none()
+                gh = (pkg or "").strip() or None
+            hit = await lookup_upstream_latest(client, name, github_url=gh)
         if not hit:
             return JSONResponse(
                 content={"detail": "no version mapping for %s" % name},
                 status_code=404,
             )
         return JSONResponse(
-            content={"package_name": name, "source": "anitya", **hit}
+            content={"package_name": name, "source": "upstream", **hit}
         )
 
     @app.get("/api/release-monitoring/status")
