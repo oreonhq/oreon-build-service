@@ -438,6 +438,18 @@ class ChainBuildTrigger(BaseModel):
     preferred_mock_environment_id: Optional[int] = None
     distgit_url: Optional[str] = Field(None, max_length=1024)
     distgit_branch: Optional[str] = Field(None, max_length=128)
+    maintenance: bool = False
+
+
+class DiscoveryBuildTrigger(BaseModel):
+    packages: List[str] = Field(..., min_length=1)
+    release_id: int = Field(..., ge=1)
+    side_tag_id: int = Field(..., ge=1)
+    architectures: List[str] = Field(default=["x86_64", "aarch64"])
+    priority: int = 0
+    preferred_mock_environment_id: Optional[int] = None
+    distgit_url: Optional[str] = Field(None, max_length=1024)
+    distgit_branch: Optional[str] = Field(None, max_length=128)
 
 
 class RpmbuildPlanResponse(BaseModel):

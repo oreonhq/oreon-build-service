@@ -209,6 +209,7 @@ class ResultPayload(BaseModel):
     log_r2_key: str | None = None
     artifacts: list[ArtifactPayload] = []
     missing_provides: list[str] = []
+    rpm_provides: list[str] = []
     source_requirements: list[str] = []
     resolve_stage: str | None = None
     failure_kind: str | None = Field(default=None, max_length=64)
@@ -585,6 +586,7 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
             "build_profile": pass_info.get("build_profile") or "full",
             "rpmbuild_defines": pass_info.get("rpmbuild_defines") or {},
             "bootstrap_stub_provides": pass_info.get("bootstrap_stub_provides") or [],
+            "discovery": bool(pass_info.get("discovery")),
         },
     }
 
@@ -1840,6 +1842,27 @@ async def report_result(
             )
     terminal_st = normalize_terminal_build_status(str(payload.status), err_msg)
 
+    if terminal_st == "blocked":
+        from oreon_build.services.discovery import mark_job_blocked
+
+        attempt.status = BuildStatus.BLOCKED
+        attempt.finished_at = datetime.now(timezone.utc)
+        attempt.error_message = err_msg
+        if payload.log_r2_key:
+            attempt.log_r2_key = payload.log_r2_key
+        await mark_job_blocked(job, missing)
+        if job.rpmbuild_plan_id is not None:
+            plan = await db.get(RpmbuildPlan, job.rpmbuild_plan_id)
+            if plan is not None:
+                from oreon_build.services.discovery import maybe_finish_discovery_plan
+
+                await maybe_finish_discovery_plan(db, plan)
+        await db.flush()
+        await sync_worker_state_after_attempt_finished(db, worker)
+        await db.commit()
+        await _burst_vm_stop_check()
+        return {"status": "ok", "blocked": True}
+
     if terminal_st == "failed":
         prior_art_count = await db.scalar(
             select(func.count(Artifact.id)).where(Artifact.build_attempt_id == attempt_id)
@@ -1924,6 +1947,12 @@ async def report_result(
     if not queued_next_pass:
         job.status = BuildStatus(terminal_st)
         job.completed_at = attempt.finished_at
+    if job.rpmbuild_plan_id is not None:
+        plan = await db.get(RpmbuildPlan, job.rpmbuild_plan_id)
+        if plan is not None:
+            from oreon_build.services.discovery import maybe_finish_discovery_plan
+
+            await maybe_finish_discovery_plan(db, plan)
     await db.flush()
     await sync_worker_state_after_attempt_finished(db, worker)
     await db.commit()
@@ -1991,6 +2020,16 @@ async def report_result(
                 job.id,
             )
             await db.rollback()
+        provided = [str(x).strip() for x in (payload.rpm_provides or []) if str(x).strip()]
+        if provided and job.rpmbuild_plan_id is not None:
+            try:
+                from oreon_build.services.discovery import wake_blocked_jobs
+
+                await wake_blocked_jobs(db, int(job.rpmbuild_plan_id), provided)
+                await db.commit()
+            except Exception:
+                logger.exception("discovery wake failed for plan %s", job.rpmbuild_plan_id)
+                await db.rollback()
 
     if job.package_version_id:
         try:
