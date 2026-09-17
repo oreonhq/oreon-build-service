@@ -49,4 +49,6 @@ def normalize_terminal_build_status(status: str | None, error_message: str | Non
     st = (status or "").strip().lower()
     if st == "failed" and is_architecture_excluded_error(error_message):
         return "skipped"
+    if st == "blocked":
+        return "blocked"
     return st
