@@ -42,6 +42,7 @@ def poll_payload_from_job(job: BuildJob) -> dict[str, Any]:
         "bootstrap_stub_provides": [str(x).strip() for x in (stubs or []) if str(x).strip()]
         if isinstance(stubs, (list, tuple))
         else [],
+        "discovery": bool(opts.get("discovery")),
     }
     return out
 

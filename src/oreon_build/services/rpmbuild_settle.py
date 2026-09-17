@@ -52,7 +52,7 @@ async def _manual_chain_for_user(db: Any, user: Any, chain_plan_id: int) -> Rpmb
     from oreon_build.services.side_tags import get_side_tag_by_name, require_side_tag_access
 
     plan = await db.get(RpmbuildPlan, chain_plan_id)
-    if plan is None or plan.seed_mode != "manual_chain":
+    if plan is None or plan.seed_mode not in ("manual_chain", "discovery"):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chain build not found")
     tag: SideTag | None = await get_side_tag_by_name(db, plan.release_id, plan.repo_branch)
     if tag is None:
