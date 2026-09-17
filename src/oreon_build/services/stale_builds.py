@@ -137,6 +137,36 @@ async def reconcile_queue_inconsistencies(
         if w2 is not None:
             await sync_worker_state_after_attempt_finished(db, w2)
 
+    pending_with_running = await db.execute(
+        select(BuildAttempt)
+        .join(BuildJob, BuildAttempt.build_job_id == BuildJob.id)
+        .where(
+            BuildAttempt.status == BuildStatus.RUNNING,
+            BuildJob.status.in_((BuildStatus.PENDING, BuildStatus.QUEUED)),
+        )
+        .options(selectinload(BuildAttempt.worker))
+    )
+    for att in pending_with_running.scalars().all():
+        prev = (att.error_message or "").strip()
+        att.status = BuildStatus.CANCELLED
+        att.finished_at = att.finished_at or now
+        att.error_message = (prev + "\n\n" if prev else "") + (
+            f"[Controller] Parent build_job id={att.build_job_id} was reopened; "
+            "cancelled leftover RUNNING attempt so workers can claim it."
+        )
+        if att.signing_status in ("not_started", "running", "uploading"):
+            att.signing_status = "failed"
+        await db.flush()
+        if att.worker is not None:
+            await sync_worker_state_after_attempt_finished(db, att.worker)
+        attempts_fixed += 1
+        logger.warning(
+            "Reconciled build_attempt id=%s from RUNNING to cancelled (job %s is %s)",
+            att.id,
+            att.build_job_id,
+            BuildStatus.PENDING.value,
+        )
+
     running_with_terminal_job = await db.execute(
         select(BuildAttempt)
         .join(BuildJob, BuildAttempt.build_job_id == BuildJob.id)

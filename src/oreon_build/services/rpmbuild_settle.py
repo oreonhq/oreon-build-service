@@ -155,6 +155,20 @@ async def resume_chain_plan_by_user(db: Any, request: Any, user: Any, chain_plan
         job.completed_at = None
         job.blocked_reason = None
         job.error_message = None
+    now = datetime.now(timezone.utc)
+    reopen_ids = [j.id for j in reopen]
+    await db.execute(
+        update(BuildAttempt)
+        .where(
+            BuildAttempt.build_job_id.in_(reopen_ids),
+            BuildAttempt.status.in_((BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.RUNNING)),
+        )
+        .values(
+            status=BuildStatus.CANCELLED,
+            finished_at=now,
+            error_message="Superseded by chain resume",
+        )
+    )
     plan.status = RpmbuildPlanStatus.RUNNING
     plan.error_message = None
     plan.settle_deadline_at = None

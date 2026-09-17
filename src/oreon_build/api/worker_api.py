@@ -344,14 +344,15 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
         .order_by(BuildJob.priority.desc(), BuildJob.created_at.asc())
     )
     if get_settings().rpmbuild_strict_gate_enabled:
+        live_plan = (RpmbuildPlanStatus.RUNNING, RpmbuildPlanStatus.WAITING_SETTLE)
         q = q.outerjoin(RpmbuildPlan, BuildJob.rpmbuild_plan_id == RpmbuildPlan.id).where(
             (BuildJob.rpmbuild_plan_id.is_(None))
+            | (RpmbuildPlan.status.is_(None))
+            | (~RpmbuildPlan.status.in_(live_plan))
+            | (BuildJob.rpmbuild_layer_index.is_(None))
             | (
-                RpmbuildPlan.status.in_((RpmbuildPlanStatus.RUNNING, RpmbuildPlanStatus.WAITING_SETTLE))
-                & (
-                    (BuildJob.rpmbuild_layer_index.is_(None))
-                    | (BuildJob.rpmbuild_layer_index <= RpmbuildPlan.current_open_layer)
-                )
+                BuildJob.rpmbuild_layer_index
+                <= func.coalesce(RpmbuildPlan.current_open_layer, 0)
             )
         )
     if worker_arch:
@@ -445,6 +446,8 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
             db.add(attempt)
             await db.flush()
     except IntegrityError:
+        job.status = BuildStatus.PENDING
+        await db.flush()
         return {"job": None}
     locked_worker.current_build_attempt_id = attempt.id
     await db.flush()

@@ -921,6 +921,18 @@ async def retry_build(
             job.target_id = target.id
     job.status = BuildStatus.PENDING
     job.completed_at = None
+    job.blocked_reason = None
+    if job.rpmbuild_plan_id is not None:
+        from oreon_build.models import RpmbuildPlan, RpmbuildPlanStatus
+
+        plan = await db.get(RpmbuildPlan, job.rpmbuild_plan_id)
+        if plan is not None and plan.status in (
+            RpmbuildPlanStatus.CANCELLED,
+            RpmbuildPlanStatus.FAILED,
+        ):
+            plan.status = RpmbuildPlanStatus.RUNNING
+            plan.error_message = None
+            plan.settle_deadline_at = None
     await log_audit(
         db,
         "build.retry",
