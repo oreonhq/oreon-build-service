@@ -2154,6 +2154,27 @@ def _srpm_requires(path: Path) -> list[str]:
     return names
 
 
+def _rpm_file_provides(path: Path) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+
+    def _keep(raw: str) -> None:
+        cap = (raw or "").strip()
+        if cap.startswith("P "):
+            cap = cap[2:].strip()
+        if not cap or cap.lower().startswith("rpmlib(") or cap in seen:
+            return
+        seen.add(cap)
+        names.append(cap)
+
+    rc, out = _run(["rpm", "-qp", "--provides", str(path)], timeout_s=30)
+    if rc != 0:
+        return names
+    for line in (out or "").splitlines():
+        _keep(line)
+    return names
+
+
 def _mock_installdeps_srpm(
     mock_config: str,
     srpm_path: Path,
@@ -2963,16 +2984,25 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                 log_key = _upload_build_log_via_controller(
                     session, controller_url, attempt_id, full_log.encode("utf-8")
                 )
+                from oreon_build.core.dnf_missing import parse_dnf_missing_provides
+
+                missing = parse_dnf_missing_provides(full_log)
+                discovery = bool(job.get("discovery"))
+                if discovery and missing:
+                    result_status = "blocked"
+                else:
+                    result_status = "failed"
                 _post_worker_build_result(
                     session,
                     controller_url,
                     attempt_id,
                     {
-                        "status": "failed",
+                        "status": result_status,
                         "log_r2_key": log_key,
                         "error_message": (full_log if full_log else "mock --installdeps failed"),
                         "artifacts": [],
                         "source_requirements": _srpm_requires(srpm_path),
+                        "missing_provides": missing,
                         "resolve_stage": "installdeps",
                     },
                 )
@@ -3280,6 +3310,16 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                         }
                     )
 
+                rpm_caps: list[str] = []
+                seen_caps: set[str] = set()
+                for staged in sorted(rpm_upload_stage.glob("*.rpm")):
+                    if staged.name.endswith(".src.rpm"):
+                        continue
+                    for cap in _rpm_file_provides(staged):
+                        if cap not in seen_caps:
+                            seen_caps.add(cap)
+                            rpm_caps.append(cap)
+
                 log_key = _upload_build_log_via_controller(
                     session, controller_url, attempt_id, full_log.encode("utf-8")
                 )
@@ -3293,6 +3333,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                         "log_r2_key": log_key,
                         "error_message": None if ok else full_log,
                         "artifacts": artifacts_payload,
+                        "rpm_provides": rpm_caps,
                     },
                 )
         finally:
