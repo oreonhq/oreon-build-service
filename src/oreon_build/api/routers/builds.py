@@ -17,6 +17,7 @@ from oreon_build.api.schemas import (
     BuildTriggerAccepted,
     ChainBuildTrigger,
     ChainPlanStatusResponse,
+    DiscoveryBuildTrigger,
     LayerJobRow,
     CurrentFailureItem,
     DistgitBatchTrigger,
@@ -413,6 +414,10 @@ async def trigger_chain_build_endpoint(
         distgit_branch=data.distgit_branch,
         triggered_by_id=user.id,
     )
+    if data.maintenance:
+        opts = dict(out.plan.options_json or {}) if isinstance(out.plan.options_json, dict) else {}
+        opts["maintenance"] = True
+        out.plan.options_json = opts
     await db.commit()
     await db.refresh(out.plan)
     return RpmbuildPlanResponse(
@@ -484,10 +489,114 @@ async def _chain_plan_to_status_response(db: DbSession, plan: RpmbuildPlan, offs
     )
 
 
+@router.post("/discovery-trigger", response_model=RpmbuildPlanResponse, status_code=status.HTTP_201_CREATED)
+async def trigger_discovery_build_endpoint(
+    data: DiscoveryBuildTrigger,
+    request: Request,
+    db: DbSession,
+    user: CurrentUser,
+):
+    from oreon_build.services.discovery import create_discovery_plan
+    from oreon_build.services.side_tags import get_side_tag, require_side_tag_access
+
+    tag = await get_side_tag(db, data.side_tag_id)
+    if tag is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Side tag not found")
+    require_side_tag_access(user, tag)
+    out = await create_discovery_plan(
+        db,
+        request,
+        packages=data.packages,
+        release_id=data.release_id,
+        side_tag_id=data.side_tag_id,
+        architectures=data.architectures,
+        priority=data.priority,
+        preferred_mock_environment_id=data.preferred_mock_environment_id,
+        distgit_url=data.distgit_url,
+        distgit_branch=data.distgit_branch,
+        triggered_by_id=user.id,
+    )
+    await db.commit()
+    await db.refresh(out.plan)
+    return RpmbuildPlanResponse(
+        id=out.plan.id,
+        release_id=out.plan.release_id,
+        releasename=out.plan.releasename,
+        repo_branch=out.plan.repo_branch,
+        distgit_url=out.plan.distgit_url,
+        distgit_branch=out.plan.distgit_branch,
+        seed_mode=out.plan.seed_mode,
+        seed_packages=list(out.plan.seed_packages_json or []),
+        status=out.plan.status.value,
+        current_open_layer=int(out.plan.current_open_layer or 0),
+        total_layers=len(out.layers),
+        queued_jobs=len(out.jobs),
+        created_at=out.plan.created_at,
+        updated_at=out.plan.updated_at,
+    )
+
+
+@router.get("/discovery/{chain_plan_id}/status")
+async def get_discovery_status(chain_plan_id: int, db: DbSession):
+    from oreon_build.services.discovery import discovery_attention
+
+    plan = await db.get(RpmbuildPlan, chain_plan_id)
+    if plan is None or plan.seed_mode not in ("discovery", "manual_chain"):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Discovery plan not found")
+    return await discovery_attention(db, plan)
+
+
+@router.get("/maintenance/active")
+async def list_active_maintenance(db: DbSession, user: CurrentUser):
+    from oreon_build.models import RpmbuildPlanStatus
+
+    rows = (
+        await db.execute(
+            select(RpmbuildPlan).where(
+                RpmbuildPlan.status.in_(
+                    (RpmbuildPlanStatus.RUNNING, RpmbuildPlanStatus.WAITING_SETTLE)
+                )
+            )
+        )
+    ).scalars().all()
+    out = []
+    for plan in rows:
+        opts = plan.options_json if isinstance(plan.options_json, dict) else {}
+        if opts.get("maintenance") or plan.seed_mode == "discovery":
+            out.append(
+                {
+                    "id": plan.id,
+                    "seed_mode": plan.seed_mode,
+                    "status": plan.status.value,
+                    "releasename": plan.releasename,
+                    "packages": list(plan.seed_packages_json or []),
+                }
+            )
+    return {"items": out}
+
+
+@router.post("/jobs/{job_id}/bootstrap")
+async def bootstrap_build_job(job_id: int, db: DbSession, user: CurrentUser):
+    from oreon_build.services.discovery import apply_bootstrap_to_job
+    from oreon_build.models import SideTag
+    from oreon_build.services.side_tags import require_side_tag_access
+
+    job = await db.get(BuildJob, job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Build job not found")
+    if job.side_tag_id:
+        tag = await db.get(SideTag, job.side_tag_id)
+        if tag is not None:
+            require_side_tag_access(user, tag)
+    await apply_bootstrap_to_job(db, job)
+    await db.commit()
+    return {"id": job.id, "status": job.status.value, "build_profile": "bootstrap"}
+
+
 @router.get("/chain/{chain_plan_id}/status", response_model=ChainPlanStatusResponse)
 async def get_chain_build_status(chain_plan_id: int, db: DbSession, offset: int = Query(0, ge=0)):
     plan = await db.get(RpmbuildPlan, chain_plan_id)
-    if plan is None or plan.seed_mode != "manual_chain":
+    if plan is None or plan.seed_mode not in ("manual_chain", "discovery"):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chain build not found")
     return await _chain_plan_to_status_response(db, plan, offset=offset)
 
