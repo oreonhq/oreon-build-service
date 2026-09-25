@@ -3964,7 +3964,7 @@ def _rbo_f44_cycle_pkgs(spec_root: Path, cycle_pkgs: list[str], already: list[st
     return out
 
 
-def _neighbor_koji_chain(
+def _order_dependency_layers(
     spec_root: Path,
     names: list[str],
     load: list[str] | None,
@@ -4048,13 +4048,13 @@ def _generate_chain_from_specs(
         spec_root, seeds, satisfied, load, arch, quick=False
     )
     click.echo("neighbors %d" % len(neighbors), err=True)
-    _unused, cyclic = _neighbor_koji_chain(
+    _unused, cyclic = _order_dependency_layers(
         spec_root, neighbors, load, arch, quick=False, satisfied=satisfied
     )
     exclude = list(dict.fromkeys(cyclic))
     if exclude:
         click.echo("fedora-44 mock %s" % " ".join(exclude), err=True)
-    chain_raw, _rest = _neighbor_koji_chain(
+    chain_raw, _rest = _order_dependency_layers(
         spec_root,
         neighbors,
         load,
@@ -5624,7 +5624,7 @@ def cmd_spec_bump(
     refresh_files: bool,
     non_interactive: bool,
 ) -> None:
-    """Bump spec versions from upstream. Prefer: orbscli maintain."""
+    """Bump spec versions from upstream."""
     try:
         sys.stderr.reconfigure(line_buffering=True)
     except Exception:
@@ -6746,7 +6746,7 @@ def cmd_generate_chain(
     stale: bool,
     out_dir: Path | None,
 ) -> None:
-    """Order missing packages. Prefer: orbscli maintain."""
+    """Order missing packages into dependency layers."""
     repo_root = Path(__file__).resolve().parent.parent
     root = (spec_root.expanduser().resolve() if spec_root else repo_root / "fedora-rpms" / release_ref)
     if not root.is_dir():
@@ -7213,7 +7213,7 @@ def cmd_chain_build(
     distgit_url: str,
     distgit_branch: str,
 ) -> None:
-    """Run an explicit Koji-style chain: 'a b : c : d e'."""
+    """Run an explicit ordered build chain: 'a b : c : d e'."""
     token = require_auth(get_token())
     require_maintainer(token)
     api_base = get_api_url()
@@ -8381,420 +8381,72 @@ def advisory_resolve_custom(ctx: click.Context, advisory_id: int) -> None:
     out = http_json("POST", wd, f"/api/security/advisories/custom/{advisory_id}/resolve", token=token)
     click.echo(json.dumps(out, indent=2, default=str))
 
-_MAINTAIN_STATE = CONFIG_DIR / "maintain.json"
-
-
-def _maintain_auth() -> tuple[str, str]:
-    token = require_auth(get_token())
-    require_maintainer(token)
-    return get_api_url(), token
-
-
-def _maintain_menu(title: str, options: list[str], default: int = 0) -> int:
-    click.echo("")
-    click.echo(title)
-    click.echo("")
-    for i, label in enumerate(options):
-        click.echo(" %s %s" % (">" if i == default else " ", label))
-    click.echo("")
-    if not sys.stdin.isatty():
-        return default
-    raw = click.prompt("Choice", default=str(default + 1), show_default=True)
-    try:
-        idx = int(str(raw).strip()) - 1
-    except ValueError:
-        idx = default
-    if idx < 0 or idx >= len(options):
-        return default
-    return idx
-
-
-def _maintain_spec_root(release_ref: str, spec_root: Path | None) -> Path:
-    if spec_root is not None:
-        return spec_root.expanduser().resolve()
-    here = Path(__file__).resolve().parent
-    candidates = [
-        here.parent / "fedora-rpms" / release_ref,
-        here.parent / release_ref,
-        Path.cwd() / release_ref,
-        Path.cwd() / "fedora-rpms" / release_ref,
-    ]
-    for path in candidates:
-        if path.is_dir():
-            return path
-    return candidates[0]
-
-
-def _maintain_bump(names: list[str], spec_root: Path) -> dict[str, list[str]]:
-    root = spec_root.expanduser().resolve()
-    jobs: list[tuple[str, Path]] = []
-    fail: list[str] = []
-    for pkg in names:
-        specs = find_pkg_specs(root, pkg)
-        if len(specs) != 1:
-            fail.append(pkg)
-            click.echo("%s  no unique spec" % pkg, err=True)
-            continue
-        jobs.append((pkg, specs[0]))
-    work: list[tuple[str, Path]] = []
-    entries: dict[str, dict[str, Any]] = {}
-
-    def _load(item: tuple[str, Path]) -> tuple[str, Path, dict[str, Any] | None, str | None]:
-        pkg, spec_path = item
-        try:
-            text = spec_path.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            return pkg, spec_path, None, str(exc)
-        return pkg, spec_path, _nvchecker_resolve_entry(pkg, spec_path, text), None
-
-    for pkg, spec_path, entry, err in _iter_bounded(8, _load, jobs, inflight=8):
-        if err or not entry:
-            fail.append(pkg)
-            if err:
-                click.echo("%s  %s" % (pkg, err), err=True)
-            continue
-        work.append((pkg, spec_path))
-        entries[pkg] = entry
-    latest_map = _nvchecker_run_batched(entries) if entries else {}
-    ok: list[str] = []
-    skip: list[str] = []
-
-    def _one(item: tuple[str, Path]) -> tuple[str, str, str]:
-        pkg, spec_path = item
-        text = spec_path.read_text(encoding="utf-8", errors="replace")
-        latest = latest_map.get(pkg) or ""
-        status, payload, old, new = _spec_bump_compute(pkg, spec_path, text, latest)
-        if status == "ok":
-            spec_path.write_text(payload, encoding="utf-8")
-            return pkg, "ok", "%s -> %s" % (old or "?", new)
-        return pkg, status, payload
-
-    done = 0
-    todo = len(work)
-    for pkg, status, msg in _iter_bounded(8, _one, work, inflight=8):
-        done += 1
-        _status_line("[%d/%d] %s" % (done, todo, status))
-        if status == "ok":
-            ok.append(pkg)
-        elif status == "skip":
-            skip.append(pkg)
-        else:
-            fail.append(pkg)
-            _status_nl()
-            click.echo("%s  %s" % (pkg, msg), err=True)
-    _status_nl()
-    click.echo("bumped=%s already=%s failed=%s" % (len(ok), len(skip), len(fail)))
-    return {"ok": ok, "skip": skip, "fail": fail}
-
-
-def _maintain_repo(repo_base: str, release_ref: str, arches: list[str], side_tag_ref: str | None) -> dict[str, _RepoDetail]:
-    tags = ["testing"]
-    side_dirs: list[str] = []
-    if side_tag_ref:
-        side_dirs = _side_tag_repo_dirs(side_tag_ref)
-        for name in side_dirs:
-            if name not in tags:
-                tags.append(name)
-    present: dict[str, _RepoDetail] = {}
-    for arch in arches:
-        urls: list[str] = []
-        seen: set[str] = set()
-        got_side = False
-        for tag in tags:
-            url = _repo_url(repo_base, release_ref, tag, arch)
-            if url in seen:
-                continue
-            if not _repo_repomd_ok(url):
-                if tag == "testing":
-                    raise click.ClickException("no dnf repo at %s" % url)
-                continue
-            seen.add(url)
-            urls.append(url)
-            if tag in side_dirs:
-                got_side = True
-        if side_dirs and not got_side:
-            raise click.ClickException("no dnf repo for side tag %s on %s" % (side_tag_ref, arch))
-        if not urls:
-            raise click.ClickException("no dnf repo for %s" % arch)
-        click.echo("querying dnf %s" % arch, err=True)
-        provides, requires, provides_evr, srpms = _dnf_repo_maps(urls, arch, with_solver=False)
-        if len(requires) < _MIN_REPO_RPMS:
-            click.echo("skipping %s, dnf only saw %d rpms" % (arch, len(requires)), err=True)
-            continue
-        present[arch] = _RepoDetail(set(provides), provides, requires, provides_evr, srpms=srpms)
-    if not present:
-        raise click.ClickException("no usable dnf repos")
-    return present
-
-
-def _maintain_unbuilt(names: list[str], present: dict[str, Any]) -> list[str]:
-    out: list[str] = []
-    for name in names:
-        hit = False
-        for detail in present.values():
-            srpms = getattr(detail, "srpms", None) or set()
-            reqs = getattr(detail, "requires", None) or {}
-            if name in srpms or name in reqs:
-                hit = True
-                break
-        if not hit:
-            out.append(name)
-    return out
-
-
-def _maintain_poll(plan_id: int, discovery: bool) -> dict[str, Any]:
-    api, token = _maintain_auth()
-    path = "/api/builds/discovery/%s/status" % plan_id if discovery else "/api/builds/chain/%s/status" % plan_id
-    while True:
-        data = http_json("GET", api, path, token=token)
-        counts = data.get("counts") or {}
-        live = int(counts.get("pending") or 0) + int(counts.get("queued") or 0) + int(counts.get("running") or 0)
-        click.echo(
-            "status=%s success=%s failed=%s blocked=%s live=%s"
-            % (
-                data.get("status"),
-                int(counts.get("success") or 0),
-                int(counts.get("failed") or 0),
-                int(counts.get("blocked") or 0),
-                live,
-            )
-        )
-        if discovery and (data.get("needs_attention") or live == 0):
-            return data
-        st = (data.get("status") or "").lower()
-        if st in {"success", "failed", "cancelled"} and live == 0:
-            return data
-        if live == 0 and not discovery:
-            return data
-        time.sleep(8)
-
-
-@cli.command("maintain")
+@cli.command("bulk-bump")
+@click.option("--release", "release_ref", required=True, help="Oreon release name, e.g. oreon-11-rp1")
 @click.option("--spec-root", type=click.Path(file_okay=False, path_type=Path), default=None)
-@click.option("--release", "release_ref", default=None)
-@click.option("--arch", default=None)
-@click.option("--repo-base", envvar="ORBSCLI_REPO_BASE", default=None)
-@click.option("--distgit-url", envvar="ORBSCLI_DISTGIT_URL", default="https://github.com/oreonhq/rpm-specfiles.git")
-@click.option("--distgit-branch", envvar="ORBSCLI_DISTGIT_BRANCH", default="main")
-def cmd_maintain(
-    spec_root: Path | None,
-    release_ref: str | None,
-    arch: str | None,
-    repo_base: str | None,
-    distgit_url: str,
-    distgit_branch: str,
+@click.option("--packages", "packages_blob", default=None, help="Package names separated by spaces, commas, or newlines")
+@click.option("--all", "bump_all", is_flag=True, help="Check every spec under --spec-root")
+@click.option("--arch", "repo_arch", default="x86_64,aarch64", help="Repository architectures")
+@click.option("--repo-base", envvar="ORBSCLI_REPO_BASE", default="https://repo-us.oreonhq.com")
+@click.option("--side-tag", "side_tag_ref", default=None, help="Include this side tag when resolving dependencies")
+@click.option("--out-dir", type=click.Path(file_okay=False, path_type=Path), default=None)
+@click.option("--verify-sources/--no-verify-sources", default=False)
+@click.option("--refresh-hashes/--no-refresh-hashes", default=False)
+@click.option("--verify-patches/--no-verify-patches", default=True)
+@click.option("--refresh-files/--no-refresh-files", default=True)
+def cmd_bulk_bump(
+    release_ref: str, spec_root: Path | None, packages_blob: str | None,
+    bump_all: bool, repo_arch: str, repo_base: str, side_tag_ref: str | None,
+    out_dir: Path | None, verify_sources: bool, refresh_hashes: bool,
+    verify_patches: bool, refresh_files: bool,
 ) -> None:
-    """Interactive Oreon package maintenance. Copy this file. No OBS tree required."""
-    api, token = _maintain_auth()
-    state = _load_json(_MAINTAIN_STATE)
-    if state.get("phase") in {"discovery", "chain", "attention"}:
-        idx = _maintain_menu(
-            "Existing maintenance operation found",
-            ["Resume", "View status", "Abort"],
-        )
-        plan_id = int(state.get("discovery_plan_id") or state.get("chain_plan_id") or 0)
-        if idx == 2:
-            if plan_id:
-                http_json("POST", api, "/api/builds/chain/%s/cancel" % plan_id, token=token)
-            if _MAINTAIN_STATE.is_file():
-                _MAINTAIN_STATE.unlink()
-            click.echo("Aborted.")
-            return
-        if plan_id:
-            data = _maintain_poll(plan_id, bool(state.get("discovery_plan_id")))
-            if data.get("needs_attention"):
-                blocked = data.get("blocked") or []
-                labels = []
-                jobs = []
-                seen: set[str] = set()
-                for row in blocked:
-                    name = str(row.get("package") or "")
-                    if name in seen:
-                        continue
-                    seen.add(name)
-                    labels.append(name)
-                    jobs.append(int(row["job_id"]))
-                labels.append("Skip for now")
-                pick = _maintain_menu("Select a package to bootstrap", labels)
-                if pick < len(jobs):
-                    http_json("POST", api, "/api/builds/jobs/%s/bootstrap" % jobs[pick], token=token)
-                    _maintain_poll(plan_id, True)
-            return
-    rels = http_json("GET", api, "/api/releases", token=token, params={"limit": 1000, "offset": 0})
-    active = [x for x in (rels.get("items") or []) if x.get("is_active", True)]
-    if not active:
-        raise click.ClickException("No releases on the API")
-    if release_ref:
-        name = release_ref
-        rid = resolve_release_id(api, token, release_ref)
-        item = next((x for x in active if x.get("releasename") == name or str(x.get("id")) == str(rid)), active[0])
-    else:
-        labels = [str(x.get("releasename")) for x in active]
-        item = active[0 if len(active) == 1 else _maintain_menu("Release", labels)]
-        name = str(item.get("releasename") or "")
-        rid = int(item["id"])
-    arches = item.get("architectures") or item.get("arch_list") or ["x86_64", "aarch64"]
-    if isinstance(arches, str):
-        arches = [a.strip() for a in arches.split(",") if a.strip()]
-    if arch:
-        arches = [a.strip() for a in arch.split(",") if a.strip()]
-    if not arches:
-        arches = ["x86_64", "aarch64"]
-    root = _maintain_spec_root(name, spec_root)
+    """Bump upstream versions in bulk and write an ordered build chain."""
+    if bump_all == (packages_blob is not None):
+        raise click.UsageError("choose exactly one of --all or --packages")
+    root = (spec_root.expanduser().resolve() if spec_root else
+            Path(__file__).resolve().parent.parent / "fedora-rpms" / release_ref)
     if not root.is_dir():
         raise click.ClickException("spec root is not a directory: %s" % root)
-    click.echo("")
-    click.echo("Oreon Package Maintenance")
-    click.echo("Target: %s" % name)
-    click.echo("Architectures: %s" % ", ".join(arches))
-    mode = _maintain_menu(
-        "What would you like to maintain?",
-        ["All outdated packages", "Specific packages", "Changed specs"],
-    )
-    if mode == 0:
-        names = [n for n, _p in _spec_dirs_with_specs(root)]
-    elif mode == 2:
-        git_root = root
-        try:
-            found = subprocess.run(
-                ("git", "rev-parse", "--show-toplevel"),
-                cwd=root,
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
-            if found:
-                git_root = Path(found)
-        except (OSError, subprocess.CalledProcessError):
-            pass
-        names = [p.parent.name for p in _git_changed_spec_paths(git_root, root, False)]
-    else:
-        names = parse_package_blob(click.prompt("Package names (spaces or commas)"))
+    names = ([name for name, _ in _spec_dirs_with_specs(root)] if bump_all else
+             list(dict.fromkeys(parse_package_blob(packages_blob or ""))))
     if not names:
-        click.echo("No packages selected.")
-        return
-    click.echo("Selected %d packages" % len(names))
-    stats = _maintain_bump(names, root)
-    if stats["fail"] and sys.stdin.isatty() and not click.confirm("Continue with packages that are ready?", default=True):
-        return
-    ready = list(dict.fromkeys(stats["ok"] + stats["skip"] + [n for n in names if n not in stats["fail"]]))
-    if not ready:
-        click.echo("Nothing left to build.")
-        return
-    tags = http_json("GET", api, "/api/side-tags", token=token, params={"release_id": rid, "limit": 200, "offset": 0})
-    tag_items = list(tags.get("items") or [])
-    tag_labels = ["Create new side tag"] + ["%s (%s)" % (t.get("name"), t.get("id")) for t in tag_items]
-    tidx = _maintain_menu("Side tag", tag_labels)
-    if tidx == 0:
-        created = http_json(
-            "POST",
-            api,
-            "/api/side-tags",
-            token=token,
-            json_body={"release_id": rid, "name": click.prompt("New side tag name")},
+        raise click.ClickException("no packages selected")
+    paths: dict[str, Path] = {}
+    for name in names:
+        specs = find_pkg_specs(root, name)
+        if len(specs) != 1:
+            raise click.ClickException("%s has %d specs; expected one" % (name, len(specs)))
+        paths[name] = specs[0]
+    before = {name: path.read_bytes() for name, path in paths.items()}
+    click.echo("Checking %d specs for upstream updates" % len(names), err=True)
+    try:
+        cmd_spec_bump.callback(
+            packages_blob=" ".join(names), spec_root=root, bump_all=False,
+            verify_sources=verify_sources, refresh_hashes=refresh_hashes,
+            verify_patches=verify_patches, refresh_configs=False,
+            refresh_files=refresh_files, non_interactive=True,
         )
-        side_tag_id = int(created["id"])
-        tag_name = created.get("name")
-    else:
-        side_tag_id = int(tag_items[tidx - 1]["id"])
-        tag_name = tag_items[tidx - 1].get("name")
-    base = (repo_base or str(_load_json(CONFIG_PATH).get("repo_base") or "https://repo-us.oreonhq.com")).rstrip("/")
-    click.echo("Analyzing Oreon repodata...")
-    present = _maintain_repo(base, name, list(arches), str(tag_name or side_tag_id))
-    missing = _maintain_unbuilt(ready, present)
-    built = [n for n in ready if n not in set(missing)]
-    state = {
-        "phase": "discovery" if missing else "chain",
-        "release": name,
-        "release_id": rid,
-        "packages": ready,
-        "unbuilt": missing,
-        "side_tag_id": side_tag_id,
-    }
-    _save_json(_MAINTAIN_STATE, state)
-    if missing:
-        click.echo("%d packages have no Oreon repodata. Submitting discovery batch." % len(missing))
-        disc = http_json(
-            "POST",
-            api,
-            "/api/builds/discovery-trigger",
-            token=token,
-            json_body={
-                "packages": missing,
-                "release_id": rid,
-                "side_tag_id": side_tag_id,
-                "architectures": list(arches),
-                "distgit_url": distgit_url,
-                "distgit_branch": distgit_branch,
-            },
-            timeout=300.0,
+    except SystemExit as exc:
+        if exc.code:
+            raise click.ClickException("some bumps failed; fix them before generating a chain") from exc
+    changed = [name for name, path in paths.items() if path.read_bytes() != before[name]]
+    click.echo("Changed specs: %d" % len(changed), err=True)
+    if not changed:
+        click.echo("All selected specs already match upstream; no chain needed.")
+        return
+    cmd_generate_chain.callback(
+        release_ref=release_ref, pushed=False, spec_root=root,
+        packages_blob=" ".join(changed), packages_file=None,
+        side_tag_ref=side_tag_ref, repo_arch=repo_arch, repo_base=repo_base,
+        no_repo_filter=False, stale=False, out_dir=out_dir,
+    )
+    destination = out_dir.expanduser().resolve() if out_dir else Path(__file__).resolve().parent.parent
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", release_ref).strip("-") or "chain"
+    cycles_file = destination / ("chain-%s-fedora-44.txt" % slug)
+    if cycles_file.is_file() and cycles_file.read_text(encoding="utf-8").strip():
+        raise click.ClickException(
+            "dependency cycles need bootstrap builds; review %s before submitting the chain" % cycles_file
         )
-        state["discovery_plan_id"] = disc.get("id")
-        _save_json(_MAINTAIN_STATE, state)
-        click.echo("discovery plan %s queued_jobs=%s" % (disc.get("id"), disc.get("queued_jobs")))
-        result = _maintain_poll(int(disc["id"]), True)
-        if result.get("needs_attention"):
-            click.echo("Discovery needs a bootstrap choice. Re-run orbscli maintain.")
-            return
-        if (result.get("status") or "").lower() == "failed":
-            click.echo("Discovery finished with failures.")
-            return
-        present = _maintain_repo(base, name, list(arches), str(tag_name or side_tag_id))
-        still = _maintain_unbuilt(ready, present)
-        built = [n for n in ready if n not in set(still)]
-        if still:
-            click.echo("Still no repodata for: %s" % " ".join(still[:40]))
-    if not built:
-        click.echo("No packages with Oreon repodata for the main chain.")
-        return
-    host_arch = os.uname().machine
-    chain, selected, cyclic = _generate_chain_from_specs(
-        root,
-        built,
-        present,
-        repo_urls=None,
-        repo_arch=host_arch if host_arch in present else next(iter(present)),
-    )
-    layers = [p.split() for p in chain.split(":") if p.strip()]
-    click.echo("Generating build plan...")
-    click.echo("Packages: %d" % len(selected))
-    click.echo("Architectures: %s" % ", ".join(arches))
-    for i, layer in enumerate(layers, 1):
-        click.echo("Layer %d: %d packages" % (i, len(layer)))
-    if cyclic:
-        click.echo("Unresolved cycle names: %s" % cyclic)
-    if sys.stdin.isatty() and not click.confirm("Execute build plan?", default=True):
-        state["phase"] = "chain"
-        state["chain_text"] = chain
-        _save_json(_MAINTAIN_STATE, state)
-        return
-    out = http_json(
-        "POST",
-        api,
-        "/api/builds/chain-trigger",
-        token=token,
-        json_body={
-            "chain": chain,
-            "release_id": rid,
-            "side_tag_id": side_tag_id,
-            "architectures": list(arches),
-            "distgit_url": distgit_url,
-            "distgit_branch": distgit_branch,
-            "maintenance": True,
-        },
-        timeout=300.0,
-    )
-    state["phase"] = "chain"
-    state["chain_plan_id"] = out.get("id")
-    _save_json(_MAINTAIN_STATE, state)
-    click.echo(
-        "chain_id=%s status=%s groups=%s queued_jobs=%s"
-        % (out.get("id"), out.get("status"), out.get("total_layers"), out.get("queued_jobs"))
-    )
-    final = _maintain_poll(int(out["id"]), False)
-    click.echo("Finished: %s %s" % (final.get("status"), final.get("counts")))
-    if (final.get("status") or "").lower() == "success" and _MAINTAIN_STATE.is_file():
-        _MAINTAIN_STATE.unlink()
 
 
 def main() -> None:
