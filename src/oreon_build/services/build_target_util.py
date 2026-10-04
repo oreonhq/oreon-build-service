@@ -205,16 +205,16 @@ async def has_successful_build_for_target(
     package_version_id: int | None,
     *,
     jobs_created_on_or_after: datetime | None = None,
+    ignore_bootstrap: bool = False,
 ) -> bool:
     q = (
-        select(BuildJob.id)
+        select(BuildJob)
         .where(
             BuildJob.package_id == package_id,
             BuildJob.release_id == release_id,
             BuildJob.target_id == target_id,
             BuildJob.status == BuildStatus.SUCCESS,
         )
-        .limit(1)
     )
     if package_version_id is not None:
         q = q.where(BuildJob.package_version_id == package_version_id)
@@ -225,8 +225,14 @@ async def has_successful_build_for_target(
 
             ref = ref.replace(tzinfo=_tz.utc)
         q = q.where(BuildJob.created_at >= ref)
-    r = await db.execute(q)
-    return r.scalar_one_or_none() is not None
+    rows = list((await db.execute(q)).scalars().all())
+    if not ignore_bootstrap:
+        return bool(rows)
+    for job in rows:
+        opts = job.job_options if isinstance(job.job_options, dict) else {}
+        if str(opts.get("build_profile") or "full").strip().lower() != "bootstrap":
+            return True
+    return False
 
 
 async def batch_package_ids_by_name(db, names: Iterable[str]) -> dict[str, int]:

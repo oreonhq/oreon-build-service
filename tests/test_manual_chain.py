@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from oreon_build.services.rpmbuild_order import parse_manual_chain
+from oreon_build.services.rpmbuild_order import bootstrap_names_by_layer, parse_manual_chain
 
 
 def test_parse_manual_chain_koji_format() -> None:
@@ -23,6 +23,12 @@ def test_parse_manual_chain_rejects_invalid_input(chain: str) -> None:
         parse_manual_chain(chain)
 
 
-def test_parse_manual_chain_rejects_duplicate_package() -> None:
-    with pytest.raises(ValueError, match="more than once"):
-        parse_manual_chain("pkg-a : pkg-a")
+def test_parse_manual_chain_allows_later_bootstrap_repeat() -> None:
+    layers = parse_manual_chain("maven-surefire : maven-compiler : maven-surefire")
+    assert layers == [["maven-surefire"], ["maven-compiler"], ["maven-surefire"]]
+    assert bootstrap_names_by_layer(layers) == {0: {"maven-surefire"}}
+
+
+def test_parse_manual_chain_rejects_duplicate_in_same_group() -> None:
+    with pytest.raises(ValueError, match="same group"):
+        parse_manual_chain("pkg-a pkg-a")

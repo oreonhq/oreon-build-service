@@ -65,23 +65,41 @@ def distgit_new_package_dict(
 
 
 def parse_manual_chain(chain: str) -> list[list[str]]:
-    """Parse Koji-style ``a b : c : d e`` groups without graph expansion."""
+    """Parse Koji-style ``a b : c : d e`` groups without graph expansion.
+
+    The same package may show up in a later group. That earlier copy is a
+    bootstrap build. Twice in one group is still invalid.
+    """
     raw_groups = chain.split(":")
     if any(not group.strip() for group in raw_groups):
         raise ValueError("Chain contains an empty group")
     layers: list[list[str]] = []
-    seen: set[str] = set()
     for raw_group in raw_groups:
         group: list[str] = []
+        seen: set[str] = set()
         for name in raw_group.replace(",", " ").split():
             if not _CHAIN_PACKAGE_RE.fullmatch(name):
                 raise ValueError(f"Invalid package name in chain: {name}")
             if name in seen:
-                raise ValueError(f"Package appears more than once in chain: {name}")
+                raise ValueError(f"Package appears more than once in the same group: {name}")
             seen.add(name)
             group.append(name)
         layers.append(group)
     return layers
+
+
+def bootstrap_names_by_layer(layers: list[list[str]]) -> dict[int, set[str]]:
+    """Names whose later copy is the real build. Earlier copies are bootstrap."""
+    last: dict[str, int] = {}
+    for idx, group in enumerate(layers):
+        for name in group:
+            last[name] = idx
+    out: dict[int, set[str]] = {}
+    for idx, group in enumerate(layers):
+        boots = {name for name in group if last.get(name) != idx}
+        if boots:
+            out[idx] = boots
+    return out
 
 
 def _plan_skip_jobs_not_before(plan: RpmbuildPlan) -> datetime | None:
@@ -212,6 +230,7 @@ async def enqueue_plan_layer_jobs(
     await bump_side_tag_activity(db, side_tag.id)
     jobs: list[BuildJob] = []
     layer_pkgs = [str(x) for x in layers[layer_index] if str(x).strip()]
+    boot_names = bootstrap_names_by_layer([[str(x) for x in g] for g in layers]).get(layer_index, set())
     plan_not_before = _plan_skip_jobs_not_before(plan)
     for pkg_name in layer_pkgs:
         pkg, _pref = await _get_or_create_distgit_package(
@@ -232,13 +251,15 @@ async def enqueue_plan_layer_jobs(
             )
             target = await get_or_create_build_target(db, release.id, canon, m_id)
             pv_id = await latest_package_version_id(db, pkg.id)
-            if skip_complete_arches and await has_successful_build_for_target(
+            is_bootstrap = pkg_name in boot_names
+            if skip_complete_arches and not is_bootstrap and await has_successful_build_for_target(
                 db,
                 pkg.id,
                 release.id,
                 target.id,
                 pv_id,
                 jobs_created_on_or_after=plan_not_before,
+                ignore_bootstrap=True,
             ):
                 continue
             act = await db.execute(
@@ -269,6 +290,11 @@ async def enqueue_plan_layer_jobs(
                 rpmbuild_layer_index=layer_index,
                 rpmbuild_wave_index=0,
             )
+            if is_bootstrap:
+                job.job_options = {
+                    "build_profile": "bootstrap",
+                    "rpmbuild_defines": {"bootstrap": "1"},
+                }
             db.add(job)
             await db.flush()
             jobs.append(job)
