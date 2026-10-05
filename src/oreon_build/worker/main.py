@@ -2615,6 +2615,11 @@ def _prune_stale_var_lib_mock_dirs() -> None:
             pass
 
 def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict) -> None:
+    if job.get("job_kind") == "iso":
+        from oreon_build.worker.iso_job import run_iso_job
+
+        run_iso_job(controller_url, worker_headers, job)
+        return
     done_event = threading.Event()
     abort_event = threading.Event()
     session: httpx.Client | None = None
