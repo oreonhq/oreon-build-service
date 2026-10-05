@@ -52,7 +52,7 @@ def _row(job: IsoBuild) -> dict:
 
 
 @router.get("/kickstarts")
-async def kickstarts(folder: str | None = None):
+async def kickstarts(user: CurrentUser, folder: str | None = None):
     try:
         return list_kickstart_tree(folder)
     except ValueError as exc:
@@ -91,6 +91,29 @@ async def create_iso_builds(data: IsoBuildCreate, db: DbSession, user: CurrentUs
     mock = await db.get(MockEnvironment, data.mock_environment_id)
     if mock is None or not mock.is_available:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Mock environment not found")
+    names = [spec["iso_name"] for spec in specs]
+    if len(set(names)) != len(names):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="ISO names collide")
+    bucket = get_settings().mirrorlist_r2_bucket
+    r2 = get_r2_client()
+    for name in names:
+        if r2.object_exists_in_bucket(bucket, name):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"{name} already exists in {bucket}")
+    busy = list(
+        (
+            await db.execute(
+                select(IsoBuild.iso_name).where(
+                    IsoBuild.iso_name.in_(names),
+                    IsoBuild.status.in_((BuildStatus.PENDING.value, BuildStatus.RUNNING.value, BuildStatus.SUCCESS.value)),
+                )
+            )
+        ).scalars().all()
+    )
+    if busy:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="ISO name already used: " + ", ".join(sorted(set(busy))),
+        )
     created = []
     for spec in specs:
         job = IsoBuild(
@@ -104,12 +127,27 @@ async def create_iso_builds(data: IsoBuildCreate, db: DbSession, user: CurrentUs
             project=spec["project"],
             volid=spec["volid"],
             releasever=spec["releasever"],
-            macboot=bool(data.macboot),
+            macboot=bool(data.macboot) and spec["architecture"] == "x86_64",
             triggered_by_id=user.id,
         )
         db.add(job)
         created.append(job)
     await db.flush()
+    for job in created:
+        await db.refresh(job)
+    from oreon_build.services.discord import DISCORD_COLOR_INFO, send_discord_embed
+
+    for job in created:
+        await send_discord_embed(
+            title=f"ISO build queued #{job.id}",
+            description=f"{job.iso_name} ({job.architecture})",
+            fields=[
+                ("folder", job.release_folder),
+                ("kickstart", job.kickstart),
+                ("mock", job.mock_config),
+            ],
+            color=DISCORD_COLOR_INFO,
+        )
     return {"items": [_row(j) for j in created]}
 
 
@@ -154,4 +192,5 @@ async def cancel_iso(iso_id: int, db: DbSession, user: CurrentUser):
     job.completed_at = datetime.now(timezone.utc)
     job.error_message = "Cancelled by user"
     await db.flush()
+    await db.refresh(job)
     return _row(job)
