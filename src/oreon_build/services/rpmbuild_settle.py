@@ -7,13 +7,12 @@ import io
 import logging
 import lzma
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select, update
 
-from oreon_build.config import get_settings
-from oreon_build.models import BuildAttempt, BuildJob, BuildStatus, BuildTarget, Package, PublishTask, Release, RpmbuildPlan, RpmbuildPlanStatus
+from oreon_build.models import BuildAttempt, BuildJob, BuildStatus, PublishTask, Release, RpmbuildPlan, RpmbuildPlanStatus
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
 from oreon_build.services.r2 import get_r2_client
 from oreon_build.services.rpmbuild_order import enqueue_plan_layer_jobs
@@ -278,8 +277,6 @@ async def _layer_status(db: Any, plan: RpmbuildPlan, layer: int) -> tuple[list[B
 
 
 async def advance_rpmbuild_plans_once(db: Any) -> None:
-    settings = get_settings()
-    now = datetime.now(timezone.utc)
     rows = await db.execute(
         select(RpmbuildPlan)
         .where(RpmbuildPlan.status.in_((RpmbuildPlanStatus.RUNNING, RpmbuildPlanStatus.WAITING_SETTLE)))
@@ -335,40 +332,6 @@ async def advance_rpmbuild_plans_once(db: Any) -> None:
         if rel is None:
             plan.status = RpmbuildPlanStatus.FAILED
             plan.error_message = "Release missing"
-            continue
-        pkg_names_by_job: dict[int, str] = {}
-        if jobs:
-            pids = sorted({j.package_id for j in jobs})
-            prs = await db.execute(select(Package.id, Package.name).where(Package.id.in_(pids)))
-            pkg_names_by_job = {int(pid): str(name) for pid, name in prs.all()}
-
-        per_arch_need: dict[str, set[str]] = {}
-        for j in jobs:
-            if j.target_id is None:
-                continue
-            tr = await db.execute(select(BuildTarget.architecture).where(BuildTarget.id == j.target_id))
-            arch = tr.scalar_one_or_none()
-            if not arch:
-                continue
-            per_arch_need.setdefault(str(arch), set()).add(pkg_names_by_job.get(j.package_id, ""))
-
-        repodata_ready = True
-        for arch, needed in per_arch_need.items():
-            visible = _sources_visible_in_arch(rel.releasename, plan.repo_branch, arch)
-            for n in needed:
-                if n and n not in visible:
-                    repodata_ready = False
-                    break
-            if not repodata_ready:
-                break
-
-        if not repodata_ready:
-            plan.status = RpmbuildPlanStatus.WAITING_SETTLE
-            if plan.settle_deadline_at is None:
-                plan.settle_deadline_at = now + timedelta(seconds=settings.rpmbuild_settle_timeout_seconds)
-            elif now >= plan.settle_deadline_at:
-                plan.status = RpmbuildPlanStatus.FAILED
-                plan.error_message = f"Timed out waiting for repodata settle at layer {cur}"
             continue
 
         plan.settle_deadline_at = None
