@@ -16,8 +16,17 @@ def run_iso_job(controller_url: str, worker_headers: dict[str, str], job: dict) 
     logs: list[str] = []
 
     def note(text: str) -> None:
-        if text and text.strip():
-            logs.append(text.strip())
+        if not text or not text.strip():
+            return
+        logs.append(text.strip())
+        try:
+            session.post(
+                f"{controller_url}/api/worker/iso/{iso_id}/log",
+                json={"log": "\n\n".join(logs)[-200000:]},
+                timeout=30.0,
+            )
+        except Exception:
+            pass
 
     def cancelled() -> bool:
         try:
@@ -42,6 +51,7 @@ def run_iso_job(controller_url: str, worker_headers: dict[str, str], job: dict) 
         session.close()
 
     try:
+        note(f"starting iso build {job.get('iso_name')} on {job.get('mock_config')}")
         if cancelled():
             finish("cancelled", "Cancelled before start")
             return

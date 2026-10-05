@@ -15,6 +15,7 @@ from oreon_build.models import (
     BuildJob,
     BuildStatus,
     BuildTarget,
+    IsoBuild,
     Worker,
     WorkerState,
 )
@@ -46,8 +47,29 @@ async def reconcile_queue_inconsistencies(
                     BuildAttempt.status == BuildStatus.RUNNING,
                 )
             ),
+            ~exists(
+                select(1).select_from(IsoBuild).where(
+                    IsoBuild.worker_id == Worker.id,
+                    IsoBuild.status == BuildStatus.RUNNING.value,
+                )
+            ),
         )
     )
+    stale_iso_before = now - timedelta(minutes=15)
+    stale_iso = await db.execute(
+        select(IsoBuild).where(
+            IsoBuild.status == BuildStatus.RUNNING.value,
+            IsoBuild.updated_at < stale_iso_before,
+            (IsoBuild.log_text.is_(None)) | (IsoBuild.log_text == ""),
+        )
+    )
+    for iso in stale_iso.scalars().all():
+        iso.status = BuildStatus.PENDING.value
+        iso.worker_id = None
+        iso.error_message = None
+        await db.flush()
+        logger.warning("Requeued ISO build id=%s, worker never reported a log", iso.id)
+
     for w in busy_orphan.scalars().all():
         w.state = WorkerState.IDLE
         w.current_build_attempt_id = None

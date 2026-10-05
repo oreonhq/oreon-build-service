@@ -269,7 +269,11 @@ async def heartbeat(db: DbSession, worker: Annotated[Worker, Depends(_require_wo
     return {"status": "ok", "state": worker.state.value}
 
 @router.get("/poll")
-async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_worker)]):
+async def poll_job(
+    db: DbSession,
+    worker: Annotated[Worker, Depends(_require_worker)],
+    x_worker_features: Annotated[str | None, Header(alias="X-Worker-Features")] = None,
+):
     await _touch_worker_presence(
         db,
         worker,
@@ -343,7 +347,8 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
         locked_worker.state = WorkerState.BUSY
         locked_worker.current_build_attempt_id = newest_running_attempt_id
         await db.flush()
-    if running_attempts == 0:
+    features = {p.strip() for p in (x_worker_features or "").split(",") if p.strip()}
+    if running_attempts == 0 and "iso" in features:
         iso_job = await _claim_iso_job(db, locked_worker)
         if iso_job is not None:
             return {"job": iso_job}
@@ -2194,6 +2199,29 @@ async def _claim_iso_job(db, locked_worker: Worker) -> dict | None:
         "releasever": job.releasever,
         "macboot": bool(job.macboot),
     }
+
+
+class IsoLogBody(BaseModel):
+    log: str = ""
+
+
+@router.post("/iso/{iso_id}/log")
+async def iso_progress_log(
+    iso_id: int,
+    payload: IsoLogBody,
+    db: DbSession,
+    worker: Annotated[Worker, Depends(_require_worker)],
+):
+    from oreon_build.models import IsoBuild
+
+    job = await db.get(IsoBuild, iso_id)
+    if job is None or job.worker_id != worker.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="ISO build not found")
+    if job.status != BuildStatus.RUNNING.value:
+        return {"status": "ok"}
+    job.log_text = (payload.log or "")[-1_500_000:]
+    await db.flush()
+    return {"status": "ok"}
 
 
 @router.get("/iso/{iso_id}/cancel-check")

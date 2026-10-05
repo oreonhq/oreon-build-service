@@ -3447,7 +3447,10 @@ def main() -> None:
             continue
 
         try:
-            resp = session.get(f"{controller_url}/api/worker/poll")
+            resp = session.get(
+                f"{controller_url}/api/worker/poll",
+                headers={"X-Worker-Features": "iso"},
+            )
             resp.raise_for_status()
             data = resp.json()
             job = data.get("job")
