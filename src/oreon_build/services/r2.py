@@ -140,8 +140,11 @@ class R2Client:
                 yield obj["Key"]
 
     def object_exists(self, key: str) -> bool:
+        return self.object_exists_in_bucket(self.bucket, key)
+
+    def object_exists_in_bucket(self, bucket: str, key: str) -> bool:
         try:
-            self._client.head_object(Bucket=self.bucket, Key=key)
+            self._client.head_object(Bucket=bucket, Key=key)
             return True
         except ClientError:
             return False
@@ -178,6 +181,7 @@ class R2Client:
         params: dict = {"Bucket": bucket, "Key": key}
         if content_type and method == "put_object":
             params["ContentType"] = content_type
+            params["IfNoneMatch"] = "*"
         return self._client.generate_presigned_url(
             method,
             Params=params,
