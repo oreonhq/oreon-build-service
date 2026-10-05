@@ -149,7 +149,7 @@ def run_iso_job(controller_url: str, worker_headers: dict[str, str], job: dict) 
             put = httpx.put(
                 upload_url,
                 content=fh,
-                headers={"Content-Type": "application/octet-stream"},
+                headers={"Content-Type": "application/octet-stream", "If-None-Match": "*"},
                 timeout=httpx.Timeout(60.0, read=7200.0, write=7200.0),
             )
         note(f"## upload\nstatus={put.status_code}")
