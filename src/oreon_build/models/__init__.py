@@ -20,6 +20,7 @@ from .rpm_complete_lock import RpmCompleteLock
 from .security_advisory import SecurityAdvisory, SecurityAdvisoryRelease
 from .side_tag import SideTag, SideTagCreatedFrom, SideTagMember
 from .release_monitor import ReleaseMonitorScan, ReleaseMonitorOutdated
+from .iso_build import IsoBuild
 
 __all__ = [
     "Account",
@@ -65,4 +66,5 @@ __all__ = [
     "SideTagMember",
     "ReleaseMonitorScan",
     "ReleaseMonitorOutdated",
+    "IsoBuild",
 ]
