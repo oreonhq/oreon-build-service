@@ -59,6 +59,7 @@ from .routers import (
     search as search_router,
     github_webhook,
     side_tags,
+    iso_builds,
 )
 from .worker_api import router as worker_router
 
@@ -505,6 +506,7 @@ def create_app() -> FastAPI:
     app.include_router(mock_envs.router, prefix="/api")
     app.include_router(promotions.router, prefix="/api")
     app.include_router(side_tags.router, prefix="/api")
+    app.include_router(iso_builds.router, prefix="/api")
     app.include_router(repos.router, prefix="/api")
     app.include_router(schedules.router, prefix="/api")
     app.include_router(logs.router, prefix="/api")
@@ -562,6 +564,9 @@ def create_app() -> FastAPI:
         @app.get("/search.html")
         def _search():
             return _html(web_dir / "search.html")
+        @app.get("/iso-builds.html")
+        def _iso_builds():
+            return _html(web_dir / "iso-builds.html")
 
         @app.get("/chains.html")
         def _chains_removed():

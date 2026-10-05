@@ -297,6 +297,19 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
         ).scalar()
         or 0
     )
+    from oreon_build.models import IsoBuild
+
+    running_attempts += int(
+        (
+            await db.execute(
+                select(func.count(IsoBuild.id)).where(
+                    IsoBuild.worker_id == locked_worker.id,
+                    IsoBuild.status == BuildStatus.RUNNING.value,
+                )
+            )
+        ).scalar()
+        or 0
+    )
     max_parallel = _worker_declared_max_parallel_attempts(locked_worker)
     if running_attempts == 0 and locked_worker.state == WorkerState.BUSY:
         locked_worker.state = WorkerState.IDLE
@@ -330,6 +343,10 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
         locked_worker.state = WorkerState.BUSY
         locked_worker.current_build_attempt_id = newest_running_attempt_id
         await db.flush()
+    if running_attempts == 0:
+        iso_job = await _claim_iso_job(db, locked_worker)
+        if iso_job is not None:
+            return {"job": iso_job}
     worker_arch = (locked_worker.architecture or "").strip() or None
     q = (
         select(BuildJob)
@@ -2127,3 +2144,122 @@ async def register_artifact(
     db.add(art)
     await db.flush()
     return {"id": art.id}
+
+
+class IsoResultBody(BaseModel):
+    status: str
+    log: str | None = None
+    error_message: str | None = None
+    sha256: str | None = None
+    size_bytes: int | None = None
+    r2_key: str | None = None
+
+
+async def _claim_iso_job(db, locked_worker: Worker) -> dict | None:
+    from oreon_build.models import IsoBuild
+
+    arch_vals = sql_arch_match_values(locked_worker.architecture) if (locked_worker.architecture or "").strip() else []
+    if not arch_vals:
+        return None
+    row = await db.execute(
+        select(IsoBuild)
+        .where(
+            IsoBuild.status == BuildStatus.PENDING.value,
+            IsoBuild.architecture.in_(arch_vals),
+        )
+        .order_by(IsoBuild.id.asc())
+        .limit(1)
+        .with_for_update(skip_locked=True)
+    )
+    job = row.scalar_one_or_none()
+    if job is None:
+        return None
+    settings = get_settings()
+    job.status = BuildStatus.RUNNING.value
+    job.worker_id = locked_worker.id
+    locked_worker.state = WorkerState.BUSY
+    await db.flush()
+    return {
+        "job_kind": "iso",
+        "iso_build_id": job.id,
+        "architecture": job.architecture,
+        "mock_config": job.mock_config,
+        "kickstart_repo": settings.kickstart_git_url,
+        "kickstart_branch": settings.kickstart_git_branch,
+        "release_folder": job.release_folder,
+        "kickstart": job.kickstart,
+        "iso_name": job.iso_name,
+        "project": job.project,
+        "volid": job.volid,
+        "releasever": job.releasever,
+        "macboot": bool(job.macboot),
+    }
+
+
+@router.get("/iso/{iso_id}/cancel-check")
+async def iso_cancel_check(iso_id: int, db: DbSession, worker: Annotated[Worker, Depends(_require_worker)]):
+    from oreon_build.models import IsoBuild
+
+    job = await db.get(IsoBuild, iso_id)
+    if job is None or job.worker_id != worker.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="ISO build not found")
+    return {"cancel_requested": job.status == BuildStatus.CANCELLED.value}
+
+
+@router.post("/iso/{iso_id}/presign")
+async def iso_presign(iso_id: int, db: DbSession, worker: Annotated[Worker, Depends(_require_worker)]):
+    from oreon_build.models import IsoBuild
+    from oreon_build.services.r2 import get_r2_client
+
+    job = await db.get(IsoBuild, iso_id)
+    if job is None or job.worker_id != worker.id or job.status != BuildStatus.RUNNING.value:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="ISO build not running")
+    url = get_r2_client().generate_presigned_url_for_bucket(
+        get_settings().mirrorlist_r2_bucket,
+        job.iso_name,
+        method="put_object",
+        content_type="application/octet-stream",
+        expires_in=6 * 3600,
+    )
+    return {"url": url, "key": job.iso_name, "bucket": get_settings().mirrorlist_r2_bucket}
+
+
+@router.post("/iso/{iso_id}/result")
+async def iso_result(
+    iso_id: int,
+    payload: IsoResultBody,
+    db: DbSession,
+    worker: Annotated[Worker, Depends(_require_worker)],
+):
+    from oreon_build.models import IsoBuild
+
+    job = await db.get(IsoBuild, iso_id)
+    if job is None or job.worker_id != worker.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="ISO build not found")
+    if job.status == BuildStatus.CANCELLED.value and payload.status != "cancelled":
+        return {"status": "ok"}
+    st = (payload.status or "").strip().lower()
+    if st not in (BuildStatus.SUCCESS.value, BuildStatus.FAILED.value, BuildStatus.CANCELLED.value):
+        st = BuildStatus.FAILED.value
+    job.status = st
+    job.log_text = (payload.log or "")[-1_500_000:] or job.log_text
+    job.error_message = (payload.error_message or None)
+    job.sha256 = (payload.sha256 or None)
+    job.size_bytes = payload.size_bytes
+    if st == BuildStatus.SUCCESS.value:
+        job.r2_key = payload.r2_key or job.iso_name
+        job.error_message = None
+    job.completed_at = datetime.now(timezone.utc)
+    locked = await db.get(Worker, worker.id)
+    if locked is not None:
+        still = await db.scalar(
+            select(func.count(BuildAttempt.id)).where(
+                BuildAttempt.worker_id == worker.id,
+                BuildAttempt.status == BuildStatus.RUNNING,
+            )
+        )
+        if not still:
+            locked.state = WorkerState.IDLE
+            locked.current_build_attempt_id = None
+    await db.flush()
+    return {"status": "ok"}
