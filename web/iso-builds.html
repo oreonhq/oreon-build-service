@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ISO Builds - Oreon Build Service</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" crossorigin="anonymous" referrerpolicy="no-referrer">
+  <link rel="stylesheet" href="/static/style.css?v=4">
+  <style>
+    .log-viewer { background: #1e1e1e; color: #d4d4d4; padding: 1rem; border-radius: 4px; overflow: auto; max-height: 60vh; font-family: ui-monospace, monospace; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
+    .ks-row { margin: 0.4rem 0; }
+    .iso-checks { display: flex; flex-direction: column; gap: 0.35rem; margin-top: 0.25rem; }
+    .iso-check { display: flex; align-items: center; gap: 0.45rem; width: fit-content; margin: 0; color: var(--text); }
+    .form-group .iso-check input[type="checkbox"] { width: auto; max-width: none; margin: 0; padding: 0; }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <a href="/" class="header-logo-link"><img src="/static/obslogo.png" alt="Oreon Build Service" class="header-logo" /></a>
+    <nav></nav>
+  </header>
+  <main class="main">
+    <section class="card">
+      <h2>ISO Builds</h2>
+      <p id="iso-hint">Builds an ISO with livemedia-creator inside a mock environment on a worker, then drops the file in the mirrorlist bucket.</p>
+      <div class="form-group">
+        <label>Mock environment</label>
+        <select id="iso-mock" class="form-control"></select>
+      </div>
+      <div class="form-group">
+        <label>Kickstart release folder</label>
+        <select id="iso-folder" class="form-control"></select>
+        <p id="iso-folder-note" style="color:var(--text-muted)"></p>
+      </div>
+      <div class="form-group">
+        <label>Arches</label>
+        <div class="iso-checks">
+          <label class="iso-check"><input type="checkbox" class="iso-arch" value="x86_64" checked> x86_64</label>
+          <label class="iso-check"><input type="checkbox" class="iso-arch" value="aarch64" checked> aarch64</label>
+        </div>
+      </div>
+      <div id="iso-ks-picks"></div>
+      <div class="form-group">
+        <label>ISO name</label>
+        <input id="iso-name" class="form-control" placeholder="Oreon-11-RP1-BB2610">
+        <p style="color:var(--text-muted)">Arch is added when the name does not already contain it. Use {arch} if you want it in a specific spot.</p>
+      </div>
+      <div class="form-group">
+        <label>Volume id</label>
+        <input id="iso-volid" class="form-control" placeholder="Oreon-11" maxlength="32">
+      </div>
+      <div class="form-group">
+        <label>Releasever</label>
+        <input id="iso-releasever" class="form-control" placeholder="11" maxlength="16">
+      </div>
+      <div class="form-group">
+        <label>Project</label>
+        <input id="iso-project" class="form-control" value="Oreon">
+      </div>
+      <div class="form-group">
+        <div class="iso-checks">
+          <label class="iso-check"><input type="checkbox" id="iso-macboot"> macboot</label>
+        </div>
+      </div>
+      <button type="button" class="btn primary" id="iso-submit">Queue ISO build</button>
+    </section>
+    <section class="card">
+      <h2>Jobs</h2>
+      <table class="table-list">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>ISO</th>
+            <th>Folder</th>
+            <th>Kickstart</th>
+            <th>Arch</th>
+            <th>Status</th>
+            <th>SHA256</th>
+            <th>Created</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="iso-tbody"></tbody>
+      </table>
+      <h3 id="iso-log-title" style="display:none">Log</h3>
+      <pre id="iso-log" class="log-viewer" style="display:none"></pre>
+    </section>
+  </main>
+  <script src="/static/app.js?v=19"></script>
+  <script>
+    (function() {
+      var api = window.oreonApi;
+      var ksFiles = [];
+
+      function escapeHtml(s) {
+        var d = document.createElement('div');
+        d.textContent = s == null ? '' : String(s);
+        return d.innerHTML;
+      }
+      function statusClass(s) {
+        if (s === 'success') return 'badge success';
+        if (s === 'failed' || s === 'cancelled') return 'badge failed';
+        if (s === 'running' || s === 'queued') return 'badge running';
+        return 'badge pending';
+      }
+      function selectedArches() {
+        return Array.prototype.map.call(document.querySelectorAll('.iso-arch:checked'), function(el) { return el.value; });
+      }
+      function renderKsPicks() {
+        var box = document.getElementById('iso-ks-picks');
+        var arches = selectedArches();
+        var prev = {};
+        box.querySelectorAll('select').forEach(function(sel) { prev[sel.dataset.arch] = sel.value; });
+        box.innerHTML = '';
+        arches.forEach(function(arch) {
+          var wrap = document.createElement('div');
+          wrap.className = 'form-group ks-row';
+          var opts = ksFiles.map(function(name) {
+            return '<option value="' + escapeHtml(name) + '">' + escapeHtml(name) + '</option>';
+          }).join('');
+          wrap.innerHTML = '<label>Kickstart for ' + escapeHtml(arch) + '</label><select class="form-control iso-ks" data-arch="' + arch + '">' + opts + '</select>';
+          box.appendChild(wrap);
+          var sel = wrap.querySelector('select');
+          if (prev[arch]) sel.value = prev[arch];
+        });
+        if (arches.length > 1) {
+          var note = document.createElement('p');
+          note.style.color = 'var(--text-muted)';
+          note.textContent = 'Each arch needs its own kickstart.';
+          box.appendChild(note);
+        }
+      }
+      function loadFolders() {
+        return api.get('/iso-builds/kickstarts').then(function(data) {
+          var sel = document.getElementById('iso-folder');
+          var note = document.getElementById('iso-folder-note');
+          sel.innerHTML = '';
+          if (data.missing_repo) {
+            note.textContent = 'Kickstart repo is not on GitHub yet (' + (data.repo || '') + ').';
+            return;
+          }
+          note.textContent = (data.repo || '') + ' @ ' + (data.branch || 'main');
+          (data.folders || []).forEach(function(name) {
+            sel.appendChild(new Option(name, name));
+          });
+          if (sel.value) return loadKs(sel.value);
+        }).catch(function(e) {
+          document.getElementById('iso-folder-note').textContent = e.message || String(e);
+        });
+      }
+      function loadKs(folder) {
+        if (!folder) { ksFiles = []; renderKsPicks(); return Promise.resolve(); }
+        return api.get('/iso-builds/kickstarts?folder=' + encodeURIComponent(folder)).then(function(data) {
+          ksFiles = data.kickstarts || [];
+          var note = document.getElementById('iso-folder-note');
+          if (!data.lorax_templates) note.textContent = folder + ' has no lorax-templates folder';
+          renderKsPicks();
+        });
+      }
+      function loadMocks() {
+        return api.get('/mock-environments?limit=500').then(function(res) {
+          var sel = document.getElementById('iso-mock');
+          sel.innerHTML = '';
+          ((res && res.items) || []).forEach(function(m) {
+            if (!m.is_available && m.is_available !== undefined) return;
+            sel.appendChild(new Option(m.name + ' (' + (m.config_name || '') + ')', m.id));
+          });
+        }).catch(function() {});
+      }
+      function loadJobs() {
+        return api.get('/iso-builds?limit=50').then(function(data) {
+          var tbody = document.getElementById('iso-tbody');
+          tbody.innerHTML = '';
+          (data.items || []).forEach(function(j) {
+            var tr = document.createElement('tr');
+            var actions = '<button type="button" class="btn iso-log" data-id="' + j.id + '">Log</button>';
+            if (j.status === 'success') {
+              actions += ' <a class="btn" href="/api/iso-builds/' + j.id + '/download">Download ISO</a>';
+            }
+            if (j.status === 'pending' || j.status === 'running' || j.status === 'queued') {
+              actions += ' <button type="button" class="btn iso-cancel" data-id="' + j.id + '">Cancel</button>';
+            }
+            tr.innerHTML =
+              '<td>' + j.id + '</td>' +
+              '<td>' + escapeHtml(j.iso_name) + '</td>' +
+              '<td>' + escapeHtml(j.release_folder) + '</td>' +
+              '<td>' + escapeHtml(j.kickstart) + '</td>' +
+              '<td>' + escapeHtml(j.architecture) + '</td>' +
+              '<td><span class="' + statusClass(j.status) + '">' + escapeHtml(j.status) + '</span></td>' +
+              '<td style="font-family:ui-monospace,monospace;font-size:12px">' + escapeHtml(j.sha256 || '') + '</td>' +
+              '<td>' + escapeHtml(j.created_at || '') + '</td>' +
+              '<td>' + actions + '</td>';
+            tbody.appendChild(tr);
+          });
+          tbody.querySelectorAll('.iso-log').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+              api.get('/iso-builds/' + btn.dataset.id + '/log').then(function(data) {
+                document.getElementById('iso-log-title').style.display = 'block';
+                var pre = document.getElementById('iso-log');
+                pre.style.display = 'block';
+                pre.textContent = data.log || '(no log yet)';
+              });
+            });
+          });
+          tbody.querySelectorAll('.iso-cancel').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+              api.post('/iso-builds/' + btn.dataset.id + '/cancel', {}).then(loadJobs).catch(function(e) { alert(e.message || e); });
+            });
+          });
+        });
+      }
+      document.querySelectorAll('.iso-arch').forEach(function(el) {
+        el.addEventListener('change', renderKsPicks);
+      });
+      document.getElementById('iso-folder').addEventListener('change', function() { loadKs(this.value); });
+      document.getElementById('iso-submit').addEventListener('click', function() {
+        var arches = selectedArches();
+        var kickstarts = {};
+        document.querySelectorAll('.iso-ks').forEach(function(sel) { kickstarts[sel.dataset.arch] = sel.value; });
+        var body = {
+          mock_environment_id: parseInt(document.getElementById('iso-mock').value, 10),
+          release_folder: document.getElementById('iso-folder').value,
+          arches: arches,
+          kickstarts: kickstarts,
+          iso_name: document.getElementById('iso-name').value.trim(),
+          volid: document.getElementById('iso-volid').value.trim(),
+          releasever: document.getElementById('iso-releasever').value.trim(),
+          project: document.getElementById('iso-project').value.trim() || 'Oreon',
+          macboot: document.getElementById('iso-macboot').checked
+        };
+        api.post('/iso-builds', body).then(function() { return loadJobs(); }).catch(function(e) { alert(e.message || e); });
+      });
+      loadMocks();
+      loadFolders();
+      loadJobs();
+      setInterval(loadJobs, 15000);
+    })();
+  </script>
+</body>
+</html>
