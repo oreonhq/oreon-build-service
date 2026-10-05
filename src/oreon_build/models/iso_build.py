@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, String, Text, func
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from oreon_build.db.base import Base
@@ -24,7 +24,7 @@ class IsoBuild(Base):
     project: Mapped[str] = mapped_column(String(64), nullable=False, default="Oreon")
     volid: Mapped[str] = mapped_column(String(32), nullable=False)
     releasever: Mapped[str] = mapped_column(String(16), nullable=False)
-    macboot: Mapped[bool] = mapped_column(nullable=False, default=False)
+    macboot: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     size_bytes: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     r2_key: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
