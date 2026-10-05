@@ -20,7 +20,7 @@
     <nav></nav>
   </header>
   <main class="main">
-    <section class="card">
+    <section class="card" id="iso-form-card">
       <h2>ISO Builds</h2>
       <p id="iso-hint">Builds an ISO with livemedia-creator inside a mock environment on a worker, then drops the file in the mirrorlist bucket.</p>
       <div class="form-group">
@@ -59,10 +59,11 @@
       </div>
       <div class="form-group">
         <div class="iso-checks">
-          <label class="iso-check"><input type="checkbox" id="iso-macboot"> macboot</label>
+          <label class="iso-check"><input type="checkbox" id="iso-macboot" checked> macboot (x86_64 only)</label>
         </div>
       </div>
       <button type="button" class="btn primary" id="iso-submit">Queue ISO build</button>
+      <p id="iso-submit-note" style="margin-top:0.6rem"></p>
     </section>
     <section class="card">
       <h2>Jobs</h2>
@@ -86,7 +87,7 @@
       <pre id="iso-log" class="log-viewer" style="display:none"></pre>
     </section>
   </main>
-  <script src="/static/app.js?v=19"></script>
+  <script src="/static/app.js?v=21"></script>
   <script>
     (function() {
       var api = window.oreonApi;
@@ -177,7 +178,7 @@
             if (j.status === 'success') {
               actions += ' <a class="btn" href="/api/iso-builds/' + j.id + '/download">Download ISO</a>';
             }
-            if (j.status === 'pending' || j.status === 'running' || j.status === 'queued') {
+            if (api.token && (j.status === 'pending' || j.status === 'running' || j.status === 'queued')) {
               actions += ' <button type="button" class="btn iso-cancel" data-id="' + j.id + '">Cancel</button>';
             }
             tr.innerHTML =
@@ -214,6 +215,9 @@
       });
       document.getElementById('iso-folder').addEventListener('change', function() { loadKs(this.value); });
       document.getElementById('iso-submit').addEventListener('click', function() {
+        var btn = document.getElementById('iso-submit');
+        var note = document.getElementById('iso-submit-note');
+        if (btn.disabled) return;
         var arches = selectedArches();
         var kickstarts = {};
         document.querySelectorAll('.iso-ks').forEach(function(sel) { kickstarts[sel.dataset.arch] = sel.value; });
@@ -228,11 +232,33 @@
           project: document.getElementById('iso-project').value.trim() || 'Oreon',
           macboot: document.getElementById('iso-macboot').checked
         };
-        api.post('/iso-builds', body).then(function() { return loadJobs(); }).catch(function(e) { alert(e.message || e); });
+        btn.disabled = true;
+        btn.textContent = 'Queuing...';
+        note.textContent = '';
+        api.post('/iso-builds', body).then(function(data) {
+          var n = (data && data.items) ? data.items.length : arches.length;
+          var names = ((data && data.items) || []).map(function(j) { return j.iso_name + ' (#' + j.id + ')'; }).join(', ');
+          note.textContent = 'Queued ' + n + ' build' + (n === 1 ? '' : 's') + (names ? ': ' + names : '') + '. They are in the list below.';
+          return loadJobs();
+        }).catch(function(e) {
+          note.textContent = '';
+          alert(e.message || e);
+        }).then(function() {
+          btn.disabled = false;
+          btn.textContent = 'Queue ISO build';
+        });
       });
-      loadMocks();
-      loadFolders();
-      loadJobs();
+      function showForAuth() {
+        var on = !!(api && api.token);
+        document.getElementById('iso-form-card').style.display = on ? 'block' : 'none';
+        if (on) {
+          loadMocks();
+          loadFolders();
+        }
+        loadJobs();
+      }
+      showForAuth();
+      window.addEventListener('auth-change', showForAuth);
       setInterval(loadJobs, 15000);
     })();
   </script>
