@@ -2214,6 +2214,13 @@ async def iso_presign(iso_id: int, db: DbSession, worker: Annotated[Worker, Depe
     job = await db.get(IsoBuild, iso_id)
     if job is None or job.worker_id != worker.id or job.status != BuildStatus.RUNNING.value:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="ISO build not running")
+    bucket = get_settings().mirrorlist_r2_bucket
+    if get_r2_client().object_exists_in_bucket(bucket, job.iso_name):
+        job.status = BuildStatus.FAILED.value
+        job.error_message = f"{job.iso_name} already exists in {bucket}"
+        job.completed_at = datetime.now(timezone.utc)
+        await db.flush()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=job.error_message)
     url = get_r2_client().generate_presigned_url_for_bucket(
         get_settings().mirrorlist_r2_bucket,
         job.iso_name,
@@ -2262,4 +2269,21 @@ async def iso_result(
             locked.state = WorkerState.IDLE
             locked.current_build_attempt_id = None
     await db.flush()
+    from oreon_build.services.discord import (
+        DISCORD_COLOR_CANCELLED,
+        DISCORD_COLOR_FAILED,
+        DISCORD_COLOR_SUCCESS,
+        send_discord_embed,
+    )
+
+    color = DISCORD_COLOR_SUCCESS if st == BuildStatus.SUCCESS.value else DISCORD_COLOR_FAILED
+    if st == BuildStatus.CANCELLED.value:
+        color = DISCORD_COLOR_CANCELLED
+    tail = (job.log_text or job.error_message or "")[-900:]
+    await send_discord_embed(
+        title=f"ISO build {st} #{job.id}",
+        description=f"{job.iso_name}\n{job.sha256 or ''}".strip(),
+        fields=[("log", tail or "no log")],
+        color=color,
+    )
     return {"status": "ok"}
