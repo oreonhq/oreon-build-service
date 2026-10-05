@@ -166,6 +166,25 @@ class R2Client:
                 return None
             raise
 
+    def generate_presigned_url_for_bucket(
+        self,
+        bucket: str,
+        key: str,
+        *,
+        method: str,
+        content_type: str | None = None,
+        expires_in: int = 3600,
+    ) -> str:
+        params: dict = {"Bucket": bucket, "Key": key}
+        if content_type and method == "put_object":
+            params["ContentType"] = content_type
+        return self._client.generate_presigned_url(
+            method,
+            Params=params,
+            ExpiresIn=expires_in,
+            HttpMethod="PUT" if method == "put_object" else "GET",
+        )
+
     def generate_presigned_put_url(
         self,
         key: str,
