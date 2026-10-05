@@ -468,9 +468,11 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
         source_query = select(Source).where(Source.package_version_id == job.package_version_id)
         if force_distgit:
             source_query = source_query.where(Source.kind == "distgit")
-        src_result = await db.execute(source_query)
+        src_result = await db.execute(source_query.order_by(Source.id.desc()))
         for src in src_result.scalars().all():
             sources.append({"kind": src.kind, "r2_key": src.r2_key, "url": src.url})
+            if force_distgit and src.kind == "distgit" and src.url:
+                break
     elif job.package_id:
         from oreon_build.models import PackageVersion as PV
 
@@ -487,6 +489,8 @@ async def poll_job(db: DbSession, worker: Annotated[Worker, Depends(_require_wor
         src_result = await db.execute(source_query.order_by(PV.id.desc(), Source.id.desc()))
         for src in src_result.scalars().all():
             sources.append({"kind": src.kind, "r2_key": src.r2_key, "url": src.url})
+            if force_distgit and src.kind == "distgit" and src.url:
+                break
     if job.target_id:
         t_result = await db.execute(
             select(BuildTarget).where(BuildTarget.id == job.target_id).options(

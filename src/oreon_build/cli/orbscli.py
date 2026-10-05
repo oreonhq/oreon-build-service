@@ -7149,16 +7149,7 @@ def cmd_build(
         return
 
     for pkg in names:
-        existing = find_package_by_name(api_base, token, pkg)
-        if existing:
-            body: dict[str, Any] = {
-                "package_id": int(existing["id"]),
-                "release_id": rid,
-                "architectures": arches,
-                "skip_complete_arches": skip_complete,
-            }
-        else:
-            body = {
+        body = {
                 "new_package": distgit_new_package_payload(
                     pkg, releasename, distgit_url=distgit_url, distgit_branch=distgit_branch
                 ),
@@ -7556,23 +7547,14 @@ def builds_fix_current(
                 continue
             release_names[rid] = rn
         releasename = release_names[rid]
-        existing = find_package_by_name(api_base, token, pkg)
-        if existing:
-            body: dict[str, Any] = {
-                "package_id": int(existing["id"]),
-                "release_id": rid,
-                "architectures": arcs,
-                "skip_complete_arches": True,
-            }
-        else:
-            body = {
-                "new_package": distgit_new_package_payload(
-                    pkg, releasename, distgit_url=distgit_url, distgit_branch=distgit_branch
-                ),
-                "release_id": rid,
-                "architectures": arcs,
-                "skip_complete_arches": True,
-            }
+        body = {
+            "new_package": distgit_new_package_payload(
+                pkg, releasename, distgit_url=distgit_url, distgit_branch=distgit_branch
+            ),
+            "release_id": rid,
+            "architectures": arcs,
+            "skip_complete_arches": True,
+        }
         created = http_json(
             "POST",
             api_base,

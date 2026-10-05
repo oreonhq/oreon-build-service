@@ -59,17 +59,22 @@ async def _sync_distgit_source(
         return
     row = await db.execute(
         select(Source)
+        .join(PackageVersion, Source.package_version_id == PackageVersion.id)
         .where(
-            Source.package_version_id == package_version_id,
+            PackageVersion.package_id
+            == select(PackageVersion.package_id)
+            .where(PackageVersion.id == package_version_id)
+            .scalar_subquery(),
             Source.kind == "distgit",
         )
-        .limit(1)
     )
-    src = row.scalar_one_or_none()
-    if src is None:
+    rows = list(row.scalars().all())
+    if not rows:
         db.add(Source(package_version_id=package_version_id, kind="distgit", url=want))
-    elif (src.url or "").strip() != want:
-        src.url = want
+    else:
+        for src in rows:
+            if (src.url or "").strip() != want:
+                src.url = want
     await db.flush()
 
 

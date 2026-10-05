@@ -154,16 +154,19 @@ async def _get_or_create_distgit_package(
                 preferred_mock_environment_id=preferred_mock_environment_id,
             )["source_url"]
             src_r = await db.execute(
-                select(Source).where(
-                    Source.package_version_id == pv_id,
+                select(Source)
+                .join(PackageVersion, Source.package_version_id == PackageVersion.id)
+                .where(
+                    PackageVersion.package_id == pkg.id,
                     Source.kind == "distgit",
-                ).limit(1)
+                )
             )
-            src = src_r.scalar_one_or_none()
-            if src is None:
+            rows = list(src_r.scalars().all())
+            if not rows:
                 db.add(Source(package_version_id=pv_id, kind="distgit", url=want))
             else:
-                src.url = want
+                for src in rows:
+                    src.url = want
             await db.flush()
         return pkg, pkg.preferred_mock_environment_id
 
@@ -280,7 +283,7 @@ async def enqueue_plan_layer_jobs(
                 package_id=pkg.id,
                 release_id=release.id,
                 target_id=target.id,
-                package_version_id=None,
+                package_version_id=pv_id,
                 status=BuildStatus.PENDING,
                 priority=priority,
                 triggered_by_id=triggered_by_id,
