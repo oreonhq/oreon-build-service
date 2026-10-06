@@ -139,8 +139,15 @@ def run_iso_job(controller_url: str, worker_headers: dict[str, str], job: dict) 
             "mkdir -p /run/dbus && "
             "if [ ! -S /run/dbus/system_bus_socket ]; then dbus-daemon --system --fork; fi && "
             + inner
+            + "; rc=$?; "
+            "if [ \"$rc\" -ne 0 ]; then "
+            "echo '## anaconda logs'; "
+            "for f in /tmp/anaconda.log /var/log/anaconda/anaconda.log /var/log/anaconda/packaging.log; do "
+            "if [ -f \"$f\" ]; then echo \"## $f\"; tail -c 50000 \"$f\"; fi; "
+            "done; "
+            "fi; exit \"$rc\""
         )
-        rc, out = _run(base + ["--chroot", "--", "bash", "-c", script], timeout_s=21600)
+        rc, out = _run(base + ["--enable-network", "--chroot", "--", "bash", "-c", script], timeout_s=21600)
         note("## livemedia-creator\n" + _tail_lines(out, 4000))
         if rc != 0:
             extra = []
