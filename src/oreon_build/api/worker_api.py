@@ -2307,11 +2307,15 @@ async def iso_result(
     color = DISCORD_COLOR_SUCCESS if st == BuildStatus.SUCCESS.value else DISCORD_COLOR_FAILED
     if st == BuildStatus.CANCELLED.value:
         color = DISCORD_COLOR_CANCELLED
-    tail = (job.log_text or job.error_message or "")[-900:]
+    fields = [("arch", job.architecture or "")]
+    if job.sha256:
+        fields.append(("sha256", job.sha256))
+    if job.error_message:
+        fields.append(("error", (job.error_message or "")[:300]))
     await send_discord_embed(
         title=f"ISO build {st} #{job.id}",
-        description=f"{job.iso_name}\n{job.sha256 or ''}".strip(),
-        fields=[("log", tail or "no log")],
+        description=job.iso_name,
+        fields=fields,
         color=color,
     )
     return {"status": "ok"}

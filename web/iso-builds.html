@@ -7,8 +7,10 @@
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" crossorigin="anonymous" referrerpolicy="no-referrer">
   <link rel="stylesheet" href="/static/style.css?v=4">
   <style>
-    .log-viewer { background: #1e1e1e; color: #d4d4d4; padding: 1rem; border-radius: 4px; overflow: auto; max-height: 60vh; font-family: ui-monospace, monospace; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
     .ks-row { margin: 0.4rem 0; }
+    .iso-sha { font-family: ui-monospace, monospace; font-size: 12px; word-break: break-all; max-width: 16rem; }
+    .iso-actions { white-space: nowrap; }
+    .iso-actions .btn { white-space: nowrap; display: inline-block; margin: 0 0.35rem 0 0; text-decoration: none; vertical-align: middle; }
     .iso-checks { display: flex; flex-direction: column; gap: 0.35rem; margin-top: 0.25rem; }
     .iso-check { display: flex; align-items: center; gap: 0.45rem; width: fit-content; margin: 0; color: var(--text); }
     .form-group .iso-check input[type="checkbox"] { width: auto; max-width: none; margin: 0; padding: 0; }
@@ -67,6 +69,18 @@
     </section>
     <section class="card">
       <h2>Jobs</h2>
+      <div class="list-toolbar">
+        <div class="pagination" id="iso-pagination">
+          <button type="button" class="btn" id="iso-prev" disabled>Prev</button>
+          <span class="page-info" id="iso-page-info">Page 1 of 1</span>
+          <button type="button" class="btn" id="iso-next" disabled>Next</button>
+          <select class="page-size" id="iso-page-size" title="Items per page">
+            <option value="25" selected>25</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+          </select>
+        </div>
+      </div>
       <table class="table-list">
         <thead>
           <tr>
@@ -83,8 +97,6 @@
         </thead>
         <tbody id="iso-tbody"></tbody>
       </table>
-      <h3 id="iso-log-title" style="display:none">Log</h3>
-      <pre id="iso-log" class="log-viewer" style="display:none"></pre>
     </section>
   </main>
   <script src="/static/app.js?v=21"></script>
@@ -92,6 +104,7 @@
     (function() {
       var api = window.oreonApi;
       var ksFiles = [];
+      var isoPage = 0, isoPageSize = 25, isoTotal = 0;
 
       function escapeHtml(s) {
         var d = document.createElement('div');
@@ -169,47 +182,54 @@
         }).catch(function() {});
       }
       function loadJobs() {
-        return api.get('/iso-builds?limit=50').then(function(data) {
+        var offset = isoPage * isoPageSize;
+        return api.get('/iso-builds?limit=' + isoPageSize + '&offset=' + offset).then(function(data) {
           var tbody = document.getElementById('iso-tbody');
-          tbody.innerHTML = '';
-          (data.items || []).forEach(function(j) {
-            var tr = document.createElement('tr');
-            var actions = '<button type="button" class="btn iso-log" data-id="' + j.id + '">Log</button>';
+          var jobs = (data && data.items) ? data.items : [];
+          isoTotal = (data && typeof data.total === 'number') ? data.total : 0;
+          tbody.innerHTML = jobs.map(function(j) {
+            var actions = '<a class="btn" href="/iso-build.html?id=' + j.id + '">Log</a>';
             if (j.status === 'success') {
-              actions += ' <a class="btn" href="/api/iso-builds/' + j.id + '/download">Download ISO</a>';
+              actions += '<a class="btn" href="/api/iso-builds/' + j.id + '/download">Download ISO</a>';
             }
             if (api.token && (j.status === 'pending' || j.status === 'running' || j.status === 'queued')) {
               actions += ' <button type="button" class="btn iso-cancel" data-id="' + j.id + '">Cancel</button>';
             }
-            tr.innerHTML =
+            return '<tr>' +
               '<td>' + j.id + '</td>' +
               '<td>' + escapeHtml(j.iso_name) + '</td>' +
               '<td>' + escapeHtml(j.release_folder) + '</td>' +
               '<td>' + escapeHtml(j.kickstart) + '</td>' +
               '<td>' + escapeHtml(j.architecture) + '</td>' +
               '<td><span class="' + statusClass(j.status) + '">' + escapeHtml(j.status) + '</span></td>' +
-              '<td style="font-family:ui-monospace,monospace;font-size:12px">' + escapeHtml(j.sha256 || '') + '</td>' +
-              '<td>' + escapeHtml(j.created_at || '') + '</td>' +
-              '<td>' + actions + '</td>';
-            tbody.appendChild(tr);
-          });
-          tbody.querySelectorAll('.iso-log').forEach(function(btn) {
-            btn.addEventListener('click', function() {
-              api.get('/iso-builds/' + btn.dataset.id + '/log').then(function(data) {
-                document.getElementById('iso-log-title').style.display = 'block';
-                var pre = document.getElementById('iso-log');
-                pre.style.display = 'block';
-                pre.textContent = data.log || '(no log yet)';
-              });
-            });
-          });
+              '<td class="iso-sha">' + escapeHtml(j.sha256 || '') + '</td>' +
+              '<td>' + escapeHtml((j.created_at || '').slice(0, 19)) + '</td>' +
+              '<td class="iso-actions">' + actions + '</td></tr>';
+          }).join('') || '<tr><td colspan="9">No ISO builds</td></tr>';
           tbody.querySelectorAll('.iso-cancel').forEach(function(btn) {
             btn.addEventListener('click', function() {
               api.post('/iso-builds/' + btn.dataset.id + '/cancel', {}).then(loadJobs).catch(function(e) { alert(e.message || e); });
             });
           });
+          var numPages = isoTotal ? Math.ceil(isoTotal / isoPageSize) : 1;
+          if (isoPage > numPages - 1) isoPage = Math.max(0, numPages - 1);
+          document.getElementById('iso-page-info').textContent = 'Page ' + (isoPage + 1) + ' of ' + numPages;
+          document.getElementById('iso-prev').disabled = isoPage <= 0;
+          document.getElementById('iso-next').disabled = isoPage >= numPages - 1;
         });
       }
+      document.getElementById('iso-prev').addEventListener('click', function() {
+        if (isoPage > 0) { isoPage--; loadJobs(); }
+      });
+      document.getElementById('iso-next').addEventListener('click', function() {
+        var numPages = isoTotal ? Math.ceil(isoTotal / isoPageSize) : 1;
+        if (isoPage < numPages - 1) { isoPage++; loadJobs(); }
+      });
+      document.getElementById('iso-page-size').addEventListener('change', function() {
+        isoPageSize = parseInt(this.value, 10) || 25;
+        isoPage = 0;
+        loadJobs();
+      });
       document.querySelectorAll('.iso-arch').forEach(function(el) {
         el.addEventListener('change', renderKsPicks);
       });

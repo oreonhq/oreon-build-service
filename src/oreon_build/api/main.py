@@ -567,6 +567,9 @@ def create_app() -> FastAPI:
         @app.get("/iso-builds.html")
         def _iso_builds():
             return _html(web_dir / "iso-builds.html")
+        @app.get("/iso-build.html")
+        def _iso_build():
+            return _html(web_dir / "iso-build.html")
 
         @app.get("/chains.html")
         def _chains_removed():
