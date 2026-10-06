@@ -88,7 +88,10 @@ def run_iso_job(controller_url: str, worker_headers: dict[str, str], job: dict) 
         if rc != 0:
             finish("failed", "mock init failed")
             return
-        rc, out = _run(base + ["--install", "lorax", "lorax-lmc-novirt", "pykickstart"], timeout_s=3600)
+        install = ["lorax", "lorax-lmc-novirt", "pykickstart"]
+        if job.get("macboot"):
+            install.append("hfsplus-tools")
+        rc, out = _run(base + ["--install"] + install, timeout_s=3600)
         note("## mock install\n" + out)
         if rc != 0:
             finish("failed", "mock install of lorax failed")
@@ -128,6 +131,8 @@ def run_iso_job(controller_url: str, worker_headers: dict[str, str], job: dict) 
         ]
         if job.get("macboot"):
             lmc.append("--macboot")
+        else:
+            lmc.append("--nomacboot")
         rc, out = _run(base + ["--chroot", "--"] + lmc, timeout_s=21600)
         note("## livemedia-creator\n" + _tail_lines(out, 4000))
         if rc != 0:
