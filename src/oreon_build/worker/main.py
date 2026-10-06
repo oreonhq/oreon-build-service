@@ -17,6 +17,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import traceback
 import tarfile
 import tempfile
 import threading
@@ -2616,9 +2617,27 @@ def _prune_stale_var_lib_mock_dirs() -> None:
 
 def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict) -> None:
     if job.get("job_kind") == "iso":
-        from oreon_build.worker.iso_job import run_iso_job
+        try:
+            from oreon_build.worker.iso_job import run_iso_job
 
-        run_iso_job(controller_url, worker_headers, job)
+            run_iso_job(controller_url, worker_headers, job)
+        except Exception as exc:
+            logger.exception("ISO job crashed before it could report")
+            iso_id = job.get("iso_build_id")
+            if iso_id is not None:
+                try:
+                    httpx.post(
+                        f"{controller_url}/api/worker/iso/{iso_id}/result",
+                        headers=worker_headers,
+                        json={
+                            "status": "failed",
+                            "error_message": str(exc),
+                            "log": traceback.format_exc(),
+                        },
+                        timeout=60.0,
+                    )
+                except Exception:
+                    logger.exception("Failed to report ISO crash")
         return
     done_event = threading.Event()
     abort_event = threading.Event()
@@ -3474,7 +3493,7 @@ def main() -> None:
                     _inflight_attempt_ids.add(aid)
                 _mark_inflight_attempt_external(aid)
 
-            def _run_job() -> None:
+            def _run_job(job=job) -> None:
                 try:
                     _process_job(controller_url, headers, job)
                 finally:
