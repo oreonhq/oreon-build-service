@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import shlex
 import threading
 from pathlib import Path
 
@@ -88,7 +89,7 @@ def run_iso_job(controller_url: str, worker_headers: dict[str, str], job: dict) 
         if rc != 0:
             finish("failed", "mock init failed")
             return
-        install = ["lorax", "lorax-lmc-novirt", "pykickstart"]
+        install = ["lorax", "lorax-lmc-novirt", "pykickstart", "dbus"]
         if job.get("macboot"):
             install.append("hfsplus-tools")
         rc, out = _run(base + ["--install"] + install, timeout_s=3600)
@@ -133,9 +134,26 @@ def run_iso_job(controller_url: str, worker_headers: dict[str, str], job: dict) 
             lmc.append("--macboot")
         else:
             lmc.append("--nomacboot")
-        rc, out = _run(base + ["--chroot", "--"] + lmc, timeout_s=21600)
+        inner = " ".join(shlex.quote(x) for x in lmc)
+        script = (
+            "mkdir -p /run/dbus && "
+            "if [ ! -S /run/dbus/system_bus_socket ]; then dbus-daemon --system --fork; fi && "
+            + inner
+        )
+        rc, out = _run(base + ["--chroot", "--", "bash", "-c", script], timeout_s=21600)
         note("## livemedia-creator\n" + _tail_lines(out, 4000))
         if rc != 0:
+            extra = []
+            for src in (
+                "/var/log/anaconda/anaconda.log",
+                "/var/log/anaconda/packaging.log",
+            ):
+                dest = work / Path(src).name
+                _run(base + ["--copyout", src, str(dest)], timeout_s=120)
+                if dest.is_file():
+                    extra.append("## " + src + "\n" + dest.read_text(errors="replace")[-60000:])
+            if extra:
+                note("\n".join(extra))
             finish("failed", "livemedia-creator failed")
             return
         dest = work / iso_name
