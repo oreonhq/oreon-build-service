@@ -46,13 +46,21 @@
       </div>
       <h1 style="margin:0 0 0.35rem; font-size:1.35rem;">Release Monitoring</h1>
       <p class="errata-lead">
-        Checks published source RPM versions in the repository against upstream.
+        Checks published source RPM versions against upstream. A side tag is layered on the main repos, so a newer build there replaces the main version.
       </p>
 
       <div class="errata-filters">
         <div class="form-group">
           <label for="rm-release-id">Release</label>
-          <select id="rm-release-id" class="form-control"></select>
+          <select id="rm-release-id" class="form-control">
+            <option value="">Select a release</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label for="rm-side-tag">Side tag</label>
+          <select id="rm-side-tag" class="form-control">
+            <option value="">Main repos only</option>
+          </select>
         </div>
       </div>
 
@@ -82,7 +90,7 @@
     </section>
   </main>
 
-  <script src="/static/app.js?v=21"></script>
+  <script src="/static/app.js?v=23"></script>
   <script src="/static/watchdog-release-checkboxes.js?v=1"></script>
   <script>
     (function() {
@@ -113,6 +121,10 @@
         var sel = document.getElementById('rm-release-id');
         return sel && sel.value ? sel.value : '';
       }
+      function currentSideTagId() {
+        var sel = document.getElementById('rm-side-tag');
+        return sel && sel.value ? sel.value : '';
+      }
 
       function loadReleases() {
         return api.get('/security/releases').then(function(res) {
@@ -120,8 +132,27 @@
           if (!sel) return;
           var prev = sel.value;
           var deduped = window.oreonReleaseCheckboxes.dedupeReleases((res && res.items) ? res.items : []);
-          sel.innerHTML = '';
+          sel.innerHTML = '<option value="">Select a release</option>';
           deduped.forEach(function(r) { sel.appendChild(new Option(r.releasename, r.id)); });
+          if (prev) {
+            for (var j = 0; j < sel.options.length; j++) {
+              if (sel.options[j].value === prev) { sel.value = prev; break; }
+            }
+          }
+        }).catch(function() {});
+      }
+
+      function loadSideTags() {
+        var sel = document.getElementById('rm-side-tag');
+        var rid = currentReleaseId();
+        var prev = sel ? sel.value : '';
+        if (!sel) return Promise.resolve();
+        sel.innerHTML = '<option value="">Main repos only</option>';
+        if (!rid) return Promise.resolve();
+        return api.get('/release-monitoring/side-tags?release_id=' + urlEncode(rid)).then(function(res) {
+          ((res && res.items) || []).forEach(function(t) {
+            sel.appendChild(new Option(t.name, t.id));
+          });
           if (prev) {
             for (var j = 0; j < sel.options.length; j++) {
               if (sel.options[j].value === prev) { sel.value = prev; break; }
@@ -187,8 +218,17 @@
 
       function loadResults() {
         var rid = currentReleaseId();
-        var path = '/release-monitoring/results';
-        if (rid) path += '?release_id=' + urlEncode(rid);
+        if (!rid) {
+          stopPolling();
+          progressEl.textContent = 'Select a release.';
+          statusEl.textContent = '';
+          tbody.innerHTML = '';
+          refreshActionState(false);
+          return;
+        }
+        var path = '/release-monitoring/results?release_id=' + urlEncode(rid);
+        var sid = currentSideTagId();
+        if (sid) path += '&side_tag_id=' + urlEncode(sid);
         api.get(path).then(function(res) {
           var items = (res && res.items) ? res.items : [];
           var latest = res ? res.latest_scan : null;
@@ -228,9 +268,13 @@
         scanBtn.addEventListener('click', function() {
           if (!canManage()) return;
           var rid = currentReleaseId();
+          if (!rid) { statusEl.textContent = 'Select a release first.'; return; }
+          var sid = currentSideTagId();
+          var body = { release_id: parseInt(rid, 10) };
+          if (sid) body.side_tag_id = parseInt(sid, 10);
           scanBtn.disabled = true;
           scanBtn.textContent = 'Starting...';
-          api.post('/release-monitoring/scan', rid ? { release_id: parseInt(rid, 10) } : {}).then(function() {
+          api.post('/release-monitoring/scan', body).then(function() {
             loadResults();
           }).catch(function(e) {
             statusEl.textContent = 'Scan failed to start: ' + (e.message || e);
@@ -256,14 +300,22 @@
 
       var relSel = document.getElementById('rm-release-id');
       if (relSel) {
-        relSel.addEventListener('change', function() { loadResults(); });
+        relSel.addEventListener('change', function() {
+          var tagSel = document.getElementById('rm-side-tag');
+          if (tagSel) tagSel.value = '';
+          loadSideTags().then(loadResults);
+        });
+      }
+      var tagSel = document.getElementById('rm-side-tag');
+      if (tagSel) {
+        tagSel.addEventListener('change', function() { loadResults(); });
       }
 
-      loadReleases().then(loadResults);
+      loadReleases().then(function() { return loadSideTags(); }).then(loadResults);
       refreshActionState(false);
       window.addEventListener('auth-change', function() {
         refreshActionState(false);
-        loadReleases().then(loadResults);
+        loadReleases().then(function() { return loadSideTags(); }).then(loadResults);
       });
     })();
   </script>
