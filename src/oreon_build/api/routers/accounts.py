@@ -2,10 +2,10 @@ from fastapi import APIRouter, HTTPException, Request, status
 from sqlalchemy import delete, select, update
 from sqlalchemy.orm import selectinload
 
-from oreon_build.api.deps import CurrentAdmin, DbSession
-from oreon_build.api.schemas import AccountCreate, AccountResponse, AccountUpdate
+from oreon_build.api.deps import CurrentAdmin, CurrentUser, DbSession
+from oreon_build.api.schemas import AccountCreate, AccountResponse, AccountUpdate, PasswordChange
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
-from oreon_build.core.security import hash_password
+from oreon_build.core.security import hash_password, verify_password
 from oreon_build.models import Account, Role, RoleName
 from oreon_build.models import (
     AuditLog, BuildJob, LayerPlan, Promotion, SideTag, SideTagMember,
@@ -70,6 +70,31 @@ async def create_account(
         is_active=account.is_active,
         created_at=account.created_at,
     )
+
+
+@router.post("/me/password")
+async def change_own_password(
+    data: PasswordChange,
+    request: Request,
+    db: DbSession,
+    user: CurrentUser,
+):
+    if not verify_password(data.current_password, user.password_hash):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is wrong")
+    if data.current_password == data.new_password:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="New password must be different")
+    user.password_hash = hash_password(data.new_password)
+    await log_audit(
+        db,
+        "account.password_change",
+        account_id=user.id,
+        resource_type="account",
+        resource_id=str(user.id),
+        ip_address=get_client_ip(request),
+        user_agent=get_user_agent(request),
+    )
+    await db.flush()
+    return {"status": "ok"}
 
 
 @router.get("/{account_id}", response_model=AccountResponse)
