@@ -209,7 +209,7 @@
       <div id="layer-build-alert" role="alert"></div>
       <div class="form-group" style="margin-bottom:1rem;">
         <label>Filter</label>
-        <input type="text" id="builds-filter" placeholder="Filter by ID, package, release, arch, status" style="padding:0.4rem; width:100%; max-width:20rem;">
+        <input type="text" id="builds-filter" name="oreon-build-filter" autocomplete="off" readonly onfocus="this.removeAttribute('readonly')" placeholder="Filter by ID, package, release, arch, status" style="padding:0.4rem; width:100%; max-width:20rem;">
       </div>
       <div class="list-toolbar">
         <div class="bulk-selection-bar" id="builds-bulk-bar">
@@ -238,7 +238,7 @@
       </table>
     </section>
   </main>
-  <script src="/static/app.js?v=21"></script>
+  <script src="/static/app.js?v=23"></script>
   <script>
     (function() {
       const api = window.oreonApi;
