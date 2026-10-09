@@ -18,6 +18,9 @@ class ReleaseMonitorScan(Base):
         ForeignKey("releases.id"), nullable=True, index=True
     )
     branches: Mapped[str] = mapped_column(String(256), nullable=False, default="")
+    side_tag_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("side_tags.id"), nullable=True, index=True
+    )
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="running", index=True)
     total_packages: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     checked_packages: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
