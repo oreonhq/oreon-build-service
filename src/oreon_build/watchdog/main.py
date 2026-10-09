@@ -289,6 +289,7 @@ def create_app() -> FastAPI:
             "id": int(scan.id),
             "release_id": scan.release_id,
             "branches": scan.branches or "",
+            "side_tag_id": scan.side_tag_id,
             "status": scan.status,
             "total_packages": int(scan.total_packages or 0),
             "checked_packages": int(scan.checked_packages or 0),
@@ -299,8 +300,30 @@ def create_app() -> FastAPI:
             "finished_at": _dt_to_iso(scan.finished_at),
         }
 
+    @app.get("/api/release-monitoring/side-tags")
+    async def release_monitoring_side_tags(release_id: int = Query(...)):
+        from sqlalchemy import select
+        from oreon_build.models import SideTag
+
+        async with async_session_maker() as db:
+            rows = (
+                await db.execute(
+                    select(SideTag)
+                    .where(SideTag.release_id == release_id)
+                    .order_by(SideTag.name)
+                )
+            ).scalars().all()
+            return JSONResponse(
+                content={
+                    "items": [{"id": int(t.id), "name": t.name} for t in rows],
+                }
+            )
+
     @app.get("/api/release-monitoring/results")
-    async def release_monitoring_results(release_id: int | None = Query(None)):
+    async def release_monitoring_results(
+        release_id: int | None = Query(None),
+        side_tag_id: int | None = Query(None),
+    ):
         from sqlalchemy import select
 
         async with async_session_maker() as db:
@@ -309,6 +332,12 @@ def create_app() -> FastAPI:
             if release_id is not None:
                 done_q = done_q.where(ReleaseMonitorScan.release_id == release_id)
                 active_q = active_q.where(ReleaseMonitorScan.release_id == release_id)
+            if side_tag_id is not None:
+                done_q = done_q.where(ReleaseMonitorScan.side_tag_id == side_tag_id)
+                active_q = active_q.where(ReleaseMonitorScan.side_tag_id == side_tag_id)
+            else:
+                done_q = done_q.where(ReleaseMonitorScan.side_tag_id.is_(None))
+                active_q = active_q.where(ReleaseMonitorScan.side_tag_id.is_(None))
             done_q = done_q.order_by(ReleaseMonitorScan.started_at.desc()).limit(1)
             active_q = active_q.order_by(ReleaseMonitorScan.started_at.desc()).limit(1)
 
@@ -419,12 +448,21 @@ def create_app() -> FastAPI:
         from oreon_build.services.release_monitor import schedule_scan
 
         release_id = payload.get("release_id")
+        side_tag_id = payload.get("side_tag_id")
         try:
             release_id = int(release_id) if release_id not in (None, "") else None
         except (TypeError, ValueError):
             return JSONResponse(content={"detail": "invalid release_id"}, status_code=400)
+        try:
+            side_tag_id = int(side_tag_id) if side_tag_id not in (None, "") else None
+        except (TypeError, ValueError):
+            return JSONResponse(content={"detail": "invalid side_tag_id"}, status_code=400)
+        if release_id is None:
+            return JSONResponse(content={"detail": "pick a release"}, status_code=400)
 
         async with async_session_maker() as db:
+            from oreon_build.models import SideTag
+
             running = (
                 await db.execute(
                     select(ReleaseMonitorScan).where(ReleaseMonitorScan.status == "running")
@@ -436,26 +474,18 @@ def create_app() -> FastAPI:
                     status_code=409,
                 )
 
-            release = None
-            if release_id is not None:
-                release = await db.get(Release, release_id)
-                if release is None or not release.is_active:
-                    return JSONResponse(content={"detail": "release not found"}, status_code=404)
-            else:
-                release = (
-                    await db.execute(
-                        select(Release)
-                        .where(Release.is_active.is_(True))
-                        .order_by(Release.releasename)
-                        .limit(1)
-                    )
-                ).scalar_one_or_none()
-                if release is None:
-                    return JSONResponse(content={"detail": "no releases configured"}, status_code=400)
+            release = await db.get(Release, release_id)
+            if release is None or not release.is_active:
+                return JSONResponse(content={"detail": "release not found"}, status_code=404)
+            if side_tag_id is not None:
+                tag = await db.get(SideTag, side_tag_id)
+                if tag is None or tag.release_id != release.id:
+                    return JSONResponse(content={"detail": "side tag not found"}, status_code=404)
 
             branches = ",".join(PRIMARY_REPO_BRANCHES)
             scan = ReleaseMonitorScan(
                 release_id=release.id,
+                side_tag_id=side_tag_id,
                 branches=branches,
                 status="running",
                 created_by_account_id=actor.id,
