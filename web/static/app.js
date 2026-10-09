@@ -245,11 +245,26 @@ window.oreonUI = (function() {
       + '    </div>'
       + '  </div>'
       + '</div>'
+      + '<div id="password-modal" class="modal">'
+      + '  <div class="modal-content">'
+      + '    <h3>Change password</h3>'
+      + '    <div class="form-group"><label>Current password</label><input type="password" id="pw-current" autocomplete="current-password"></div>'
+      + '    <div class="form-group"><label>New password</label><input type="password" id="pw-new" autocomplete="new-password"></div>'
+      + '    <div class="form-group"><label>Confirm new password</label><input type="password" id="pw-confirm" autocomplete="new-password"></div>'
+      + '    <p id="pw-note" style="color:var(--text-muted);min-height:1.2em;"></p>'
+      + '    <div class="modal-actions" style="justify-content:flex-end;">'
+      + '      <button type="button" class="btn" id="pw-cancel-btn">Cancel</button>'
+      + '      <button type="button" class="btn primary" id="pw-ok-btn">Save</button>'
+      + '    </div>'
+      + '  </div>'
+      + '</div>'
       + '<div id="login-modal" class="modal">'
       + '  <div class="modal-content">'
       + '    <h3>Login</h3>'
-      + '    <div class="form-group"><label>Username</label><input type="text" id="login-username"></div>'
-      + '    <div class="form-group"><label>Password</label><input type="password" id="login-password"></div>'
+      + '    <form id="login-form" autocomplete="on" onsubmit="return false;">'
+      + '    <div class="form-group"><label>Username</label><input type="text" id="login-username" name="username" autocomplete="username"></div>'
+      + '    <div class="form-group"><label>Password</label><input type="password" id="login-password" name="password" autocomplete="current-password"></div>'
+      + '    </form>'
       + '    <div class="modal-actions" style="justify-content:flex-end;">'
       + '      <button type="button" class="btn" id="login-cancel-btn">Cancel</button>'
       + '      <button type="button" class="btn primary" id="login-ok-btn">Login</button>'
@@ -294,7 +309,21 @@ window.oreonUI = (function() {
     const lm = document.getElementById('login-modal');
     if (lm) lm.classList.remove('open');
   }
-  return { confirm, openLogin, closeLogin };
+  function openPassword() {
+    ensureShell();
+    var modal = document.getElementById('password-modal');
+    document.getElementById('pw-current').value = '';
+    document.getElementById('pw-new').value = '';
+    document.getElementById('pw-confirm').value = '';
+    document.getElementById('pw-note').textContent = '';
+    modal.classList.add('open');
+    document.getElementById('pw-current').focus();
+  }
+  function closePassword() {
+    var modal = document.getElementById('password-modal');
+    if (modal) modal.classList.remove('open');
+  }
+  return { confirm, openLogin, closeLogin, openPassword, closePassword };
 })();
 
 function updateAuthUI() {
@@ -304,6 +333,8 @@ function updateAuthUI() {
   const userInfo = document.getElementById('user-info');
   if (btnLogin) btnLogin.style.display = token ? 'none' : 'inline-block';
   if (btnLogout) btnLogout.style.display = token ? 'inline-block' : 'none';
+  var btnPw = document.getElementById('btn-password');
+  if (btnPw) btnPw.style.display = token ? 'inline-block' : 'none';
   if (userInfo) {
     if (token) {
       var u = window.oreonApi.username || 'user';
@@ -376,6 +407,7 @@ function oreonInitNavbar() {
     '<span id="auth-section">' +
     '<span id="user-info"></span>' +
     '<button id="btn-login" type="button">Login</button>' +
+    '<button id="btn-password" type="button" style="display:none">Password</button>' +
     '<button id="btn-logout" type="button" style="display:none">Logout</button>' +
     '</span>'
   );
@@ -459,18 +491,12 @@ window.oreonSigningKeyHtml = oreonSigningKeyHtml;
 window.oreonControllerKeyHtml = oreonControllerKeyHtml;
 window.oreonJobDisplayStatus = oreonJobDisplayStatus;
 
-document.addEventListener('DOMContentLoaded', function() {
-  oreonInitNavbar();
-  oreonLoadStoredAuth(window.oreonApi);
-  updateAuthUI();
-  window.addEventListener('auth-change', function() {
-    oreonLoadStoredAuth(window.oreonApi);
-    updateAuthUI();
-    oreonInitNavbar();
-  });
+function oreonBindAuthButtons() {
   const btnLogin = document.getElementById('btn-login');
   const btnLogout = document.getElementById('btn-logout');
-  if (btnLogin) {
+  const btnPw = document.getElementById('btn-password');
+  if (btnLogin && !btnLogin.dataset.bound) {
+    btnLogin.dataset.bound = '1';
     btnLogin.addEventListener('click', function() {
       window.oreonUI.openLogin();
       const btnOk = document.getElementById('login-ok-btn');
@@ -505,11 +531,62 @@ document.addEventListener('DOMContentLoaded', function() {
       btnCancel.addEventListener('click', onCancel);
     });
   }
-  if (btnLogout) {
+  if (btnLogout && !btnLogout.dataset.bound) {
+    btnLogout.dataset.bound = '1';
     btnLogout.addEventListener('click', function() {
       window.oreonApi.setToken(null);
       updateAuthUI();
       window.dispatchEvent(new Event('auth-change'));
     });
   }
+  if (btnPw && !btnPw.dataset.bound) {
+    btnPw.dataset.bound = '1';
+    btnPw.addEventListener('click', function() {
+      window.oreonUI.openPassword();
+      var btnOk = document.getElementById('pw-ok-btn');
+      var btnCancel = document.getElementById('pw-cancel-btn');
+      function cleanup() {
+        btnOk.removeEventListener('click', onOk);
+        btnCancel.removeEventListener('click', onCancel);
+      }
+      function onOk() {
+        var cur = document.getElementById('pw-current').value;
+        var next = document.getElementById('pw-new').value;
+        var again = document.getElementById('pw-confirm').value;
+        var note = document.getElementById('pw-note');
+        if (!cur || !next) { note.textContent = 'Fill in the current and new password.'; return; }
+        if (next.length < 8) { note.textContent = 'New password needs at least 8 characters.'; return; }
+        if (next !== again) { note.textContent = 'New password does not match.'; return; }
+        note.textContent = '';
+        window.oreonApi.post('/accounts/me/password', { current_password: cur, new_password: next })
+          .then(function() {
+            cleanup();
+            window.oreonUI.closePassword();
+            alert('Password changed');
+          })
+          .catch(function(e) {
+            note.textContent = e.message || 'Could not change password';
+          });
+      }
+      function onCancel() {
+        cleanup();
+        window.oreonUI.closePassword();
+      }
+      btnOk.addEventListener('click', onOk);
+      btnCancel.addEventListener('click', onCancel);
+    });
+  }
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+  oreonInitNavbar();
+  oreonLoadStoredAuth(window.oreonApi);
+  updateAuthUI();
+  oreonBindAuthButtons();
+  window.addEventListener('auth-change', function() {
+    oreonLoadStoredAuth(window.oreonApi);
+    oreonInitNavbar();
+    updateAuthUI();
+    oreonBindAuthButtons();
+  });
 });
