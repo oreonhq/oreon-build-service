@@ -77,6 +77,32 @@ class R2Client:
                 return None
             raise
 
+    def object_content_length(self, key: str) -> Optional[int]:
+        try:
+            resp = self._client.head_object(Bucket=self.bucket, Key=key)
+            return int(resp["ContentLength"])
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("404", "NoSuchKey", "NotFound"):
+                return None
+            raise
+
+    def get_object_range(self, key: str, start: int, end: int) -> Optional[bytes]:
+        if end < start:
+            return b""
+        try:
+            resp = self._client.get_object(
+                Bucket=self.bucket,
+                Key=key,
+                Range=f"bytes={start}-{end}",
+            )
+            return resp["Body"].read()
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("404", "NoSuchKey", "NotFound"):
+                return None
+            raise
+
     def copy_object(self, src_key: str, dest_key: str) -> bool:
         if src_key == dest_key:
             return self.object_exists(src_key)

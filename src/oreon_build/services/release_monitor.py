@@ -369,6 +369,7 @@ async def run_release_monitor_scan(scan_id: int) -> None:
                 release = await db.get(Release, scan.release_id)
             release_name = release.releasename if release else None
             release_id = scan.release_id
+            side_tag_id = scan.side_tag_id
 
         if not release_name:
             await _finish_scan(scan_id, status="failed", error="release not found")
@@ -377,6 +378,20 @@ async def run_release_monitor_scan(scan_id: int) -> None:
             branches = list(PRIMARY_REPO_BRANCHES)
 
         packages = await asyncio.to_thread(collect_source_packages, release_name, branches)
+        if side_tag_id is not None:
+            from oreon_build.models import SideTag
+
+            async with async_session_maker() as db:
+                tag = await db.get(SideTag, side_tag_id)
+                tag_name = tag.name if tag is not None else None
+            if not tag_name:
+                await _finish_scan(scan_id, status="failed", error="side tag not found")
+                return
+            overlay = await asyncio.to_thread(collect_source_packages, release_name, [tag_name])
+            for name, evr in overlay.items():
+                cur = packages.get(name)
+                if cur is None or rpm_evr_compare(("0", evr[0], evr[1]), ("0", cur[0], cur[1])) > 0:
+                    packages[name] = evr
         total = len(packages)
         github_by_name: dict[str, str] = {}
         async with async_session_maker() as db:
