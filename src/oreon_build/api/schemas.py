@@ -26,6 +26,11 @@ class AccountCreate(BaseModel):
     role: RoleNameSchema
 
 
+class PasswordChange(BaseModel):
+    current_password: str
+    new_password: str = Field(..., min_length=8)
+
+
 class AccountUpdate(BaseModel):
     password: Optional[str] = Field(None, min_length=8)
     role: Optional[RoleNameSchema] = None
