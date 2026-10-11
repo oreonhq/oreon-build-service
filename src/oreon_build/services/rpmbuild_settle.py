@@ -15,7 +15,11 @@ from sqlalchemy import select, update
 from oreon_build.models import BuildAttempt, BuildJob, BuildStatus, PublishTask, Release, RpmbuildPlan, RpmbuildPlanStatus
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
 from oreon_build.services.r2 import get_r2_client
-from oreon_build.services.rpmbuild_order import enqueue_plan_layer_jobs
+from oreon_build.models import Package
+from oreon_build.services.rpmbuild_order import (
+    enqueue_plan_layer_jobs,
+    names_blocked_by_failures,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -250,6 +254,14 @@ def _sources_visible_in_arch(releasename: str, branch: str, arch: str) -> set[st
     return _known_sources_from_primary(primary_xml)
 
 
+_INFLIGHT = (
+    BuildStatus.PENDING,
+    BuildStatus.QUEUED,
+    BuildStatus.BLOCKED,
+    BuildStatus.RUNNING,
+)
+
+
 async def _layer_status(db: Any, plan: RpmbuildPlan, layer: int) -> tuple[list[BuildJob], bool, bool]:
     q = await db.execute(
         select(BuildJob).where(
@@ -259,21 +271,64 @@ async def _layer_status(db: Any, plan: RpmbuildPlan, layer: int) -> tuple[list[B
     )
     jobs = list(q.scalars().all())
     if not jobs:
-        return [], False, False
-    any_failed = any(j.status in (BuildStatus.FAILED, BuildStatus.CANCELLED) for j in jobs)
-    all_success = all(j.status == BuildStatus.SUCCESS for j in jobs)
-    if not all_success:
-        return jobs, any_failed, False
+        return [], True, False
+    inflight = any(j.status in _INFLIGHT for j in jobs)
     pub_ok = True
-    for j in jobs:
-        att = await db.execute(
-            select(PublishTask).where(PublishTask.build_job_id == j.id).order_by(PublishTask.id.desc()).limit(1)
+    if not inflight:
+        for j in jobs:
+            if j.status != BuildStatus.SUCCESS:
+                continue
+            att = await db.execute(
+                select(PublishTask).where(PublishTask.build_job_id == j.id).order_by(PublishTask.id.desc()).limit(1)
+            )
+            p = att.scalar_one_or_none()
+            if p is None or p.status != "success":
+                pub_ok = False
+                break
+    return jobs, inflight, pub_ok
+
+
+async def _failed_package_names(db: Any, plan_id: int) -> set[str]:
+    rows = (
+        await db.execute(
+            select(Package.name, BuildJob.status, BuildJob.job_options)
+            .join(Package, Package.id == BuildJob.package_id)
+            .where(BuildJob.rpmbuild_plan_id == plan_id)
         )
-        p = att.scalar_one_or_none()
-        if p is None or p.status != "success":
-            pub_ok = False
-            break
-    return jobs, any_failed, pub_ok
+    ).all()
+    success: set[str] = set()
+    failed: set[str] = set()
+    for name, status, opts in rows:
+        if isinstance(opts, dict) and opts.get("build_profile") == "bootstrap":
+            continue
+        if status == BuildStatus.SUCCESS:
+            success.add(name)
+        elif status in (BuildStatus.FAILED, BuildStatus.CANCELLED):
+            failed.add(name)
+    return failed - success
+
+
+def _stored_dep_providers(plan: RpmbuildPlan) -> dict[str, list[str]] | None:
+    opts = plan.options_json if isinstance(plan.options_json, dict) else {}
+    raw = opts.get("dep_providers")
+    if not isinstance(raw, dict):
+        return None
+    out: dict[str, list[str]] = {}
+    for key, val in raw.items():
+        if isinstance(val, list):
+            out[str(key)] = [str(x) for x in val]
+    return out
+
+
+async def _finish_plan(db: Any, plan: RpmbuildPlan) -> None:
+    failed = await _failed_package_names(db, plan.id)
+    if failed:
+        plan.status = RpmbuildPlanStatus.FAILED
+        shown = ", ".join(sorted(failed)[:20])
+        plan.error_message = f"No further progress. Failed builds: {shown}"
+        return
+    plan.status = RpmbuildPlanStatus.SUCCESS
+    plan.error_message = None
 
 
 async def advance_rpmbuild_plans_once(db: Any) -> None:
@@ -297,60 +352,63 @@ async def advance_rpmbuild_plans_once(db: Any) -> None:
             plan.error_message = "Plan has no layers"
             continue
         cur = int(plan.current_open_layer or 0)
-        jobs, any_failed, publish_ready = await _layer_status(db, plan, cur)
-        if any_failed:
-            # Let other packages in the same parallel group finish before the
-            # chain becomes terminal. Later groups remain unopened.
-            if any(j.status in (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.BLOCKED, BuildStatus.RUNNING) for j in jobs):
-                plan.status = RpmbuildPlanStatus.RUNNING
-                continue
-            plan.status = RpmbuildPlanStatus.FAILED
-            label = "Group" if plan.seed_mode == "manual_chain" else "Layer"
-            plan.error_message = f"{label} {cur + 1 if plan.seed_mode == 'manual_chain' else cur} contains failed job(s)"
-            continue
-        if not jobs:
-            rel = await db.get(Release, plan.release_id)
-            if rel is None:
-                plan.status = RpmbuildPlanStatus.FAILED
-                plan.error_message = "Release missing"
-                continue
-            await enqueue_plan_layer_jobs(
-                db,
-                plan=plan,
-                layer_index=cur,
-                architectures=plan_arches or rel.arch_list() or ["x86_64", "aarch64"],
-                priority=plan_priority,
-                triggered_by_id=None,
-                preferred_mock_environment_id=plan_mock_id,
-            )
-            continue
-        if not publish_ready:
-            plan.status = RpmbuildPlanStatus.RUNNING
-            continue
-
         rel = await db.get(Release, plan.release_id)
         if rel is None:
             plan.status = RpmbuildPlanStatus.FAILED
             plan.error_message = "Release missing"
             continue
+        arches = plan_arches or rel.arch_list() or ["x86_64", "aarch64"]
+        providers = _stored_dep_providers(plan)
+        if providers is None:
+            from oreon_build.services.rpmbuild_order import _dep_providers_for_names
 
-        plan.settle_deadline_at = None
-        next_layer = cur + 1
-        if next_layer >= len(layers):
-            plan.status = RpmbuildPlanStatus.SUCCESS
-            continue
-        plan.current_open_layer = next_layer
-        plan.status = RpmbuildPlanStatus.RUNNING
-        await enqueue_plan_layer_jobs(
-            db,
-            plan=plan,
-            layer_index=next_layer,
-            architectures=plan_arches or rel.arch_list() or ["x86_64", "aarch64"],
-            priority=plan_priority,
-            triggered_by_id=None,
-            preferred_mock_environment_id=plan_mock_id,
-        )
-        logger.info("rpmbuild plan advanced id=%s layer=%s", plan.id, next_layer)
+            names = {str(n) for group in layers for n in group}
+            providers = await _dep_providers_for_names(
+                releasename=rel.releasename,
+                distgit_url=plan.distgit_url,
+                distgit_branch=plan.distgit_branch,
+                names=names,
+            )
+            opts = dict(options)
+            opts["dep_providers"] = providers
+            plan.options_json = opts
+        opened = False
+        while cur < len(layers):
+            jobs, inflight, publish_ready = await _layer_status(db, plan, cur)
+            if inflight or (jobs and not publish_ready):
+                plan.status = RpmbuildPlanStatus.RUNNING
+                opened = True
+                break
+            failed = await _failed_package_names(db, plan.id)
+            skip = names_blocked_by_failures(
+                [[str(n) for n in group] for group in layers],
+                failed,
+                providers,
+            )
+            if not jobs:
+                await enqueue_plan_layer_jobs(
+                    db,
+                    plan=plan,
+                    layer_index=cur,
+                    architectures=arches,
+                    priority=plan_priority,
+                    triggered_by_id=None,
+                    preferred_mock_environment_id=plan_mock_id,
+                    skip_package_names=skip,
+                )
+                opened = True
+                break
+            plan.settle_deadline_at = None
+            cur += 1
+            if cur >= len(layers):
+                await _finish_plan(db, plan)
+                opened = True
+                break
+            plan.current_open_layer = cur
+            plan.status = RpmbuildPlanStatus.RUNNING
+            logger.info("rpmbuild plan advanced id=%s layer=%s", plan.id, cur)
+        if not opened and cur >= len(layers):
+            await _finish_plan(db, plan)
 
 
 async def on_repo_publish_event_for_rpmbuild(attempt_id: int) -> None:

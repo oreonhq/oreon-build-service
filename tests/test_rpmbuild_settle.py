@@ -1,8 +1,19 @@
+from oreon_build.services.rpmbuild_order import names_blocked_by_failures
 from oreon_build.services.rpmbuild_settle import (
     _known_sources_from_primary,
     _resolve_primary_key,
     rewrite_distgit_source_url,
 )
+
+
+def test_names_blocked_by_failures_is_transitive() -> None:
+    layers = [["lib"], ["mid"], ["app", "other"]]
+    blocked = names_blocked_by_failures(
+        layers,
+        {"lib"},
+        {"mid": ["lib"], "app": ["mid"], "other": []},
+    )
+    assert blocked == {"mid", "app"}
 
 
 def test_resolve_primary_key_from_repomd() -> None:

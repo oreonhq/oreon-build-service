@@ -88,6 +88,62 @@ def parse_manual_chain(chain: str) -> list[list[str]]:
     return layers
 
 
+async def _dep_providers_for_names(
+    *,
+    releasename: str,
+    distgit_url: str,
+    distgit_branch: str,
+    names: set[str],
+) -> dict[str, list[str]]:
+    from oreon_build.services.distgit_order import compute_distgit_build_order_for_chain
+
+    if not names:
+        return {}
+    try:
+        order = await compute_distgit_build_order_for_chain(
+            releasename=releasename,
+            distgit_url=distgit_url,
+            distgit_branch=distgit_branch,
+            root_packages=sorted(names),
+        )
+    except Exception:
+        logger.exception("chain dep lookup failed for %s", releasename)
+        return {}
+    return dep_providers_from_edges(order.edges, names)
+
+
+def dep_providers_from_edges(edges: list[dict], names: set[str]) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {n: [] for n in names}
+    for edge in edges or []:
+        if not isinstance(edge, dict):
+            continue
+        cons = str(edge.get("from") or "").strip()
+        dep = str(edge.get("to") or "").strip()
+        if cons in names and dep in names and dep != cons and dep not in out[cons]:
+            out[cons].append(dep)
+    return out
+
+
+def names_blocked_by_failures(
+    layers: list[list[str]],
+    failed: set[str],
+    providers: dict[str, list[str]],
+) -> set[str]:
+    """Packages that cannot build because a dependency failed, directly or through another skip."""
+    blocked = set(failed)
+    names = [str(n) for group in layers for n in group]
+    changed = True
+    while changed:
+        changed = False
+        for name in names:
+            if name in blocked:
+                continue
+            if any(dep in blocked for dep in providers.get(name, [])):
+                blocked.add(name)
+                changed = True
+    return blocked - set(failed)
+
+
 def bootstrap_names_by_layer(layers: list[list[str]]) -> dict[int, set[str]]:
     """Names whose later copy is the real build. Earlier copies are bootstrap."""
     last: dict[str, int] = {}
@@ -204,6 +260,7 @@ async def enqueue_plan_layer_jobs(
     skip_complete_arches: bool = True,
     triggered_by_id: int | None = None,
     preferred_mock_environment_id: int | None = None,
+    skip_package_names: set[str] | None = None,
 ) -> list[BuildJob]:
     layers = plan.layers_json if isinstance(plan.layers_json, list) else []
     if layer_index < 0 or layer_index >= len(layers):
@@ -233,6 +290,7 @@ async def enqueue_plan_layer_jobs(
     await bump_side_tag_activity(db, side_tag.id)
     jobs: list[BuildJob] = []
     layer_pkgs = [str(x) for x in layers[layer_index] if str(x).strip()]
+    skip_names = skip_package_names or set()
     boot_names = bootstrap_names_by_layer([[str(x) for x in g] for g in layers]).get(layer_index, set())
     plan_not_before = _plan_skip_jobs_not_before(plan)
     for pkg_name in layer_pkgs:
@@ -273,7 +331,13 @@ async def enqueue_plan_layer_jobs(
                     BuildJob.target_id == target.id,
                     BuildJob.rpmbuild_plan_id == plan.id,
                     BuildJob.rpmbuild_layer_index == layer_index,
-                    BuildJob.status.in_((BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.RUNNING, BuildStatus.SUCCESS)),
+                    BuildJob.status.in_((
+                        BuildStatus.PENDING,
+                        BuildStatus.QUEUED,
+                        BuildStatus.RUNNING,
+                        BuildStatus.SUCCESS,
+                        BuildStatus.SKIPPED,
+                    )),
                 )
                 .limit(1)
             )
@@ -293,7 +357,10 @@ async def enqueue_plan_layer_jobs(
                 rpmbuild_layer_index=layer_index,
                 rpmbuild_wave_index=0,
             )
-            if is_bootstrap:
+            if pkg_name in skip_names:
+                job.status = BuildStatus.SKIPPED
+                job.error_message = "Skipped, a dependency in this chain failed"
+            elif is_bootstrap:
                 job.job_options = {
                     "build_profile": "bootstrap",
                     "rpmbuild_defines": {"bootstrap": "1"},
@@ -360,6 +427,12 @@ async def create_manual_chain_plan(
             "architectures": selected_arches,
             "priority": int(priority),
             "preferred_mock_environment_id": preferred_mock_environment_id,
+            "dep_providers": await _dep_providers_for_names(
+                releasename=release.releasename,
+                distgit_url=durl,
+                distgit_branch=dbranch,
+                names=set(flat),
+            ),
         },
         status=RpmbuildPlanStatus.RUNNING,
         current_open_layer=0,
@@ -473,6 +546,12 @@ async def create_rpmbuild_plan(
         seed_mode="minimal_seed",
         seed_packages_json=clean_seed,
         layers_json=order.layers,
+        options_json={
+            "dep_providers": dep_providers_from_edges(
+                order.edges,
+                {str(n) for layer in order.layers for n in layer},
+            ),
+        },
         status=RpmbuildPlanStatus.RUNNING,
         current_open_layer=start_layer,
     )
