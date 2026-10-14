@@ -88,30 +88,6 @@ def parse_manual_chain(chain: str) -> list[list[str]]:
     return layers
 
 
-async def _dep_providers_for_names(
-    *,
-    releasename: str,
-    distgit_url: str,
-    distgit_branch: str,
-    names: set[str],
-) -> dict[str, list[str]]:
-    from oreon_build.services.distgit_order import compute_distgit_build_order_for_chain
-
-    if not names:
-        return {}
-    try:
-        order = await compute_distgit_build_order_for_chain(
-            releasename=releasename,
-            distgit_url=distgit_url,
-            distgit_branch=distgit_branch,
-            root_packages=sorted(names),
-        )
-    except Exception:
-        logger.exception("chain dep lookup failed for %s", releasename)
-        return {}
-    return dep_providers_from_edges(order.edges, names)
-
-
 def dep_providers_from_edges(edges: list[dict], names: set[str]) -> dict[str, list[str]]:
     out: dict[str, list[str]] = {n: [] for n in names}
     for edge in edges or []:
@@ -427,12 +403,6 @@ async def create_manual_chain_plan(
             "architectures": selected_arches,
             "priority": int(priority),
             "preferred_mock_environment_id": preferred_mock_environment_id,
-            "dep_providers": await _dep_providers_for_names(
-                releasename=release.releasename,
-                distgit_url=durl,
-                distgit_branch=dbranch,
-                names=set(flat),
-            ),
         },
         status=RpmbuildPlanStatus.RUNNING,
         current_open_layer=0,

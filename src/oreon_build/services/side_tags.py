@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from datetime import datetime, timedelta, timezone
@@ -264,11 +265,6 @@ async def cancel_open_work_for_side_tag(db: Any, side_tag_id: int) -> None:
 
 async def scrap_side_tag(db: Any, tag: SideTag, *, releasename: str) -> dict[str, Any]:
     await cancel_open_work_for_side_tag(db, tag.id)
-    deleted = 0
-    try:
-        deleted = delete_side_tag_r2_prefix(releasename, tag.name)
-    except Exception:
-        logger.exception("scrap side tag r2 wipe failed tag=%s", tag.name)
     tag_id = tag.id
     name = tag.name
     await db.execute(delete(SideTagMember).where(SideTagMember.side_tag_id == tag_id))
@@ -278,9 +274,23 @@ async def scrap_side_tag(db: Any, tag: SideTag, *, releasename: str) -> dict[str
     await db.execute(
         update(LayerPlan).where(LayerPlan.side_tag_id == tag_id).values(side_tag_id=None)
     )
+    from oreon_build.models import ReleaseMonitorScan
+
+    await db.execute(
+        update(ReleaseMonitorScan).where(ReleaseMonitorScan.side_tag_id == tag_id).values(side_tag_id=None)
+    )
     await db.execute(delete(SideTag).where(SideTag.id == tag_id))
     await db.flush()
-    return {"id": tag_id, "name": name, "r2_objects_deleted": deleted}
+
+    async def _wipe() -> None:
+        try:
+            n = await asyncio.to_thread(delete_side_tag_r2_prefix, releasename, name)
+            logger.info("scrapped side tag %s deleted %s objects", name, n)
+        except Exception:
+            logger.exception("scrap side tag r2 wipe failed tag=%s", name)
+
+    asyncio.create_task(_wipe())
+    return {"id": tag_id, "name": name, "releasename": releasename}
 
 
 async def scrap_inactive_side_tags(db: Any) -> list[dict[str, Any]]:

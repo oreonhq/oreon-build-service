@@ -271,7 +271,7 @@ async def _layer_status(db: Any, plan: RpmbuildPlan, layer: int) -> tuple[list[B
     )
     jobs = list(q.scalars().all())
     if not jobs:
-        return [], True, False
+        return [], False, True
     inflight = any(j.status in _INFLIGHT for j in jobs)
     pub_ok = True
     if not inflight:
@@ -282,7 +282,7 @@ async def _layer_status(db: Any, plan: RpmbuildPlan, layer: int) -> tuple[list[B
                 select(PublishTask).where(PublishTask.build_job_id == j.id).order_by(PublishTask.id.desc()).limit(1)
             )
             p = att.scalar_one_or_none()
-            if p is None or p.status != "success":
+            if p is None or p.status in ("pending", "running", "queued"):
                 pub_ok = False
                 break
     return jobs, inflight, pub_ok
@@ -358,20 +358,7 @@ async def advance_rpmbuild_plans_once(db: Any) -> None:
             plan.error_message = "Release missing"
             continue
         arches = plan_arches or rel.arch_list() or ["x86_64", "aarch64"]
-        providers = _stored_dep_providers(plan)
-        if providers is None:
-            from oreon_build.services.rpmbuild_order import _dep_providers_for_names
-
-            names = {str(n) for group in layers for n in group}
-            providers = await _dep_providers_for_names(
-                releasename=rel.releasename,
-                distgit_url=plan.distgit_url,
-                distgit_branch=plan.distgit_branch,
-                names=names,
-            )
-            opts = dict(options)
-            opts["dep_providers"] = providers
-            plan.options_json = opts
+        providers = _stored_dep_providers(plan) or {}
         opened = False
         while cur < len(layers):
             jobs, inflight, publish_ready = await _layer_status(db, plan, cur)
@@ -396,8 +383,22 @@ async def advance_rpmbuild_plans_once(db: Any) -> None:
                     preferred_mock_environment_id=plan_mock_id,
                     skip_package_names=skip,
                 )
-                opened = True
-                break
+                jobs, inflight, publish_ready = await _layer_status(db, plan, cur)
+                if inflight or (jobs and not publish_ready):
+                    plan.status = RpmbuildPlanStatus.RUNNING
+                    opened = True
+                    break
+                if not jobs:
+                    plan.settle_deadline_at = None
+                    cur += 1
+                    if cur >= len(layers):
+                        await _finish_plan(db, plan)
+                        opened = True
+                        break
+                    plan.current_open_layer = cur
+                    plan.status = RpmbuildPlanStatus.RUNNING
+                    logger.info("rpmbuild plan advanced id=%s layer=%s", plan.id, cur)
+                    continue
             plan.settle_deadline_at = None
             cur += 1
             if cur >= len(layers):
