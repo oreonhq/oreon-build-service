@@ -262,7 +262,7 @@ _INFLIGHT = (
 )
 
 
-async def _layer_status(db: Any, plan: RpmbuildPlan, layer: int) -> tuple[list[BuildJob], bool, bool]:
+async def _layer_status(db: Any, plan: RpmbuildPlan, layer: int) -> tuple[list[BuildJob], bool, bool, bool]:
     q = await db.execute(
         select(BuildJob).where(
             BuildJob.rpmbuild_plan_id == plan.id,
@@ -271,9 +271,10 @@ async def _layer_status(db: Any, plan: RpmbuildPlan, layer: int) -> tuple[list[B
     )
     jobs = list(q.scalars().all())
     if not jobs:
-        return [], False, True
+        return [], False, True, False
     inflight = any(j.status in _INFLIGHT for j in jobs)
     pub_ok = True
+    dirty = any(j.status in (BuildStatus.FAILED, BuildStatus.CANCELLED) for j in jobs)
     if not inflight:
         for j in jobs:
             if j.status != BuildStatus.SUCCESS:
@@ -284,8 +285,9 @@ async def _layer_status(db: Any, plan: RpmbuildPlan, layer: int) -> tuple[list[B
             p = att.scalar_one_or_none()
             if p is None or p.status in ("pending", "running", "queued"):
                 pub_ok = False
-                break
-    return jobs, inflight, pub_ok
+            elif p.status != "success":
+                dirty = True
+    return jobs, inflight, pub_ok, dirty
 
 
 async def _failed_package_names(db: Any, plan_id: int) -> set[str]:
@@ -318,6 +320,29 @@ def _stored_dep_providers(plan: RpmbuildPlan) -> dict[str, list[str]] | None:
         if isinstance(val, list):
             out[str(key)] = [str(x) for x in val]
     return out
+
+
+async def _stop_unclean_group(db: Any, plan: RpmbuildPlan, jobs: list[BuildJob], layer_index: int) -> None:
+    bad_ids = [j.id for j in jobs if j.status in (BuildStatus.FAILED, BuildStatus.CANCELLED)]
+    for j in jobs:
+        if j.status != BuildStatus.SUCCESS:
+            continue
+        att = await db.execute(
+            select(PublishTask.status).where(PublishTask.build_job_id == j.id).order_by(PublishTask.id.desc()).limit(1)
+        )
+        if att.scalar_one_or_none() not in (None, "success", "pending", "running", "queued"):
+            bad_ids.append(j.id)
+    names: list[str] = []
+    if bad_ids:
+        rows = (
+            await db.execute(
+                select(Package.name).join(BuildJob, BuildJob.package_id == Package.id).where(BuildJob.id.in_(bad_ids))
+            )
+        ).all()
+        names = sorted({str(n) for (n,) in rows})
+    shown = ", ".join(names[:20]) if names else "unknown"
+    plan.status = RpmbuildPlanStatus.FAILED
+    plan.error_message = f"Stopped, group {layer_index + 1} was not clean. Failed builds: {shown}"
 
 
 async def _finish_plan(db: Any, plan: RpmbuildPlan) -> None:
@@ -361,9 +386,13 @@ async def advance_rpmbuild_plans_once(db: Any) -> None:
         providers = _stored_dep_providers(plan) or {}
         opened = False
         while cur < len(layers):
-            jobs, inflight, publish_ready = await _layer_status(db, plan, cur)
+            jobs, inflight, publish_ready, dirty = await _layer_status(db, plan, cur)
             if inflight or (jobs and not publish_ready):
                 plan.status = RpmbuildPlanStatus.RUNNING
+                opened = True
+                break
+            if dirty:
+                await _stop_unclean_group(db, plan, jobs, cur)
                 opened = True
                 break
             failed = await _failed_package_names(db, plan.id)
@@ -383,9 +412,13 @@ async def advance_rpmbuild_plans_once(db: Any) -> None:
                     preferred_mock_environment_id=plan_mock_id,
                     skip_package_names=skip,
                 )
-                jobs, inflight, publish_ready = await _layer_status(db, plan, cur)
+                jobs, inflight, publish_ready, dirty = await _layer_status(db, plan, cur)
                 if inflight or (jobs and not publish_ready):
                     plan.status = RpmbuildPlanStatus.RUNNING
+                    opened = True
+                    break
+                if dirty:
+                    await _stop_unclean_group(db, plan, jobs, cur)
                     opened = True
                     break
                 if not jobs:
