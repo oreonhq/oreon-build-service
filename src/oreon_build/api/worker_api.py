@@ -17,6 +17,7 @@ from fastapi import APIRouter, Body, Depends, File, Header, HTTPException, Query
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, exists, func, or_, select, update
+from sqlalchemy.orm import aliased
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -353,6 +354,7 @@ async def poll_job(
         if iso_job is not None:
             return {"job": iso_job}
     worker_arch = (locked_worker.architecture or "").strip() or None
+    compatible_target_ids: list[int] | None = None
     q = (
         select(BuildJob)
         .where(
@@ -364,7 +366,6 @@ async def poll_job(
                 )
             ),
         )
-        .order_by(BuildJob.priority.desc(), BuildJob.created_at.asc())
     )
     if get_settings().rpmbuild_strict_gate_enabled:
         live_plan = (RpmbuildPlanStatus.RUNNING, RpmbuildPlanStatus.WAITING_SETTLE)
@@ -416,6 +417,24 @@ async def poll_job(
             (BuildJob.package_id.is_(None)) | (~func.lower(Package.name).in_(all_burst_names))
         )
 
+    running_job = aliased(BuildJob)
+    running_count = (
+        select(func.count(running_job.id))
+        .where(
+            running_job.status == BuildStatus.RUNNING,
+            running_job.side_tag_id.is_not_distinct_from(BuildJob.side_tag_id),
+        )
+        .correlate(BuildJob)
+    )
+    if compatible_target_ids is not None:
+        running_count = running_count.where(
+            (running_job.target_id.is_(None)) | (running_job.target_id.in_(compatible_target_ids))
+        )
+    q = q.order_by(
+        BuildJob.priority.desc(),
+        running_count.scalar_subquery().asc(),
+        BuildJob.created_at.asc(),
+    )
     q = q.limit(1).with_for_update(of=BuildJob, skip_locked=True)
     result = await db.execute(q)
     candidates = list(result.scalars().all())
