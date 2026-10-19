@@ -1155,6 +1155,24 @@ def _write_oreon_mock_mixed_repos_wrapper_cfg(
             'config_opts["dnf.conf"] += "\\n" + _oreon_extra',
             "",
         ]
+    lines += [
+        'config_opts["use_container_host_hostname"] = False',
+        '_oreon_macros = dict(config_opts.get("macros") or {})',
+        '_oreon_macros["%_buildhost"] = "build.oreonhq.com"',
+        '_oreon_macros["%source_date_epoch_from_changelog"] = "1"',
+        '_oreon_macros["%clamp_mtime_to_source_date_epoch"] = "1"',
+        '_oreon_macros["%use_source_date_epoch_as_buildtime"] = "1"',
+        'config_opts["macros"] = _oreon_macros',
+        '_oreon_env = dict(config_opts.get("environment") or {})',
+        '_oreon_env["HOSTNAME"] = "build.oreonhq.com"',
+        '_oreon_env["LANG"] = "C.UTF-8"',
+        'config_opts["environment"] = _oreon_env',
+        '_oreon_nspawn = list(config_opts.get("nspawn_args") or [])',
+        'if not any(str(a).startswith("--hostname") for a in _oreon_nspawn):',
+        '    _oreon_nspawn.append("--hostname=build.oreonhq.com")',
+        'config_opts["nspawn_args"] = _oreon_nspawn',
+        "",
+    ]
     out.write_text("\n".join(lines), encoding="utf-8")
     return out
 
@@ -1166,8 +1184,8 @@ def _mock_config_for_mixed_addrepos(
     *,
     prefer_arch: str | None = None,
 ) -> str:
-    if not addrepo_baseurls or _truthy_env("OREON_WORKER_MOCK_SKIP_MIXED_REPOS_OPTS"):
-        return base_cfg
+    if _truthy_env("OREON_WORKER_MOCK_SKIP_MIXED_REPOS_OPTS"):
+        addrepo_baseurls = []
     inc = _resolve_mock_config_file(base_cfg)
     if not inc:
         logger.warning(
@@ -1311,6 +1329,13 @@ def _mock_cmd_base(
             cmd += ["--addrepo", url]
     cmd += _mock_rpmbuild_smp_define_args()
     cmd += _mock_rpmbuild_define_args(rpmbuild_defines)
+    cmd += [
+        "--define", "_buildhost build.oreonhq.com",
+        "--define", "source_date_epoch_from_changelog 1",
+        "--define", "clamp_mtime_to_source_date_epoch 1",
+        "--define", "use_source_date_epoch_as_buildtime 1",
+        "--config-opts", "use_container_host_hostname=False",
+    ]
     if rpm_dist:
         cmd += ["--define", f"dist {rpm_dist}"]
     return cmd
