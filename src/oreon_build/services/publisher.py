@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import json
@@ -649,13 +650,31 @@ def _cleanup_old_repodata(
     if not to_delete:
         return
 
-    for k in to_delete:
-        client.delete_object(k)
+    from botocore.exceptions import ClientError
 
+    kept = 0
+    for k in to_delete:
+        deleted = False
+        for attempt in range(6):
+            try:
+                client.delete_object(k)
+                deleted = True
+                break
+            except ClientError as e:
+                code = str(e.response.get("Error", {}).get("Code", ""))
+                msg = str(e)
+                transient = code in {"ServiceUnavailable", "SlowDown", "RequestTimeout"} or "concurrent request rate" in msg
+                if not transient or attempt == 5:
+                    logger.warning("stale repodata delete failed %s: %s", k, e)
+                    break
+                time.sleep(0.4 * (2 ** attempt))
+        if not deleted:
+            kept += 1
     logger.info(
-        "Purged %d stale repodata objects from %s",
-        len(to_delete),
+        "Purged %d stale repodata objects from %s (%d left after rate limit)",
+        len(to_delete) - kept,
         f"{r2_prefix}/repodata/",
+        kept,
     )
 
 def _createrepo_cache_dir(container: Path) -> Path:
