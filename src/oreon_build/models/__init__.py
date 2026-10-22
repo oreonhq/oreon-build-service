@@ -21,6 +21,7 @@ from .security_advisory import SecurityAdvisory, SecurityAdvisoryRelease
 from .side_tag import SideTag, SideTagCreatedFrom, SideTagMember
 from .release_monitor import ReleaseMonitorScan, ReleaseMonitorOutdated
 from .iso_build import IsoBuild
+from .rpm_scan import RpmScanFinding
 
 __all__ = [
     "Account",
@@ -67,4 +68,5 @@ __all__ = [
     "ReleaseMonitorScan",
     "ReleaseMonitorOutdated",
     "IsoBuild",
+    "RpmScanFinding",
 ]

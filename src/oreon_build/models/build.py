@@ -98,6 +98,7 @@ class BuildJob(Base):
     rpmbuild_layer_index: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
     rpmbuild_wave_index: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     job_options: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    scan_state: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
 
     package: Mapped["Package"] = relationship("Package", back_populates="build_jobs")
     release: Mapped["Release"] = relationship("Release", back_populates="build_jobs")
