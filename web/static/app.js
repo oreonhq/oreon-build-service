@@ -347,13 +347,12 @@ function updateAuthUI() {
 var OREON_NAV_ITEMS = [
   { href: '/', label: 'Dashboard', match: function(p) { return p === '/' || p === '/index.html'; } },
   { href: '/builds.html', label: 'Builds', match: function(p) { return p === '/builds.html' || p === '/build.html'; } },
-  { href: '/iso-builds.html', label: 'ISO Builds', match: function(p) { return p === '/iso-builds.html'; } },
+  { href: '/iso-builds.html', label: 'ISO Builds', match: function(p) { return p === '/iso-builds.html' || p === '/iso-build.html'; } },
   { href: '/side-tags.html', label: 'Side Tags', match: function(p) { return p === '/side-tags.html' || p === '/side-tag.html'; } },
-  { href: '/failures.html', label: 'Failures', match: function(p) { return p === '/failures.html'; } },
   { href: '/packages.html', label: 'Packages', match: function(p) { return p === '/packages.html'; } },
   { href: '/releases.html', label: 'Releases', match: function(p) { return p === '/releases.html'; } },
   { href: '/workers.html', label: 'Workers', match: function(p) { return p === '/workers.html'; } },
-  { href: '/mock-environments.html', label: 'Mock Environments', match: function(p) { return p === '/mock-environments.html'; } },
+  { href: '/mock-environments.html', label: 'Mock', match: function(p) { return p === '/mock-environments.html'; } },
   { href: '/repos.html', label: 'Repositories', match: function(p) { return p === '/repos.html'; } },
   { href: '/promotions.html', label: 'Promotions', match: function(p) { return p === '/promotions.html'; } },
   { href: '/admin.html', label: 'Administration', match: function(p) { return p === '/admin.html'; } },
@@ -435,28 +434,62 @@ window.oreonPrefillUrlSearch = function(inputId, paramNames) {
   return val;
 };
 
+function oreonStatusIcon(status) {
+  var s = String(status || 'pending').toLowerCase();
+  var color = '#38bdf8';
+  var label = s;
+  var body = '<circle cx="12" cy="12" r="5" fill="none" stroke="currentColor" stroke-width="2.2"/>';
+  var spin = '';
+  if (s === 'success' || s === 'ok' || s === 'signed' || s === 'idle' || s === 'complete' || s === 'closed') {
+    color = '#22c55e';
+    body = '<path d="M5 12.5 9.2 16.5 19 7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>';
+  } else if (s === 'skipped') {
+    color = '#2dd4bf';
+    body = '<path d="M7 6v12l6-6 6 6V6" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/>';
+  } else if (s === 'failed') {
+    color = '#ff3b30';
+    body = '<path d="M7 7l10 10M17 7 7 17" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>';
+  } else if (s === 'cancelled' || s === 'canceled') {
+    color = '#ff9f0a';
+    body = '<circle cx="12" cy="12" r="7.2" fill="none" stroke="currentColor" stroke-width="2.2"/><path d="M8.2 8.2 15.8 15.8" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>';
+  } else if (s === 'running' || s === 'building' || s === 'busy') {
+    color = '#3b82f6';
+    spin = ' st-spin';
+    body = '<path d="M12 4.5a7.5 7.5 0 1 1-6.4 3.6" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>';
+  } else if (s === 'queued' || s === 'waiting_settle' || s === 'waiting') {
+    color = '#f5b400';
+    body = '<circle cx="12" cy="12" r="7.2" fill="none" stroke="currentColor" stroke-width="2.2"/><path d="M12 8v4.5l3 2" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>';
+  } else if (s === 'blocked' || s === 'quarantined') {
+    color = '#f5b400';
+    body = '<rect x="7" y="11" width="10" height="7.5" rx="1.2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M9 11V8.5a3 3 0 0 1 6 0V11" fill="none" stroke="currentColor" stroke-width="2"/>';
+  } else if (s === 'pending' || s === 'free' || s === 'open') {
+    color = '#38bdf8';
+    body = '<circle cx="12" cy="12" r="6.2" fill="none" stroke="currentColor" stroke-width="2.2"/>';
+  }
+  var safe = label.replace(/_/g, ' ');
+  safe = safe.charAt(0).toUpperCase() + safe.slice(1);
+  safe = safe.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+  return '<span class="st-ico' + spin + '" style="color:' + color + '">' +
+    '<svg viewBox="0 0 24 24" aria-hidden="true">' + body + '</svg>' +
+    '<span class="st-label">' + safe + '</span></span>';
+}
+
 function oreonSigningKeyHtml(signingStatus) {
   var ss = (signingStatus || 'not_started').toLowerCase();
   if (ss === 'uploading') {
     ss = 'running';
   }
-  var c = '#94a3b8';
+  var c = '#38bdf8';
   var label = 'Pending';
-  var tip =
-    'Signing: waiting for the build to finish (mock still running or worker has not notified yet).';
   if (ss === 'running') {
     c = '#3b82f6';
     label = 'Running';
-    tip =
-      'Signing in progress (RPM upload, GPG signing, R2, repodata) after mock succeeded.';
   } else if (ss === 'signed') {
     c = '#22c55e';
     label = 'Complete';
-    tip = 'Signing finished (GPG, repo publish, and finalization).';
   } else if (ss === 'failed') {
     c = '#ef4444';
     label = 'Failed';
-    tip = 'Signing failed during upload, GPG signing, R2, or repodata.';
   }
   function esc(s) {
     return String(s)
@@ -465,15 +498,12 @@ function oreonSigningKeyHtml(signingStatus) {
       .replace(/"/g, '&quot;');
   }
   return (
-    '<span class="oreon-controller-key" title="' +
-    esc(tip) +
-    '" style="display:inline-flex;align-items:center;gap:0.35rem;">' +
-    '<i class="fa-solid fa-key" aria-hidden="true" style="color:' +
-    c +
-    ';"></i>' +
-    '<span style="font-size:0.85rem;color:var(--text-muted);">' +
-    esc(label) +
-    '</span></span>'
+    '<span class="oreon-controller-key st-ico" style="color:' + c + ';">' +
+    '<svg viewBox="0 0 24 24" aria-hidden="true">' +
+    '<circle cx="8.2" cy="10" r="3.1" fill="none" stroke="currentColor" stroke-width="2.2"/>' +
+    '<path d="M11.1 10H19M15.6 10v2.4M18.6 10v2.4" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>' +
+    '</svg>' +
+    '<span class="st-label">' + esc(label) + '</span></span>'
   );
 }
 
@@ -490,6 +520,7 @@ function oreonControllerKeyHtml(signingStatus) {
 window.oreonSigningKeyHtml = oreonSigningKeyHtml;
 window.oreonControllerKeyHtml = oreonControllerKeyHtml;
 window.oreonJobDisplayStatus = oreonJobDisplayStatus;
+window.oreonStatusIcon = oreonStatusIcon;
 
 function oreonBindAuthButtons() {
   const btnLogin = document.getElementById('btn-login');
