@@ -5,41 +5,19 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Side Tag - Oreon Build Service</title>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" crossorigin="anonymous" referrerpolicy="no-referrer">
-  <link rel="stylesheet" href="/static/style.css?v=4">
+  <link rel="stylesheet" href="/static/style.css?v=29">
   <style>
     .promo-testing { background: #d4edda; color: #155724; }
     .promo-stable { background: #cce5ff; color: #004085; }
     #release-search-select, #release-new-select { pointer-events: none; opacity: 0.7; }
-    .side-tag-meta {
-      margin: 0 0 1.25rem 0;
-    }
-    .side-tag-meta-top {
-      display: flex;
-      align-items: center;
-      gap: 0.65rem;
-      margin-bottom: 0.75rem;
-    }
-    .side-tag-meta-top .tag-name {
-      font-size: 1.05rem;
-      font-weight: 600;
-    }
-    .side-tag-meta-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr));
-      gap: 0.85rem 1.25rem;
-    }
-    .side-tag-meta-item label {
-      display: block;
-      font-size: 0.75rem;
-      text-transform: uppercase;
-      letter-spacing: 0.03em;
-      color: var(--text-muted, #777);
-      margin-bottom: 0.2rem;
-    }
-    .side-tag-meta-item .val {
-      font-size: 0.95rem;
-      word-break: break-word;
-    }
+    .side-tag-meta { margin: 0 0 0.85rem 0; }
+    .tag-head { display: flex; flex-direction: column; align-items: flex-start; gap: 0.55rem; }
+    .tag-title { display: flex; align-items: center; gap: 0.45rem; }
+    .tag-head h2 { margin: 0; font-size: 1.25rem; }
+    .tag-facts { display: flex; flex-wrap: wrap; gap: 0.65rem 1.35rem; }
+    .tag-facts span { display: flex; flex-direction: column; gap: 0.05rem; white-space: nowrap; }
+    .tag-facts .k { font-size: 0.72rem; color: var(--text-muted); }
+    .tag-facts .v { font-size: 0.92rem; color: var(--text); }
     #side-tag-actions {
       display: none;
       flex-direction: column;
@@ -57,22 +35,12 @@
       color: var(--text-muted, #777);
       min-width: 5rem;
     }
-    #layer-build-alert { display: none; margin: 1rem 0; padding: 1rem 1.1rem; border-radius: 6px; border: none; box-shadow: none; outline: none; }
-    #layer-build-alert.layer-alert-error { background: rgba(220,53,69,0.08); }
-    #layer-build-alert.layer-alert-info { background: rgba(13,110,253,0.08); }
-    #layer-build-alert.layer-alert-success { background: rgba(25,135,84,0.08); }
-    #layer-build-alert h3 { margin: 0 0 0.5rem 0; font-size: 1.05rem; }
-    #layer-build-alert .layer-alert-actions { margin-top: 0.75rem; display: flex; flex-wrap: wrap; gap: 0.5rem; }
-    #layer-build-alert .btn,
-    #layer-build-alert .btn:hover,
-    #layer-build-alert .btn:focus,
-    #layer-build-alert .btn:focus-visible,
-    #layer-build-alert .btn:active {
-      border-color: var(--border);
-      color: var(--text);
-      outline: none;
-      box-shadow: none;
-    }
+    #layer-build-alert { display: none; margin: 0.75rem 0 1rem; padding: 0.75rem 0.9rem; border-radius: 10px; border: none; box-shadow: none; outline: none; }
+    #layer-build-alert.layer-alert-error { background: rgba(255,59,48,0.1); }
+    #layer-build-alert.layer-alert-info { background: rgba(59,130,246,0.1); }
+    #layer-build-alert.layer-alert-success { background: rgba(34,197,94,0.12); }
+    #layer-build-alert h3 { margin: 0 0 0.35rem 0; font-size: 1rem; display: flex; align-items: center; gap: 0.4rem; }
+    #layer-build-alert .layer-alert-actions { margin-top: 0.6rem; display: flex; flex-wrap: wrap; gap: 0.4rem; }
   </style>
 </head>
 <body>
@@ -82,19 +50,15 @@
   </header>
   <main class="main">
     <section class="card">
-      <h2 id="side-tag-title">Side Tag</h2>
-      <p id="builds-hint">Trigger builds into this side tag. Login required for trigger/invite/scrap.</p>
       <div id="side-tag-meta" class="side-tag-meta"></div>
       <div id="side-tag-actions"></div>
-      <div id="trigger-build-section" class="card" style="display:none; margin-bottom:1rem;">
-        <h3 style="margin-top:0;">Trigger build into this side tag</h3>
-        <div class="build-mode-tabs" style="margin-bottom:1rem;">
-          <button type="button" class="build-mode-tab active" data-mode="existing">Build existing package</button>
-          <button type="button" class="build-mode-tab" data-mode="new">New package + build</button>
+      <div id="trigger-build-section" style="display:none; margin: 0.25rem 0 1rem;">
+        <div class="build-mode-tabs" style="margin-bottom:0.75rem;">
+          <button type="button" class="build-mode-tab active" data-mode="existing">Existing package</button>
+          <button type="button" class="build-mode-tab" data-mode="new">New package</button>
         </div>
 
         <div id="build-existing-block">
-          <p style="color:var(--text-muted); font-size:0.9rem;">Pick a <a href="/packages.html">package</a> and <a href="/releases.html">release</a>.</p>
           <div class="form-group">
             <label>Package</label>
             <div id="package-search-select" class="search-select">
@@ -126,7 +90,6 @@
         </div>
 
         <div id="build-new-block" style="display:none;">
-          <p style="color:var(--text-muted); font-size:0.9rem;">Create a package and trigger a build in one step. Package name and description come from the specfile (Upload) or from the source.</p>
           <div class="form-group">
             <label>1. Select the source type</label>
             <div class="source-type-tabs" style="display:flex; gap:0.25rem; flex-wrap:wrap; margin-bottom:0.5rem;">
@@ -141,8 +104,7 @@
               <input type="text" id="source-url-input" class="form-control" placeholder="https://... (one URL or comma-separated)">
             </div>
             <div id="source-upload-panel" class="source-panel" style="display:none;">
-              <p style="color:var(--text-muted); margin-bottom:0.5rem;">Upload SRPM and/or .spec files. Worker will build from the SRPM (or from spec + sources when provided).</p>
-              <label>SRPM or .spec file(s)</label>
+              <label>SRPM or spec</label>
               <input type="file" id="source-upload-files" class="form-control" accept=".src.rpm,.spec" multiple>
             </div>
             <div id="source-scm-panel" class="source-panel" style="display:none;">
@@ -152,26 +114,12 @@
               <input type="text" id="source-scm-branch" class="form-control" placeholder="main">
             </div>
             <div id="source-distgit-panel" class="source-panel" style="display:none;">
-              <label>DistGit (rpm-specfiles on GitHub)</label>
-              <p style="color:var(--text-muted); font-size:0.85rem; margin-bottom:0.5rem;">
-                Uses the <code>oreonhq/rpm-specfiles</code> repository. For each package name,
-                the specfile path will be <code>&lt;release-name&gt;/&lt;package&gt;/&lt;package&gt;.spec</code>
-                (release name comes from the selected release).
-              </p>
-              <div class="form-group">
-                <label>Package names</label>
-                <textarea id="distgit-packages" class="form-control" rows="3" placeholder="Example:&#10;389-ds-base&#10;another-package"></textarea>
-                <p style="color:var(--text-muted); font-size:0.8rem; margin-top:0.25rem;">
-                  Enter one or more package names (one per line or separated by spaces). A build will be triggered for each.
-                </p>
-              </div>
+              <label>Package names</label>
+                <textarea id="distgit-packages" class="form-control" rows="3" placeholder="one package per line"></textarea>
             </div>
             <div id="source-chainbuild-panel" class="source-panel" style="display:none;">
-              <label>Koji-style package chain</label>
-              <p style="color:var(--text-muted); font-size:0.85rem; margin-bottom:0.5rem;">
-                A colon starts the next sequential group. Packages within one group build in parallel.
-              </p>
-              <textarea id="chainbuild-spec" class="form-control" rows="4" placeholder="Example:&#10;pkg-a pkg-b : pkg-c : pkg-d pkg-e"></textarea>
+              <label>Chain</label>
+              <textarea id="chainbuild-spec" class="form-control" rows="3" placeholder="pkg-a pkg-b : pkg-c"></textarea>
             </div>
           </div>
           <div class="form-group">
@@ -186,15 +134,13 @@
           </div>
           <div class="form-group">
             <label>Specfiles Git branch</label>
-            <input type="text" id="distgit-branch-input" class="form-control" placeholder="select a release first" maxlength="128">
-            <p style="color:var(--text-muted); font-size:0.85rem; margin-top:0.25rem;">Branch in oreonhq/rpm-specfiles. Defaults from the release but you can override to test before merging.</p>
+            <input type="text" id="distgit-branch-input" class="form-control" placeholder="branch" maxlength="128">
           </div>
           <div class="form-group">
             <label>Mock environment (optional)</label>
             <select id="new-package-mock-env" class="form-control">
               <option value="">Use release default</option>
             </select>
-            <p style="color:var(--text-muted); font-size:0.85rem; margin-top:0.25rem;">Select a release first; mock envs apply to both x86_64 and aarch64.</p>
           </div>
           <div class="form-group">
             <label>Architectures</label>
@@ -208,8 +154,7 @@
       </div>
       <div id="layer-build-alert" role="alert"></div>
       <div class="form-group" style="margin-bottom:1rem;">
-        <label>Filter</label>
-        <input type="text" id="builds-filter" name="oreon-build-filter" autocomplete="off" readonly onfocus="this.removeAttribute('readonly')" placeholder="Filter by ID, package, release, arch, status" style="padding:0.4rem; width:100%; max-width:20rem;">
+        <input type="text" id="builds-filter" name="oreon-build-filter" autocomplete="off" readonly onfocus="this.removeAttribute('readonly')" placeholder="Filter" style="padding:0.4rem 0.55rem; width:100%; max-width:16rem;">
       </div>
       <div class="list-toolbar">
         <div class="bulk-selection-bar" id="builds-bulk-bar">
@@ -232,13 +177,13 @@
       </div>
       <table class="table-list">
         <thead>
-          <tr><th class="col-checkbox"><input type="checkbox" id="builds-select-all" title="Select all on this page"></th><th>ID</th><th>Package</th><th>Release</th><th>Arch</th><th>Status</th><th>Signing</th><th>Chain</th><th>Created</th><th>Actions</th></tr>
+          <tr><th class="col-checkbox"><input type="checkbox" id="builds-select-all" title="Select all on this page"></th><th>ID</th><th>Package</th><th>Arch</th><th>Status</th><th>Signing</th><th>Chain</th><th>Created</th><th></th></tr>
         </thead>
         <tbody id="builds-tbody"></tbody>
       </table>
     </section>
   </main>
-  <script src="/static/app.js?v=23"></script>
+  <script src="/static/app.js?v=31"></script>
   <script>
     (function() {
       const api = window.oreonApi;
@@ -250,21 +195,14 @@
       var canAccessTag = false;
 
       function updateLoggedInUI() {
-        const hint = document.getElementById('builds-hint');
         const section = document.getElementById('trigger-build-section');
         if (!sideTagId) {
-          if (hint) hint.textContent = 'Missing side tag id. Open a tag from Side Tags.';
           if (section) section.style.display = 'none';
+          renderSideTagChrome();
           return;
         }
-        if (api.token && canAccessTag) {
-          if (hint) hint.textContent = 'Trigger builds into this side tag. Jobs below are for this tag only.';
-          if (section) section.style.display = 'block';
-          loadOptions();
-        } else {
-          if (hint) hint.textContent = api.token ? 'You can view this tag but not trigger (owner/whitelist/admin only).' : 'Login to trigger builds on this side tag.';
-          if (section) section.style.display = 'none';
-        }
+        if (api.token && canAccessTag) loadOptions();
+        else if (section) section.style.display = 'none';
         renderSideTagChrome();
       }
       function loadOptions() {
@@ -282,54 +220,56 @@
         }).catch(function() { releases = []; updateDistgitBranchFromRelease(); });
       }
       function renderSideTagChrome() {
-        var title = document.getElementById('side-tag-title');
         var meta = document.getElementById('side-tag-meta');
         var actions = document.getElementById('side-tag-actions');
         if (!sideTag) {
-          if (title) title.textContent = 'Side Tag';
-          if (meta) meta.textContent = sideTagId ? ('Loading #' + sideTagId + '...') : 'No id';
+          if (meta) meta.textContent = sideTagId ? ('Loading #' + sideTagId) : 'Missing side tag id';
           if (actions) { actions.style.display = 'none'; actions.innerHTML = ''; }
           return;
         }
-        if (title) title.textContent = 'Side Tag: ' + sideTag.name;
         var st = sideTag.status || 'idle';
-        var chip = st === 'busy' ? 'badge running' : 'badge success';
+        var icon = window.oreonStatusIcon ? window.oreonStatusIcon(st) : escapeHtml(st);
         var members = (sideTag.members || []).map(function(m) { return m.username; }).filter(Boolean);
-        var membersHtml = members.length
-          ? members.map(function(u) { return escapeHtml(u); }).join(', ')
-          : '<span style="color:var(--text-muted)">none</span>';
+        var memberText = members.length ? members.join(', ') : 'None';
+        var activity = (sideTag.last_activity_at || '').toString().replace('T', ' ').slice(0, 16);
+        function fact(k, v) {
+          return '<span><span class="k">' + k + '</span><span class="v">' + escapeHtml(v) + '</span></span>';
+        }
         if (meta) {
           meta.innerHTML =
-            '<div class="side-tag-meta-top">' +
-              '<span class="' + chip + '">' + escapeHtml(st) + '</span>' +
-              '<span class="tag-name">' + escapeHtml(sideTag.name) + '</span>' +
-            '</div>' +
-            '<div class="side-tag-meta-grid">' +
-              '<div class="side-tag-meta-item"><label>Release</label><div class="val">' + escapeHtml(sideTag.releasename || ('#' + sideTag.release_id)) + '</div></div>' +
-              '<div class="side-tag-meta-item"><label>Owner</label><div class="val">' + escapeHtml(sideTag.owner_username || '-') + '</div></div>' +
-              '<div class="side-tag-meta-item"><label>Created from</label><div class="val">' + escapeHtml(sideTag.created_from || '-') + '</div></div>' +
-              '<div class="side-tag-meta-item"><label>Last activity</label><div class="val">' + escapeHtml((sideTag.last_activity_at || '').toString().slice(0, 19) || '') + '</div></div>' +
-              '<div class="side-tag-meta-item" style="grid-column:1 / -1"><label>Members</label><div class="val">' + membersHtml + '</div></div>' +
-            '</div>';
+            '<div class="tag-head">' +
+            '<div class="tag-title">' + icon + '<h2>' + escapeHtml(sideTag.name) + '</h2></div>' +
+            '<div class="tag-facts">' +
+              fact('Release', sideTag.releasename || ('#' + sideTag.release_id)) +
+              fact('Owner', sideTag.owner_username || '-') +
+              fact('Members', memberText) +
+              fact('From', sideTag.created_from || '-') +
+              (activity ? fact('Last activity', activity) : '') +
+            '</div></div>';
         }
+        document.title = sideTag.name + ' - Side Tag';
         if (!actions) return;
         if (!api.token) { actions.style.display = 'none'; actions.innerHTML = ''; return; }
         actions.style.display = 'flex';
-        var html = '';
+        var html = '<div class="action-row">';
         if (canAccessTag) {
-          html += '<div class="action-row"><span class="action-label">Access</span>';
-          html += '<input type="text" id="invite-username" class="form-control" placeholder="invite username" style="width:10rem;">';
+          html += '<button type="button" class="btn" id="btn-show-build">New build</button>';
+          html += '<input type="text" id="invite-username" class="form-control" placeholder="username" style="width:9rem;max-width:9rem;">';
           html += '<button type="button" class="btn" id="btn-invite">Invite</button>';
-          html += '<button type="button" class="btn" id="btn-scrap">Scrap side tag</button>';
-          html += '</div>';
         }
-        html += '<div class="action-row"><span class="action-label">Promote</span>';
-        html += '<button type="button" class="btn promo-testing" id="btn-promo-dev">- dev</button>';
-        html += '<button type="button" class="btn promo-testing" id="btn-promo-testing">- testing</button>';
-        html += '<button type="button" class="btn promo-stable" id="btn-promo-stable">- stable</button>';
+        html += '<button type="button" class="btn promo-testing" id="btn-promo-dev">dev</button>';
+        html += '<button type="button" class="btn promo-testing" id="btn-promo-testing">testing</button>';
+        html += '<button type="button" class="btn promo-stable" id="btn-promo-stable">stable</button>';
+        if (canAccessTag) html += '<button type="button" class="btn" id="btn-scrap">Scrap</button>';
         html += '</div>';
-        html += '<div id="side-tag-promo-status" style="margin-top:0.5rem;color:var(--text-muted);font-size:0.9rem;"></div>';
+        html += '<div id="side-tag-promo-status" style="color:var(--text-muted);font-size:0.9rem;"></div>';
         actions.innerHTML = html;
+        var showBuild = document.getElementById('btn-show-build');
+        if (showBuild) showBuild.onclick = function() {
+          var section = document.getElementById('trigger-build-section');
+          if (!section) return;
+          section.style.display = section.style.display === 'block' ? 'none' : 'block';
+        };
         var inv = document.getElementById('btn-invite');
         if (inv) inv.onclick = function() {
           var u = (document.getElementById('invite-username').value || '').trim();
@@ -461,7 +401,7 @@
         var titleEl = el.querySelector('h3');
         var bodyEl = el.querySelector('.layer-alert-body');
         if (el.getAttribute('data-alert-shell') === shellKey && titleEl && bodyEl) {
-          titleEl.textContent = title;
+          titleEl.innerHTML = (opts.iconHtml || '') + escapeHtml(title);
           bodyEl.innerHTML = bodyHtml;
           return;
         }
@@ -474,7 +414,7 @@
           actions += '<button type="button" class="btn" id="layer-alert-cancel">Cancel chain</button>';
         }
         actions += '<button type="button" class="btn" id="layer-alert-dismiss">Dismiss</button></div>';
-        el.innerHTML = '<h3>' + escapeHtml(title) + '</h3><div class="layer-alert-body">' + bodyHtml + '</div>' + actions;
+        el.innerHTML = '<h3>' + (opts.iconHtml || '') + escapeHtml(title) + '</h3><div class="layer-alert-body">' + bodyHtml + '</div>' + actions;
         bindLayerAlertActions(el, opts);
       }
       function renderLayerFailedJobs(data) {
@@ -491,33 +431,50 @@
         return '<p style="margin:0.5rem 0 0.25rem 0;">Failed packages</p>'
           + '<ul style="margin:0 0 0.75rem 1.1rem;padding:0;list-style:disc;">' + items.join('') + '</ul>';
       }
+      function chainCountsHtml(counts) {
+        var keys = ['running', 'queued', 'pending', 'blocked', 'success', 'failed', 'cancelled'];
+        var bits = [];
+        keys.forEach(function(k) {
+          if (!counts || !counts[k]) return;
+          var icon = window.oreonStatusIcon ? window.oreonStatusIcon(k) : escapeHtml(k);
+          bits.push('<span class="chain-count">' + icon + '<span>' + counts[k] + '</span></span>');
+        });
+        return '<div class="chain-counts">' + bits.join('') + '</div>';
+      }
+      function chainThreatsHtml(data) {
+        var rows = data.threats || [];
+        if (!rows.length) return '';
+        var items = rows.map(function(t) {
+          var label = (t.package_name || ('job ' + t.job_id)) + ' ' + (t.rule || '');
+          return '<li><a href="/security-finding.html?id=' + encodeURIComponent(t.finding_id) + '">' + escapeHtml(label) + '</a></li>';
+        });
+        return '<ul style="margin:0.4rem 0 0 1.1rem;padding:0;">' + items.join('') + '</ul>';
+      }
       function renderChainAlertFromStatus(data) {
         if (!data) return;
         watchedChainId = data.chain_plan_id;
         var st = (data.status || '').toLowerCase();
-        var counts = data.counts || {};
-        var bits = ['pending', 'queued', 'blocked', 'running', 'success', 'failed', 'cancelled'].map(function(k) {
-          return counts[k] ? (counts[k] + ' ' + k) : null;
-        }).filter(Boolean).join(', ');
         var progress = 'Group ' + data.current_group + ' of ' + data.total_groups;
         var live = st === 'running' || st === 'waiting_settle' || st === 'pending';
+        var head = 'Chain ' + data.chain_plan_id;
         if (st === 'failed' || st === 'cancelled') {
-          showLayerAlert('error', 'Chain ' + data.chain_plan_id + ' ' + st,
-            (data.error_message ? '<p style="margin:0 0 0.5rem 0;font-size:0.9rem;">' + escapeHtml(data.error_message) + '</p>' : '')
+          showLayerAlert('error', head,
+            (data.error_message ? '<p style="margin:0 0 0.4rem 0;">' + escapeHtml(data.error_message) + '</p>' : '')
             + renderLayerFailedJobs(data)
-            + '<p style="margin:0;color:var(--text-muted);font-size:0.88rem;">' + escapeHtml(progress + (bits ? ' - ' + bits : '')) + '</p>',
+            + chainCountsHtml(data.counts)
+            + chainThreatsHtml(data)
+            + '<p style="margin:0.35rem 0 0;color:var(--text-muted);font-size:0.85rem;">' + escapeHtml(progress) + '</p>',
             { showResume: true, chainId: data.chain_plan_id });
           stopLayerPoll();
           return;
         }
         if (st === 'success') {
-          showLayerAlert('success', 'Chain ' + data.chain_plan_id + ' finished',
-            '<p>' + escapeHtml(bits || 'All jobs completed.') + '</p>', { chainId: data.chain_plan_id });
+          showLayerAlert('success', head, chainCountsHtml(data.counts) + chainThreatsHtml(data), { chainId: data.chain_plan_id });
           stopLayerPoll();
           return;
         }
-        showLayerAlert('info', 'Chain ' + data.chain_plan_id + ': ' + st.replace('_', ' '),
-          '<p style="margin:0 0 0.35rem 0;">' + escapeHtml(progress) + '</p><p style="margin:0;color:var(--text-muted);font-size:0.88rem;">' + escapeHtml(bits || 'Jobs updating...') + '</p>',
+        showLayerAlert('info', head,
+          '<p style="margin:0 0 0.35rem 0;">' + escapeHtml(progress) + '</p>' + chainCountsHtml(data.counts) + chainThreatsHtml(data),
           { showCancel: live, chainId: data.chain_plan_id });
       }
       function pollChainStatus(chainId) {
@@ -799,17 +756,10 @@
           buildsTotal = (data && typeof data.total === 'number') ? data.total : 0;
           function packageLabel(j) {
             var fromJob = (j.package_name || '').trim();
-            if (fromJob) return escapeHtml(fromJob) + ' (' + j.package_id + ')';
+            if (fromJob) return escapeHtml(fromJob);
             var pkg = packagesList.find(function(p) { return p.id === j.package_id; });
-            var name = pkg ? (pkg.name || '').trim()  : '-';
-            return name ? escapeHtml(name) + ' (' + j.package_id + ')' : ('#' + j.package_id);
-          }
-          function releaseLabel(j) {
-            var fromJob = (j.release_name || '').trim();
-            if (fromJob) return escapeHtml(fromJob) + ' (' + j.release_id + ')';
-            var rel = releasesList.find(function(r) { return r.id === j.release_id; });
-            var name = rel ? (rel.releasename || '').trim()  : '-';
-            return name ? escapeHtml(name) + ' (' + j.release_id + ')' : ('#' + j.release_id);
+            var name = pkg ? (pkg.name || '').trim() : '';
+            return name ? escapeHtml(name) : ('#' + j.package_id);
           }
           tbody.innerHTML = jobs.map(function(j) {
             const canAct = api.token;
@@ -826,17 +776,16 @@
             }
             var arch = (j.architecture != null && j.architecture !== '') ? j.architecture  : '-';
             var sd = window.oreonJobDisplayStatus ? window.oreonJobDisplayStatus(j) : String(j.status || '');
+            var statusCell = window.oreonStatusIcon ? window.oreonStatusIcon(sd) : escapeHtml(sd);
             var signCell = window.oreonSigningKeyHtml ? window.oreonSigningKeyHtml(j.signing_status)  : '-';
             var layerPart = '-';
             if (j.rpmbuild_plan_id != null && j.rpmbuild_plan_id !== undefined) {
-              var chainGroup = (j.rpmbuild_layer_index != null && j.rpmbuild_layer_index !== undefined)
-                ? ' group ' + (Number(j.rpmbuild_layer_index) + 1)
-                 : '';
-              layerPart = '<a href="#" class="watch-chain-id" data-chain-id="' + escapeAttr(String(j.rpmbuild_plan_id)) + '">Chain ' + escapeHtml(String(j.rpmbuild_plan_id)) + '</a>'
-                + '<span style="color:var(--text-muted); font-size:0.85em">' + escapeHtml(chainGroup) + '</span>';
+              var groupNote = (j.rpmbuild_layer_index != null && j.rpmbuild_layer_index !== undefined)
+                ? (' group ' + (Number(j.rpmbuild_layer_index) + 1)) : '';
+              layerPart = '<a href="#" class="watch-chain-id" data-chain-id="' + escapeAttr(String(j.rpmbuild_plan_id)) + '" title="' + escapeAttr('Chain ' + j.rpmbuild_plan_id + groupNote) + '">' + escapeHtml(String(j.rpmbuild_plan_id)) + '</a>';
             }
-            return '<tr data-id="' + j.id + '" data-status="' + escapeAttr(j.status || '') + '" data-side-tag="' + (j.side_tag_id != null ? '1' : '0') + '"><td class="col-checkbox"><input type="checkbox" class="build-row-cb" data-id="' + j.id + '"></td><td>' + j.id + '</td><td>' + packageLabel(j) + '</td><td>' + releaseLabel(j) + '</td><td>' + arch + '</td><td><span class="' + statusClass(sd) + '">' + escapeHtml(sd) + '</span></td><td>' + signCell + '</td><td style="white-space:normal; max-width:16rem;">' + layerPart + '</td><td>' + (j.created_at || '').slice(0,19) + '</td><td><a href="/build.html?job_id=' + j.id + '">View</a>' + retryBtn + cancelBtn + '</td></tr>';
-          }).join('') || '<tr><td colspan="10">No builds</td></tr>';
+            return '<tr data-id="' + j.id + '" data-status="' + escapeAttr(j.status || '') + '" data-side-tag="' + (j.side_tag_id != null ? '1' : '0') + '"><td class="col-checkbox"><input type="checkbox" class="build-row-cb" data-id="' + j.id + '"></td><td>' + j.id + '</td><td>' + packageLabel(j) + '</td><td>' + arch + '</td><td>' + statusCell + '</td><td>' + signCell + '</td><td>' + layerPart + '</td><td>' + (j.created_at || '').slice(0,19) + '</td><td><a href="/build.html?job_id=' + j.id + '">View</a>' + retryBtn + cancelBtn + '</td></tr>';
+          }).join('') || '<tr><td colspan="9">No builds</td></tr>';
           tbody.querySelectorAll('.retry:not([disabled])').forEach(function(btn) {
             btn.addEventListener('click', function() {
               var jid = String(btn.dataset.id);
