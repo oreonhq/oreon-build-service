@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Oreon Build Service</title>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" crossorigin="anonymous" referrerpolicy="no-referrer">
-  <link rel="stylesheet" href="/static/style.css?v=4">
+  <link rel="stylesheet" href="/static/style.css?v=29">
 </head>
 <body>
   <header class="header">
@@ -25,7 +25,7 @@
     </section>
   </main>
   <footer class="footer">Oreon Build Service</footer>
-  <script src="/static/app.js?v=23"></script>
+  <script src="/static/app.js?v=31"></script>
   <script>
     (function() {
       const api = window.oreonApi || {};
@@ -44,10 +44,7 @@
 
           var buildsHost = document.getElementById('dashboard-builds');
           function statusBadge(s) {
-            if (s === 'success' || s === 'skipped') return '<span class="badge success">' + s + '</span>';
-            if (s === 'failed' || s === 'cancelled') return '<span class="badge failed">' + s + '</span>';
-            if (s === 'running' || s === 'queued') return '<span class="badge running">' + s + '</span>';
-            return '<span class="badge pending">' + (s || 'pending') + '</span>';
+            return window.oreonStatusIcon ? window.oreonStatusIcon(s) : s;
           }
           function jobDisplayStatus(b) {
             return window.oreonJobDisplayStatus ? window.oreonJobDisplayStatus(b) : String(b.status || '');
