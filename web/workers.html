@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Workers - Oreon Build Service</title>
-  <link rel="stylesheet" href="/static/style.css?v=4">
+  <link rel="stylesheet" href="/static/style.css?v=29">
   <style>
     .burst-badge {
       display: inline-block;
@@ -13,7 +13,7 @@
       font-size: 0.72rem;
       font-weight: 600;
       padding: 0.1rem 0.4rem;
-      border-radius: 3px;
+      border-radius: 10px;
       margin-left: 0.35rem;
       vertical-align: middle;
       letter-spacing: 0.02em;
@@ -31,14 +31,14 @@
     #edit-modal-overlay.open { display: flex; }
     #edit-modal {
       background: #fff;
-      border: 1px solid #ddd;
-      border-radius: 6px;
+      border: none;
+      border-radius: 10px;
+      box-shadow: none;
       padding: 1.5rem;
       min-width: 380px;
       max-width: 520px;
       width: 90%;
       color: #222;
-      box-shadow: 0 4px 24px rgba(0,0,0,0.13);
     }
     #edit-modal h3 { margin-top: 0; color: #222; }
     #edit-modal .form-group { margin-bottom: 0.85rem; }
@@ -47,8 +47,8 @@
       width: 100%; box-sizing: border-box;
       padding: 0.4rem 0.55rem;
       background: #f9f9f9;
-      border: 1px solid #ccc;
-      border-radius: 4px;
+      border: none;
+      border-radius: 10px;
       color: #222;
       font-size: 0.9rem;
     }
@@ -165,7 +165,7 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=23"></script>
+  <script src="/static/app.js?v=31"></script>
   <script>
     (function() {
       var api = window.oreonApi;
