@@ -22,7 +22,7 @@ def create_access_token(username: str, role: RoleName) -> str:
     return jwt.encode(
         payload,
         settings.secret_key,
-        algorithm=settings.jwt_algorithm,
+        algorithm="HS256",
     )
 
 
@@ -38,7 +38,7 @@ async def get_current_user_optional(
         payload = jwt.decode(
             token,
             settings.secret_key,
-            algorithms=[settings.jwt_algorithm],
+            algorithms=["HS256"],
         )
         username = payload.get("sub")
         if not username:
