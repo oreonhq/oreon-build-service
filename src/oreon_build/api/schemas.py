@@ -329,6 +329,7 @@ class BuildJobResponse(BaseModel):
     blocked_reason: Optional[str] = None
     rpmbuild_plan_id: Optional[int] = None
     rpmbuild_layer_index: Optional[int] = None
+    scan_state: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -487,6 +488,16 @@ class ChainPlanStatusResponse(BaseModel):
     side_tag_name: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    threats: List["ChainThreatRow"] = Field(default_factory=list)
+
+
+class ChainThreatRow(BaseModel):
+    finding_id: int
+    job_id: int
+    package_name: Optional[str] = None
+    engine: str
+    rule: str
+    file_path: str
 
 
 class CurrentFailureItem(BaseModel):

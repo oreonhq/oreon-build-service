@@ -340,6 +340,26 @@ async def lifespan(app: FastAPI):
 
     rpmbuild_settle_task = asyncio.create_task(_rpmbuild_settle_loop(), name="rpmbuild-settle")
 
+    async def _rpm_scan_loop() -> None:
+        from oreon_build.db.session import async_session_maker
+        from oreon_build.services.rpm_scan import retry_pending_scans
+
+        while True:
+            try:
+                async with async_session_maker() as db:
+                    await retry_pending_scans(db)
+                await asyncio.sleep(20)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("rpm scan loop error")
+                try:
+                    await asyncio.sleep(30)
+                except asyncio.CancelledError:
+                    break
+
+    rpm_scan_task = asyncio.create_task(_rpm_scan_loop(), name="rpm-scan")
+
     async def _burst_vm_watcher_loop() -> None:
         from oreon_build.db.session import async_session_maker
         from oreon_build.models import BuildJob, BuildStatus, Package, Worker
@@ -438,6 +458,7 @@ async def lifespan(app: FastAPI):
         (publish_task, "publish-tasks"),
         (mass_rebuild_task, "mass-rebuild"),
         (rpmbuild_settle_task, "rpmbuild-settle"),
+        (rpm_scan_task, "rpm-scan"),
         (burst_vm_task, "burst-vm-watcher"),
         (side_tag_idle_task, "side-tag-inactivity"),
     ]:
@@ -449,6 +470,25 @@ async def lifespan(app: FastAPI):
                 pass
             except Exception:
                 logger.exception("Error stopping background task %s", label)
+
+def _cors_origins(settings: Settings) -> list[str]:
+    origins = [
+        "https://build.oreonhq.com",
+        "https://watchdog.oreonhq.com",
+        "http://127.0.0.1:8000",
+        "http://localhost:8000",
+        "http://127.0.0.1:8001",
+        "http://localhost:8001",
+    ]
+    wd = (settings.watchdog_url or "").rstrip("/")
+    if wd and wd not in origins:
+        origins.append(wd)
+    for part in (settings.cors_origins or "").split(","):
+        item = part.strip().rstrip("/")
+        if item and item not in origins:
+            origins.append(item)
+    return origins
+
 
 def create_app() -> FastAPI:
     app = FastAPI(
@@ -483,7 +523,7 @@ def create_app() -> FastAPI:
         )
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=_cors_origins(get_settings()),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -528,9 +568,6 @@ def create_app() -> FastAPI:
         @app.get("/builds.html")
         def _builds():
             return _html(web_dir / "builds.html")
-        @app.get("/failures.html")
-        def _failures():
-            return _html(web_dir / "failures.html")
         @app.get("/build.html")
         def _build():
             return _html(web_dir / "build.html")
@@ -570,6 +607,9 @@ def create_app() -> FastAPI:
         @app.get("/iso-build.html")
         def _iso_build():
             return _html(web_dir / "iso-build.html")
+        @app.get("/security-finding.html")
+        def _security_finding():
+            return _html(web_dir / "security-finding.html")
 
         @app.get("/chains.html")
         def _chains_removed():

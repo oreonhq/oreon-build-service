@@ -1945,7 +1945,8 @@ async def report_result(
                 arch = target.architecture if target else None
                 branch = job_publish_branch(job.branch, release)
                 if release and arch:
-                    await _enqueue_repo_publish_task()
+                    from oreon_build.services.rpm_scan import gate_publish
+                    await gate_publish(db, job, attempt_id)
                 if job.side_tag_id:
                     from oreon_build.services.side_tags import bump_side_tag_activity
 
@@ -2032,7 +2033,8 @@ async def report_result(
             arch = target.architecture if target else None
             branch = job_publish_branch(job.branch, release)
             if release and arch:
-                await _enqueue_repo_publish_task()
+                from oreon_build.services.rpm_scan import gate_publish
+                await gate_publish(db, job, attempt_id)
                 if job.package_version_id:
                     src_result = await db.execute(
                         select(Source).where(
