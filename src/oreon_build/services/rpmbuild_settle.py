@@ -277,6 +277,9 @@ async def _layer_status(db: Any, plan: RpmbuildPlan, layer: int) -> tuple[list[B
     dirty = any(j.status in (BuildStatus.FAILED, BuildStatus.CANCELLED) for j in jobs)
     if not inflight:
         for j in jobs:
+            if j.status == BuildStatus.SUCCESS and (j.scan_state or "") in ("pending", "quarantined"):
+                pub_ok = False
+                continue
             if j.status != BuildStatus.SUCCESS:
                 continue
             att = await db.execute(
