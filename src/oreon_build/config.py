@@ -234,6 +234,7 @@ class Settings(BaseSettings):
     security_discord_webhook_url: Optional[str] = Field(default=None)
 
     watchdog_url: str = Field(default="http://localhost:8001", description="Public base URL for Oreon Watchdog")
+    cors_origins: str = Field(default="", description="Comma-separated extra browser origins")
     cve_scan_interval_minutes: int = Field(
         default=30,
         ge=1,
