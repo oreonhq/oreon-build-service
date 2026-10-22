@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ISO Build - Oreon Build Service</title>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" crossorigin="anonymous" referrerpolicy="no-referrer">
-  <link rel="stylesheet" href="/static/style.css?v=4">
+  <link rel="stylesheet" href="/static/style.css?v=29">
   <style>
-    .log-viewer { background: #1e1e1e; color: #d4d4d4; padding: 1rem; border-radius: 4px; overflow: auto; max-height: 70vh; font-family: ui-monospace, monospace; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
+    .log-viewer { background: #1e1e1e; color: #d4d4d4; padding: 1rem; border-radius: 10px; overflow: auto; max-height: 70vh; font-family: ui-monospace, monospace; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
     .build-meta dl { display: grid; grid-template-columns: auto 1fr; gap: 0.25rem 1rem; }
     .build-meta dt { color: var(--text-muted); }
   </style>
@@ -26,7 +26,7 @@
       <pre id="iso-log" class="log-viewer">(no log yet)</pre>
     </section>
   </main>
-  <script src="/static/app.js?v=23"></script>
+  <script src="/static/app.js?v=31"></script>
   <script>
     (function() {
       var api = window.oreonApi;
@@ -52,7 +52,7 @@
           document.getElementById('iso-meta').innerHTML =
             '<dl>' +
             '<dt>Name</dt><dd>' + escapeHtml(job.iso_name) + '</dd>' +
-            '<dt>Status</dt><dd><span class="' + statusClass(job.status) + '">' + escapeHtml(job.status) + '</span></dd>' +
+            '<dt>Status</dt><dd>' + (window.oreonStatusIcon ? window.oreonStatusIcon(job.status) : escapeHtml(job.status)) + '</dd>' +
             '<dt>Arch</dt><dd>' + escapeHtml(job.architecture) + '</dd>' +
             '<dt>Kickstart</dt><dd>' + escapeHtml(job.release_folder) + '/' + escapeHtml(job.kickstart) + '</dd>' +
             '<dt>Mock</dt><dd>' + escapeHtml(job.mock_config || '') + '</dd>' +
