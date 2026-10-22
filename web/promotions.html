@@ -4,11 +4,11 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Promotions - Oreon Build Service</title>
-  <link rel="stylesheet" href="/static/style.css?v=4">
+  <link rel="stylesheet" href="/static/style.css?v=29">
   <style>
     .promo-testing { background: #d4edda; color: #155724; }
     .promo-stable { background: #cce5ff; color: #004085; }
-    .warn { color: #856404; background: #fff3cd; padding: 0.75rem 1rem; border-radius: 4px; margin: 0.75rem 0; }
+    .warn { color: #856404; background: #fff3cd; padding: 0.75rem 1rem; border-radius: 10px; margin: 0.75rem 0; }
     #promo-status { margin-top: 1rem; display: none; }
     #promo-status .line { margin: 0.35rem 0; }
   </style>
@@ -56,7 +56,7 @@
       <p style="margin-top:1.25rem;">For side-tag promotions open <a href="/side-tags.html">Side Tags</a>.</p>
     </section>
   </main>
-  <script src="/static/app.js?v=23"></script>
+  <script src="/static/app.js?v=31"></script>
   <script>
     (function() {
       const api = window.oreonApi;
@@ -102,7 +102,7 @@
           lines.push('<div class="line"><strong>Queued</strong> ' + escapeHtml(kickoff.from_branch) + ' - ' + escapeHtml(kickoff.to_branch) + ' (' + escapeHtml(kickoff.releasename || '') + ')</div>');
           lines.push('<div class="line" style="color:var(--text-muted)">job ' + escapeHtml(kickoff.job_id) + ' - you can leave this page</div>');
         }
-        lines.push('<div class="line">Status: <span class="badge ' + (st === 'ok' ? 'success' : (st === 'failed' ? 'failed' : 'running')) + '">' + escapeHtml(st) + '</span></div>');
+        lines.push('<div class="line">Status ' + (window.oreonStatusIcon ? window.oreonStatusIcon(st) : escapeHtml(st)) + '</div>');
         if (job && job.message) lines.push('<div class="line">' + escapeHtml(job.message) + '</div>');
         if (job && job.error) lines.push('<div class="line" style="color:#a00">' + escapeHtml(job.error) + '</div>');
         if (job && job.r2) lines.push('<div class="line">R2: copied=' + escapeHtml(String(job.r2.copied != null ? job.r2.copied : '?')) + '</div>');
