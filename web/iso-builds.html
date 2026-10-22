@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ISO Builds - Oreon Build Service</title>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" crossorigin="anonymous" referrerpolicy="no-referrer">
-  <link rel="stylesheet" href="/static/style.css?v=4">
+  <link rel="stylesheet" href="/static/style.css?v=29">
   <style>
     .ks-row { margin: 0.4rem 0; }
     .iso-sha { font-family: ui-monospace, monospace; font-size: 12px; word-break: break-all; max-width: 16rem; }
@@ -99,7 +99,7 @@
       </table>
     </section>
   </main>
-  <script src="/static/app.js?v=23"></script>
+  <script src="/static/app.js?v=31"></script>
   <script>
     (function() {
       var api = window.oreonApi;
@@ -201,7 +201,7 @@
               '<td>' + escapeHtml(j.release_folder) + '</td>' +
               '<td>' + escapeHtml(j.kickstart) + '</td>' +
               '<td>' + escapeHtml(j.architecture) + '</td>' +
-              '<td><span class="' + statusClass(j.status) + '">' + escapeHtml(j.status) + '</span></td>' +
+              '<td>' + (window.oreonStatusIcon ? window.oreonStatusIcon(j.status) : escapeHtml(j.status)) + '</td>' +
               '<td class="iso-sha">' + escapeHtml(j.sha256 || '') + '</td>' +
               '<td>' + escapeHtml((j.created_at || '').slice(0, 19)) + '</td>' +
               '<td class="iso-actions">' + actions + '</td></tr>';
