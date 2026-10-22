@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Security finding - Oreon Build Service</title>
+  <link rel="stylesheet" href="/static/style.css?v=29">
+</head>
+<body>
+  <header class="header">
+    <a href="/" class="header-logo-link"><img src="/static/obslogo.png" alt="Oreon Build Service" class="header-logo" /></a>
+    <nav></nav>
+  </header>
+  <main class="main">
+    <section class="card">
+      <h2>Security finding</h2>
+      <div id="finding">Loading</div>
+    </section>
+  </main>
+  <script src="/static/app.js?v=31"></script>
+  <script>
+    (function() {
+      var api = window.oreonApi;
+      var id = new URLSearchParams(window.location.search).get('id');
+      var host = document.getElementById('finding');
+      function esc(s) {
+        var d = document.createElement('div');
+        d.textContent = s == null ? '' : String(s);
+        return d.innerHTML;
+      }
+      if (!id) {
+        host.textContent = 'Missing finding id';
+        return;
+      }
+      api.get('/builds/scan-findings/' + encodeURIComponent(id)).then(function(row) {
+        var status = window.oreonStatusIcon && row.scan_state ? window.oreonStatusIcon(row.scan_state) : esc(row.scan_state || '');
+        var btn = row.scan_state === 'quarantined'
+          ? '<p><button type="button" class="btn" id="btn-disregard">Disregard</button></p>'
+          : '';
+        host.innerHTML =
+          '<p>' + status + '</p>' +
+          '<p><a href="/build.html?job_id=' + encodeURIComponent(row.build_job_id) + '">' + esc(row.package_name || ('job ' + row.build_job_id)) + '</a></p>' +
+          '<p>' + esc(row.engine) + ' ' + esc(row.rule) + '</p>' +
+          '<p class="mono">' + esc(row.file_path) + '</p>' +
+          (row.evidence ? '<p class="mono">' + esc(row.evidence) + '</p>' : '') +
+          btn;
+        var disregard = document.getElementById('btn-disregard');
+        if (!disregard) return;
+        disregard.onclick = function() {
+          if (!api.token) { alert('Login required'); return; }
+          oreonWithLoading(disregard, function() {
+            return api.post('/builds/jobs/' + row.build_job_id + '/disregard-scan', {}).then(function() {
+              window.location.href = '/build.html?job_id=' + row.build_job_id;
+            });
+          });
+        };
+      }).catch(function(e) {
+        host.textContent = e.message || 'Failed to load';
+      });
+    })();
+  </script>
+</body>
+</html>
