@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Builds - Oreon Build Service</title>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" crossorigin="anonymous" referrerpolicy="no-referrer">
-  <link rel="stylesheet" href="/static/style.css?v=4">
+  <link rel="stylesheet" href="/static/style.css?v=29">
 </head>
 <body>
   <header class="header">
@@ -59,7 +59,7 @@
       </table>
     </section>
   </main>
-  <script src="/static/app.js?v=23"></script>
+  <script src="/static/app.js?v=31"></script>
   <script>
     (function() {
       const api = window.oreonApi;
@@ -193,7 +193,7 @@
             return '<tr data-id="' + j.id + '" data-status="' + escapeAttr(j.status || '') + '" data-side-tag="' + (j.side_tag_id != null ? '1' : '0') + '">' +
               '<td class="col-checkbox"><input type="checkbox" class="build-row-cb" data-id="' + j.id + '"></td>' +
               '<td>' + j.id + '</td><td>' + pkg + '</td><td>' + rel + '</td><td>' + sideTag + '</td><td>' + arch + '</td>' +
-              '<td><span class="' + statusClass(sd) + '">' + escapeHtml(sd) + '</span></td>' +
+              '<td>' + (window.oreonStatusIcon ? window.oreonStatusIcon(sd) : escapeHtml(sd)) + '</td>' +
               '<td>' + signCell + '</td><td style="white-space:normal; max-width:16rem;">' + chainPart + '</td>' +
               '<td>' + (j.created_at || '').slice(0, 19) + '</td>' +
               '<td><a href="/build.html?job_id=' + j.id + '">View</a>' + retryBtn + cancelBtn + '</td></tr>';
