@@ -5,14 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Build - Oreon Build Service</title>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" crossorigin="anonymous" referrerpolicy="no-referrer">
-  <link rel="stylesheet" href="/static/style.css?v=4">
+  <link rel="stylesheet" href="/static/style.css?v=29">
   <style>
     .build-meta { margin-bottom: 1rem; }
     .build-meta dl { display: grid; grid-template-columns: auto 1fr; gap: 0.25rem 1rem; }
     .build-meta dt { color: var(--text-muted); }
-    .attempt-card { margin-bottom: 1rem; border: 1px solid var(--border); border-radius: 6px; padding: 0.75rem; }
+    .attempt-card { margin-bottom: 1rem; border: none; border-radius: 10px; padding: 0.75rem; }
     .attempt-card h4 { margin: 0 0 0.5rem 0; }
-    .log-viewer { background: #1e1e1e; color: #d4d4d4; padding: 1rem; border-radius: 4px; overflow: auto; max-height: 70vh; font-family: ui-monospace, monospace; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
+    .log-viewer { background: #1e1e1e; color: #d4d4d4; padding: 1rem; border-radius: 10px; overflow: auto; max-height: 70vh; font-family: ui-monospace, monospace; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
     .log-placeholder { color: var(--text-muted); font-style: italic; }
   </style>
 </head>
@@ -31,7 +31,7 @@
       <div id="attempts-list"></div>
     </section>
   </main>
-  <script src="/static/app.js?v=23"></script>
+  <script src="/static/app.js?v=31"></script>
   <script>
     (function() {
       const api = window.oreonApi;
@@ -152,10 +152,30 @@
           meta.innerHTML = '<dl><dt>Package</dt><dd>' + pkgLabel + '</dd>' +
             '<dt>Release</dt><dd>' + relLabel + '</dd>' +
             '<dt>Architecture</dt><dd>' + escapeHtml(job.architecture || '---') + '</dd>' +
-            '<dt>Status</dt><dd><span class="' + statusClass(jobDisp) + '">' + escapeHtml(jobDisp) + '</span></dd>' +
+            '<dt>Status</dt><dd>' + (window.oreonStatusIcon ? window.oreonStatusIcon(jobDisp) : escapeHtml(jobDisp)) + '</dd>' +
             signingRow +
             '<dt>Created</dt><dd>' + (job.created_at || '').slice(0, 19) + '</dd>' +
-            '<dt>Completed</dt><dd>' + (job.completed_at ? job.completed_at.slice(0, 19) : '---') + '</dd></dl>';
+            '<dt>Completed</dt><dd>' + (job.completed_at ? job.completed_at.slice(0, 19) : '---') + '</dd></dl>' +
+            '<div id="scan-box"></div>';
+          var scanBox = document.getElementById('scan-box');
+          if (scanBox && job.scan_state === 'quarantined') {
+            scanBox.innerHTML = '<p style="margin:0.75rem 0 0"><button type="button" class="btn" id="btn-disregard">Disregard</button></p><div id="scan-hits"></div>';
+            api.get('/builds/jobs/' + job.id + '/scan-findings').then(function(rows) {
+              var host = document.getElementById('scan-hits');
+              if (!host) return;
+              var list = Array.isArray(rows) ? rows : [];
+              host.innerHTML = list.map(function(hit) {
+                return '<div style="margin-top:0.35rem"><a href="/security-finding.html?id=' + encodeURIComponent(hit.id) + '">' + escapeHtml((hit.rule || '') + ' ' + (hit.file_path || '')) + '</a></div>';
+              }).join('');
+            }).catch(function() {});
+            var disregard = document.getElementById('btn-disregard');
+            if (disregard) disregard.onclick = function() {
+              if (!api.token) { alert('Login required'); return; }
+              oreonWithLoading(disregard, function() {
+                return api.post('/builds/jobs/' + job.id + '/disregard-scan', {}).then(function() { loadBuild(); });
+              });
+            };
+          }
           return api.get('/builds/jobs/' + jobId + '/attempts');
         }).then(function(attempts) {
           var list = Array.isArray(attempts) ? attempts : [];
@@ -180,7 +200,7 @@
               workerLine = '<div><small>Worker: ' + who + ' &nbsp; Last heartbeat (UTC): ' + hb + '</small></div>';
             }
             return '<div class="attempt-card" data-attempt-id="' + a.id + '" data-attempt-status="' + escapeAttr(st) + '" data-started-at="' + escapeAttr(a.started_at || '') + '">' +
-              '<h4>Attempt #' + (a.attempt_number || (idx + 1)) + ' <span class="' + statusClass(adisp) + '">' + escapeHtml(adisp) + '</span></h4>' +
+              '<h4>Attempt #' + (a.attempt_number || (idx + 1)) + ' ' + (window.oreonStatusIcon ? window.oreonStatusIcon(adisp) : escapeHtml(adisp)) + '</h4>' +
               signingLine +
               workerLine +
               '<div class="attempt-elapsed-live" style="color:var(--text-muted);"></div>' +
