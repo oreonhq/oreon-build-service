@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Side Tags - Oreon Build Service</title>
-  <link rel="stylesheet" href="/static/style.css?v=4">
+  <link rel="stylesheet" href="/static/style.css?v=29">
   <style>
     .badge.busy { background: rgba(13,110,253,0.18); color: #0d6efd; }
     .badge.idle { background: rgba(25,135,84,0.18); color: #198754; }
@@ -54,7 +54,7 @@
       </table>
     </section>
   </main>
-  <script src="/static/app.js?v=23"></script>
+  <script src="/static/app.js?v=31"></script>
   <script>
     (function() {
       const api = window.oreonApi;
@@ -93,7 +93,7 @@
           var tbody = document.getElementById('tags-tbody');
           tbody.innerHTML = items.map(function(t) {
             var st = (t.status || 'idle');
-            var chip = st === 'busy' ? 'badge busy' : 'badge idle';
+            var chip = window.oreonStatusIcon ? window.oreonStatusIcon(st) : escapeHtml(st);
             var acts = '<a class="btn" href="/side-tag.html?id=' + t.id + '">Open</a>';
             if (api.token && t.can_access) {
               acts += ' <button type="button" class="btn scrap-tag" data-id="' + t.id + '" data-name="' + escapeHtml(t.name) + '">Scrap</button>';
@@ -102,7 +102,7 @@
               '<td><a href="/side-tag.html?id=' + t.id + '">' + escapeHtml(t.name) + '</a></td>' +
               '<td>' + escapeHtml(t.releasename || ('#' + t.release_id)) + '</td>' +
               '<td>' + escapeHtml(t.owner_username || '-') + '</td>' +
-              '<td><span class="' + chip + '">' + escapeHtml(st) + '</span></td>' +
+              '<td>' + chip + '</td>' +
               '<td>' + (t.last_activity_at || '').toString().slice(0, 19) + '</td>' +
               '<td>' + acts + '</td>' +
               '</tr>';
