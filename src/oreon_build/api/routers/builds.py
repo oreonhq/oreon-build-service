@@ -17,6 +17,7 @@ from oreon_build.api.schemas import (
     BuildTriggerAccepted,
     ChainBuildTrigger,
     ChainPlanStatusResponse,
+    ChainThreatRow,
     DiscoveryBuildTrigger,
     LayerJobRow,
     CurrentFailureItem,
@@ -28,7 +29,7 @@ from oreon_build.api.schemas import (
 from oreon_build.core.audit import get_client_ip, get_user_agent, log_audit
 from oreon_build.core.machine_arch import normalize_machine_arch
 from oreon_build.core.repo_branch import r2_publish_branch
-from oreon_build.models import BuildAttempt, BuildJob, BuildStatus, BuildTarget, Package, Release, RpmbuildPlan, Worker
+from oreon_build.models import BuildAttempt, BuildJob, BuildStatus, BuildTarget, Package, Release, RpmbuildPlan, RpmScanFinding, Worker
 from oreon_build.services.build_target_util import (
     get_or_create_build_target,
     has_successful_build_for_target,
@@ -52,6 +53,8 @@ def _attempt_display_status(a: BuildAttempt) -> str:
 
 
 def _job_display_status(job: BuildJob, latest: BuildAttempt | None) -> str:
+    if (getattr(job, "scan_state", None) or "") == "quarantined":
+        return "quarantined"
     if job.status == BuildStatus.SUCCESS:
         return "success"
     if latest is not None and latest.mock_succeeded_at is not None and job.status == BuildStatus.RUNNING:
@@ -473,6 +476,27 @@ async def _chain_plan_to_status_response(db: DbSession, plan: RpmbuildPlan, offs
     ]
     rel = await db.get(Release, plan.release_id)
     tag = await db.scalar(select(SideTag).where(SideTag.release_id == plan.release_id, SideTag.name == plan.repo_branch))
+    threat_rows = (
+        await db.execute(
+            select(RpmScanFinding, BuildJob, Package.name)
+            .join(BuildJob, BuildJob.id == RpmScanFinding.build_job_id)
+            .join(Package, Package.id == BuildJob.package_id)
+            .where(BuildJob.rpmbuild_plan_id == plan.id, BuildJob.scan_state == "quarantined")
+            .order_by(RpmScanFinding.id.asc())
+            .limit(50)
+        )
+    ).all()
+    threats = [
+        ChainThreatRow(
+            finding_id=finding.id,
+            job_id=job.id,
+            package_name=name,
+            engine=finding.engine,
+            rule=finding.rule,
+            file_path=finding.file_path,
+        )
+        for finding, job, name in threat_rows
+    ]
     return ChainPlanStatusResponse(
         chain_plan_id=plan.id,
         status=plan.status.value,
@@ -486,6 +510,7 @@ async def _chain_plan_to_status_response(db: DbSession, plan: RpmbuildPlan, offs
         side_tag_name=tag.name if tag else None,
         created_at=plan.created_at,
         updated_at=plan.updated_at,
+        threats=threats,
     )
 
 
@@ -939,6 +964,7 @@ async def _job_to_response(
         blocked_reason=getattr(job, "blocked_reason", None),
         rpmbuild_plan_id=getattr(job, "rpmbuild_plan_id", None),
         rpmbuild_layer_index=getattr(job, "rpmbuild_layer_index", None),
+        scan_state=getattr(job, "scan_state", None),
     )
 
 
@@ -1110,3 +1136,81 @@ async def cancel_build(
     )
     payload = await _job_to_response(db, job)
     return JSONResponse(status_code=200, content=payload.model_dump(mode="json"))
+
+
+@router.get("/jobs/{job_id}/scan-findings")
+async def list_job_scan_findings(job_id: int, db: DbSession):
+    rows = (
+        await db.execute(
+            select(RpmScanFinding)
+            .where(RpmScanFinding.build_job_id == job_id)
+            .order_by(RpmScanFinding.id.asc())
+        )
+    ).scalars().all()
+    return [
+        {
+            "id": row.id,
+            "build_job_id": row.build_job_id,
+            "engine": row.engine,
+            "rule": row.rule,
+            "file_path": row.file_path,
+            "evidence": row.evidence,
+        }
+        for row in rows
+    ]
+
+
+@router.get("/scan-findings/{finding_id}")
+async def get_scan_finding(finding_id: int, db: DbSession):
+    row = await db.get(RpmScanFinding, finding_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Finding not found")
+    job = await db.get(BuildJob, row.build_job_id)
+    package_name = None
+    if job is not None:
+        package_name = await db.scalar(select(Package.name).where(Package.id == job.package_id))
+    return {
+        "id": row.id,
+        "build_job_id": row.build_job_id,
+        "package_name": package_name,
+        "engine": row.engine,
+        "rule": row.rule,
+        "file_path": row.file_path,
+        "evidence": row.evidence,
+        "scan_state": job.scan_state if job else None,
+    }
+
+
+@router.post("/jobs/{job_id}/disregard-scan")
+async def disregard_scan(job_id: int, request: Request, db: DbSession):
+    from oreon_build.core.auth import require_maintainer_or_admin
+    from oreon_build.services.rpm_scan import _enqueue
+
+    user = await require_maintainer_or_admin(request, db)
+    job = await db.get(BuildJob, job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Build not found")
+    if (job.scan_state or "") != "quarantined":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Build is not quarantined")
+    attempt_id = await db.scalar(
+        select(BuildAttempt.id)
+        .where(BuildAttempt.build_job_id == job_id, BuildAttempt.status == BuildStatus.SUCCESS)
+        .order_by(BuildAttempt.id.desc())
+        .limit(1)
+    )
+    if attempt_id is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No successful attempt")
+    job.scan_state = "disregarded"
+    await _enqueue(db, job.id, int(attempt_id))
+    await log_audit(
+        db,
+        action="scan.disregard",
+        account_id=user.id,
+        resource_type="build_job",
+        resource_id=str(job_id),
+        details=f"attempt_id={attempt_id}",
+        ip_address=get_client_ip(request),
+        user_agent=get_user_agent(request),
+    )
+    await db.commit()
+    return {"status": "ok", "job_id": job_id}
