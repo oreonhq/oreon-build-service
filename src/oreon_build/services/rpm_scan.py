@@ -8,12 +8,12 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from sqlalchemy import delete, select
+from sqlalchemy import case, delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from oreon_build.core.audit import log_audit
 from oreon_build.db.session import async_session_maker
-from oreon_build.models import Artifact, BuildAttempt, BuildJob, BuildStatus, PublishTask, RpmScanFinding
+from oreon_build.models import Artifact, BuildAttempt, BuildJob, BuildStatus, PublishTask, RpmScanFinding, RpmbuildPlan, RpmbuildPlanStatus
 from oreon_build.services.r2 import get_r2_client
 
 logger = logging.getLogger(__name__)
@@ -287,6 +287,10 @@ async def _scan_job(job_id: int, attempt_id: int) -> None:
                 dest = root / Path(art.filename).name
                 err = await asyncio.to_thread(_download, art.r2_key, dest)
                 if err:
+                    if "missing" in err and not await _plan_live(db, job):
+                        job.scan_state = "skipped"
+                        await db.commit()
+                        return
                     logger.warning("rpm scan held job %s: %s", job_id, err)
                     return
                 hits, scan_err = await asyncio.to_thread(scan_rpm_path, dest)
@@ -321,12 +325,31 @@ async def _scan_job(job_id: int, attempt_id: int) -> None:
         await db.commit()
 
 
+async def _plan_live(db, job: BuildJob) -> bool:
+    if job.rpmbuild_plan_id is None:
+        return False
+    plan = await db.get(RpmbuildPlan, job.rpmbuild_plan_id)
+    if plan is None:
+        return False
+    return plan.status in (
+        RpmbuildPlanStatus.PENDING,
+        RpmbuildPlanStatus.RUNNING,
+        RpmbuildPlanStatus.WAITING_SETTLE,
+    )
+
+
 async def retry_pending_scans(db) -> None:
+    live = (
+        RpmbuildPlanStatus.PENDING,
+        RpmbuildPlanStatus.RUNNING,
+        RpmbuildPlanStatus.WAITING_SETTLE,
+    )
     rows = (
         await db.execute(
             select(BuildJob.id)
+            .outerjoin(RpmbuildPlan, RpmbuildPlan.id == BuildJob.rpmbuild_plan_id)
             .where(BuildJob.scan_state == "pending", BuildJob.status == BuildStatus.SUCCESS)
-            .order_by(BuildJob.id.asc())
+            .order_by(case((RpmbuildPlan.status.in_(live), 0), else_=1), BuildJob.id.desc())
             .limit(4)
         )
     ).scalars().all()

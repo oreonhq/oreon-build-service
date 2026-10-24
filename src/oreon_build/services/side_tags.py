@@ -16,6 +16,8 @@ from oreon_build.models import (
     LayerPlanStatus,
     BuildJob,
     BuildStatus,
+    RpmbuildPlan,
+    RpmbuildPlanStatus,
     SideTag,
     SideTagCreatedFrom,
     SideTagMember,
@@ -210,7 +212,27 @@ async def side_tag_is_busy(db: Any, side_tag_id: int) -> bool:
         )
         .limit(1)
     )
-    return open_chain.scalar_one_or_none() is not None
+    if open_chain.scalar_one_or_none() is not None:
+        return True
+    tag = await db.get(SideTag, int(side_tag_id))
+    if tag is None:
+        return False
+    open_plan = await db.execute(
+        select(RpmbuildPlan.id)
+        .where(
+            RpmbuildPlan.release_id == tag.release_id,
+            RpmbuildPlan.repo_branch == tag.name,
+            RpmbuildPlan.status.in_(
+                [
+                    RpmbuildPlanStatus.PENDING,
+                    RpmbuildPlanStatus.RUNNING,
+                    RpmbuildPlanStatus.WAITING_SETTLE,
+                ]
+            ),
+        )
+        .limit(1)
+    )
+    return open_plan.scalar_one_or_none() is not None
 
 
 def delete_side_tag_r2_prefix(releasename: str, tag_name: str) -> int:
