@@ -256,6 +256,8 @@
           html += '<button type="button" class="btn" id="btn-show-build">New build</button>';
           html += '<input type="text" id="invite-username" class="form-control" placeholder="username" style="width:9rem;max-width:9rem;">';
           html += '<button type="button" class="btn" id="btn-invite">Invite</button>';
+          html += '<input type="text" id="delete-package-name" class="form-control" placeholder="package to delete" style="width:12rem;max-width:14rem;">';
+          html += '<button type="button" class="btn" id="btn-delete-package">Delete package</button>';
         }
         html += '<button type="button" class="btn promo-testing" id="btn-promo-dev">dev</button>';
         html += '<button type="button" class="btn promo-testing" id="btn-promo-testing">testing</button>';
@@ -278,6 +280,23 @@
             return api.post('/side-tags/' + sideTagId + '/invite', { username: u })
               .then(function(t) { sideTag = t; canAccessTag = !!t.can_access; updateLoggedInUI(); })
               .catch(function(e) { alert(e.message); });
+          });
+        };
+        var delPkg = document.getElementById('btn-delete-package');
+        if (delPkg) delPkg.onclick = function() {
+          var raw = (document.getElementById('delete-package-name').value || '').trim();
+          var names = raw.split(/[\s,]+/).filter(Boolean);
+          if (!names.length) { alert('Enter a package name'); return; }
+          if (!confirm('Remove ' + names.join(', ') + ' from ' + sideTag.name + '? Deletes those RPMs from the tag and lets them build again. The rest of the tag stays.')) return;
+          oreonWithLoading(delPkg, function() {
+            return api.post('/side-tags/' + sideTagId + '/packages/delete', { names: names })
+              .then(function(info) {
+                setPromoStatus('Removed ' + (info.names || names).join(', ') + ' (' + (info.deleted_objects || 0) + ' files). Repo index is rebuilding.');
+                var box = document.getElementById('delete-package-name');
+                if (box) box.value = '';
+                render();
+              })
+              .catch(function(e) { alert(e.message || e); });
           });
         };
         var scrap = document.getElementById('btn-scrap');

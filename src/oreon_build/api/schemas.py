@@ -373,6 +373,10 @@ class SideTagPromoteRequest(BaseModel):
     to_branch: str = Field(..., description="dev, testing, or stable")
 
 
+class SideTagDeletePackages(BaseModel):
+    names: List[str] = Field(..., min_length=1)
+
+
 class BranchPromoteRequest(BaseModel):
     release_id: int = Field(..., ge=1)
     from_branch: str = Field(..., min_length=1, max_length=128)

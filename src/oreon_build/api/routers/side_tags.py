@@ -10,6 +10,7 @@ from oreon_build.api.deps import CurrentUser, CurrentUserOptional, DbSession
 from oreon_build.api.schemas import (
     PaginatedResponse,
     SideTagCreate,
+    SideTagDeletePackages,
     SideTagInvite,
     SideTagMemberResponse,
     SideTagPackageRow,
@@ -33,6 +34,7 @@ from oreon_build.services.side_tags import (
     can_access_side_tag,
     create_side_tag,
     get_side_tag,
+    delete_side_tag_packages,
     require_side_tag_access,
     scrap_side_tag,
     side_tag_is_busy,
@@ -266,6 +268,34 @@ async def remove_member(
     await db.commit()
     tag = await get_side_tag(db, side_tag_id)
     return await _to_response(db, tag, user)
+
+
+@router.post("/{side_tag_id}/packages/delete")
+async def delete_side_tag_packages_endpoint(
+    side_tag_id: int,
+    data: SideTagDeletePackages,
+    request: Request,
+    db: DbSession,
+    user: CurrentUser,
+):
+    tag = await get_side_tag(db, side_tag_id)
+    if not tag:
+        raise HTTPException(status_code=404, detail="Side tag not found")
+    require_side_tag_access(user, tag)
+    releasename = tag.release.releasename if tag.release else ""
+    info = await delete_side_tag_packages(db, tag, data.names, releasename=releasename)
+    await log_audit(
+        db,
+        "side_tag.delete_packages",
+        account_id=user.id,
+        resource_type="side_tag",
+        resource_id=str(tag.id),
+        details=" ".join(info["names"]),
+        ip_address=get_client_ip(request),
+        user_agent=get_user_agent(request),
+    )
+    await db.commit()
+    return info
 
 
 @router.post("/{side_tag_id}/scrap")

@@ -12,10 +12,14 @@ from sqlalchemy.orm import selectinload
 
 from oreon_build.models import (
     Account,
-    LayerPlan,
-    LayerPlanStatus,
+    Artifact,
+    BuildAttempt,
     BuildJob,
     BuildStatus,
+    LayerPlan,
+    LayerPlanStatus,
+    Package,
+    PublishTask,
     RpmbuildPlan,
     RpmbuildPlanStatus,
     SideTag,
@@ -313,6 +317,129 @@ async def scrap_side_tag(db: Any, tag: SideTag, *, releasename: str) -> dict[str
 
     asyncio.create_task(_wipe())
     return {"id": tag_id, "name": name, "releasename": releasename}
+
+
+def _side_tag_prefix(releasename: str, tag_name: str) -> str:
+    return f"{(releasename or '').strip()}/{(tag_name or '').strip()}/"
+
+
+async def delete_side_tag_packages(
+    db: Any,
+    tag: SideTag,
+    names: list[str],
+    *,
+    releasename: str,
+) -> dict[str, Any]:
+    wanted = []
+    seen = set()
+    for raw in names:
+        n = (raw or "").strip()
+        if not n or n in seen:
+            continue
+        seen.add(n)
+        wanted.append(n)
+    if not wanted:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No package names")
+    rows = (
+        await db.execute(select(Package).where(Package.name.in_(wanted)))
+    ).scalars().all()
+    by_name = {p.name: p for p in rows}
+    missing = [n for n in wanted if n not in by_name]
+    if missing:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown package " + ", ".join(missing))
+    pkg_ids = [p.id for p in rows]
+    jobs = (
+        await db.execute(
+            select(BuildJob).where(
+                BuildJob.side_tag_id == tag.id,
+                BuildJob.package_id.in_(pkg_ids),
+            )
+        )
+    ).scalars().all()
+    if not jobs:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="None of those packages are on this side tag")
+    job_ids = [j.id for j in jobs]
+    attempt_ids = [
+        r[0]
+        for r in (
+            await db.execute(select(BuildAttempt.id).where(BuildAttempt.build_job_id.in_(job_ids)))
+        ).all()
+    ]
+    filenames: set[str] = set()
+    keys: set[str] = set()
+    prefix = _side_tag_prefix(releasename, tag.name)
+    if attempt_ids:
+        arts = (
+            await db.execute(
+                select(Artifact.filename, Artifact.r2_key).where(Artifact.build_attempt_id.in_(attempt_ids))
+            )
+        ).all()
+        for filename, r2_key in arts:
+            if filename and str(filename).endswith(".rpm"):
+                filenames.add(str(filename))
+            if r2_key and str(r2_key).startswith(prefix):
+                keys.add(str(r2_key))
+    if prefix.strip("/"):
+        r2 = get_r2_client()
+        if filenames:
+            for key in await asyncio.to_thread(lambda: list(r2.iter_keys_with_prefix(prefix))):
+                if "/repodata/" in key:
+                    continue
+                base = key.rsplit("/", 1)[-1]
+                if base in filenames:
+                    keys.add(key)
+        if keys:
+            await asyncio.to_thread(r2.delete_objects, sorted(keys))
+    now = datetime.now(timezone.utc)
+    await db.execute(
+        update(BuildJob)
+        .where(
+            BuildJob.id.in_(job_ids),
+            BuildJob.status.in_(
+                [
+                    BuildStatus.PENDING,
+                    BuildStatus.QUEUED,
+                    BuildStatus.RUNNING,
+                    BuildStatus.BLOCKED,
+                    BuildStatus.SUCCESS,
+                ]
+            ),
+        )
+        .values(status=BuildStatus.CANCELLED, completed_at=now, blocked_reason="Removed from side tag", scan_state="skipped")
+    )
+    await db.execute(
+        update(BuildAttempt)
+        .where(
+            BuildAttempt.build_job_id.in_(job_ids),
+            BuildAttempt.status.in_(
+                (BuildStatus.PENDING, BuildStatus.QUEUED, BuildStatus.RUNNING)
+            ),
+        )
+        .values(status=BuildStatus.CANCELLED, finished_at=now, error_message="Removed from side tag")
+    )
+    await db.execute(
+        update(PublishTask)
+        .where(
+            PublishTask.build_job_id.in_(job_ids),
+            PublishTask.status.in_(("pending", "queued", "running")),
+        )
+        .values(status="cancelled", error_message="package removed from side tag", finished_at=now)
+    )
+    await bump_side_tag_activity(db, tag.id)
+    arches = []
+    rel = tag.release
+    if rel is not None and hasattr(rel, "arch_list"):
+        arches = [str(a) for a in rel.arch_list() if a]
+    if not arches:
+        arches = ["x86_64", "aarch64"]
+    from oreon_build.services.rpmbuild_settle import schedule_side_tag_repodata_rebuild
+
+    schedule_side_tag_repodata_rebuild(releasename, tag.name, arches)
+    return {
+        "names": wanted,
+        "deleted_objects": len(keys),
+        "jobs": len(job_ids),
+    }
 
 
 async def scrap_inactive_side_tags(db: Any) -> list[dict[str, Any]]:
