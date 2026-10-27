@@ -1,5 +1,5 @@
 from oreon_build.api.routers.auth import _login_hits, login_rate_limited
-from oreon_build.services.rpm_scan import parse_clam_line, parse_yr_json, skip_scan_path
+from oreon_build.services.rpm_scan import parse_clam_line, parse_yr_json, skip_scan_path, _scan_failure
 from pathlib import Path
 
 
@@ -36,6 +36,15 @@ def test_yr_only_keeps_our_rules():
     assert len(rows) == 1
     assert rows[0][0] == "oreon_curl_or_wget_piped_to_shell"
     assert "curl x | sh" in rows[0][2]
+
+
+def test_dead_clamd_is_not_a_walk_error():
+    text = "\n".join([
+        "WARNING: Ignoring unsupported option --recursive (-r)",
+        "ERROR: Could not connect to clamd on LocalSocket /tmp/clamd.sock: No such file or directory",
+        "LibClamAV Error: File tree walk aborted.",
+    ])
+    assert _scan_failure(text) == "clamd is not running"
 
 
 def test_login_rate_limit_trips():

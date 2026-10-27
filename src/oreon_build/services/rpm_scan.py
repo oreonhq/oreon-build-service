@@ -3,12 +3,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import case, delete, select
+from sqlalchemy import case, delete, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from oreon_build.core.audit import log_audit
@@ -93,6 +97,131 @@ def parse_yr_json(raw: str) -> list[tuple[str, str, str]]:
     return out
 
 
+_clamd_lock = threading.Lock()
+
+
+def _clamd_config() -> Path | None:
+    env = (os.environ.get("OREON_CLAMD_CONFIG") or "").strip()
+    if env:
+        path = Path(env)
+        if path.is_file():
+            return path
+    home = Path.home() / ".config" / "clamd.conf"
+    if home.is_file():
+        return home
+    return None
+
+
+def _cfg_value(cfg: Path, key: str) -> str | None:
+    try:
+        lines = cfg.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        parts = text.split(None, 1)
+        if len(parts) == 2 and parts[0] == key:
+            return parts[1].strip()
+    return None
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _clear_stale_clamd(cfg: Path) -> None:
+    pid_path = _cfg_value(cfg, "PidFile")
+    if not pid_path:
+        return
+    path = Path(pid_path)
+    if not path.is_file():
+        return
+    try:
+        pid = int(path.read_text().strip() or "0")
+    except (OSError, ValueError):
+        pid = 0
+    if _pid_alive(pid):
+        return
+    path.unlink(missing_ok=True)
+    sock = _cfg_value(cfg, "LocalSocket")
+    if sock:
+        Path(sock).unlink(missing_ok=True)
+
+
+def _clamdscan_bin() -> str:
+    if _clamd_config() is not None and Path("/usr/bin/clamdscan").is_file():
+        return "/usr/bin/clamdscan"
+    return "clamdscan"
+
+
+def _clamd_ping() -> bool:
+    cmd = [_clamdscan_bin(), "--ping", "2"]
+    cfg = _clamd_config()
+    if cfg is not None:
+        cmd[1:1] = ["--config-file", str(cfg)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0 and "PONG" in (proc.stdout or "")
+
+
+def ensure_clamd() -> str | None:
+    if shutil.which("clamdscan") is None or shutil.which("clamd") is None:
+        return "clamd missing"
+    if _clamd_ping():
+        return None
+    cfg = _clamd_config()
+    if cfg is None:
+        return "clamd is not running"
+    with _clamd_lock:
+        if _clamd_ping():
+            return None
+        _clear_stale_clamd(cfg)
+        try:
+            subprocess.Popen(
+                ["clamd", "--config-file", str(cfg)],
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            return f"clamd failed to start {exc}"[:240]
+        for _ in range(60):
+            time.sleep(0.5)
+            if _clamd_ping():
+                logger.info("clamd started")
+                return None
+    return "clamd is not running"
+
+
+def _scan_failure(text: str) -> str:
+    lines = []
+    for line in (text or "").splitlines():
+        item = line.strip()
+        if not item or item.startswith("WARNING:"):
+            continue
+        lines.append(item)
+    for item in lines:
+        low = item.lower()
+        if "could not connect" in low or "ping timeout" in low:
+            return "clamd is not running"
+    useful = [item for item in lines if "File tree walk aborted" not in item]
+    if useful:
+        return useful[-1][:240]
+    if lines:
+        return lines[-1][:240]
+    return "clamdscan failed"
+
+
 def _tools_missing() -> str | None:
     for name in ("rpm2cpio", "cpio", "rpm", "clamdscan", "yr"):
         if shutil.which(name) is None:
@@ -134,21 +263,28 @@ def _unpack(rpm: Path, dest: Path) -> str | None:
     return None
 
 
+def _run_clamdscan(root: Path) -> subprocess.CompletedProcess[str]:
+    cmd = [_clamdscan_bin(), "--fdpass", "--infected", "--no-summary", str(root)]
+    cfg = _clamd_config()
+    if cfg is not None:
+        cmd[1:1] = ["--config-file", str(cfg)]
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+
+
 def _clam(root: Path) -> tuple[list[tuple[str, str]], str | None]:
-    proc = subprocess.run(
-        ["clamdscan", "--fdpass", "--infected", "--no-summary", "-r", str(root)],
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
+    proc = _run_clamdscan(root)
+    blob = f"{proc.stderr or ''}\n{proc.stdout or ''}"
+    if proc.returncode == 2 and _scan_failure(blob) == "clamd is not running":
+        if ensure_clamd() is None:
+            proc = _run_clamdscan(root)
+            blob = f"{proc.stderr or ''}\n{proc.stdout or ''}"
     hits: list[tuple[str, str]] = []
-    for line in (proc.stdout or "").splitlines() + (proc.stderr or "").splitlines():
+    for line in blob.splitlines():
         parsed = parse_clam_line(line, root)
         if parsed:
             hits.append(parsed)
     if proc.returncode == 2 and not hits:
-        err = ((proc.stderr or proc.stdout or "clamdscan failed").strip().splitlines() or ["clamdscan failed"])[-1]
-        return [], err[:240]
+        return [], _scan_failure(blob)
     if proc.returncode not in (0, 1, 2):
         return [], "clamdscan failed"
     return hits, None
@@ -287,9 +423,23 @@ async def _scan_job(job_id: int, attempt_id: int) -> None:
                 dest = root / Path(art.filename).name
                 err = await asyncio.to_thread(_download, art.r2_key, dest)
                 if err:
-                    if "missing" in err and not await _plan_live(db, job):
+                    if "missing" in err:
                         job.scan_state = "skipped"
+                        await _enqueue(db, job_id, attempt_id)
+                        await db.execute(
+                            update(PublishTask)
+                            .where(
+                                PublishTask.attempt_id == attempt_id,
+                                PublishTask.status.in_(("pending", "queued")),
+                            )
+                            .values(
+                                status="failed",
+                                error_message=err[:500],
+                                finished_at=datetime.now(timezone.utc),
+                            )
+                        )
                         await db.commit()
+                        logger.warning("rpm scan dropped job %s: %s", job_id, err)
                         return
                     logger.warning("rpm scan held job %s: %s", job_id, err)
                     return
@@ -325,20 +475,11 @@ async def _scan_job(job_id: int, attempt_id: int) -> None:
         await db.commit()
 
 
-async def _plan_live(db, job: BuildJob) -> bool:
-    if job.rpmbuild_plan_id is None:
-        return False
-    plan = await db.get(RpmbuildPlan, job.rpmbuild_plan_id)
-    if plan is None:
-        return False
-    return plan.status in (
-        RpmbuildPlanStatus.PENDING,
-        RpmbuildPlanStatus.RUNNING,
-        RpmbuildPlanStatus.WAITING_SETTLE,
-    )
-
-
 async def retry_pending_scans(db) -> None:
+    down = await asyncio.to_thread(ensure_clamd)
+    if down:
+        logger.warning("rpm scan waiting on clamd: %s", down)
+        return
     live = (
         RpmbuildPlanStatus.PENDING,
         RpmbuildPlanStatus.RUNNING,
