@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """Map perl(Module) caps to distgit perl-* sources (parent walk + metacpan)."""
 
 from __future__ import annotations

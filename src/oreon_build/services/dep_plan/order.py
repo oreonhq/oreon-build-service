@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """Build order via networkx topological_generations."""
 
 from __future__ import annotations

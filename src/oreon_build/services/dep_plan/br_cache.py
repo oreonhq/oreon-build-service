@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """SQLite-backed BR/provides cache keyed by (package, content_key).
 
 content_key stands in for a per-file git commit sha. Specs are fetched from

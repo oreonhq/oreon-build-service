@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """Persist manual chain build execution options."""
 
 from alembic import op

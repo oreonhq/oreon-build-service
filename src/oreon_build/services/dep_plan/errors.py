@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """Accurate plan errors: import vs in-distgit blocked path."""
 
 from __future__ import annotations

@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 from oreon_build.api.routers.auth import _login_hits, login_rate_limited
 from oreon_build.services.rpm_scan import parse_clam_line, parse_yr_json, skip_scan_path, _scan_failure
 from pathlib import Path

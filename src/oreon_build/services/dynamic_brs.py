@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """Evaluate BuildRequires the way rpm/mock do, including %generate_buildrequires."""
 
 from __future__ import annotations

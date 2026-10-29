@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """Map virtual RPM caps to distgit source package names.
 
 Resolution is driven by provider data only. A cap is decomposed into rich-dep

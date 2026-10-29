@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 from oreon_build.core.build_result import (
     find_architecture_excluded_line,
     is_architecture_excluded_error,

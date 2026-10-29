@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """Indexes for scalable worker claims after bulk layer enqueue."""
 
 from alembic import op

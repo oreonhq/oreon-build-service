@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 from oreon_build.services.current_build_failures import is_spec_not_found_error
 
 

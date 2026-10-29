@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 from oreon_build.services.repo_publish import (
     _PrefixPublishBatch,
     _group_publish_tasks_by_prefix,

@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """Reload the PID-file-managed API, allowing the old process to drain requests."""
 from pathlib import Path
 import os

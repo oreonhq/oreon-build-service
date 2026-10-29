@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 from oreon_build.services.rpmbuild_order import names_blocked_by_failures
 from oreon_build.services.rpmbuild_settle import (
     _known_sources_from_primary,

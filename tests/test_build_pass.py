@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 from oreon_build.services.build_pass import job_options_dict, schedule_next_pass_after_publish
 from oreon_build.models import BuildJob, BuildStatus
 

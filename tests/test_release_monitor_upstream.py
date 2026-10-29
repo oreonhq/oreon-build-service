@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 from oreon_build.services.release_monitor import (
     ingest_anitya_package_items,
     kernel_org_stable_version,

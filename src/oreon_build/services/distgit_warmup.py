@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """Background warmup for distgit provides index + solv caches."""
 
 from __future__ import annotations

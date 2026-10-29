@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 import pytest
 
 from oreon_build.services.iso_builds import iso_filename_for_arch, mock_config_for_arch, validate_iso_request

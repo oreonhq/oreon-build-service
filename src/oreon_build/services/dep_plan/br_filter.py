@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """BR filtering based on RPM rich-dep semantics only. No package name lists."""
 
 from __future__ import annotations

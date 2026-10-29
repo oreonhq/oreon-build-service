@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """Installability oracle: libsolv only (repos + plan overlay)."""
 
 from __future__ import annotations

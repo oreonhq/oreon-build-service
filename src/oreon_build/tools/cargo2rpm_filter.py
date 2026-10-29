@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """cargo2rpm wrapper that drops foreign-target crate BuildRequires."""
 
 from __future__ import annotations

@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """Add bridge/native tracking fields to build_jobs."""
 
 from alembic import op

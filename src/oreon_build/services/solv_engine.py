@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """libsolv installability engine for Oreon repos + plan overlay.
 
 Loads rpmmd into a persistent Pool, caches .solv on disk, and injects planned

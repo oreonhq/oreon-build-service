@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """Drop crate BuildRequires that only apply to foreign rustc targets."""
 
 from __future__ import annotations

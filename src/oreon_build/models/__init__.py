@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 from .account import Account, Role, RoleName
 from .audit import AuditLog
 from .build import BuildAttempt, BuildJob, BuildPhase, BuildStatus, BuildTarget

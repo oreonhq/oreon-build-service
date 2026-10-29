@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 from .auth import create_access_token, get_current_user_optional, require_account, require_admin
 from .security import hash_password, verify_password, hash_worker_token, verify_worker_token
 

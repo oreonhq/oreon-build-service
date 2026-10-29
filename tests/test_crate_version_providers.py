@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 from oreon_build.services.dep_plan.providers import (
     _rust_compat_series_from_package,
     _source_may_satisfy_crate_versions,

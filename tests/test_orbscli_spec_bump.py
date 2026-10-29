@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Oreon HQ
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 from pathlib import Path
 
 from oreon_build.cli.orbscli import bump_spec_to_version, find_pkg_specs, parse_package_blob
