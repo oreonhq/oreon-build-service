@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import base64
+import fnmatch
 import io
 import json
 import logging
 import os
 import re
+import shlex
 import stat
 import sys
 import tarfile
@@ -22,7 +24,7 @@ import asyncio
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, unquote, urljoin
 
 import click
 import httpx
@@ -285,6 +287,83 @@ def _expand_spec_version_token(preamble: str, val: str) -> str | None:
         cur = nxt
     return None
 
+def _composite_version_parts(preamble: str, val: str, depth: int = 0) -> list[tuple[str, str | None]] | None:
+    """Flatten ``Version: %{a}.%{b}.3`` into (text, owner) chunks.
+
+    owner is the macro that defines the chunk, "" for a literal digit run in
+    the Version tag itself, or None for fixed separators / empty optionals.
+    """
+    if depth > 4:
+        return None
+    out: list[tuple[str, str | None]] = []
+    pos = 0
+    tokens: list[tuple[int, int, bool, str, bool]] = []
+    i = 0
+    while i < len(val):
+        if val[i] != "%":
+            i += 1
+            continue
+        if val.startswith("%{", i):
+            level, j = 0, i + 1
+            while j < len(val):
+                if val[j] == "{":
+                    level += 1
+                elif val[j] == "}":
+                    level -= 1
+                    if level == 0:
+                        break
+                j += 1
+            if j >= len(val):
+                return None
+            inner = val[i + 2 : j]
+            mm = re.fullmatch(r"(!?\?)?([A-Za-z_]\w*)(:.*)?", inner, re.S)
+            if not mm or (mm.group(1) or "").startswith("!"):
+                return None
+            tokens.append((i, j + 1, bool(mm.group(1)), mm.group(2), bool(mm.group(3))))
+            i = j + 1
+            continue
+        mm = re.match(r"%([A-Za-z_]\w*)", val[i:])
+        if not mm:
+            return None
+        tokens.append((i, i + mm.end(), False, mm.group(1), False))
+        i += mm.end()
+    for start, end, optional, name, has_alt in tokens:
+        lit = val[pos:start]
+        for chunk in re.findall(r"[A-Za-z0-9]+|[^A-Za-z0-9]+", lit):
+            out.append((chunk, "" if depth == 0 and chunk.isdigit() else None))
+        pos = end
+        if name in ("nil",):
+            continue
+        body = _define_literal(preamble, name)
+        if optional:
+            if body is None:
+                continue
+            return None
+        if body is None or has_alt:
+            return None
+        if "%" in body:
+            if "%(" in body:
+                return None
+            sub = _composite_version_parts(preamble, body, depth + 1)
+            if sub is None:
+                return None
+            out.extend(sub)
+            continue
+        out.append((body, name))
+    lit = val[pos:]
+    for chunk in re.findall(r"[A-Za-z0-9]+|[^A-Za-z0-9]+", lit):
+        out.append((chunk, "" if depth == 0 and chunk.isdigit() else None))
+    return out
+
+
+def _composite_shape(value: str) -> str:
+    return "".join(
+        r"\d+" if piece.isdigit() else (r"[A-Za-z]+" if piece.isalpha() else
+                                        (r"[A-Za-z0-9]+" if piece.isalnum() else re.escape(piece)))
+        for piece in re.findall(r"[0-9]+|[A-Za-z]+|[^A-Za-z0-9]+", value)
+    )
+
+
 def _spec_literal_version(preamble: str) -> tuple[str, str] | None:
     vm = _RE_SPEC_VERSION.search(preamble)
     if not vm:
@@ -294,10 +373,70 @@ def _spec_literal_version(preamble: str) -> tuple[str, str] | None:
         return None
     if "%" in val:
         dval = _expand_spec_version_token(preamble, val)
-        if not dval or "%" in dval:
-            return None
-        return dval, "macro"
+        if dval and "%" not in dval:
+            return dval, "macro"
+        parts = _composite_version_parts(preamble, val)
+        if parts and any(owner for _t, owner in parts):
+            joined = "".join(t for t, _o in parts)
+            if joined and "%" not in joined:
+                return joined, "composite"
+        return None
     return val, "tag"
+
+
+def _bump_composite_version(pre: str, old: str, latest: str) -> str | None:
+    vm = _RE_SPEC_VERSION.search(pre)
+    if not vm:
+        return None
+    parts = _composite_version_parts(pre, vm.group("val").strip())
+    if not parts or "".join(t for t, _o in parts) != old:
+        return None
+    rx = "".join(
+        ("(" + _composite_shape(text) + ")") if owner is not None else re.escape(text)
+        for text, owner in parts
+    )
+    m = re.fullmatch(rx, latest)
+    if not m:
+        return None
+    new_vals: dict[str, str] = {}
+    lit_new: list[str] = []
+    gi = 0
+    for text, owner in parts:
+        if owner is None:
+            continue
+        gi += 1
+        got = m.group(gi)
+        if owner == "":
+            lit_new.append(got)
+            continue
+        if owner in new_vals and new_vals[owner] != got:
+            return None
+        new_vals[owner] = got
+    old_vals = {owner: text for text, owner in parts if owner}
+
+    def _sub(dm: re.Match[str]) -> str:
+        name = dm.group("name")
+        if name in new_vals and (dm.group("val") or "").strip() == old_vals.get(name):
+            return dm.group("pre") + name + dm.group("sp") + new_vals[name] + dm.group("post")
+        return dm.group(0)
+
+    pre = _RE_SPEC_DEFINE.sub(_sub, pre)
+    if lit_new:
+        val = vm.group("val")
+        it = iter(lit_new)
+        rebuilt = []
+        pos = 0
+        for mt in re.finditer(r"%\{(?:[^{}]|\{[^{}]*\})*\}|%[A-Za-z_]\w*", val):
+            rebuilt.append(re.sub(r"\d+", lambda _m: next(it), val[pos : mt.start()]))
+            rebuilt.append(mt.group(0))
+            pos = mt.end()
+        rebuilt.append(re.sub(r"\d+", lambda _m: next(it), val[pos:]))
+        vm2 = _RE_SPEC_VERSION.search(pre)
+        pre = pre[: vm2.start("val")] + "".join(rebuilt) + pre[vm2.end("val") :]
+    found = _spec_literal_version(pre)
+    if not found or found[0] != latest:
+        return None
+    return pre
 
 def _dotted_prefixes(ver: str) -> dict[int, str]:
     parts = [p for p in (ver or "").split(".") if p != ""]
@@ -307,28 +446,53 @@ def _dotted_prefixes(ver: str) -> dict[int, str]:
     return out
 
 
-def _bump_preserve_define(name: str) -> bool:
-    # kabi dumps are separate artifacts. rewriting kabiversion with the
-    # kernel version makes Source300/301 point at files that do not exist yet.
-    n = (name or "").lower()
-    return n.startswith("kabi")
+def _aux_source_only_defines(preamble: str) -> set[str]:
+    # A macro used only by secondary Source tags feeds some other artifact
+    # with its own version. The main source and Version own the bump.
+    srcs = [(int(m.group("num") or 0), m.start()) for m in _RE_SPEC_SOURCE.finditer(preamble)]
+    primary = min(srcs)[0] if srcs else 0
+    names = {m.group("name").lower(): m.group("name") for m in _RE_SPEC_DEFINE.finditer(preamble)}
+    out: set[str] = set()
+    for low, name in names.items():
+        ref = re.compile(r"%\{[!?]*" + re.escape(name) + r"\b|%" + re.escape(name) + r"\b")
+        aux = other = False
+        for line in preamble.splitlines():
+            if not ref.search(line) or _RE_SPEC_DEFINE.match(line) and _RE_SPEC_DEFINE.match(line).group("name") == name:
+                continue
+            sm = _RE_SPEC_SOURCE.match(line) or _RE_SPEC_PATCH.match(line)
+            if sm and (sm.groupdict().get("num") or "0") != str(primary) and "Source" in line.split(":")[0]:
+                aux = True
+            else:
+                other = True
+        if aux and not other:
+            out.add(low)
+    return out
 
 
 def _rewrite_version_defines(preamble: str, old: str, new: str) -> str:
-    old_px = _dotted_prefixes(old)
-    new_px = _dotted_prefixes(new)
+    # Only a macro that supplies Version is owned by this bump. Equal numeric
+    # values elsewhere can describe an ABI, dependency or older release.
+    vm = _RE_SPEC_VERSION.search(preamble)
+    owner = _RE_VERSION_MACRO.fullmatch(vm.group("val")) if vm else None
+    if not owner:
+        return preamble
+    owner_name = owner.group(1).lower()
+    aux = _aux_source_only_defines(preamble)
+    old_parts, new_parts = old.split("."), new.split(".")
+    multi = len(old_parts) > 2 and len(new_parts) > 2
+    old_mm, new_mm = ".".join(old_parts[:2]), ".".join(new_parts[:2])
 
     def _sub(m: re.Match[str]) -> str:
-        if _bump_preserve_define(m.group("name")):
+        name = m.group("name").lower()
+        if name in aux:
             return m.group(0)
         val = (m.group("val") or "").strip()
         if val == old:
             val = new
+        elif multi and val == old_mm and old_mm != new_mm:
+            val = new_mm
         else:
-            for n, px in old_px.items():
-                if val == px and n in new_px:
-                    val = new_px[n]
-                    break
+            return m.group(0)
         return m.group("pre") + m.group("name") + m.group("sp") + val + m.group("post")
 
     return _RE_SPEC_DEFINE.sub(_sub, preamble)
@@ -340,18 +504,32 @@ def _replace_version_token(text: str, old: str, new: str) -> str:
     if len(old) < 3 and "." not in old:
         return text
     rx = re.compile(r"(?<![0-9A-Za-z.])" + re.escape(old) + r"(?!(?:[0-9A-Za-z]|\.\d))")
+    tag_rx = re.compile(r"(?<![0-9A-Za-z.])v" + re.escape(old) + r"(?!(?:[0-9A-Za-z]|\.\d))")
     out: list[str] = []
     for line in text.splitlines(keepends=True):
-        dm = _RE_SPEC_DEFINE.match(line)
-        if dm and _bump_preserve_define(dm.group("name")):
+        # A literal version in an HTTP Source URL belongs to the fetched
+        # artifact. Do not rewrite dependencies, comments, macros or scripts.
+        body = line.rstrip("\n")
+        sm = _RE_SPEC_SOURCE.match(body)
+        if not sm or "://" not in sm.group("val"):
             out.append(line)
             continue
-        out.append(rx.sub(new, line))
+        url = sm.group("val")
+        url = tag_rx.sub("v" + new, url)
+        url = rx.sub(new, url)
+        gnome = re.search(r"(?i)(https?://download\.gnome\.org/sources/[^/]+/)(\d+(?:\.\d+)*)/", url)
+        if gnome:
+            width = len(gnome.group(2).split("."))
+            new_parts = new.split(".")
+            if len(new_parts) >= width and all(part.isdigit() for part in new_parts[:width]):
+                series = ".".join(new_parts[:width])
+                url = url[:gnome.start(2)] + series + url[gnome.end(2):]
+        out.append(sm.group("pre") + url + sm.group("post") + ("\n" if line.endswith("\n") else ""))
     return "".join(out)
 
 def bump_spec_to_version(text: str, latest: str) -> tuple[str, str, str] | None:
     latest = (latest or "").strip()
-    if not latest or "%" in latest:
+    if not latest or "%" in latest or "-" in latest:
         return None
     pre, log = _split_spec_changelog(text)
     found = _spec_literal_version(pre)
@@ -360,17 +538,18 @@ def bump_spec_to_version(text: str, latest: str) -> tuple[str, str, str] | None:
     old, kind = found
     if old == latest:
         return text, old, latest
-    if kind == "macro":
+    if kind == "composite":
+        bumped = _bump_composite_version(pre, old, latest)
+        if bumped is None:
+            return None
+        pre = bumped
+    elif kind == "macro":
         pre = _rewrite_version_defines(pre, old, latest)
     else:
         pre = _RE_SPEC_VERSION.sub(lambda m: m.group("pre") + latest + m.group("post"), pre, count=1)
         pre = _rewrite_version_defines(pre, old, latest)
     pre = _RE_SPEC_RELEASE.sub(lambda m: m.group("pre") + "1" + m.group("rest"), pre, count=1)
     pre = _replace_version_token(pre, old, latest)
-    old_maj = old.split(".", 1)[0]
-    new_maj = latest.split(".", 1)[0]
-    if old_maj != new_maj and old_maj.isdigit() and new_maj.isdigit():
-        pre = pre.replace("v%s.x" % old_maj, "v%s.x" % new_maj)
     return pre + log, old, latest
 
 
@@ -558,6 +737,17 @@ def _pip_install_nvchecker() -> None:
         raise click.ClickException("nvchecker install failed")
 
 
+def _lang2rpm_ensure_kind(kind: str) -> bool:
+    if any(shutil.which(name) for name in _lang2rpm_bins(kind)):
+        return True
+    rpms = _lang2rpm_rpms_for_kind(kind)
+    if not rpms:
+        return False
+    if not _dnf_install_host(rpms):
+        return False
+    return any(shutil.which(name) for name in _lang2rpm_bins(kind))
+
+
 def _lang2rpm_ensure_host_tools() -> None:
     want_rpms: list[str] = []
     missing_kinds: list[str] = []
@@ -637,7 +827,7 @@ def _lang2rpm_argv(
     kind: str, bin_name: str, upstream: str, latest: str, pkg: str, text: str
 ) -> list[str]:
     if kind == "rust":
-        argv = [bin_name, "--no-existence-check", "--no-auto-changelog-entry"]
+        argv = [bin_name, "-t", "plain", "--no-existence-check", "--no-rpmautospec"]
         if re.search(r"(?im)^Patch\d*\s*:", text):
             argv.append("--reuse-patch")
         name = _spec_package_name_from_text(text) or pkg
@@ -686,25 +876,204 @@ def _lang2rpm_pick_spec(tmp: Path, spec_path: Path) -> Path | None:
     return None
 
 
+def _spec_preamble(pre: str) -> str:
+    cut = re.search(
+        r"(?m)^%(?:prep|package|description|build|install|files|check|generate_buildrequires)\b",
+        pre,
+    )
+    return pre[: cut.start()] if cut else pre
+
+
+def _tag_value(pre: str, tag: str) -> str | None:
+    match = re.search(r"(?im)^" + tag + r"\d*\s*:\s*(\S.*?)\s*$", _spec_preamble(pre))
+    return match.group(1).strip() if match else None
+
+
+def _replace_preamble_tag(pre: str, tag: str, value: str) -> str:
+    return re.sub(
+        r"(?im)^(?P<pre>\s*" + tag + r"\d*\s*:\s*)\S.*$",
+        lambda m: m.group("pre") + value,
+        pre,
+        count=1,
+    )
+
+
+def _br_token(line: str) -> str:
+    value = line.split(":", 1)[1].strip()
+    value = value.lstrip("(").strip()
+    return value.split()[0] if value else ""
+
+
 def _lang2rpm_merge(old_text: str, new_text: str) -> str:
-    new_pre, _ = _split_spec_changelog(new_text)
+    """Edit the existing spec. The translator is a hint, not a replacement."""
+    new_pre, _new_log = _split_spec_changelog(new_text)
     old_pre, old_log = _split_spec_changelog(old_text)
-    if not re.search(r"(?im)^Patch\d*\s*:", new_pre):
-        patches = [
-            m.group(0).rstrip()
-            for m in re.finditer(r"(?im)^Patch\d*\s*:.*$", old_pre)
-        ]
-        if patches:
-            desc = re.search(r"(?im)^%description\b", new_pre)
-            blob = "\n".join(patches) + "\n\n"
-            if desc:
-                new_pre = new_pre[: desc.start()] + blob + new_pre[desc.start() :]
-            else:
-                new_pre = new_pre.rstrip() + "\n" + blob
-    merged = (new_pre.rstrip() + "\n\n" + old_log) if old_log else new_pre
-    if "%global source0_hash" not in merged and "%global source0_hash" in old_text:
-        merged = _set_source_hash_guard(merged, "none")
+    new_head = _spec_preamble(new_pre)
+    out = old_pre
+    new_ver = _tag_value(new_pre, "Version")
+    if new_ver:
+        out = _replace_preamble_tag(out, "Version", new_ver)
+        out = _RE_SPEC_RELEASE.sub(lambda m: m.group("pre") + "1" + m.group("rest"), out, count=1)
+    new_lic = _tag_value(new_pre, "License")
+    if new_lic:
+        out = _replace_preamble_tag(out, "License", new_lic)
+    for match in re.finditer(r"(?im)^Source(?P<num>\d*)\s*:\s*(?P<val>\S.*?)\s*$", new_head):
+        num = match.group("num") or ""
+        val = match.group("val").strip()
+        if num in ("", "0"):
+            pat = re.compile(r"(?im)^(\s*Source0?\s*:\s*)\S.*$")
+            label = "Source"
+        else:
+            pat = re.compile(r"(?im)^(\s*Source" + re.escape(num) + r"\s*:\s*)\S.*$")
+            label = "Source" + num
+        if pat.search(_spec_preamble(out)):
+            out = pat.sub(lambda m, val=val: m.group(1) + val, out, count=1)
+        else:
+            out = _insert_after_tag(out, "Source", "%s: %s" % (label, val))
+    for match in re.finditer(
+        r"(?im)^[ \t]*%(?:global|define)\s+(?P<name>[\w]+)\s+(?P<val>\S.*?)\s*$",
+        new_head,
+    ):
+        name = match.group("name")
+        if name in {"debug_package", "crate"}:
+            continue
+        if not re.search(r"(?i)version|hash|commit|tag|gem_name|pypi_name|npm_name", name):
+            continue
+        val = match.group("val").strip()
+        gpat = re.compile(
+            r"(?im)^([ \t]*%(?:global|define)\s+" + re.escape(name) + r"\s+)\S.*$"
+        )
+        if gpat.search(out):
+            out = gpat.sub(lambda m, val=val: m.group(1) + val, out, count=1)
+    old_brs = {
+        _br_token(m.group(0))
+        for m in re.finditer(r"(?im)^BuildRequires\s*:.*$", _spec_preamble(out))
+    }
+    add_brs = []
+    for match in re.finditer(r"(?im)^BuildRequires\s*:.*$", new_head):
+        line = match.group(0).rstrip()
+        token = _br_token(line)
+        if token and token not in old_brs:
+            old_brs.add(token)
+            add_brs.append(line)
+    if add_brs:
+        out = _insert_buildrequires(out, add_brs)
+    out, added_deps = _sync_translator_deps(out, new_pre)
+    if add_brs or added_deps:
+        out = out.replace("# !!!ADD DEPS!!! !!!ADD DEPS!!! !!!ADD DEPS!!!\n", "")
+    merged = (out.rstrip() + "\n\n" + old_log) if old_log else out
+    if new_ver and "%global source0_hash" in old_text:
+        new_hash = re.search(
+            r"(?im)^[ \t]*%(?:global|define)\s+source0_hash\s+([0-9a-fA-F]{64})\s*$",
+            new_head,
+        )
+        merged = _replace_source_hash_guard(merged, new_hash.group(1) if new_hash else "none")
     return merged
+
+
+def _insert_after_tag(pre: str, tag: str, line: str) -> str:
+    head_end = re.search(
+        r"(?m)^%(?:prep|package|description|build|install|files|check|generate_buildrequires)\b",
+        pre,
+    )
+    head = pre[: head_end.start()] if head_end else pre
+    rest = pre[head_end.start() :] if head_end else ""
+    hits = list(re.finditer(r"(?im)^" + tag + r"\d*\s*:.*$", head))
+    if not hits:
+        return head.rstrip() + "\n" + line + "\n" + rest
+    at = hits[-1].end()
+    return head[:at] + "\n" + line + head[at:] + rest
+
+
+def _pkg_blocks(pre: str) -> tuple[list[tuple[str, str]], str]:
+    prep = re.search(r"(?m)^%prep\b", pre)
+    head = pre[: prep.start()] if prep else pre
+    tail = pre[prep.start() :] if prep else ""
+    parts = re.split(r"(?m)^(?=%package\b)", head)
+    blocks: list[tuple[str, str]] = []
+    for part in parts:
+        if not part:
+            continue
+        match = re.match(r"%package(?:\s+-n\s+(\S+)|\s+(\S+))?", part)
+        if part.startswith("%package") and match:
+            ident = match.group(1) or match.group(2) or ""
+        else:
+            ident = ""
+        blocks.append((ident, part))
+    return blocks, tail
+
+
+def _dep_tag_lines(block: str) -> list[str]:
+    out = []
+    for line in block.splitlines():
+        if re.match(r"(?i)(?:Requires|Provides)\s*:", line):
+            out.append(line.rstrip())
+    return out
+
+
+def _sync_translator_deps(old_pre: str, new_pre: str) -> tuple[str, bool]:
+    """Copy Requires and Provides the translator emitted, plus new subpackages."""
+    old_blocks, tail = _pkg_blocks(old_pre)
+    new_blocks, _new_tail = _pkg_blocks(new_pre)
+    old_ids = {ident for ident, _block in old_blocks}
+    added = False
+    fresh: list[tuple[str, str]] = []
+    extras: list[str] = []
+    for ident, block in new_blocks:
+        if ident and ident not in old_ids:
+            extras.append(block if block.endswith("\n") else block + "\n")
+            added = True
+            continue
+        old_block = ""
+        for bid, body in old_blocks:
+            if bid == ident:
+                old_block = body
+                break
+        have = {_br_token(line) for line in _dep_tag_lines(old_block)}
+        missing = []
+        for line in _dep_tag_lines(block):
+            token = _br_token(line)
+            if token and token not in have:
+                have.add(token)
+                missing.append(line)
+        if not missing:
+            fresh.append((ident, old_block))
+            continue
+        added = True
+        desc = re.search(r"(?m)^%description\b", old_block)
+        blob = "\n".join(missing) + "\n"
+        if desc:
+            old_block = old_block[: desc.start()] + blob + old_block[desc.start() :]
+        else:
+            old_block = old_block.rstrip() + "\n" + blob
+        fresh.append((ident, old_block))
+    # blocks that only exist in the old spec stay where they are
+    seen = {ident for ident, _block in fresh}
+    for ident, block in old_blocks:
+        if ident not in seen:
+            fresh.append((ident, block))
+    # keep original order for packages we already had
+    order = [ident for ident, _block in old_blocks]
+    fresh.sort(key=lambda item: order.index(item[0]) if item[0] in order else len(order))
+    head = "".join(block for _ident, block in fresh)
+    for extra in extras:
+        head += extra if extra.endswith("\n") else extra + "\n"
+    return head + tail, added
+
+
+def _insert_buildrequires(pre: str, lines: list[str]) -> str:
+    blob = "\n".join(lines)
+    head_end = re.search(
+        r"(?m)^%(?:prep|package|description|build|install|files|check|generate_buildrequires)\b",
+        pre,
+    )
+    head = pre[: head_end.start()] if head_end else pre
+    rest = pre[head_end.start() :] if head_end else ""
+    hits = list(re.finditer(r"(?im)^BuildRequires\s*:.*$", head))
+    if hits:
+        at = hits[-1].end()
+        return head[:at] + "\n" + blob + head[at:] + rest
+    return head.rstrip() + "\n" + blob + "\n" + rest
 
 
 def _lang2rpm_run(
@@ -757,8 +1126,62 @@ def _lang2rpm_run(
             if not body.strip():
                 last_err = "%s wrote no spec" % bin_name
                 continue
+            if body == text:
+                # the input spec is copied into tmp; an unchanged file means the
+                # translator silently did nothing (cpanspec exits 0 on bad args).
+                last_err = "%s left the spec unchanged" % bin_name
+                continue
             return _lang2rpm_merge(text, body), None
     return None, last_err
+
+
+def _lang2rpm_generate(kind: str, upstream: str, version: str, pkg: str) -> tuple[str | None, str | None]:
+    """Run the *2rpm tool and return its spec. No existing spec to merge."""
+    if not _lang2rpm_ensure_kind(kind):
+        return None, "missing-translator"
+    dummy = "Name: %s\nVersion: %s\n" % (pkg, version)
+    if kind == "rust":
+        dummy += "%%global crate %s\n" % upstream
+    bins = [name for name in _lang2rpm_bins(kind) if shutil.which(name)]
+    last_err = "translator failed"
+    for bin_name in bins:
+        argv = _lang2rpm_argv(kind, bin_name, upstream, version, pkg, dummy)
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            run_argv = list(argv)
+            if kind == "python" and Path(bin_name).name == "pyp2spec":
+                run_argv = argv[:1] + ["-o", str(tmp / (pkg + ".spec"))] + argv[1:]
+            if kind == "rust":
+                run_argv = argv[:1] + ["-o", str(tmp)] + argv[1:]
+            proc = subprocess.run(run_argv, cwd=tmp, capture_output=True, text=True)
+            if proc.returncode != 0:
+                err_lines = ((proc.stderr or proc.stdout or last_err).strip().splitlines())
+                last_err = err_lines[-1][:300] if err_lines else "translator failed"
+                continue
+            out_spec = _lang2rpm_pick_spec(tmp, Path(pkg + ".spec"))
+            body = ""
+            if out_spec and out_spec.is_file():
+                body = out_spec.read_text(encoding="utf-8", errors="replace")
+            stdout = proc.stdout or ""
+            if len(stdout.strip()) > 40 and ("Name:" in stdout or "%package" in stdout):
+                body = stdout
+            if not body.strip() or "Name:" not in body:
+                last_err = "%s wrote no spec" % bin_name
+                continue
+            return body, None
+    return None, last_err
+
+
+def _bump_translator_enabled(kind: str) -> bool:
+    # Translators only edit Version, License, sources, version globals, and
+    # missing BuildRequires. The rest of the spec stays. Set
+    # ORBSCLI_BUMP_TRANSLATORS=none to skip them.
+    raw = os.environ.get("ORBSCLI_BUMP_TRANSLATORS", "all").strip().lower()
+    if raw == "all":
+        return True
+    if raw in ("", "none"):
+        return False
+    return kind in {part.strip() for part in raw.split(",")}
 
 
 def _spec_bump_compute(
@@ -768,7 +1191,9 @@ def _spec_bump_compute(
     old_ver = found[0] if found else None
     if not latest:
         return "fail", "no version from checker", None, None
-    if old_ver == latest:
+    if "-" in latest:
+        return "fail", "upstream version needs an RPM-safe Version mapping", old_ver, latest
+    if old_ver == latest or old_ver and _ver_rank(old_ver) == _ver_rank(latest):
         return "skip", "current", old_ver, latest
     if old_ver and _ver_rank(latest) < _ver_rank(old_ver):
         return "skip", "not newer", old_ver, latest
@@ -779,11 +1204,13 @@ def _spec_bump_compute(
     ):
         return "skip", "compat", old_ver, latest
     kind = _lang2rpm_kind(pkg, text)
-    if kind:
+    if kind and _bump_translator_enabled(kind):
         new_text, err = _lang2rpm_run(kind, spec_path, text, latest)
-        if err or not new_text:
+        if new_text and not err:
+            return "ok", new_text, old_ver, latest
+        if bump_spec_to_version(text, latest) is None:
             return "fail", err or "translator produced empty spec", old_ver, latest
-        return "ok", new_text, old_ver, latest
+        # translator failed; fall through to the plain in-place Version bump.
     bumped = bump_spec_to_version(text, latest)
     if bumped is None:
         return "fail", "no literal Version", old_ver, latest
@@ -1009,6 +1436,24 @@ def _expand_source_macros(raw: str, macros: dict[str, str]) -> str:
     return expanded
 
 
+def _brace_alternatives(pattern: str) -> list[str]:
+    alternatives = [pattern]
+    while True:
+        expanded = []
+        changed = False
+        for item in alternatives:
+            group = re.search(r'\{([^{}]+)\}', item)
+            if not group:
+                expanded.append(item)
+                continue
+            changed = True
+            expanded.extend(item[:group.start()] + choice + item[group.end():]
+                            for choice in group[1].split(','))
+        alternatives = expanded
+        if not changed:
+            return alternatives
+
+
 def _spec_http_sources(text: str, macros: dict[str, str]) -> list[tuple[str, str, str]]:
     """Return ``(number, raw, expanded)`` for each remote HTTP(S) Source.
 
@@ -1050,17 +1495,100 @@ def _spec_http_sources(text: str, macros: dict[str, str]) -> list[tuple[str, str
         expanded = _expand_source_macros(raw, macros)
         if "crates_source" in raw:
             crate = macros.get("crate")
-            ver = (macros.get("crate_version") or macros.get("version") or "").split("+", 1)[0]
+            # crates.io file names keep SemVer build metadata (toml_edit-0.25.15+spec-1.1.0.crate)
+            ver = macros.get("crate_version") or (macros.get("version") or "").split("+", 1)[0]
             if crate and ver:
                 expanded = "https://static.crates.io/crates/%s/%s-%s.crate" % (
                     crate,
                     crate,
                     ver,
                 )
+        num = match.group("num") or "0"
+        if ("%{" in expanded or "%(" in expanded) and ("__rpmspec_src_" + num) in macros:
+            expanded = macros["__rpmspec_src_" + num]
         if not expanded.lower().startswith(("http://", "https://")):
             continue
-        out.append((match.group("num") or "0", raw, expanded))
+        out.append((num, raw, expanded))
     return out
+
+
+def _rpmspec_expand_sources(text: str, spec_dir: Path) -> dict[str, str]:
+    """Expand Source tags with rpmspec -P for macros the offline parser can't do."""
+    if shutil.which("rpmspec") is None:
+        return {}
+    out: dict[str, str] = {}
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw) / "bump.spec"
+        tmp.write_text(text, encoding="utf-8")
+        cmd = [
+            "rpmspec", "-P", *_rpmspec_distro_args(),
+            "--define", "_sourcedir %s" % spec_dir, str(tmp),
+        ]
+        try:
+            proc = subprocess.run(cmd, cwd=spec_dir, capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.TimeoutExpired):
+            return {}
+        if proc.returncode != 0:
+            return {}
+        for line in proc.stdout.splitlines():
+            m = re.match(r"(?i)^Source(\d*)\s*:\s*(\S+)", line.strip())
+            if m and "%" not in m.group(2):
+                out.setdefault(m.group(1) or "0", m.group(2))
+    return out
+
+
+def _expand_spec(text: str, spec_dir: Path) -> str:
+    if shutil.which("rpmspec") is None:
+        return text
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw) / "bump.spec"
+        tmp.write_text(text, encoding="utf-8")
+        cmd = [
+            "rpmspec", "-P", *_rpmspec_distro_args(),
+            "--define", "_sourcedir %s" % spec_dir, str(tmp),
+        ]
+        try:
+            proc = subprocess.run(cmd, cwd=spec_dir, capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.TimeoutExpired):
+            return text
+        if proc.returncode != 0:
+            return text
+        return proc.stdout
+
+
+def _cpan_moved_source0(
+    client: "httpx.Client", text: str, url: str, version: str, macros: dict[str, str]
+) -> str | None:
+    """CPAN by-module links lag and releases move between authors; ask metacpan."""
+    if "cpan" not in (url or "").lower():
+        return None
+    base = _source_url_basename(url)
+    m = re.match(r"^(?P<dist>.+?)-v?" + re.escape(version) + r"(?P<ext>\.(?:tar\.gz|tgz|tar\.bz2|tar\.xz|zip))$", base)
+    if not m:
+        return None
+    try:
+        resp = client.get("https://fastapi.metacpan.org/v1/release/%s" % m.group("dist"), follow_redirects=True)
+        data = resp.json() if resp.status_code < 400 else {}
+    except Exception:
+        return None
+    dl = str(data.get("download_url") or "")
+    if str(data.get("version") or "").lstrip("v") != version or not dl:
+        return None
+    if _source_url_basename(dl) != base:
+        return None
+    new_raw = _macroize_url(dl, macros, version)
+    pre, log = _split_spec_changelog(text)
+    done = False
+
+    def _sub(sm: re.Match[str]) -> str:
+        nonlocal done
+        if done or (sm.group("num") or "0") != "0":
+            return sm.group(0)
+        done = True
+        return sm.group("pre") + new_raw + sm.group("post")
+
+    pre = _RE_SPEC_SOURCE.sub(_sub, pre)
+    return pre + log if done else None
 
 
 def _verify_source_url(client: "httpx.Client", url: str) -> bool:
@@ -1080,12 +1608,19 @@ def _verify_source_url(client: "httpx.Client", url: str) -> bool:
 
 
 def _fetch_source_sha256(client: "httpx.Client", url: str) -> str | None:
-    """Stream a Source URL and return its hex SHA-256 digest, if fetchable."""
-    got = _fetch_source_archive(client, url, None)
-    if not got:
+    """Stream a Source URL twice and return its hex SHA-256 digest when both agree."""
+    first = _fetch_source_archive(client, url, None)
+    if not first:
         return None
-    path, digest = got
-    path.unlink(missing_ok=True)
+    one, digest = first
+    one.unlink(missing_ok=True)
+    second = _fetch_source_archive(client, url, None)
+    if not second:
+        return None
+    _path2, digest2 = second
+    _path2.unlink(missing_ok=True)
+    if digest2 != digest:
+        return None
     return digest
 
 
@@ -1105,18 +1640,37 @@ def _fetch_source_archive(
         else:
             handle = dest.open("wb")
         digest = _hashlib.sha256()
-        url = url.split("#", 1)[0]
-        with client.stream("GET", url, follow_redirects=True) as response:
+        source_name = _source_url_basename(url.split("#", 1)[1]) if "#" in url else _source_url_basename(url)
+        request_url = url.split("#", 1)[0]
+        with client.stream("GET", request_url, follow_redirects=True) as response:
             if response.status_code >= 400:
                 handle.close()
-                if close_later:
-                    dest.unlink(missing_ok=True)
+                dest.unlink(missing_ok=True)
                 return None
             for chunk in response.iter_bytes(chunk_size=1024 * 1024):
                 if chunk:
                     handle.write(chunk)
                     digest.update(chunk)
         handle.close()
+        # A 200 response may be an HTML error or login page. Check the bytes
+        # before allowing a digest to be written to the spec.
+        name = source_name.lower()
+        archive = name.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tar.xz", ".tar", ".crate"))
+        valid = True
+        if archive:
+            valid = tarfile.is_tarfile(dest)
+        elif name.endswith((".zip", ".whl")):
+            valid = zipfile.is_zipfile(dest)
+        elif name.endswith((".asc", ".sig")):
+            head = dest.read_bytes()[:4096]
+            valid = bool(head) and not head.lstrip().lower().startswith((b"<!doctype html", b"<html"))
+        else:
+            with dest.open("rb") as source:
+                head = source.read(512).lstrip().lower()
+            valid = not head.startswith((b"<!doctype html", b"<html"))
+        if not valid:
+            dest.unlink(missing_ok=True)
+            return None
         return dest, digest.hexdigest()
     except Exception:
         if handle is not None:
@@ -1124,7 +1678,7 @@ def _fetch_source_archive(
                 handle.close()
             except OSError:
                 pass
-        if close_later and dest is not None:
+        if dest is not None:
             dest.unlink(missing_ok=True)
         return None
 
@@ -1180,7 +1734,7 @@ def _patch_strip_works(tree: Path, patch: Path, strip: int) -> bool:
     if subprocess.run(argv, capture_output=True).returncode == 0:
         return True
     argv = [
-        "patch", "-d", str(tree), "--dry-run", "--forward", "--batch",
+        "patch", "-d", str(tree), "--dry-run", "--forward", "--batch", "--fuzz=0",
         "-p%d" % strip, "-i", str(patch),
     ]
     return subprocess.run(argv, capture_output=True).returncode == 0
@@ -1191,7 +1745,7 @@ def _apply_patch(tree: Path, patch: Path, strip: int) -> bool:
     if subprocess.run(argv, capture_output=True).returncode == 0:
         return True
     argv = [
-        "patch", "-d", str(tree), "--forward", "--batch",
+        "patch", "-d", str(tree), "--forward", "--batch", "--fuzz=0",
         "-p%d" % strip, "-i", str(patch),
     ]
     return subprocess.run(argv, capture_output=True).returncode == 0
@@ -1206,7 +1760,7 @@ def _patch_reverse_works(tree: Path, patch: Path, strip: int) -> bool:
         return True
     argv = [
         "patch", "-d", str(tree), "--dry-run", "--reverse", "--forward",
-        "--batch", "-p%d" % strip, "-i", str(patch),
+        "--batch", "--fuzz=0", "-p%d" % strip, "-i", str(patch),
     ]
     return subprocess.run(argv, capture_output=True).returncode == 0
 
@@ -1243,6 +1797,65 @@ def _check_or_apply_patches(
     return errors, dropped
 
 
+def _prep_simple_cmds(text: str) -> list[str]:
+    """cd tracking plus plain sed/mv/cp/rm/ln lines from %prep, continuations joined."""
+    section = []
+    inside = False
+    for line in text.splitlines():
+        if re.match(r"^%(?:package|description|changelog|install|build|check|clean|files|prep|pre|post)\b", line):
+            inside = line.strip() == "%prep"
+            continue
+        if inside:
+            section.append(line)
+    joined = []
+    buffer = ""
+    for line in section:
+        stripped = line.strip()
+        if not buffer and (not stripped or stripped.startswith("#")):
+            continue
+        buffer = (buffer + " " + stripped) if buffer else stripped
+        if buffer.endswith("\\"):
+            buffer = buffer[:-1].strip()
+            continue
+        joined.append(buffer)
+        buffer = ""
+    if buffer:
+        joined.append(buffer)
+    out = []
+    for line in joined:
+        if not re.match(r"(?:cd\s+|(?:\S*/)?(?:sed|mv|cp|rm|ln)\s)", line):
+            continue
+        if any(bad in line for bad in ("$(", "`", "${", "%{", "|", "&&", ";")):
+            continue
+        out.append(line)
+    return out
+
+
+def _replay_prep_cmds(cmds: list[str], spec_dir: Path, tree: Path) -> tuple[list[str], list[str]]:
+    """Run prep lines against the unpacked tree. Returns (errors, skipped)."""
+    errors, skipped = [], []
+    cwd = tree
+    for line in cmds:
+        found = re.match(r"cd\s+(.+)$", line)
+        if found:
+            target = found[1].strip().strip("'\"")
+            if target.startswith("/"):
+                continue
+            candidate = cwd / target
+            if candidate.is_dir():
+                cwd = candidate
+            continue
+        paths = re.findall(r"(?<![\w.-])/(?:[\w.@+-]+/)*[\w.@+-]+", line)
+        if any(not Path(p).exists() for p in paths if not p.startswith(str(tree))):
+            skipped.append(line)
+            continue
+        result = subprocess.run(["sh", "-c", line], cwd=cwd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            message = (result.stderr.strip().splitlines() or ["failed"])[-1]
+            errors.append(line[:80] + ": " + message[:120])
+    return errors, skipped
+
+
 def _spec_drop_patches(text: str, names: list[str]) -> str:
     want = set(names)
     if not want:
@@ -1257,11 +1870,14 @@ def _spec_drop_patches(text: str, names: list[str]) -> str:
             return ""
         return match.group(0)
 
-    out = _RE_SPEC_PATCH.sub(repl, text)
+    # line-local match: _RE_SPEC_PATCH's trailing \s* also eats following comment lines
+    line_rx = re.compile(r"(?im)^[ \t]*Patch(?P<num>\d*)[ \t]*:[ \t]*(?P<val>\S[^\n]*)\n?")
+    out = line_rx.sub(repl, text)
     for num in nums:
-        n = num or "0"
-        out = re.sub(r"(?im)^%%patch%s\b.*\n" % re.escape(n), "", out)
-        out = re.sub(r"(?im)^%%patch\s+-P\s*%s\b.*\n" % re.escape(n), "", out)
+        n = re.escape(num or "0")
+        # %patchN, %patch N, %patch -PN, %patch -p1 -P N, %patch N -p1 ...
+        out = re.sub(r"(?im)^%%patch%s\b.*\n" % n, "", out)
+        out = re.sub(r"(?im)^%%patch(?:\s+-[^P\s]\S*)*\s+(?:-P\s*)?0*%s\b.*\n" % n, "", out)
     return out
 
 
@@ -1477,6 +2093,82 @@ def _set_source_hash_guard(text: str, digest: str, number: str = "0") -> str:
     return (guard + "\n" + body if body else guard) + changelog
 
 
+def _replace_source_hash_guard(text: str, digest: str, number: str = "0") -> str:
+    """Update an existing ``sourceN_hash`` guard in place, or add one."""
+    macro = "source" + str(number or "0") + "_hash"
+    preamble, changelog = _split_spec_changelog(text)
+    pat = re.compile(
+        r"(?im)^([ \t]*%(?:global|define)\s+" + re.escape(macro) + r")(?:[ \t]+\S+)?[^\n]*$"
+    )
+    hits = list(pat.finditer(preamble))
+    if len(hits) != 1:
+        return _set_source_hash_guard(text, digest, number)
+    m = hits[0]
+    preamble = preamble[: m.start()] + m.group(1) + " " + digest + preamble[m.end() :]
+    return preamble + changelog
+
+
+def _spec_hash_guard_numbers(text: str) -> list[str]:
+    preamble, _ = _split_spec_changelog(text)
+    seen: list[str] = []
+    for m in re.finditer(r"(?im)^[ \t]*%(?:global|define)\s+source(\d+)_hash\b", preamble):
+        if m.group(1) not in seen:
+            seen.append(m.group(1))
+    return seen
+
+
+def _refresh_source_hash_guards(
+    web: "httpx.Client",
+    text: str,
+    macros: dict[str, str],
+    spec_dir: Path,
+    known: dict[str, str] | None = None,
+) -> tuple[str, str | None]:
+    """Recompute every ``sourceN_hash`` guard (plus Source0) after a bump.
+
+    Remote Sources are downloaded, local Sources are hashed from the spec
+    directory. A guarded remote Source that cannot be fetched is an error:
+    leaving a stale digest behind only moves the failure into %prep.
+    """
+    import hashlib as _hashlib
+
+    known = dict(known or {})
+    remote = {num: expanded for num, _raw, expanded in _spec_http_sources(text, macros)}
+    want = _spec_hash_guard_numbers(text)
+    # Signatures are Sources too, even when no hash guard existed previously.
+    for num in remote:
+        if num not in want:
+            want.append(num)
+    preamble, _ = _split_spec_changelog(text)
+    local: dict[str, str] = {}
+    for line in preamble.splitlines():
+        m = _RE_SPEC_SOURCE.match(line)
+        if m:
+            local.setdefault(m.group("num") or "0", m.group("val").strip())
+    failures: list[str] = []
+    for num in want:
+        digest = known.get(num)
+        if not digest and num in remote:
+            digest = _fetch_source_sha256(web, remote[num])
+            if not digest:
+                failures.append("Source%s %s" % (num, remote[num]))
+                continue
+        if not digest and num in local:
+            name = _expand_source_macros(local[num], macros).split("#", 1)[0]
+            path = spec_dir / Path(name).name
+            if path.is_file():
+                h = _hashlib.sha256()
+                with path.open("rb") as fh:
+                    for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                        h.update(chunk)
+                digest = h.hexdigest()
+        if digest:
+            text = _replace_source_hash_guard(text, digest, num)
+    if failures:
+        return text, "cannot fetch for hash refresh: " + "; ".join(failures)
+    return text, None
+
+
 def find_pkg_specs(root: Path, pkg: str) -> list[Path]:
     root = root.expanduser().resolve()
     direct = root / pkg / f"{pkg}.spec"
@@ -1640,7 +2332,36 @@ class _SpecMeta:
         self.needs = needs
 
 
+def _ansible_collection_capabilities(spec_text: str, known_provides: set[str]) -> set[str]:
+    preamble, _ = _split_spec_changelog(spec_text)
+    if (not re.search(r'(?m)^%ansible_collection_install\b', preamble)
+            or not re.search(r'(?m)^%files\b', preamble)
+            or not re.search(r'%\{ansible_collection_(?:filelist|files)\}', preamble)):
+        return set()
+    namespaces = set(re.findall(r'(?m)^%global\s+collection_namespace\s+(\S+)', preamble))
+    collections = set(re.findall(r'(?m)^%global\s+collection_name\s+(\S+)', preamble))
+    direct = set(re.findall(r'%\{ansible_collection_url\s+(\S+)\s+(\S+)\}', preamble))
+    candidates = direct | {(namespace, collection) for namespace in namespaces for collection in collections}
+    provide_names = {provide.split()[0] for provide in known_provides}
+    found = {(namespace, collection) for namespace, collection in candidates
+             if 'ansible-collection-' + namespace + '-' + collection in provide_names}
+    if not found:
+        found = direct if len(direct) == 1 else candidates if len(candidates) == 1 else set()
+    return {'ansible-collection(' + namespace + '.' + collection + ')'
+            for namespace, collection in found}
+
+
 _SPEC_META_CACHE: dict[str, _SpecMeta | None] = {}
+
+
+def _qml_module_from_file_entry(line: str) -> str | None:
+    entry = line.strip()
+    if entry.startswith(('%dir ', '%exclude ')):
+        return None
+    match = re.search(r'(?:%\{_(?:kf6|qt6)_qmldir\}|/[^\s]*/qml)/([A-Za-z0-9_.+-]+(?:/[A-Za-z0-9_.+-]+)+)/?\s*$', entry)
+    if not match or any(char in match[1] for char in '*?[]{}%'):
+        return None
+    return '.'.join(match[1].split('/'))
 
 
 def _spec_meta(path: Path) -> _SpecMeta | None:
@@ -1700,6 +2421,9 @@ def _spec_meta(path: Path) -> _SpecMeta | None:
         if files:
             in_script = False
             in_files = True
+            if active[-1]:
+                for artifact in re.findall(r'(?:^|\s)-f\s+\.mfiles-([A-Za-z0-9_.+-]+)', line):
+                    provides.add('maven-artifact(' + artifact + ')')
             continue
         pkg_m = _RE_SPEC_PACKAGE.match(line)
         if pkg_m:
@@ -1720,6 +2444,38 @@ def _spec_meta(path: Path) -> _SpecMeta | None:
                 else:
                     provides.add(pkg + "-" + extra)
             continue
+        extras_subpkg = re.match(r'^%pyproject_extras_subpkg\b(.*)$', line)
+        if extras_subpkg:
+            try:
+                arguments = shlex.split(extras_subpkg.group(1))
+            except ValueError:
+                continue
+            base_name = None
+            extras = []
+            index = 0
+            value_options = {'-n', '--name', '-i', '--dist-info-path', '-f', '--filelist', '-D', '--dist-name'}
+            flag_options = {'-F', '--no-filelist', '-a', '--noarch', '-A', '--no-noarch'}
+            while index < len(arguments):
+                argument = arguments[index]
+                if argument in value_options:
+                    if index + 1 >= len(arguments):
+                        break
+                    if argument in {'-n', '--name'}:
+                        base_name = arguments[index + 1]
+                    index += 2
+                elif argument in flag_options:
+                    index += 1
+                elif argument.startswith('-'):
+                    index += 1
+                else:
+                    extras.extend(item for item in argument.split(',') if item)
+                    index += 1
+            if base_name:
+                base_name = base_name.replace('%{python3_pkgversion}', '3').replace('%{?python3_pkgversion}', '3')
+                base_name = _expand_source_macros(_spec_expand_name_token(base_name, pkg), macros)
+                if '%' not in base_name:
+                    provides.update(base_name + '+' + extra for extra in extras if '%' not in extra)
+            continue
         hackage = _ghc_lib_subpackage_hackage(line, macros)
         if hackage:
             if not active[-1]:
@@ -1736,6 +2492,12 @@ def _spec_meta(path: Path) -> _SpecMeta | None:
         mvn_m = re.match(r"^%mvn_(?:file|artifact)\s+(\S+)", line)
         if mvn_m:
             coord = mvn_m.group(1)
+            expanded = _expand_source_macros(coord, macros)
+            central = re.match(r"https?://repo[0-9]*\.maven\.org/maven2/(.+)/([^/]+\.pom)", expanded)
+            if central:
+                parts = [part for part in central.group(1).split("/") if part]
+                if len(parts) > 2 and parts[-1] + "-" + parts[-2] + ".pom" == central.group(2):
+                    provides.add("mvn(" + ".".join(parts[:-2]) + ":" + parts[-1] + ")")
             if (
                 ":" in coord
                 and "%" not in coord
@@ -1745,17 +2507,38 @@ def _spec_meta(path: Path) -> _SpecMeta | None:
             ):
                 provides.add("mvn(" + coord + ")")
             continue
+        alias_m = re.match(r'^%mvn_alias\s+(["\']?)([^\s"\']+)\1\s*(.*)$', line)
+        if alias_m and ':' in alias_m[2] and not any(c in alias_m[2] for c in ('$','%','*','{')):
+            provides.add('mvn(' + alias_m[2] + ')')
+            for token in alias_m[3].split():
+                token = token.strip('"\'')
+                if re.fullmatch(r"[A-Za-z0-9_.-]+:[A-Za-z0-9_.+-]+(:[A-Za-z0-9_.+-]+)*:?", token):
+                    provides.add('mvn(' + token + ')')
+            for artifact in re.findall(r':([A-Za-z0-9_.+-]+)', line):
+                provides.add('maven-artifact(' + artifact + ')')
+            continue
         if in_script:
+            if line.startswith('%jp_binding '):
+                binding = re.search(r'(?:^|\s)--provides\s+(\S+)', _expand_source_macros(line, macros))
+                if binding and '%' not in binding[1]:
+                    provides.add(binding[1])
             _spec_note_output_bins(line, provides)
             continue
         if in_files:
+            qml_module = _qml_module_from_file_entry(line)
+            if qml_module:
+                provides.add('qt6qml(' + qml_module + ')')
             expanded = _expand_source_macros(line, macros)
+            soname = re.search(r'/((?:lib[A-Za-z0-9_+.-]+)\.so)\.(?:\*|[0-9][^/\s]*)\s*$', expanded)
+            if soname:
+                provides.add(soname.group(1))
             pc = _RE_PC_FILE.search(expanded)
             if pc:
                 provides.add("pkgconfig(" + pc.group(1) + ")")
-            cmake_dir = _RE_CMAKE_DIR.search(expanded)
-            if cmake_dir:
-                provides.add("cmake(" + cmake_dir.group(1) + ")")
+            for file_pattern in _brace_alternatives(expanded):
+                cmake_dir = _RE_CMAKE_DIR.search(file_pattern)
+                if cmake_dir:
+                    provides.add("cmake(" + cmake_dir.group(1) + ")")
             cmake_file = _RE_CMAKE_FILE.search(expanded)
             if cmake_file:
                 provides.add("cmake(" + cmake_file.group(1) + ")")
@@ -1766,8 +2549,10 @@ def _spec_meta(path: Path) -> _SpecMeta | None:
             if bindir:
                 _note_bin_provide(provides, bindir.group(1))
             _spec_note_output_bins(expanded, provides)
-            if expanded.startswith(("/usr/bin/", "/bin/", "/usr/sbin/")):
-                provides.add(expanded.split()[0])
+            file_path = expanded.split()[0] if expanded else ''
+            if (file_path.startswith('/') and not file_path.endswith('/')
+                    and not any(char in file_path for char in '*?[]{}%')):
+                provides.add(file_path)
             continue
         prov_m = _RE_SPEC_PROVIDES.match(line)
         if prov_m:
@@ -1776,6 +2561,15 @@ def _spec_meta(path: Path) -> _SpecMeta | None:
                 if "%" not in atom:
                     provides.add(atom)
             continue
+        compat = re.match(r'^%mvn_compat_version\s+([A-Za-z0-9_.+-]+):([A-Za-z0-9_.+-]+)(?:\s+(.+))?$', line)
+        if compat:
+            group, artifact = compat.group(1), compat.group(2)
+            provides.add('mvn(' + group + ':' + artifact + ')')
+            provides.add('maven-artifact(' + artifact + ')')
+            for version in (compat.group(3) or '').split():
+                if re.fullmatch(r'[A-Za-z0-9_.+-]+', version):
+                    provides.add('mvn(' + group + ':' + artifact + ':' + version + ')')
+            continue
         br = _RE_SPEC_BR.match(line)
         if br:
             for atom in _spec_dep_atoms(br.group(1)):
@@ -1783,14 +2577,19 @@ def _spec_meta(path: Path) -> _SpecMeta | None:
                 if "%" in atom:
                     continue
                 needs.add(atom)
-    for key in ("pypi_name", "pkgname", "srcname", "modname"):
-        val = macros.get(key)
-        if val and "%" not in val:
-            provides.add("python3dist(" + val.lower().replace("-", "_") + ")")
-            provides.add("python3-" + val.replace("_", "-"))
-    for item in list(provides):
-        if item.startswith("python3-") and "(" not in item:
-            provides.add("python3dist(" + item[len("python3-") :].replace("-", "_") + ")")
+    native_python_binary = any(
+        item.startswith("python3-") and "(" not in item for item in provides
+    )
+    if native_python_binary:
+        for key in ("pypi_name", "pkgname", "srcname", "modname"):
+            val = macros.get(key)
+            if val and "%" not in val:
+                provides.add("python3dist(" + val.lower().replace("-", "_") + ")")
+                provides.add("python3-" + val.replace("_", "-"))
+        for item in list(provides):
+            if item.startswith("python3-") and "(" not in item:
+                provides.add("python3dist(" + item[len("python3-") :].replace("-", "_") + ")")
+    provides.update(_ansible_collection_capabilities(text, provides))
     meta = _SpecMeta(pkg, path, provides, needs)
     _SPEC_META_CACHE[key] = meta
     return meta
@@ -1852,7 +2651,7 @@ def _chain_seed_names(changed: list[Path]) -> list[str]:
 _PROVIDE_INDEX_CACHE: dict[str, dict[str, str]] = {}
 
 
-def _provide_index(spec_root: Path) -> dict[str, str]:
+def _provide_index(spec_root: Path, *, quiet: bool = False) -> dict[str, str]:
     key = str(spec_root)
     hit = _PROVIDE_INDEX_CACHE.get(key)
     if hit is not None:
@@ -1874,7 +2673,8 @@ def _provide_index(spec_root: Path) -> dict[str, str]:
         add(src + "-devel", src)
         add(src + "-prof", src)
     total = len(kids)
-    click.echo("index %d specs" % total, err=True)
+    if not quiet:
+        click.echo("index %d specs" % total, err=True)
 
     def _meta_one(child: Path) -> tuple[str, _SpecMeta | None]:
         return child.name, _spec_meta(child / (child.name + ".spec"))
@@ -1883,7 +2683,7 @@ def _provide_index(spec_root: Path) -> dict[str, str]:
     workers = min(8, _host_workers("cpu"))
     for src, meta in _iter_bounded(workers, _meta_one, kids, inflight=workers):
         done += 1
-        if done % 500 == 0 or done == total:
+        if not quiet and (done % 500 == 0 or done == total):
             _status_line("index %d/%d" % (done, total))
         if meta is None:
             continue
@@ -1893,7 +2693,8 @@ def _provide_index(spec_root: Path) -> dict[str, str]:
             add(atom, src)
             if atom.endswith("-devel"):
                 add(atom[: -len("-devel")], src)
-    _status_nl()
+    if not quiet:
+        _status_nl()
     _PROVIDE_INDEX_CACHE[key] = out
     return out
 
@@ -1997,6 +2798,18 @@ def _lookup_keys(atom: str) -> list[str]:
             keys.append(item)
 
     push(atom)
+    isa_capability = re.fullmatch(r'([A-Za-z0-9_+.-]+)\(([A-Za-z0-9_]+-[A-Za-z0-9_-]+)\)', atom)
+    if isa_capability:
+        push(isa_capability[1])
+    maven = re.fullmatch(r'mvn\([^():]+:([^():]+)(?::[^()]*)?\)', atom)
+    if maven:
+        push('maven-artifact(' + maven[1] + ')')
+        base = re.sub(r'-jdk\d+(?:on)?$', '', maven[1])
+        if base != maven[1]:
+            push('maven-artifact(' + base + ')')
+    soname = re.fullmatch(r'(lib[A-Za-z0-9_+.-]+\.so)\.[0-9]+(?:\([^)]+\))?(?:\(64bit\))?', atom)
+    if soname:
+        push(soname.group(1))
     for alias in _chain_provider_aliases(atom):
         push(alias)
     wrapped = re.fullmatch(
@@ -2612,6 +3425,38 @@ def _spec_evr(path: Path) -> tuple[int, str, str]:
 
 
 _PROVIDE_INDEX_MULTI_CACHE: dict[str, dict[str, set[str]]] = {}
+_SONAME_FILE_INDEX_CACHE: dict[str, dict[str, set[tuple[str, str]]]] = {}
+
+
+def _soname_file_provider_index(spec_root: Path) -> dict[str, set[tuple[str, str]]]:
+    key = str(spec_root)
+    cached = _SONAME_FILE_INDEX_CACHE.get(key)
+    if cached is not None:
+        return cached
+    index: dict[str, set[tuple[str, str]]] = {}
+    try:
+        specs = (child / (child.name + '.spec') for child in spec_root.iterdir())
+        for spec in specs:
+            if not spec.is_file():
+                continue
+            try:
+                text = spec.read_text(encoding='utf-8', errors='replace')
+            except OSError:
+                continue
+            for line in text.splitlines():
+                if re.match(r'^\s*(?:%files|%package|%description)', line):
+                    continue
+                match = re.search(r'/((?:lib)[A-Za-z0-9_*?+.-]+\.so\.[A-Za-z0-9_*?+.-]+)\s*$', line.strip())
+                if not match:
+                    continue
+                pattern = match[1]
+                prefix = re.split(r'[*?\[]', pattern, maxsplit=1)[0]
+                if len(prefix) >= 6:
+                    index.setdefault(prefix, set()).add((pattern, spec.parent.name))
+    except OSError:
+        pass
+    _SONAME_FILE_INDEX_CACHE[key] = index
+    return index
 
 
 def _provide_index_multi(spec_root: Path) -> dict[str, set[str]]:
@@ -2702,6 +3547,30 @@ def _provider_candidates(spec_root: Path, atom: str, idx: dict[str, str]) -> set
             cands.add(hit)
         if (spec_root / guess / (guess + ".spec")).is_file():
             cands.add(guess)
+    maven_version = re.fullmatch(r'mvn\(([^():]+):([^():]+):([^():]+)\)', atom)
+    if maven_version:
+        version = maven_version[3]
+        try:
+            specs = (child / (child.name + '.spec') for child in spec_root.iterdir())
+            for spec in specs:
+                if not spec.is_file():
+                    continue
+                try:
+                    text = spec.read_text(encoding='utf-8', errors='replace')
+                except OSError:
+                    continue
+                if any(re.match(r'^%mvn_compat_version\s+\S+\s+.*(?:^|\s)' + re.escape(version) + r'(?:\s|$)', line)
+                       for line in text.splitlines()):
+                    cands.add(spec.parent.name)
+        except OSError:
+            pass
+    soname = atom.split('(', 1)[0]
+    if re.fullmatch(r'lib[A-Za-z0-9_.+-]+\.so\.[0-9]+(?:\.[0-9]+)*', soname):
+        file_providers = _soname_file_provider_index(spec_root)
+        for length in range(6, len(soname) + 1):
+            for pattern, source in file_providers.get(soname[:length], ()):
+                if fnmatch.fnmatchcase(soname, pattern):
+                    cands.add(source)
     return cands
 
 
@@ -2803,6 +3672,13 @@ def _alias_provider_ok(src: str, atom: str, key: str) -> bool:
     s = src.lower()
     a = atom.lower()
     k = key.lower()
+    isa_capability = re.fullmatch(r'([a-z0-9_+.-]+)\([a-z0-9_]+-[a-z0-9_-]+\)', a)
+    if isa_capability and isa_capability[1] == k:
+        return True
+    if a.startswith('mvn(') and k.startswith('maven-artifact('):
+        return True
+    if k.endswith('.so') and a.startswith(k + '.'):
+        return True
     if s == k or s == a or s == k + "-devel" or a == s + "-devel" or s == k + "-prof":
         return True
     py = re.fullmatch(r"python3(?:\.\d+)?dist\(([^)]+)\)", a)
@@ -2891,12 +3767,18 @@ def _distro_macro_loads(spec_root: Path, tmp: Path) -> list[str]:
             dest = tmp / "macros.oreon-release"
             dest.write_text(match.group(1).replace("%%", "%") + "\n", encoding="utf-8")
             loads.append(str(dest.resolve()))
+    stub = tmp / "macros.oreon-bootstrap"
+    stub.write_text("%oreon_bootstrap %{nil}\n", encoding="utf-8")
+    loads.append(str(stub.resolve()))
     for relpath in (
+        "perl-srpm-macros/macros.perl-srpm",
+        "perl/macros.perl",
         "python-rpm-macros/macros.python-srpm",
         "python-rpm-macros/macros.python3",
         "ghc-srpm-macros/macros.ghc-srpm",
         "ghc-rpm-macros/macros.ghc-extra",
         "ghc-rpm-macros/macros.ghc",
+        "kf6/macros.kf6",
     ):
         path = (spec_root / relpath).resolve()
         if path.is_file():
@@ -2924,6 +3806,8 @@ def _rpmspec_distro_args() -> list[str]:
         "__python2 /usr/bin/python3",
         "--define",
         "__python3 /usr/bin/python3",
+        "--define",
+        "orbs_chain_plan 1",
     ]
 
 
@@ -3269,6 +4153,7 @@ def _br_in_yum(
 
 
 _GENBR_MEM: dict[str, list[str]] = {}
+_GENBR_VALID: dict[str, bool] = {}
 _GENBR_CLIENT: httpx.Client | None = None
 
 
@@ -3344,10 +4229,11 @@ def _pyproject_toml_brs(blob: str, extras: list[str]) -> list[str]:
 
 def _cargo_toml_dep_tables(data: dict[str, Any]) -> list[tuple[str, Any]]:
     rows: list[tuple[str, Any]] = []
-    deps = data.get("dependencies")
-    if isinstance(deps, dict):
-        for name, spec in deps.items():
-            rows.append((str(name), spec))
+    for key in ("dependencies", "build-dependencies"):
+        deps = data.get(key)
+        if isinstance(deps, dict):
+            for name, spec in deps.items():
+                rows.append((str(name), spec))
     tgt = data.get("target")
     if isinstance(tgt, dict):
         for cfg, body in tgt.items():
@@ -3356,11 +4242,45 @@ def _cargo_toml_dep_tables(data: dict[str, Any]) -> list[tuple[str, Any]]:
                 continue
             if not isinstance(body, dict):
                 continue
-            inner = body.get("dependencies")
-            if isinstance(inner, dict):
-                for name, spec in inner.items():
-                    rows.append((str(name), spec))
+            for key in ("dependencies", "build-dependencies"):
+                inner = body.get(key)
+                if isinstance(inner, dict):
+                    for name, spec in inner.items():
+                        rows.append((str(name), spec))
     return rows
+
+
+def _cargo_generated_brs(blob: str, spec_text: str = "") -> list[str] | None:
+    """Use RPM's Cargo generator for feature and SemVer constraints, offline."""
+    tool = shutil.which("cargo2rpm")
+    if not tool:
+        return None
+    args: list[str] = []
+    line = re.search(r"(?m)^%cargo_generate_buildrequires([^\n]*)", spec_text)
+    flags = line.group(1).split() if line else []
+    if "-a" in flags:
+        args.append("--all-features")
+    if "-n" in flags:
+        args.append("--no-default-features")
+    feature = re.search(r"(?:^|\s)-f\s+([A-Za-z0-9_,./-]+)", line.group(1) if line else "")
+    if feature:
+        args.extend(["--features", feature.group(1)])
+    if "-t" in flags or re.search(r"(?m)^%bcond_without\s+check\s*$|^%bcond\s+check\s+1\s*$", spec_text):
+        args.append("--with-check")
+    with tempfile.TemporaryDirectory(prefix="orbscli-cargo-metadata-") as folder:
+        manifest = Path(folder) / "Cargo.toml"
+        manifest.write_text(blob)
+        # Cargo metadata requires a target. No source is executed or compiled.
+        (Path(folder) / "src").mkdir()
+        (Path(folder) / "src/lib.rs").write_text("")
+        try:
+            proc = subprocess.run([tool, "--path", str(manifest), "buildrequires", *args],
+                                  cwd=folder, capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if proc.returncode or "FATAL ERROR" in proc.stdout:
+            return None
+        return list(dict.fromkeys(line.strip() for line in proc.stdout.splitlines() if line.strip()))
 
 
 def _cargo_toml_brs(blob: str) -> list[str]:
@@ -3377,17 +4297,24 @@ def _cargo_toml_brs(blob: str) -> list[str]:
     for name, spec in _cargo_toml_dep_tables(data):
         crate = name
         default = True
+        version = spec if isinstance(spec, str) else ""
         if isinstance(spec, dict):
             default = spec.get("default-features", True) is not False
+            crate = str(spec.get("package") or name)
+            version = str(spec.get("version") or "")
         atom = "crate(%s/default)" % crate if default else "crate(%s)" % crate
+        # Cargo's version is essential here. A repo may contain the crate but
+        # only at an older version, which cannot satisfy the generated BR.
+        vm = re.match(r"^\s*(=|\^|~|>=)?\s*(\d+(?:\.\d+){0,2})", version)
+        constraint = (" " + ("=" if vm.group(1) == "=" else ">=") + " " + vm.group(2)) if vm else ""
         if atom not in seen:
             seen.add(atom)
-            out.append(atom)
+            out.append(atom + constraint)
             if default:
                 bare = "crate(%s)" % crate
                 if bare not in seen:
                     seen.add(bare)
-                    out.append(bare)
+                    out.append(bare + constraint)
     return out
 
 
@@ -3479,7 +4406,12 @@ def _generated_buildrequires(spec: Path, load: list[str] | None = None) -> list[
             for url in urls:
                 if "%" in url or not url.lower().startswith("http"):
                     continue
-                fname = Path(url.split("?", 1)[0].split("#", 1)[0]).name or "src.bin"
+                # crates.io uses the same /download path for every crate.
+                # Cache by the full URL so one crate cannot supply another's
+                # Cargo.toml (and corrupt the dependency graph).
+                import hashlib as _hashlib
+                suffix = Path(url.split("#", 1)[1]).suffix if "#" in url else Path(url.split("?", 1)[0]).suffix
+                fname = _hashlib.sha256(url.encode("utf-8")).hexdigest() + suffix
                 dest = cache / fname
                 if not dest.is_file():
                     got = _fetch_source_archive(_genbr_http(), url, dest)
@@ -3489,10 +4421,22 @@ def _generated_buildrequires(spec: Path, load: list[str] | None = None) -> list[
                 if blob:
                     break
     out: list[str] = []
+    valid = False
     if rust and blob:
-        out = _cargo_toml_brs(blob)
+        generated = _cargo_generated_brs(blob, text)
+        valid = generated is not None
+        out = generated if generated is not None else _cargo_toml_brs(blob)
     elif py and blob:
         out = _pyproject_toml_brs(blob, _pyproject_extras_from_spec(text))
+        # Empty / dynamic project metadata is not proof that there are no BRs.
+        try:
+            import tomllib
+            metadata = tomllib.loads(blob)
+            project = metadata.get("project") or {}
+            valid = bool(project) and not (set(project.get("dynamic", [])) & {"dependencies", "optional-dependencies"})
+        except (ValueError, ImportError):
+            valid = False
+    _GENBR_VALID[key] = valid
     _GENBR_MEM[key] = out
     return out
 
@@ -4025,54 +4969,6 @@ def _order_dependency_layers(
     return chain, cyclic
 
 
-def _generate_chain_from_specs(
-    spec_root: Path,
-    seeds: list[str],
-    satisfied: set[str] | dict[str, set[str]] | None,
-    repo_urls: list[str] | None = None,
-    repo_arch: str | None = None,
-) -> tuple[str, list[str], str]:
-    if not seeds:
-        return "", [], ""
-    for name in seeds:
-        if not (spec_root / name / (name + ".spec")).is_file():
-            raise click.ClickException("no spec for %s" % name)
-    arch = repo_arch
-    if arch is None and isinstance(satisfied, dict) and satisfied:
-        arch = next(iter(satisfied))
-    macdir = Path(tempfile.mkdtemp(prefix="orbscli-rbo-mac-"))
-    try:
-        load = _distro_macro_loads(spec_root, macdir)
-    except Exception:
-        shutil.rmtree(macdir, ignore_errors=True)
-        raise
-    click.echo("building chain from %d seeds" % len(seeds), err=True)
-    neighbors = _rpmbuild_order_neighbor_names(
-        spec_root, seeds, satisfied, load, arch, quick=False
-    )
-    click.echo("neighbors %d" % len(neighbors), err=True)
-    _unused, cyclic = _order_dependency_layers(
-        spec_root, neighbors, load, arch, quick=False, satisfied=satisfied
-    )
-    exclude = list(dict.fromkeys(cyclic))
-    if exclude:
-        click.echo("fedora-44 mock %s" % " ".join(exclude), err=True)
-    chain_raw, _rest = _order_dependency_layers(
-        spec_root,
-        neighbors,
-        load,
-        arch,
-        ignore_cycles=exclude,
-        quick=False,
-        satisfied=satisfied,
-    )
-    f44_raw = " ".join(exclude)
-    shutil.rmtree(macdir, ignore_errors=True)
-    chain = " ".join(chain_raw.split())
-    selected = [p for p in chain.replace(":", " ").split() if p]
-    return chain, selected, f44_raw
-
-
 def _provide_atom(raw: str) -> str:
     s = raw.strip()
     if not s:
@@ -4211,7 +5107,8 @@ def _dnf_parse_repoquery(
 
 def _side_tag_info(api_base: str, tag_ref: str) -> tuple[str, int | None]:
     token = get_token()
-    r = http_request_raw("GET", api_base, "/api/side-tags", token=token, timeout=30.0)
+    r = http_request_raw("GET", api_base, "/api/side-tags", token=token,
+                         params={"limit": 500, "offset": 0}, timeout=30.0)
     if not r.is_success:
         if str(tag_ref).isdigit():
             raise click.ClickException("side tag lookup failed HTTP %s" % r.status_code)
@@ -4222,6 +5119,16 @@ def _side_tag_info(api_base: str, tag_ref: str) -> tuple[str, int | None]:
         items = data
     elif isinstance(data, dict):
         items = list(data.get("items") or data.get("side_tags") or [])
+        total = int(data.get('total') or len(items))
+        while len(items) < total:
+            page = http_request_raw("GET", api_base, "/api/side-tags", token=token,
+                                    params={"limit": 500, "offset": len(items)}, timeout=30.0)
+            if not page.is_success:
+                raise click.ClickException("side tag lookup failed HTTP %s" % page.status_code)
+            more = page.json().get('items')
+            if not isinstance(more, list) or not more:
+                raise click.ClickException('side tag lookup returned an incomplete list')
+            items.extend(more)
     else:
         items = []
     want = str(tag_ref)
@@ -4234,23 +5141,25 @@ def _side_tag_info(api_base: str, tag_ref: str) -> tuple[str, int | None]:
             tid = int(sid) if sid is not None else None
             if name:
                 return name, tid
+    if not want.isdigit() and '/' not in want:
+        matches = [it for it in items if isinstance(it, dict)
+                   and str(it.get('name') or '').rsplit('/', 1)[-1] == want]
+        if len(matches) == 1:
+            item = matches[0]
+            return str(item['name']), int(item['id']) if item.get('id') is not None else None
+        if len(matches) > 1:
+            raise click.ClickException('ambiguous side tag ' + want)
     if want.isdigit():
         raise click.ClickException("unknown side tag %s" % want)
     return tag_ref, None
 
 
 def _side_tag_repo_dirs(side_tag_ref: str) -> list[str]:
-    dirs: list[str] = []
     tag_name, _tag_id = _side_tag_info(get_api_url(), side_tag_ref)
-    for item in (tag_name, side_tag_ref):
-        name = str(item or "").strip()
-        if not name or name.isdigit():
-            continue
-        if name not in dirs:
-            dirs.append(name)
-    if not dirs:
+    name = str(tag_name or "").strip()
+    if not name or name.isdigit():
         raise click.ClickException("side tag %s has no repo name" % side_tag_ref)
-    return dirs
+    return [name]
 
 
 def _repo_url(repo_base: str, release_ref: str, tag: str, arch: str) -> str:
@@ -4282,7 +5191,7 @@ def _parse_repo_arches(raw: str) -> list[str]:
 
 
 class _DnfSolver:
-    def __init__(self, urls: list[str], arch: str | None, rel: str, tmp: str) -> None:
+    def __init__(self, urls: list[str], arch: str | None, rel: str, tmp: str, *, cache_dir: Path | None = None, filelists: bool = False) -> None:
         import dnf
 
         self._dnf = dnf
@@ -4299,13 +5208,17 @@ class _DnfSolver:
         conf = self.base.conf
         conf.installroot = str(root)
         conf.persistdir = str(persist)
+        conf.logdir = str(persist)
         conf.plugins = False
+        if filelists:
+            conf.optional_metadata_types = ['filelists']
         conf.substitutions["releasever"] = rel
-        conf.cachedir = str(Path(tmp) / "cache")
+        conf.cachedir = str(cache_dir if cache_dir is not None else Path(tmp) / "cache")
         conf.reposdir = str(Path(tmp) / "repos")
         conf.gpgcheck = False
         conf.sslverify = True
         if arch:
+            conf.arch = arch
             conf.substitutions["arch"] = arch
             conf.substitutions["basearch"] = arch
         self.base.repos.clear()
@@ -4315,6 +5228,7 @@ class _DnfSolver:
                 conf,
                 baseurl=[url.rstrip("/")],
                 skip_if_unavailable=False,
+                **({"metadata_expire": 0} if cache_dir is not None else {}),
             )
         self.base.fill_sack(load_system_repo=False, load_available_repos=True)
 
@@ -4872,6 +5786,36 @@ def _github_repo_from_url(url: str) -> str | None:
     return "%s/%s" % (owner, repo)
 
 
+def _github_latest_release_version(source_url: str) -> str | None:
+    if not re.match(r"(?i)^https?://github\.com/", source_url or ""):
+        return None
+    repo = _github_repo_from_url(source_url)
+    if not repo:
+        return None
+    try:
+        with httpx.Client(timeout=20.0, follow_redirects=True) as client:
+            response = client.get("https://github.com/%s/releases/latest" % repo)
+        response.raise_for_status()
+    except httpx.HTTPError:
+        return None
+    match = re.search(r"/releases/tag/([^/?#]+)$", response.url.path)
+    if not match:
+        return None
+    version = _nv_normalize_version(unquote(match.group(1)))
+    return version if _nv_is_sane_version(version) else None
+
+
+def _github_stable_release_for_spec(pkg: str, text: str, candidate: str) -> str | None:
+    if "-" not in candidate:
+        return None
+    found = _spec_literal_version(_split_spec_changelog(text)[0])
+    macros = _spec_source_macros(text, found[0] if found else "", pkg)
+    for number, _raw, expanded in _spec_http_sources(text, macros):
+        if number == "0":
+            return _github_latest_release_version(expanded)
+    return None
+
+
 def _gitlab_repo_from_url(url: str) -> tuple[str, str] | None:
     m = re.search(
         r"(?i)(?:https?://)?([^/\s]+)/([^/\s]+)/([^/\s?#]+)",
@@ -4973,13 +5917,26 @@ def _nvchecker_guess_entry(pkg: str, text: str) -> dict[str, Any] | None:
                 "url": "https://download.kde.org/stable/release-service/",
                 "regex": r"release-service/(\d+\.\d+\.\d+)/",
             }
-        m = re.search(r"(?i)https?://download\.gnome\.org/sources/([^/]+)/", url)
+        m = re.search(r"(?i)https?://download\.gnome\.org/sources/([^/]+)/([^/]+)/", url)
         if m:
             name = m.group(1)
+            series = m.group(2)
+            found = _spec_literal_version(_split_spec_changelog(text)[0])
+            suffix = re.search(r"(\d+)$", pkg)
+            if (
+                found
+                and suffix
+                and found[0].split(".", 1)[0] == suffix.group(1)
+                and re.fullmatch(r"\d+(?:\.\d+)*", series)
+                and series.split(".", 1)[0] == suffix.group(1)
+            ):
+                version_pattern = re.escape(series) + r"(?:\.\d+)*"
+            else:
+                version_pattern = r"\d+\.\d+(?:\.\d+)*"
             return {
                 "source": "regex",
                 "url": "https://download.gnome.org/sources/%s/cache.json" % name,
-                "regex": r'"(\d+\.\d+(?:\.\d+)*)"',
+                "regex": r'"(%s)"' % version_pattern,
             }
         m = re.search(r"(?i)gitlab\.gnome\.org/[^/\s]+/([^/\s?#]+)", url)
         if m:
@@ -5096,7 +6053,8 @@ def _write_nvchecker_toml(
 
 def _ver_rank(ver: str) -> tuple[tuple[int, ...], str]:
     nums = tuple(int(x) for x in re.findall(r"\d+", ver)[:8])
-    return nums, ver
+    suffix = "" if re.fullmatch(r"\d+(?:\.\d+)*", ver) else ver
+    return nums, suffix
 
 
 def _best_regex_version(text: str, pattern: str) -> str:
@@ -5238,6 +6196,16 @@ def _anitya_cache_path() -> Path:
     return root / "orbscli" / "anitya-fedora.json"
 
 
+_ANITYA_MEMO: dict[str, str] | None = None
+
+
+def _anitya_index_cached() -> dict[str, str]:
+    global _ANITYA_MEMO
+    if _ANITYA_MEMO is None:
+        _ANITYA_MEMO = _anitya_fedora_versions()
+    return _ANITYA_MEMO
+
+
 def _anitya_fedora_versions() -> dict[str, str]:
     path = _anitya_cache_path()
     if path.is_file() and time.time() - path.stat().st_mtime < 6 * 3600:
@@ -5251,7 +6219,7 @@ def _anitya_fedora_versions() -> dict[str, str]:
     url = "https://release-monitoring.org/api/v2/packages/"
     headers = {"User-Agent": "orbscli-spec-bump", "Accept": "application/json"}
 
-    async def _go() -> dict[str, str]:
+    async def _go() -> tuple[dict[str, str], bool]:
         timeout = httpx.Timeout(20.0, connect=5.0)
         limits = httpx.Limits(max_connections=8, max_keepalive_connections=8)
         async with httpx.AsyncClient(
@@ -5260,49 +6228,83 @@ def _anitya_fedora_versions() -> dict[str, str]:
             headers=headers,
             follow_redirects=True,
         ) as client:
-            first = await client.get(
-                url,
-                params={"distribution": "Fedora", "items_per_page": 250, "page": 1},
-            )
-            first.raise_for_status()
-            payload = first.json()
+            failed: list[int] = []
+
+            async def fetch(n: int) -> dict[str, Any]:
+                # release-monitoring.org regularly drops connections under
+                # load; retry transport errors, 429 and 5xx with backoff.
+                last: Exception | None = None
+                for attempt in range(5):
+                    try:
+                        resp = await client.get(
+                            url,
+                            params={
+                                "distribution": "Fedora",
+                                "items_per_page": 250,
+                                "page": n,
+                            },
+                        )
+                        if resp.status_code == 429 or resp.status_code >= 500:
+                            raise httpx.HTTPStatusError(
+                                "HTTP %d" % resp.status_code,
+                                request=resp.request,
+                                response=resp,
+                            )
+                        resp.raise_for_status()
+                        data = resp.json()
+                        return data if isinstance(data, dict) else {}
+                    except (httpx.TransportError, httpx.HTTPStatusError, ValueError) as exc:
+                        last = exc
+                        await asyncio.sleep(min(8.0, 0.5 * (2**attempt)))
+                raise last if last else RuntimeError("page %d failed" % n)
+
+            payload = await fetch(1)
             total = int(payload.get("total_items") or 0)
             pages = max(1, (total + 249) // 250)
             items = list(payload.get("items") or [])
             _status_line("index 1/%d" % pages)
-            sem = asyncio.Semaphore(8)
+            sem = asyncio.Semaphore(4)
 
             async def page(n: int) -> list[Any]:
                 async with sem:
-                    resp = await client.get(
-                        url,
-                        params={
-                            "distribution": "Fedora",
-                            "items_per_page": 250,
-                            "page": n,
-                        },
-                    )
-                    resp.raise_for_status()
-                    return list(resp.json().get("items") or [])
+                    try:
+                        data = await fetch(n)
+                    except Exception:
+                        failed.append(n)
+                        return []
+                    return list(data.get("items") or [])
 
             if pages > 1:
                 done = 1
-                for chunk in asyncio.as_completed(
-                    [page(n) for n in range(2, pages + 1)]
-                ):
-                    items.extend(await chunk)
-                    done += 1
-                    _status_line("index %d/%d" % (done, pages))
-            return _anitya_items_to_map(items)
+                tasks = [asyncio.ensure_future(page(n)) for n in range(2, pages + 1)]
+                try:
+                    for chunk in asyncio.as_completed(tasks):
+                        items.extend(await chunk)
+                        done += 1
+                        _status_line("index %d/%d" % (done, pages))
+                finally:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+            if failed:
+                _status_nl()
+                click.echo(
+                    "upstream index partial (%d/%d pages failed)"
+                    % (len(failed), pages),
+                    err=True,
+                )
+            return _anitya_items_to_map(items), not failed
 
     try:
-        out = asyncio.run(_go())
+        out, complete = asyncio.run(_go())
     except Exception as exc:
         _status_nl()
-        click.echo("upstream index failed (%s)" % exc, err=True)
+        click.echo("upstream index failed (%s)" % (exc or type(exc).__name__), err=True)
         return {}
     _status_nl()
-    if out:
+    # Only cache a complete index so a flaky run doesn't hide packages for 6h.
+    if out and complete:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(out), encoding="utf-8")
     return out
@@ -5374,18 +6376,24 @@ def _nvchecker_run_batched(
     if not entries:
         return {}
     click.echo("check %d versions" % len(entries), err=True)
-    bulk = _anitya_fedora_versions()
+    bulk = _anitya_index_cached()
     out: dict[str, str] = {}
     rest: dict[str, dict[str, Any]] = {}
     for name, conf in entries.items():
-        ver = bulk.get(name)
-        if ver and _nv_is_sane_version(ver):
-            out[name] = ver
+        if conf.get("source") == "anitya-index":
+            ver = bulk.get(name)
+            if ver and _nv_is_sane_version(ver):
+                out[name] = ver
         else:
             rest[name] = conf
-    click.echo("index hit %d  miss %d" % (len(out), len(rest)), err=True)
+    click.echo("index hit %d  direct sources %d" % (len(out), len(rest)), err=True)
     if rest:
-        out.update(_nvchecker_run(rest))
+        direct = _nvchecker_run(rest)
+        out.update(direct)
+        for name in rest.keys() - direct.keys():
+            ver = bulk.get(name)
+            if ver and _nv_is_sane_version(ver):
+                out[name] = ver
     empty = len(entries) - len(out)
     if empty:
         click.echo("no version for %d packages" % empty, err=True)
@@ -5593,12 +6601,17 @@ def cmd_whoami() -> None:
 @click.option(
     "--refresh-hashes/--no-refresh-hashes",
     default=None,
-    help="Download Source0 and refresh the source0_hash guard. Off with --all unless passed.",
+    help="Always on: every sourceN_hash guard is recomputed after a bump.",
 )
 @click.option(
     "--verify-patches/--no-verify-patches",
     default=True,
     help="Unpack Source0 and check every Patch applies. On by default, including --all.",
+)
+@click.option(
+    "--replay-seds/--no-replay-seds",
+    default=None,
+    help="Replay simple %%prep sed/mv/cp/rm/ln lines against the unpacked new tree. On by default, off with --all unless passed.",
 )
 @click.option(
     "--refresh-configs/--no-refresh-configs",
@@ -5608,8 +6621,12 @@ def cmd_whoami() -> None:
 @click.option(
     "--refresh-files/--no-refresh-files",
     default=True,
-    help="Add missing %%files entries from the new Source0 tree. On by default, including --all.",
+    help="Add verified unpackaged %%files entries from a local install when available.",
 )
+@click.option("--stack", default=None, help="Bump a whole upstream train at once, for example plasma.")
+@click.option("--to", "stack_to", default=None, help="Version for --stack, default is the newest upstream.")
+@click.option("--dry-run", is_flag=True, default=False, help="With --stack, only show what would change.")
+@click.option("--no-verify-sig", is_flag=True, default=False, help="With --stack, skip tarball signature checks.")
 @click.option(
     "--non-interactive",
     is_flag=True,
@@ -5623,11 +6640,27 @@ def cmd_spec_bump(
     verify_sources: bool,
     refresh_hashes: bool,
     verify_patches: bool,
+    replay_seds: bool | None,
     refresh_configs: bool,
     refresh_files: bool,
     non_interactive: bool,
+    stack: str | None = None,
+    stack_to: str | None = None,
+    dry_run: bool = False,
+    no_verify_sig: bool = False,
+    prepare_host_tools: bool = True,
 ) -> None:
     """Bump spec versions from upstream."""
+    if replay_seds is None:
+        replay_seds = not bump_all
+    if stack:
+        try:
+            from . import stackbump
+        except ImportError:
+            import stackbump
+        root = (spec_root or Path(__file__).resolve().parent.parent / "fedora-rpms" / "oreon-11-rp1").expanduser()
+        stackbump.stack_bump(root, stack, stack_to, dry_run, not no_verify_sig)
+        return
     try:
         sys.stderr.reconfigure(line_buffering=True)
     except Exception:
@@ -5636,15 +6669,17 @@ def cmd_spec_bump(
         non_interactive = True
     if verify_sources is None:
         verify_sources = not bump_all
-    if refresh_hashes is None:
-        refresh_hashes = not bump_all
+    if refresh_hashes is False:
+        click.echo("--no-refresh-hashes is ignored; source hashes are always refreshed", err=True)
+    refresh_hashes = True
     if refresh_configs is None:
         refresh_configs = not bump_all
-    try:
-        _lang2rpm_ensure_host_tools()
-    except click.ClickException as exc:
-        click.echo(str(exc), err=True)
-        sys.exit(1)
+    if prepare_host_tools:
+        try:
+            _lang2rpm_ensure_host_tools()
+        except click.ClickException as exc:
+            click.echo(str(exc), err=True)
+            sys.exit(1)
     if spec_root is None:
         spec_root = Path(__file__).resolve().parent.parent / "fedora-rpms" / "oreon-11-rp1"
     root = spec_root.expanduser()
@@ -5705,7 +6740,11 @@ def cmd_spec_bump(
             text = spec_path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
             return pkg, spec_path, None, "cannot read %s (%s)" % (spec_path, exc)
-        return pkg, spec_path, _nvchecker_resolve_entry(pkg, spec_path, text), None
+        entry = _nvchecker_resolve_entry(pkg, spec_path, text)
+        if entry is None and pkg in _anitya_index_cached():
+            # release-monitoring already maps this package; no probe URL needed.
+            entry = {"source": "anitya-index"}
+        return pkg, spec_path, entry, None
 
     done = 0
     for pkg, spec_path, entry, err in _iter_bounded(8, _load, jobs, inflight=8):
@@ -5738,6 +6777,8 @@ def cmd_spec_bump(
     unpack_n = _host_workers("unpack")
     global _unpack_sem
     _unpack_sem = threading.Semaphore(unpack_n)
+    github_fallbacks: set[str] = set()
+    github_fallback_lock = threading.Lock()
     click.echo(
         "bump workers %d  unpack %d  mem %dM" % (workers, unpack_n, _mem_available_mb()),
         err=True,
@@ -5750,11 +6791,22 @@ def cmd_spec_bump(
         except OSError as exc:
             return pkg, "fail", "cannot read %s (%s)" % (spec_path, exc)
         latest = latest_map.get(pkg) or ""
+        if latest and "-" in latest:
+            release_version = _github_stable_release_for_spec(pkg, text, latest)
+            if release_version and release_version != latest:
+                latest = release_version
+                latest_map[pkg] = release_version
         status, payload, old, new = _spec_bump_compute(pkg, spec_path, text, latest)
         if status != "ok":
             return pkg, status, payload
         new_text = payload
         macros = _spec_source_macros(new_text, new, pkg)
+        if any(
+            "%" in _expand_source_macros(m.group("val"), macros)
+            for m in _RE_SPEC_SOURCE.finditer(_split_spec_changelog(new_text)[0])
+        ):
+            for number, url in _rpmspec_expand_sources(new_text, spec_path.parent).items():
+                macros["__rpmspec_src_" + number] = url
         patch_files = _spec_patch_files(new_text, macros, spec_path.parent)
         want_kernel_cfg = refresh_configs and (
             pkg == "kernel" or (spec_path.parent / "process_configs.sh").is_file()
@@ -5766,6 +6818,7 @@ def cmd_spec_bump(
         ]
         want_tree = bool(
             (verify_patches and real_patches) or want_kernel_cfg
+            or (replay_seds and _prep_simple_cmds(new_text))
         )
         want_files = refresh_files and want_tree and bool(re.search(r"(?im)^%files\b", new_text))
         need_fetch = bool(verify_sources or refresh_hashes or want_tree)
@@ -5805,10 +6858,28 @@ def cmd_spec_bump(
                     if (refresh_hashes or want_tree) and primaries:
                         got = _fetch_source_archive(web, primaries[0][1], None)
                         if not got:
+                            moved = _cpan_moved_source0(web, new_text, primaries[0][1], new, macros)
+                            if moved:
+                                new_text = moved
+                                primaries = [
+                                    (number, expanded)
+                                    for number, _, expanded in _spec_http_sources(new_text, macros)
+                                    if number == "0"
+                                ]
+                                got = _fetch_source_archive(web, primaries[0][1], None) if primaries else None
+                        if not got:
                             return "Source0 download failed"
                         archive_path, archive_digest = got
-                        if refresh_hashes:
-                            new_text = _set_source_hash_guard(new_text, archive_digest)
+                    if refresh_hashes:
+                        new_text, hash_err = _refresh_source_hash_guards(
+                            web,
+                            new_text,
+                            macros,
+                            spec_path.parent,
+                            {"0": archive_digest} if archive_digest else None,
+                        )
+                        if hash_err:
+                            return hash_err
                 if not want_tree:
                     return None
                 if archive_path is None:
@@ -5827,18 +6898,23 @@ def cmd_spec_bump(
                         if tree is None:
                             return "cannot unpack Source0 for patch check"
                         errors, dropped = _check_or_apply_patches(
-                            tree, real_patches, apply=want_kernel_cfg
+                            tree, real_patches, apply=want_tree
                         )
                         if dropped:
                             new_text = _spec_drop_patches(new_text, dropped)
                         if errors:
                             return "patch " + "; ".join(errors)
+                        if replay_seds:
+                            sed_errors, _skipped = _replay_prep_cmds(
+                                _prep_simple_cmds(_expand_spec(new_text, spec_path.parent)), spec_path.parent, tree
+                            )
+                            if sed_errors:
+                                return "prep replay " + "; ".join(sed_errors[:3])
                         if want_kernel_cfg:
                             cfg_err = _kernel_refresh_configs(spec_path.parent, tree, pkg)
                             if cfg_err:
                                 return "configs %s" % cfg_err
                         if want_files:
-                            new_text, _added = _bump_sync_files_from_tree(new_text, tree)
                             if archive_path is not None and not bump_all:
                                 new_text, _added_i, _err = _bump_sync_files_via_install(
                                     spec_path, new_text, archive_path
@@ -5853,6 +6929,23 @@ def cmd_spec_bump(
             if archive_path is not None:
                 archive_path.unlink(missing_ok=True)
             if err:
+                if err.startswith("cannot fetch Source0 "):
+                    with github_fallback_lock:
+                        retry_release = pkg not in github_fallbacks
+                        github_fallbacks.add(pkg)
+                    if retry_release:
+                        source0 = next(
+                            (
+                                expanded
+                                for number, _raw, expanded in _spec_http_sources(new_text, macros)
+                                if number == "0"
+                            ),
+                            "",
+                        )
+                        release_version = _github_latest_release_version(source0)
+                        if release_version and release_version != latest:
+                            latest_map[pkg] = release_version
+                            return _finish_item(item)
                 return pkg, "fail", err
         spec_path.write_text(new_text, encoding="utf-8")
         return pkg, "ok", "%s -> %s" % (old or "?", new)
@@ -5950,7 +7043,7 @@ _RE_LOG_PKG_NAME = re.compile(
 _RE_NO_MATCH_PKG = re.compile(r"No matching package to install:\s*'([^']+)'")
 _RE_UNPACKAGED_MARKER = re.compile(r"Installed \(but unpackaged\) file\(s\) found:")
 _RE_PATH_LINE = re.compile(r"^(/\S+)\s*$")
-_RE_FILES_SECTION = re.compile(r"(?im)^%files(?:\s+[^\n]*)?$")
+_RE_FILES_SECTION = re.compile(r"(?im)^%files(?:[ \t]+[^\n]*)?$")
 _RE_BUILDREQUIRES_LINE = re.compile(r"(?im)^BuildRequires:.*$")
 _RE_SPEC_SECTION = re.compile(r"(?im)^%(?:files|changelog|description|prep|build|install|check|clean|pre|post|preun|postun)\b")
 
@@ -6078,7 +7171,7 @@ def _fastfix_patch_failure(log_text: str) -> bool:
     """Detect %prep patch application failures (manual review required)."""
     return bool(
         re.search(
-            r"hunk FAILED|can'?t find file to patch|Patch .* failed|Bad exit status from \S+ \(%prep\)",
+            r"hunk(?:\s+#?\d+)?\s+FAILED|can'?t find file to patch|Patch .* failed",
             log_text,
             re.IGNORECASE,
         )
@@ -6413,35 +7506,14 @@ def _files_collapse_unpackaged(paths: list[str], spec_text: str) -> list[str]:
     if not cleaned:
         return []
 
-    # group by parent dir when many files share one
-    by_parent: dict[str, list[str]] = {}
-    for path in cleaned:
-        if path.endswith("/"):
-            parent = path.rstrip("/")
-            by_parent.setdefault(parent, []).append(path)
-            continue
-        parent = path.rsplit("/", 1)[0] if "/" in path else path
-        by_parent.setdefault(parent, []).append(path)
-
-    entries: list[str] = []
-    seen: set[str] = set()
-    for parent, kids in sorted(by_parent.items()):
-        if any(k.endswith("/") for k in kids) or len(kids) >= 2 or parent.startswith(fw + "/"):
-            cand = parent + "/"
-        else:
-            cand = kids[0]
-        cand = _files_macroize_abs(cand, spec_text)
-        if cand not in seen:
-            seen.add(cand)
-            entries.append(cand)
-    return entries
+    # A log proves these files were installed; it does not prove that we own
+    # their entire parent directory (which can include unrelated packages).
+    return list(dict.fromkeys(_files_macroize_abs(path, spec_text) for path in cleaned))
 
 
 def _files_entry_already_present(spec_text: str, entry: str) -> bool:
     needle = entry.strip()
     if not needle:
-        return True
-    if needle in spec_text:
         return True
     macros = _files_path_macros(spec_text)
     expanded = _files_expand_entry(needle, macros)
@@ -6501,9 +7573,11 @@ def _fastfix_apply_unpackaged(spec_text: str, files: list[str]) -> tuple[str, li
     todo = [e for e in entries if not _files_entry_already_present(spec_text, e)]
     if not todo:
         return spec_text, []
-    picked = _files_pick_section(spec_text, todo)
-    if not picked:
+    spans = _files_section_spans(spec_text)
+    if len(spans) != 1:
+        # Subpackage ownership cannot be inferred from a common directory.
         return spec_text, []
+    picked = spans[0]
     _section, _start, end = picked
     insertion = "".join(path + "\n" for path in todo)
     return spec_text[:end].rstrip("\n") + "\n" + insertion + spec_text[end:], todo
@@ -6703,188 +7777,17 @@ def _write_chain_outputs(
     return oreon_path, f44_path, layers_path
 
 
-@cli.command("generate-chain")
-@click.option("--release", "release_ref", required=True, help="Oreon release directory/name, e.g. oreon-11-rp1")
-@click.option("--pushed", is_flag=True, help="Use specs changed in origin/HEAD...HEAD instead of the working tree")
-@click.option("--spec-root", type=click.Path(file_okay=False, path_type=Path), default=None)
-@click.option("--packages", "packages_blob", default=None, help="Raw package names (whitespace, commas, or newlines)")
-@click.option("--packages-file", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None,
-              help="File containing one or more raw package names")
-@click.option("--side-tag", "side_tag_ref", default=None, help="Side tag id or name whose dnf repo also counts as satisfied")
-@click.option(
-    "--arch",
-    "repo_arch",
-    default="x86_64,aarch64",
-    help="Repo arch dirs. Comma list. Each arch uses rpmspec --target against that arch dnf repo.",
-)
-@click.option(
-    "--repo-base",
-    envvar="ORBSCLI_REPO_BASE",
-    default="https://repo-us.oreonhq.com",
-    help="dnf repo root (release/tag/arch)",
-)
-@click.option("--no-repo-filter", is_flag=True, help="Do not drop packages already in testing or --side-tag")
-@click.option(
-    "--stale",
-    is_flag=True,
-    default=False,
-    help="Chain every distgit spec whose Version does not match testing or --side-tag.",
-)
-@click.option(
-    "--out-dir",
-    type=click.Path(file_okay=False, path_type=Path),
-    default=None,
-    help="Where to write chain files. Default is the rpm-specfiles repo root.",
-)
-def cmd_generate_chain(
-    release_ref: str,
-    pushed: bool,
-    spec_root: Path | None,
-    packages_blob: str | None,
-    packages_file: Path | None,
-    side_tag_ref: str | None,
-    repo_arch: str,
-    repo_base: str,
-    no_repo_filter: bool,
-    stale: bool,
-    out_dir: Path | None,
-) -> None:
-    """Order missing packages into dependency layers."""
-    repo_root = Path(__file__).resolve().parent.parent
-    root = (spec_root.expanduser().resolve() if spec_root else repo_root / "fedora-rpms" / release_ref)
-    if not root.is_dir():
-        raise click.ClickException("spec root is not a directory: %s" % root)
-    git_root = repo_root
+def _closure_spec_requires(spec: Path, arch: str) -> set[str] | None:
+    """Read explicit binary requirements before and after a verified bump."""
+    command = ["rpmspec", *_rpmspec_distro_args(), *_rpmspec_target_args(arch),
+               "--define", "dist .or11", "-q", "--requires", str(spec)]
     try:
-        import subprocess
-        found_root = subprocess.run(
-            ("git", "rev-parse", "--show-toplevel"), cwd=root, check=True,
-            capture_output=True, text=True
-        ).stdout.strip()
-        if found_root:
-            git_root = Path(found_root).resolve()
-    except (OSError, subprocess.CalledProcessError):
-        pass
-    if stale and no_repo_filter:
-        raise click.UsageError("--stale needs repo metadata, do not pass --no-repo-filter")
-    if stale and (packages_blob is not None or packages_file is not None):
-        raise click.UsageError("--stale cannot be combined with --packages")
-    if packages_blob is not None and packages_file is not None:
-        raise click.UsageError("use only one of --packages and --packages-file")
-    raw_names: list[str] = []
-    if not stale:
-        if packages_file is not None:
-            raw_names = parse_package_blob(packages_file.read_text(encoding="utf-8"))
-        elif packages_blob is not None:
-            raw_names = parse_package_blob(packages_blob)
-    if raw_names:
-        changed = []
-        for name in raw_names:
-            hits = find_pkg_specs(root, name)
-            if len(hits) == 1:
-                changed.append(hits[0])
-            else:
-                click.echo("%s: no unique spec" % name, err=True)
-    elif stale:
-        changed = []
-    else:
-        changed = _git_changed_spec_paths(git_root, root, pushed)
-    if not stale and not changed:
-        click.echo("no changed specs found")
-        return
-    present: set[str] | dict[str, set[str]] | None = None
-    urls_by_arch: dict[str, list[str]] = {}
-    if not no_repo_filter:
-        tags = ["testing"]
-        side_dirs: list[str] = []
-        if side_tag_ref:
-            side_dirs = _side_tag_repo_dirs(side_tag_ref)
-            for name in side_dirs:
-                if name not in tags:
-                    tags.append(name)
-        present: dict[str, set[str]] = {}
-        arches = _parse_repo_arches(repo_arch)
-        for arch in arches:
-            urls: list[str] = []
-            seen_url: set[str] = set()
-            got_side = False
-            for tag in tags:
-                url = _repo_url(repo_base, release_ref, tag, arch)
-                if url in seen_url:
-                    continue
-                if not _repo_repomd_ok(url):
-                    if tag == "testing":
-                        raise click.ClickException("no dnf repo at %s" % url)
-                    continue
-                seen_url.add(url)
-                urls.append(url)
-                if tag in side_dirs:
-                    got_side = True
-            if side_dirs and not got_side:
-                raise click.ClickException(
-                    "no dnf repo for side tag %s on %s" % (side_tag_ref, arch)
-                )
-            if not urls:
-                raise click.ClickException("no dnf repo for %s" % arch)
-            click.echo("querying dnf %s" % arch, err=True)
-            provides, requires, provides_evr, srpms = _dnf_repo_maps(
-                urls, arch, with_solver=False
-            )
-            click.echo(
-                "dnf %s %d rpms %d srpms %d caps"
-                % (arch, len(requires), len(srpms), len(provides)),
-                err=True,
-            )
-            if len(requires) < _MIN_REPO_RPMS:
-                click.echo(
-                    "skipping %s, dnf only saw %d rpms" % (arch, len(requires)),
-                    err=True,
-                )
-                continue
-            caps = set(provides)
-            present[arch] = _RepoDetail(caps, provides, requires, provides_evr, srpms=srpms)
-            urls_by_arch[arch] = urls
-        if not present:
-            raise click.ClickException("no usable dnf repos")
-    if stale:
-        seeds = _stale_distgit_seeds(root, present)
-        click.echo("stale=%d" % len(seeds), err=True)
-        if not seeds:
-            click.echo("distgit versions already match the repo")
-            return
-    else:
-        seeds = _chain_seed_names(changed)
-    click.echo("seeds=%d" % len(seeds), err=True)
-    global _RPMSPEC_FAILS
-    _RPMSPEC_FAILS = 0
-    host_arch = os.uname().machine
-    host_urls = urls_by_arch.get(host_arch) or next(iter(urls_by_arch.values()), [])
-    chain, selected, f44_chain = _generate_chain_from_specs(
-        root, seeds, present, repo_urls=host_urls, repo_arch=host_arch if host_urls else None
-    )
-    if any(name in {"gcc", "gcc-c++"} for name in selected):
-        click.echo("GCC is in this chain", err=True)
-    dest = out_dir.expanduser().resolve() if out_dir else repo_root
-    oreon_path, f44_path, layers_path = _write_chain_outputs(
-        dest, release_ref, chain, f44_chain or ""
-    )
-    n_oreon = _chain_pkg_count(chain)
-    n_f44 = _chain_pkg_count(f44_chain or "")
-    n_layers = len([p for p in (chain or "").split(":") if p.strip()])
-    click.echo("fedora-44 %d pkgs  %s" % (n_f44, f44_path), err=True)
-    click.echo("oreon-11 %d pkgs %d layers  %s" % (n_oreon, n_layers, oreon_path), err=True)
-    click.echo("layers  %s" % layers_path, err=True)
-    preview = 60
-    if n_oreon <= preview and sys.stdout.isatty():
-        click.echo("fedora-44 %s" % (f44_chain or "").strip())
-        click.echo("oreon-11 %s" % chain)
-    elif not sys.stdout.isatty():
-        click.echo("oreon-11 %s" % chain)
-    click.echo(
-        "packages=%d source=%s rpmspec-fail=%d"
-        % (len(selected), "stale" if stale else ("pushed" if pushed else "unpushed"), _RPMSPEC_FAILS),
-        err=True,
-    )
+        result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode:
+        return None
+    return set(result.stdout.splitlines())
 
 
 @cli.command("fast-fix")
@@ -6920,9 +7823,9 @@ def cmd_fast_fix(
     """Auto-fix deterministic build failures from downloaded build logs.
 
     Applies only safe, mechanical repairs: appending installed-but-unpackaged
-    files to ``%files``, adding ``BuildRequires: python3-devel`` for the
-    ``Could NOT find Python3`` CMake failure, and adding plain missing
-    ``BuildRequires`` names. Dependency-chain problems (``cmake(...)`` /
+    files to an unambiguous ``%files`` section, adding ``BuildRequires: python3-devel`` for the
+    ``Could NOT find Python3`` CMake failure. Missing packages are prerequisites,
+    not new BuildRequires entries. Dependency-chain problems (``cmake(...)`` /
     ``pkgconfig(...)`` capabilities, ``nothing provides``) and ``%prep``
     patch or checksum failures are reported for manual handling.
     """
@@ -6990,9 +7893,9 @@ def cmd_fast_fix(
             }
         )
         if plain_missing:
-            spec_text, added = _fastfix_apply_buildrequires(spec_text, plain_missing)
-            if added:
-                actions.append("added BuildRequires: %s" % ", ".join(added))
+            need_chain.setdefault(pkg, []).extend(
+                "build provider for %s first" % dep for dep in plain_missing
+            )
         capabilities = sorted(
             {
                 dep
@@ -7058,6 +7961,235 @@ def cmd_fast_fix(
             len(need_manual),
         )
     )
+
+
+@cli.command("repair-chain")
+@click.argument("chain_id", type=int)
+@click.option("--log-dir", type=click.Path(file_okay=False, path_type=Path), default=None,
+              help="Use existing logs instead of downloading the chain failures.")
+@click.option("--spec-root", type=click.Path(exists=True, file_okay=False, path_type=Path), default=None)
+@click.option("--source-dir", type=click.Path(exists=True, file_okay=False, path_type=Path), default=None,
+              help="Optional PACKAGE.tar / .tar.gz / .tar.xz / .tar.bz2 archives; hashes must match Source0.")
+@click.option("--apply", is_flag=True, help="Apply supported repairs; default is a diff preview.")
+def cmd_repair_chain(chain_id: int, log_dir: Path | None, spec_root: Path | None,
+                     source_dir: Path | None, apply: bool) -> None:
+    """Explain failed builds and preview or apply supported local repairs.
+
+    Prints results in the terminal. Downloads use temporary storage which is
+    removed when the command finishes. No reports, commits or submissions.
+    """
+    if log_dir is None:
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="orbscli-repair-") as folder:
+            temporary_logs = Path(folder)
+            _download_failed_plan_logs(chain_id, str(temporary_logs), quiet=False)
+            _repair_chain_from_logs(chain_id, temporary_logs, spec_root, source_dir, apply, supplied_logs=False)
+    else:
+        _repair_chain_from_logs(chain_id, log_dir, spec_root, source_dir, apply, supplied_logs=True)
+
+
+def _repair_repository_checksums(log):
+    """Check current metadata and exact RPM bytes for checksum failures in old logs."""
+    import hashlib
+    import hawkey
+    import dnf
+    import tempfile
+    failures = set(re.findall(r"(?:\[MIRROR\]\s+)([^\s:]+\.rpm):.*checksum doesn't match", log))
+    urls = set(re.findall(r"(?m)^(https://[^\s]+/(?:x86_64|aarch64)/)\s*$", log))
+    if not failures or not urls:
+        return False
+    found = set()
+    checked = set()
+    try:
+        with tempfile.TemporaryDirectory(prefix='orbscli-repo-check-') as folder:
+            for url in sorted(urls):
+                arch = url.rstrip('/').rsplit('/', 1)[-1]
+                solver = _DnfSolver([url], arch, 'oreon-11-rp1', folder + '/' + arch)
+                try:
+                    names = {filename.rsplit('-', 2)[0] for filename in failures}
+                    with httpx.Client(timeout=60, follow_redirects=True) as client:
+                        for package in solver.base.sack.query().filter(name=list(names)):
+                            filename = f'{package.name}-{package.version}-{package.release}.{package.arch}.rpm'
+                            if filename not in failures:
+                                continue
+                            kind, expected = package.chksum
+                            algorithm = hawkey.chksum_name(kind)
+                            key = (package.remote_location(), expected.hex())
+                            if key not in checked:
+                                digest = hashlib.new(algorithm)
+                                with client.stream('GET', key[0]) as response:
+                                    response.raise_for_status()
+                                    for chunk in response.iter_bytes():
+                                        digest.update(chunk)
+                                if digest.digest() != expected:
+                                    return False
+                                checked.add(key)
+                            found.add(filename)
+                finally:
+                    solver.close()
+    except (OSError, ValueError, httpx.HTTPError, RuntimeError, dnf.exceptions.Error):
+        return False
+    return found == failures
+
+
+def _repair_chain_from_logs(chain_id, log_dir, spec_root, source_dir, apply, *, supplied_logs):
+    try:
+        from . import repair
+    except ImportError:
+        import repair
+    module = sys.modules[__name__]
+    root = (spec_root or Path(__file__).resolve().parent.parent / "fedora-rpms" / "oreon-11-rp1").resolve()
+    grouped: dict[str, list[Path]] = {}
+    for log in sorted(log_dir.glob("*.log")):
+        package = _fastfix_pkg_name(log)
+        if package:
+            grouped.setdefault(package, []).append(log)
+    if not grouped:
+        click.echo(f"Chain {chain_id}: no failed build logs to analyze.")
+        return
+    plans = []
+    index = None
+    prerequisites: set[str] = set()
+    click.echo("analyzing %s failed packages" % len(grouped), err=True)
+    for package, logs in sorted(grouped.items()):
+        click.echo("repair %s" % package, err=True)
+        specs = find_pkg_specs(root, package)
+        if len(specs) != 1:
+            plans.append({"package": package, "manual": ["No unique local spec"], "actions": [],
+                          "missing_dependencies": []})
+            continue
+        archives = ([source_dir / (package + suffix) for suffix in (".tar", ".tar.gz", ".tar.xz", ".tar.bz2")]
+                    if source_dir else [])
+        source = next((p for p in archives if p.is_file()), None)
+        # Fetch only when a guarded archive can resolve a missing doc name.
+        downloaded_source = None
+        combined = "\n".join(p.read_text(errors="replace") for p in logs)
+        if source is None and (bool(re.search(r"error:.*(?:not a member of|no member named)", combined)) or ("t/11_TCP_ipv4.t" in combined and "t/12_TCP_ipv6.t" in combined) or _fastfix_patch_failure(combined) or "No file to patch." in combined or "build backend cannot provide build metadata" in combined or "ipsec algparse: invalid option" in combined or "cp: cannot stat" in combined or (repair.needs_macro_source(specs[0], combined) or "[-Werror=stringop-truncation]" in combined or "no matching function for call" in combined or "Cannot open inc/Devel/CheckLib.pm:" in combined or "Can't locate object method" in combined or _fastfix_source_hash_failure(combined))):
+            text = specs[0].read_text()
+            guard = re.search(r"(?m)^%global\s+source0_hash\s+(?:[0-9a-f]{64}|none)\s*$", text)
+            if guard:
+                url = _rpmspec_expand_sources(text, specs[0].parent).get("0", "")
+                if url.startswith(("https://", "http://")):
+                    click.echo(f"{package}: checking the verified source archive...")
+                    with httpx.Client(timeout=60, follow_redirects=True) as client:
+                        fetched = _fetch_source_archive(client, url, None)
+                    if fetched:
+                        downloaded_source = source = fetched[0]
+        registry_checksum = None
+        if source is not None and _fastfix_source_hash_failure(combined):
+            url = _rpmspec_expand_sources(specs[0].read_text(), specs[0].parent).get("0", "")
+            crate = re.match(r"https://crates\.io/api/v1/crates/([^/]+)/([^/]+)/download(?:#.*)?$", url)
+            if crate:
+                try:
+                    with httpx.Client(timeout=30, follow_redirects=True) as client:
+                        response = client.get("https://crates.io/api/v1/crates/" + crate[1] + "/" + crate[2])
+                        response.raise_for_status()
+                        version = response.json().get("version", {})
+                        if version.get("num") == crate[2]:
+                            registry_checksum = version.get("checksum")
+                except (httpx.HTTPError, ValueError, TypeError):
+                    pass
+        patch_payloads = {}
+        if source is not None and (_fastfix_patch_failure(combined) or "No file to patch." in combined):
+            for declaration in re.findall(r"(?m)^Patch\d*:\s*(\S+)", specs[0].read_text()):
+                if declaration.startswith(("https://", "http://")):
+                    try:
+                        with httpx.Client(timeout=30, follow_redirects=True) as client:
+                            response = client.get(declaration)
+                            response.raise_for_status()
+                            patch_payloads[declaration] = response.text
+                    except httpx.HTTPError:
+                        pass
+                else:
+                    local_patch = specs[0].parent / declaration
+                    if local_patch.is_file():
+                        patch_payloads[declaration] = local_patch.read_text()
+        try:
+            repo_checksum_verified = False
+            if "checksum doesn't match" in combined:
+                click.echo(f"{package}: checking the repository RPM checksum...")
+                repo_checksum_verified = _repair_repository_checksums(combined)
+            with tempfile.TemporaryDirectory(prefix='orbscli-repair-metadata-') as metadata_dir:
+                loads = _distro_macro_loads(root, Path(metadata_dir))
+                metadata = _plancmd.P.Tooling(module, root, loads, Path(metadata_dir))
+                expanded_spec = (metadata.expanded('x86_64', specs[0])
+                                 if _fastfix_unpackaged_files(combined) and len(_files_section_spans(specs[0].read_text())) > 1 else None)
+                def resolve_artifact(kind, name):
+                    patterns = ([name] if kind == 'executable' and name.startswith('/') else
+                                ['/usr/bin/' + name, '/usr/sbin/' + name] if kind == 'executable' else
+                                ['/usr/include/' + name, '/usr/include/*/' + name]
+                                if kind == 'header' else
+                                ['/usr/lib*/python*/site-packages/' + name.replace('.', '/') + suffix
+                                 for suffix in ('.py', '/__init__.py', '/*.so', '.*.so')])
+                    verified = []
+                    all_urls = sorted(set(re.findall(r'(?m)^(https://[^\s]+/(?:x86_64|aarch64)/)\s*$', combined)))
+                    if not all_urls:
+                        return None
+                    for arch in sorted({url.rstrip('/').rsplit('/', 1)[-1] for url in all_urls}):
+                        urls = [url for url in all_urls if url.endswith('/' + arch + '/')]
+                        release = urls[0].split('/', 3)[3].split('/', 1)[0]
+                        base_url = urls[0].split('/' + release + '/', 1)[0]
+                        urls.append(_repo_url(base_url, release, 'testing', arch))
+                        urls = list(dict.fromkeys(urls))
+                        cache_root = Path(tempfile.gettempdir()) / ('orbscli-cache-' + str(os.getuid()))
+                        cache_root.mkdir(mode=0o700, exist_ok=True)
+                        if cache_root.is_symlink() or cache_root.stat().st_uid != os.getuid() or cache_root.stat().st_mode & 0o077:
+                            raise click.ClickException('Unsafe repository cache directory: ' + str(cache_root))
+                        import hashlib
+                        cache_key = hashlib.sha256('\n'.join([arch, release, *urls]).encode()).hexdigest()
+                        solver = _DnfSolver(urls, arch, release, metadata_dir + '/repo/' + arch,
+                                            cache_dir=cache_root / ('repair-' + cache_key), filelists=True)
+                        owners = set()
+                        paths = set()
+                        try:
+                            for pattern in patterns:
+                                packages = list(solver.base.sack.query().filter(file__glob=pattern))
+                                owners.update((pkg.name, str(pkg.epoch)) for pkg in packages)
+                                if kind == 'executable' and packages:
+                                    paths.add(pattern)
+                        finally:
+                            solver.close()
+                        if kind != 'executable' and len(owners) != 1:
+                            return None
+                        if kind == 'executable':
+                            if len(paths) != 1:
+                                return None
+                            verified.append(next(iter(paths)))
+                        else:
+                            verified.append(next(iter(owners)))
+                    return verified[0] if len(set(verified)) == 1 else None
+                plan = repair.plan_package(package, specs[0], logs, module, source, registry_checksum, patch_payloads, repo_checksum_verified, resolve_artifact, expanded_spec)
+        finally:
+            if downloaded_source is not None:
+                downloaded_source.unlink(missing_ok=True)
+        suggestions = []
+        for requirement in plan["missing_dependencies"] + plan.get("source_requirements", []):
+            if index is None:
+                index = _provide_index(root, quiet=True)
+            atoms = _spec_dep_atoms(requirement)
+            candidates = sorted({provider for atom in atoms
+                                 for provider in _provider_candidates(root, atom, index)})
+            suggestions.append({"requirement": requirement, "candidate_sources": candidates,
+                                "validation": "Verify version and installability on both architectures"})
+            prerequisites.update(c for c in candidates if c != package)
+        plan["prerequisites"] = suggestions
+        plans.append(plan)
+
+    if apply:
+        # Check all input specs before touching any one of them.
+        import hashlib
+        for plan in plans:
+            if "spec" in plan and hashlib.sha256(Path(plan["spec"]).read_bytes()).hexdigest() != plan["before_sha256"]:
+                raise click.ClickException("Spec changed while planning: " + plan["spec"])
+            for patch in plan.get("patch_changes", []):
+                if (hashlib.sha256(Path(patch["path"]).read_bytes()).hexdigest() if Path(patch["path"]).exists() else None) != patch["before_sha256"]:
+                    raise click.ClickException("Patch changed while planning: " + patch["path"])
+        for plan in plans:
+            if "spec" in plan:
+                repair.apply_plan(plan)
+    summary = repair.friendly_summary(chain_id, plans, apply=apply,
+                                     log_dir=log_dir if supplied_logs else None, job_count=sum(len(logs) for logs in grouped.values()))
+    click.echo("\n" + summary)
 
 
 @cli.command("build")
@@ -7152,7 +8284,16 @@ def cmd_build(
         return
 
     for pkg in names:
-        body = {
+        existing = find_package_by_name(api_base, token, pkg)
+        if existing:
+            body: dict[str, Any] = {
+                "package_id": int(existing["id"]),
+                "release_id": rid,
+                "architectures": arches,
+                "skip_complete_arches": skip_complete,
+            }
+        else:
+            body = {
                 "new_package": distgit_new_package_payload(
                     pkg, releasename, distgit_url=distgit_url, distgit_branch=distgit_branch
                 ),
@@ -7253,14 +8394,33 @@ def _wait_job_and_maybe_log(api_base: str, token: str, job_id: int, log_dir: Pat
     if log_dir and attempt_id:
         _fetch_attempt_log(api_base, attempt_id, log_dir / f"build-{job_id}.log")
 
-def _fetch_attempt_log(api_base: str, attempt_id: int, dest: Path) -> bool:
+def _fetch_attempt_log(api_base: str, attempt_id: int, dest: Path, *, quiet: bool = False, tail_lines: int | None = None) -> bool:
+    if tail_lines:
+        r = http_request_raw(
+            "GET", api_base, f"/api/logs/attempts/{attempt_id}/tail",
+            token=None, params={"lines": tail_lines}, timeout=60.0,
+        )
+        if r.status_code != 200:
+            click.echo("log not available for attempt %s (HTTP %s)" % (attempt_id, r.status_code), err=True)
+            return False
+        try:
+            lines = r.json().get("lines") or []
+        except ValueError:
+            click.echo("log tail for attempt %s was not json" % attempt_id, err=True)
+            return False
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+        if not quiet:
+            click.echo("wrote %s (%s lines)" % (dest, len(lines)))
+        return True
     r = http_request_raw("GET", api_base, f"/api/logs/attempts/{attempt_id}", token=None, timeout=300.0)
     if r.status_code != 200:
         click.echo("log not available for attempt %s (HTTP %s)" % (attempt_id, r.status_code), err=True)
         return False
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(r.content)
-    click.echo("wrote %s" % dest)
+    if not quiet:
+        click.echo("wrote %s" % dest)
     return True
 
 
@@ -7269,25 +8429,27 @@ def _safe_log_name(value: str) -> str:
     return s.strip("._") or "unknown"
 
 
-def _list_failed_chain_jobs(api_base: str, token: str | None, chain_id: int) -> list[dict[str, Any]]:
+def _list_failed_chain_jobs(api_base: str, token: str | None, chain_id: int, *, quiet: bool = False) -> list[dict[str, Any]]:
     jobs: list[dict[str, Any]] = []
     seen: set[int] = set()
+    target: int | None = None
     while True:
+        click.echo("chain %s, asking for failed jobs at offset %s" % (chain_id, len(jobs)), err=True)
         data = http_json("GET", api_base, f"/api/builds/chain/{chain_id}/status",
-                         token=token, params={"offset": len(jobs)}, timeout=30.0)
+                         token=token, params={"offset": len(jobs)}, timeout=60.0)
         page = data.get("jobs") or []
-        total = int((data.get("counts") or {}).get("failed") or 0)
+        if target is None:
+            # one snapshot. a live chain keeps failing and the old loop never caught up
+            target = int((data.get("counts") or {}).get("failed") or 0)
         for job in page:
             jid = int(job["job_id"])
             if jid in seen:
-                raise click.ClickException("Server does not support chain log pagination; update the API.")
+                raise click.ClickException("Server does not support chain log pagination. Update the API.")
             seen.add(jid)
             jobs.append(dict(job, id=jid))
-        click.echo(f"Found {len(jobs)}/{total} failed chain jobs", err=True)
-        if len(jobs) >= total:
+        click.echo("chain %s failed jobs %s/%s" % (chain_id, len(jobs), target), err=True)
+        if len(jobs) >= target or not page or len(page) < 100:
             return jobs
-        if not page:
-            raise click.ClickException("Server returned an incomplete chain job list.")
 
 @cli.group("builds")
 def grp_builds() -> None:
@@ -7550,14 +8712,23 @@ def builds_fix_current(
                 continue
             release_names[rid] = rn
         releasename = release_names[rid]
-        body = {
-            "new_package": distgit_new_package_payload(
-                pkg, releasename, distgit_url=distgit_url, distgit_branch=distgit_branch
-            ),
-            "release_id": rid,
-            "architectures": arcs,
-            "skip_complete_arches": True,
-        }
+        existing = find_package_by_name(api_base, token, pkg)
+        if existing:
+            body: dict[str, Any] = {
+                "package_id": int(existing["id"]),
+                "release_id": rid,
+                "architectures": arcs,
+                "skip_complete_arches": True,
+            }
+        else:
+            body = {
+                "new_package": distgit_new_package_payload(
+                    pkg, releasename, distgit_url=distgit_url, distgit_branch=distgit_branch
+                ),
+                "release_id": rid,
+                "architectures": arcs,
+                "skip_complete_arches": True,
+            }
         created = http_json(
             "POST",
             api_base,
@@ -7628,14 +8799,15 @@ def logs_chain_fail(chain_id: int, out_dir: str | None) -> None:
     _download_failed_plan_logs(chain_id, out_dir)
 
 
-def _download_failed_plan_logs(chain_id: int, out_dir: str | None) -> None:
+def _download_failed_plan_logs(chain_id: int, out_dir: str | None, *, quiet: bool = False) -> None:
     token = get_token()
     api_base = get_api_url()
     dest = Path(out_dir) if out_dir else Path("chain-%s-failed-logs" % chain_id)
     dest.mkdir(parents=True, exist_ok=True)
-    click.echo("Fetching failed jobs for chain %s..." % chain_id, err=True)
+    if not quiet:
+        click.echo("Fetching failed jobs for chain %s..." % chain_id, err=True)
     try:
-        jobs = _list_failed_chain_jobs(api_base, token, chain_id)
+        jobs = _list_failed_chain_jobs(api_base, token, chain_id, quiet=quiet)
     except httpx.RequestError as exc:
         raise click.ClickException(f"Could not fetch failed jobs: {exc}") from exc
     if not jobs:
@@ -7645,32 +8817,33 @@ def _download_failed_plan_logs(chain_id: int, out_dir: str | None) -> None:
     missing = 0
     for index, job in enumerate(jobs, 1):
         jid = int(job["id"])
-        click.echo(f"[{index}/{len(jobs)}] Fetching attempts and log for job {jid}...", err=True)
         pkg = _safe_log_name(str(job.get("package_name") or "pkg-%s" % (job.get("package_id") or jid)))
         arch = _safe_log_name(str(job.get("architecture") or "noarch"))
+        click.echo("[%s/%s] log for %s %s job %s" % (index, len(jobs), pkg, arch, jid), err=True)
         attempts = http_json("GET", api_base, f"/api/builds/jobs/{jid}/attempts", token=token)
         if not isinstance(attempts, list) or not attempts:
-            click.echo("job %s %s %s has no attempts" % (jid, pkg, arch), err=True)
+            if not quiet:
+                click.echo("job %s %s %s has no attempts" % (jid, pkg, arch), err=True)
             missing += 1
             continue
         att = next((a for a in attempts if isinstance(a, dict)), None)
         if att is None:
-            click.echo("job %s %s %s has no attempts" % (jid, pkg, arch), err=True)
+            if not quiet:
+                click.echo("job %s %s %s has no attempts" % (jid, pkg, arch), err=True)
             missing += 1
             continue
         aid = int(att["id"])
         name = "%s-%s-job%s.log" % (pkg, arch, jid)
-        if _fetch_attempt_log(api_base, aid, dest / name):
+        if _fetch_attempt_log(api_base, aid, dest / name, quiet=quiet, tail_lines=800):
             wrote += 1
         else:
             missing += 1
-    click.echo("chain %s failed jobs=%s logs written=%s missing=%s dir=%s" % (
-        chain_id,
-        len(jobs),
-        wrote,
-        missing,
-        dest,
-    ))
+    if quiet:
+        if missing:
+            raise click.ClickException(f"{missing} of {len(jobs)} failed build logs were unavailable. Cannot analyze every failed job.")
+    else:
+        click.echo("chain %s failed jobs=%s logs written=%s missing=%s dir=%s" % (
+            chain_id, len(jobs), wrote, missing, dest))
 
 @cli.command("promote")
 @click.argument("from_channel")
@@ -8376,7 +9549,7 @@ def advisory_resolve_custom(ctx: click.Context, advisory_id: int) -> None:
 @click.option("--side-tag", "side_tag_ref", default=None, help="Include this side tag when resolving dependencies")
 @click.option("--out-dir", type=click.Path(file_okay=False, path_type=Path), default=None)
 @click.option("--verify-sources/--no-verify-sources", default=False)
-@click.option("--refresh-hashes/--no-refresh-hashes", default=False)
+@click.option("--refresh-hashes/--no-refresh-hashes", default=True, help="Always on; kept for compatibility.")
 @click.option("--verify-patches/--no-verify-patches", default=True)
 @click.option("--refresh-files/--no-refresh-files", default=True)
 def cmd_bulk_bump(
@@ -8419,19 +9592,128 @@ def cmd_bulk_bump(
     if not changed:
         click.echo("All selected specs already match upstream; no chain needed.")
         return
-    cmd_generate_chain.callback(
-        release_ref=release_ref, pushed=False, spec_root=root,
-        packages_blob=" ".join(changed), packages_file=None,
-        side_tag_ref=side_tag_ref, repo_arch=repo_arch, repo_base=repo_base,
-        no_repo_filter=False, stale=False, out_dir=out_dir,
+    cmd_plan_chain_ref.callback(
+        release=release_ref, spec_root=root, repo_base=repo_base, arch=repo_arch, side_tag=side_tag_ref,
+        jobs=8, refresh=False, packages_blob=" ".join(changed), packages_file=None, groups=(), owners=(),
+        chain_id=None, pushed=False, output=None, split_dir=None, blockers=None, with_prereqs=False,
+        no_dynamic=False, strict=False, verbose=False,
     )
-    destination = out_dir.expanduser().resolve() if out_dir else Path(__file__).resolve().parent.parent
-    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", release_ref).strip("-") or "chain"
-    cycles_file = destination / ("chain-%s-fedora-44.txt" % slug)
-    if cycles_file.is_file() and cycles_file.read_text(encoding="utf-8").strip():
-        raise click.ClickException(
-            "dependency cycles need bootstrap builds; review %s before submitting the chain" % cycles_file
-        )
+
+
+def _pkghash_latest(repo_url: str, package: str) -> tuple[str, str] | None:
+    import xml.etree.ElementTree as ET
+
+    import rpm
+
+    try:
+        from . import planner as P
+    except ImportError:
+        import planner as P
+
+    ns = "http://linux.duke.edu/metadata/common"
+    root = ET.fromstring(P._fetch(repo_url.rstrip("/") + "/repodata/repomd.xml"))
+    primary = next((d for d in root.findall("{http://linux.duke.edu/metadata/repo}data") if d.get("type") == "primary"), None)
+    if primary is None:
+        raise click.ClickException("no primary metadata at " + repo_url)
+    href = primary.find("{http://linux.duke.edu/metadata/repo}location").get("href")
+    best = None
+    with tempfile.TemporaryDirectory(prefix="orbscli-pkghash-") as folder:
+        stream, process = P._open_primary(P._fetch(repo_url.rstrip("/") + "/" + href, 600), href, folder)
+        try:
+            for _event, element in ET.iterparse(stream, events=("end",)):
+                if element.tag != "{%s}package" % ns:
+                    continue
+                name = element.findtext("{%s}name" % ns)
+                version = element.find("{%s}version" % ns)
+                loc = element.find("{%s}location" % ns)
+                arch = element.findtext("{%s}arch" % ns) or ""
+                if name == package and version is not None and loc is not None and loc.get("href"):
+                    evr = (version.get("epoch") or "0", version.get("ver") or "", version.get("rel") or "")
+                    if best is None or rpm.labelCompare(evr, best[0]) > 0:
+                        label = "%s-%s-%s.%s" % (name, evr[1], evr[2], arch)
+                        if evr[0] not in ("0", ""):
+                            label = "%s:%s" % (evr[0], label)
+                        best = (evr, label, loc.get("href"))
+                element.clear()
+        finally:
+            stream.close()
+            if process is not None:
+                process.wait()
+    if best is None:
+        return None
+    return best[1], urljoin(repo_url.rstrip("/") + "/", best[2])
+
+
+def _pkghash_fetch(url: str) -> str:
+    import hashlib
+    from urllib.request import Request, urlopen
+
+    digest = hashlib.sha256()
+    req = Request(url, headers={"User-Agent": "orbscli", "Cache-Control": "no-cache"})
+    with urlopen(req, timeout=600) as response:
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+@cli.command("pkghash")
+@click.argument("package")
+@click.option("--release", "release_ref", default="oreon-11-rp1", show_default=True)
+@click.option("--tag", default="testing", show_default=True)
+@click.option("--arch", "repo_arch", default="x86_64,aarch64", show_default=True)
+@click.option("--repo-base", envvar="ORBSCLI_REPO_BASE", default="https://repo-us.oreonhq.com", show_default=True)
+def cmd_pkghash(package: str, release_ref: str, tag: str, repo_arch: str, repo_base: str) -> None:
+    """Download the latest published rpm twice and compare sha256."""
+    arches = _parse_repo_arches(repo_arch)
+    failed = False
+    for arch in arches:
+        repo_url = _repo_url(repo_base, release_ref, tag, arch)
+        try:
+            found = _pkghash_latest(repo_url, package)
+        except Exception as exc:
+            click.echo("%s %s lookup failed %s" % (package, arch, exc), err=True)
+            failed = True
+            continue
+        if not found:
+            click.echo("%s %s not in %s" % (package, arch, repo_url), err=True)
+            failed = True
+            continue
+        label, rpm_url = found
+        click.echo("%s" % label)
+        click.echo(rpm_url)
+        try:
+            first = _pkghash_fetch(rpm_url)
+            second = _pkghash_fetch(rpm_url)
+        except Exception as exc:
+            click.echo("download failed %s" % exc, err=True)
+            failed = True
+            continue
+        click.echo("first  %s" % first)
+        click.echo("second %s" % second)
+        if first == second:
+            click.echo("match")
+        else:
+            click.echo("mismatch")
+            failed = True
+    if failed:
+        sys.exit(1)
+
+
+try:
+    from . import plancmd as _plancmd
+except ImportError:
+    import plancmd as _plancmd
+_plancmd.register(cli, sys.modules[__name__])
+cmd_plan_chain_ref = cmd_plan_chain
+
+try:
+    from . import specadd as _specadd
+except ImportError:
+    import specadd as _specadd
+_specadd.register(cli)
 
 
 def main() -> None:
