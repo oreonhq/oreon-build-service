@@ -10,7 +10,7 @@ import io
 import logging
 import lzma
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import select, update
@@ -257,15 +257,61 @@ def _sources_visible_in_arch(releasename: str, branch: str, arch: str) -> set[st
     return _known_sources_from_primary(primary_xml)
 
 
-_INFLIGHT = (
+_BUILDING = (
     BuildStatus.PENDING,
     BuildStatus.QUEUED,
-    BuildStatus.BLOCKED,
     BuildStatus.RUNNING,
 )
+_PUBLISH_OPEN = ("pending", "running", "queued")
 
 
-async def _layer_status(db: Any, plan: RpmbuildPlan, layer: int) -> tuple[list[BuildJob], bool, bool, bool]:
+def decide_open_layer(
+    *,
+    builds_active: bool,
+    publish_waiting: bool,
+    dirty: bool,
+    blocked: bool,
+    discovery: bool,
+    deadline_passed: bool,
+) -> str:
+    if builds_active:
+        return "builds"
+    if dirty:
+        return "fail"
+    if publish_waiting:
+        if deadline_passed:
+            return "expire"
+        return "settle"
+    if blocked and not discovery:
+        return "fail"
+    if blocked:
+        return "blocked"
+    return "advance"
+
+
+def _aware(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _deadline_passed(plan: RpmbuildPlan, now: datetime) -> bool:
+    dl = _aware(plan.settle_deadline_at)
+    return dl is not None and now >= dl
+
+
+def _arm_settle_deadline(plan: RpmbuildPlan, now: datetime) -> None:
+    if _aware(plan.settle_deadline_at) is not None:
+        return
+    from oreon_build.config import get_settings
+
+    secs = int(get_settings().rpmbuild_settle_timeout_seconds)
+    plan.settle_deadline_at = now + timedelta(seconds=secs)
+
+
+async def _layer_status(db: Any, plan: RpmbuildPlan, layer: int) -> dict[str, Any]:
     q = await db.execute(
         select(BuildJob).where(
             BuildJob.rpmbuild_plan_id == plan.id,
@@ -273,27 +319,39 @@ async def _layer_status(db: Any, plan: RpmbuildPlan, layer: int) -> tuple[list[B
         )
     )
     jobs = list(q.scalars().all())
+    info: dict[str, Any] = {
+        "jobs": jobs,
+        "builds_active": False,
+        "publish_waiting": False,
+        "dirty": False,
+        "blocked": False,
+    }
     if not jobs:
-        return [], False, True, False
-    inflight = any(j.status in _INFLIGHT for j in jobs)
-    pub_ok = True
-    dirty = any(j.status in (BuildStatus.FAILED, BuildStatus.CANCELLED) for j in jobs)
-    if not inflight:
-        for j in jobs:
-            if j.status == BuildStatus.SUCCESS and (j.scan_state or "") in ("pending", "quarantined"):
-                pub_ok = False
-                continue
-            if j.status != BuildStatus.SUCCESS:
-                continue
-            att = await db.execute(
-                select(PublishTask).where(PublishTask.build_job_id == j.id).order_by(PublishTask.id.desc()).limit(1)
-            )
-            p = att.scalar_one_or_none()
-            if p is None or p.status in ("pending", "running", "queued"):
-                pub_ok = False
-            elif p.status != "success":
-                dirty = True
-    return jobs, inflight, pub_ok, dirty
+        return info
+    info["builds_active"] = any(j.status in _BUILDING for j in jobs)
+    info["blocked"] = any(j.status == BuildStatus.BLOCKED for j in jobs)
+    info["dirty"] = any(j.status in (BuildStatus.FAILED, BuildStatus.CANCELLED) for j in jobs)
+    if info["builds_active"]:
+        return info
+    for j in jobs:
+        if j.status != BuildStatus.SUCCESS:
+            continue
+        scan = (j.scan_state or "").strip()
+        if scan == "quarantined":
+            info["dirty"] = True
+            continue
+        if scan in ("", "pending"):
+            info["publish_waiting"] = True
+            continue
+        att = await db.execute(
+            select(PublishTask).where(PublishTask.build_job_id == j.id).order_by(PublishTask.id.desc()).limit(1)
+        )
+        p = att.scalar_one_or_none()
+        if p is None or p.status in _PUBLISH_OPEN:
+            info["publish_waiting"] = True
+        elif p.status != "success":
+            info["dirty"] = True
+    return info
 
 
 async def _failed_package_names(db: Any, plan_id: int) -> set[str]:
@@ -329,7 +387,12 @@ def _stored_dep_providers(plan: RpmbuildPlan) -> dict[str, list[str]] | None:
 
 
 async def _stop_unclean_group(db: Any, plan: RpmbuildPlan, jobs: list[BuildJob], layer_index: int) -> None:
-    bad_ids = [j.id for j in jobs if j.status in (BuildStatus.FAILED, BuildStatus.CANCELLED)]
+    bad_ids = [
+        j.id
+        for j in jobs
+        if j.status in (BuildStatus.FAILED, BuildStatus.CANCELLED, BuildStatus.BLOCKED)
+        or (j.status == BuildStatus.SUCCESS and (j.scan_state or "") == "quarantined")
+    ]
     for j in jobs:
         if j.status != BuildStatus.SUCCESS:
             continue
@@ -349,6 +412,44 @@ async def _stop_unclean_group(db: Any, plan: RpmbuildPlan, jobs: list[BuildJob],
     shown = ", ".join(names[:20]) if names else "unknown"
     plan.status = RpmbuildPlanStatus.FAILED
     plan.error_message = f"Stopped, group {layer_index + 1} was not clean. Failed builds: {shown}"
+
+
+async def _hold_layer(db: Any, plan: RpmbuildPlan, layer: int, *, discovery: bool, now: datetime) -> str:
+    info = await _layer_status(db, plan, layer)
+    return decide_open_layer(
+        builds_active=bool(info["builds_active"]),
+        publish_waiting=bool(info["publish_waiting"]),
+        dirty=bool(info["dirty"]),
+        blocked=bool(info["blocked"]),
+        discovery=discovery,
+        deadline_passed=_deadline_passed(plan, now),
+    )
+
+
+async def _jobs_for_layer(db: Any, plan_id: int, layer: int) -> list[BuildJob]:
+    return list(
+        (
+            await db.execute(
+                select(BuildJob).where(
+                    BuildJob.rpmbuild_plan_id == plan_id,
+                    BuildJob.rpmbuild_layer_index == layer,
+                )
+            )
+        ).scalars().all()
+    )
+
+
+async def _stop_for_hold(db: Any, plan: RpmbuildPlan, layer: int, hold: str) -> None:
+    jobs = await _jobs_for_layer(db, plan.id, layer)
+    if hold == "expire":
+        await _stop_unclean_group(db, plan, jobs, layer)
+        plan.error_message = (
+            f"Stopped, group {layer + 1} had no active builds and publishing did not finish "
+            f"before the settle timeout. {plan.error_message or ''}"
+        ).strip()
+    else:
+        await _stop_unclean_group(db, plan, jobs, layer)
+    plan.settle_deadline_at = None
 
 
 async def _finish_plan(db: Any, plan: RpmbuildPlan) -> None:
@@ -391,23 +492,36 @@ async def advance_rpmbuild_plans_once(db: Any) -> None:
         arches = plan_arches or rel.arch_list() or ["x86_64", "aarch64"]
         providers = _stored_dep_providers(plan) or {}
         opened = False
-        while cur < len(layers):
-            jobs, inflight, publish_ready, dirty = await _layer_status(db, plan, cur)
-            if inflight or (jobs and not publish_ready):
+        discovery = plan.seed_mode == "discovery"
+        now = datetime.now(timezone.utc)
+
+        async def _take(hold: str) -> bool:
+            if hold in ("builds", "blocked"):
                 plan.status = RpmbuildPlanStatus.RUNNING
+                plan.settle_deadline_at = None
+                return True
+            if hold == "settle":
+                _arm_settle_deadline(plan, now)
+                plan.status = RpmbuildPlanStatus.WAITING_SETTLE
+                return True
+            if hold in ("fail", "expire"):
+                await _stop_for_hold(db, plan, cur, hold)
+                return True
+            return False
+
+        while cur < len(layers):
+            hold = await _hold_layer(db, plan, cur, discovery=discovery, now=now)
+            if await _take(hold):
                 opened = True
                 break
-            if dirty:
-                await _stop_unclean_group(db, plan, jobs, cur)
-                opened = True
-                break
-            failed = await _failed_package_names(db, plan.id)
-            skip = names_blocked_by_failures(
-                [[str(n) for n in group] for group in layers],
-                failed,
-                providers,
-            )
-            if not jobs:
+            existing = await _jobs_for_layer(db, plan.id, cur)
+            if not existing:
+                failed = await _failed_package_names(db, plan.id)
+                skip = names_blocked_by_failures(
+                    [[str(n) for n in group] for group in layers],
+                    failed,
+                    providers,
+                )
                 await enqueue_plan_layer_jobs(
                     db,
                     plan=plan,
@@ -418,26 +532,10 @@ async def advance_rpmbuild_plans_once(db: Any) -> None:
                     preferred_mock_environment_id=plan_mock_id,
                     skip_package_names=skip,
                 )
-                jobs, inflight, publish_ready, dirty = await _layer_status(db, plan, cur)
-                if inflight or (jobs and not publish_ready):
-                    plan.status = RpmbuildPlanStatus.RUNNING
+                hold = await _hold_layer(db, plan, cur, discovery=discovery, now=now)
+                if await _take(hold):
                     opened = True
                     break
-                if dirty:
-                    await _stop_unclean_group(db, plan, jobs, cur)
-                    opened = True
-                    break
-                if not jobs:
-                    plan.settle_deadline_at = None
-                    cur += 1
-                    if cur >= len(layers):
-                        await _finish_plan(db, plan)
-                        opened = True
-                        break
-                    plan.current_open_layer = cur
-                    plan.status = RpmbuildPlanStatus.RUNNING
-                    logger.info("rpmbuild plan advanced id=%s layer=%s", plan.id, cur)
-                    continue
             plan.settle_deadline_at = None
             cur += 1
             if cur >= len(layers):
