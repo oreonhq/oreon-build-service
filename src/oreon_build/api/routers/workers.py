@@ -5,13 +5,13 @@ from datetime import datetime, timezone
 import secrets
 
 from fastapi import APIRouter, Header, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from oreon_build.api.deps import CurrentAdmin, DbSession
 from oreon_build.api.schemas import PaginatedResponse, WorkerEnroll, WorkerResponse, WorkerUpdate
 from oreon_build.config import get_settings
 from oreon_build.core.security import hash_password, worker_token_fingerprint
-from oreon_build.models import Worker, WorkerState
+from oreon_build.models import BuildAttempt, IsoBuild, Worker, WorkerState
 
 router = APIRouter(prefix="/workers", tags=["workers"])
 
@@ -132,6 +132,10 @@ async def delete_worker(worker_id: int, db: DbSession, _: CurrentAdmin):
     w = result.scalar_one_or_none()
     if not w:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Worker not found")
+    w.current_build_attempt_id = None
+    await db.flush()
+    await db.execute(update(BuildAttempt).where(BuildAttempt.worker_id == w.id).values(worker_id=None))
+    await db.execute(update(IsoBuild).where(IsoBuild.worker_id == w.id).values(worker_id=None))
     await db.delete(w)
     await db.flush()
 
