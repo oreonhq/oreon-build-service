@@ -430,6 +430,24 @@ class Settings(BaseSettings):
     )
 
     log_level: str = Field(default="INFO")
+    taiga_api_url: str = Field(
+        default="",
+        description="Taiga API root, like https://taiga.example/api/v1. Empty skips issue filing. TAIGA_API_URL.",
+    )
+    taiga_token: Optional[str] = Field(
+        default=None,
+        description="Taiga application token. TAIGA_TOKEN. Used instead of username and password when set.",
+    )
+    taiga_username: Optional[str] = Field(default=None, description="TAIGA_USERNAME.")
+    taiga_password: Optional[SecretStr] = Field(default=None, description="TAIGA_PASSWORD.")
+    taiga_project_slug: str = Field(
+        default="",
+        description="Taiga project slug that receives outdated-package issues. TAIGA_PROJECT_SLUG.",
+    )
+    taiga_groups_url: str = Field(
+        default="https://raw.githubusercontent.com/oreonhq/rpm-specfiles/refs/heads/main/groups/{release}",
+        description="Group file URL. {release} is the releasename. TAIGA_GROUPS_URL.",
+    )
 
     @field_validator("layer_provides_catalog", mode="before")
     @classmethod

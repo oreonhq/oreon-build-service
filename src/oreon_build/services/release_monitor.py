@@ -519,6 +519,9 @@ async def run_release_monitor_scan(scan_id: int) -> None:
             matched,
             len(outdated),
         )
+        from oreon_build.services.taiga_outdated import file_outdated_taiga_issues
+
+        await file_outdated_taiga_issues(release_id, outdated)
     except Exception as exc:
         logger.exception("release monitor scan %s crashed", scan_id)
         await _finish_scan(scan_id, status="failed", error=str(exc)[:4000])

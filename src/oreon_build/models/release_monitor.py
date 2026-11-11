@@ -66,3 +66,17 @@ class ReleaseMonitorOutdated(Base):
     scan: Mapped["ReleaseMonitorScan"] = relationship(
         "ReleaseMonitorScan", back_populates="outdated"
     )
+
+
+class ReleaseMonitorTaigaIssue(Base):
+
+    __tablename__ = "release_monitor_taiga_issues"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    releasename: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    package_name: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+    latest_version: Mapped[str] = mapped_column(String(256), nullable=False)
+    taiga_issue_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

@@ -22,7 +22,7 @@ from .publish_task import PublishTask
 from .rpm_complete_lock import RpmCompleteLock
 from .security_advisory import SecurityAdvisory, SecurityAdvisoryRelease
 from .side_tag import SideTag, SideTagCreatedFrom, SideTagMember
-from .release_monitor import ReleaseMonitorScan, ReleaseMonitorOutdated
+from .release_monitor import ReleaseMonitorScan, ReleaseMonitorOutdated, ReleaseMonitorTaigaIssue
 from .iso_build import IsoBuild
 from .rpm_scan import RpmScanFinding
 
@@ -70,6 +70,7 @@ __all__ = [
     "SideTagMember",
     "ReleaseMonitorScan",
     "ReleaseMonitorOutdated",
+    "ReleaseMonitorTaigaIssue",
     "IsoBuild",
     "RpmScanFinding",
 ]
