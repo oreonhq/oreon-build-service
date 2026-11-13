@@ -957,7 +957,7 @@ def _count_primary_packages(repodata_dir: Path) -> int:
     raw = primary_file.read_bytes()
     try:
         if primary_file.name.endswith(".zst"):
-            with tempfile.TemporaryDirectory() as td:
+            with tempfile.TemporaryDirectory(dir=_repo_temp_dir_parent()) as td:
                 zst = Path(td) / primary_file.name
                 zst.write_bytes(raw)
                 out = Path(td) / "primary.xml"

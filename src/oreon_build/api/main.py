@@ -68,6 +68,9 @@ from .worker_api import router as worker_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from oreon_build.core.scratch import pin_process_tmpdir
+
+    pin_process_tmpdir()
     settings = get_settings()
     _configure_oreon_logging(settings)
     logger.info(

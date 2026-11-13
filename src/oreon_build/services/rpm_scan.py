@@ -21,6 +21,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from oreon_build.core.audit import log_audit
 from oreon_build.db.session import async_session_maker
 from oreon_build.models import Artifact, BuildAttempt, BuildJob, BuildStatus, PublishTask, RpmScanFinding, RpmbuildPlan, RpmbuildPlanStatus
+from oreon_build.core.scratch import disk_tmpdir
 from oreon_build.services.r2 import get_r2_client
 
 logger = logging.getLogger(__name__)
@@ -195,6 +196,7 @@ def ensure_clamd() -> str | None:
                 start_new_session=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                env=_tool_env(),
             )
         except OSError as exc:
             return f"clamd failed to start {exc}"[:240]
@@ -234,6 +236,10 @@ def _tools_missing() -> str | None:
     return None
 
 
+def _scan_tmp_parent() -> Path:
+    return disk_tmpdir("scan")
+
+
 def _download(key: str, dest: Path) -> str | None:
     body = get_r2_client().get_object_stream(key)
     if body is None:
@@ -243,6 +249,8 @@ def _download(key: str, dest: Path) -> str | None:
             for chunk in body.iter_chunks(1024 * 1024):
                 if chunk:
                     fh.write(chunk)
+    except OSError as e:
+        return f"disk write failed: {e}"
     finally:
         close = getattr(body, "close", None)
         if close:
@@ -250,19 +258,34 @@ def _download(key: str, dest: Path) -> str | None:
     return None
 
 
+def _tool_env() -> dict[str, str]:
+    env = os.environ.copy()
+    loc = str(_scan_tmp_parent())
+    env["TMPDIR"] = loc
+    env["TEMP"] = loc
+    env["TMP"] = loc
+    return env
+
+
 def _unpack(rpm: Path, dest: Path) -> str | None:
-    cpio = subprocess.run(["rpm2cpio", str(rpm)], capture_output=True, timeout=180)
-    if cpio.returncode != 0 or not cpio.stdout:
-        return "rpm2cpio failed"
-    extracted = subprocess.run(
-        ["cpio", "-idm"],
-        input=cpio.stdout,
+    env = _tool_env()
+    p1 = subprocess.Popen(["rpm2cpio", str(rpm)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    p2 = subprocess.Popen(
+        ["cpio", "-idm", "--quiet"],
+        stdin=p1.stdout,
         cwd=dest,
-        capture_output=True,
-        timeout=300,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        env=env,
     )
-    if extracted.returncode not in (0, 2):
-        return "cpio failed"
+    if p1.stdout:
+        p1.stdout.close()
+    _out2, err2 = p2.communicate()
+    p1.wait()
+    if p2.returncode not in (0, 2):
+        return (err2 or b"cpio failed").decode("utf-8", "replace")[-240:] or "cpio failed"
+    if p1.returncode not in (0, None):
+        return "rpm2cpio failed"
     return None
 
 
@@ -271,7 +294,7 @@ def _run_clamdscan(root: Path) -> subprocess.CompletedProcess[str]:
     cfg = _clamd_config()
     if cfg is not None:
         cmd[1:1] = ["--config-file", str(cfg)]
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    return subprocess.run(cmd, capture_output=True, text=True, env=_tool_env())
 
 
 def _clam(root: Path) -> tuple[list[tuple[str, str]], str | None]:
@@ -300,7 +323,7 @@ def _yara_texts(rpm: Path, root: Path) -> Path | None:
         ["rpm", "-qp", "--scripts", str(rpm)],
         capture_output=True,
         text=True,
-        timeout=60,
+        env=_tool_env(),
     )
     wrote = False
     body = scripts.stdout or ""
@@ -321,7 +344,7 @@ def _yara(folder: Path) -> tuple[list[tuple[str, str, str]], str | None]:
         ["yr", "scan", "--output-format", "json", str(_RULES), str(folder)],
         capture_output=True,
         text=True,
-        timeout=120,
+        env=_tool_env(),
     )
     if proc.returncode not in (0, 1) and not (proc.stdout or "").strip():
         err = ((proc.stderr or "yr failed").strip().splitlines() or ["yr failed"])[-1]
@@ -333,7 +356,7 @@ def scan_rpm_path(rpm: Path) -> tuple[list[dict], str | None]:
     missing = _tools_missing()
     if missing:
         return [], missing
-    with tempfile.TemporaryDirectory(prefix="oreon-scan-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="oreon-scan-", dir=_scan_tmp_parent()) as tmp:
         root = Path(tmp)
         err = _unpack(rpm, root)
         if err:
@@ -420,7 +443,7 @@ async def _scan_job(job_id: int, attempt_id: int) -> None:
             await db.commit()
             return
         findings: list[dict] = []
-        with tempfile.TemporaryDirectory(prefix="oreon-rpm-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="oreon-rpm-", dir=_scan_tmp_parent()) as tmp:
             root = Path(tmp)
             for art in rpms:
                 dest = root / Path(art.filename).name
@@ -446,7 +469,10 @@ async def _scan_job(job_id: int, attempt_id: int) -> None:
                         return
                     logger.warning("rpm scan held job %s: %s", job_id, err)
                     return
-                hits, scan_err = await asyncio.to_thread(scan_rpm_path, dest)
+                try:
+                    hits, scan_err = await asyncio.to_thread(scan_rpm_path, dest)
+                finally:
+                    dest.unlink(missing_ok=True)
                 if scan_err:
                     logger.warning("rpm scan held job %s: %s", job_id, scan_err)
                     return

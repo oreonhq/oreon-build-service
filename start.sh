@@ -115,6 +115,11 @@ if ! command -v createrepo_c &>/dev/null; then
   echo "WARNING: createrepo_c not on PATH. Install it for repodata refresh (e.g. dnf install createrepo_c)."
 fi
 
+export TMPDIR="${OREON_DISK_TMPDIR:-$HOME/.oreon/tmp}"
+export TEMP="$TMPDIR"
+export TMP="$TMPDIR"
+mkdir -p "$TMPDIR"
+
 LOG_DIR="${OREON_LOG_DIR:-.oreon-logs}"
 mkdir -p "$LOG_DIR"
 

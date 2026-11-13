@@ -17,21 +17,18 @@ def test_failed_group_fails_even_when_publishes_are_still_open() -> None:
         dirty=True,
         blocked=False,
         discovery=False,
-        deadline_passed=False,
     ) == "fail"
 
 
-def test_idle_group_waits_for_publish_only_until_deadline() -> None:
+def test_idle_group_does_not_expire_while_publish_is_in_flight() -> None:
     waiting = dict(
         builds_active=False,
         publish_waiting=True,
         dirty=False,
         blocked=False,
         discovery=False,
-        deadline_passed=False,
     )
     assert decide_open_layer(**waiting) == "settle"
-    assert decide_open_layer(**{**waiting, "deadline_passed": True}) == "expire"
 
 
 def test_active_builds_hold_the_group() -> None:
@@ -41,7 +38,6 @@ def test_active_builds_hold_the_group() -> None:
         dirty=True,
         blocked=False,
         discovery=False,
-        deadline_passed=True,
     ) == "builds"
 
 
@@ -52,7 +48,6 @@ def test_clean_published_group_advances() -> None:
         dirty=False,
         blocked=False,
         discovery=False,
-        deadline_passed=False,
     ) == "advance"
 
 
@@ -63,7 +58,6 @@ def test_blocked_manual_group_fails_when_nothing_is_building() -> None:
         dirty=False,
         blocked=True,
         discovery=False,
-        deadline_passed=False,
     ) == "fail"
 
 
@@ -74,7 +68,6 @@ def test_blocked_discovery_stays_open_for_attention() -> None:
         dirty=False,
         blocked=True,
         discovery=True,
-        deadline_passed=True,
     ) == "blocked"
 
 

@@ -10,7 +10,7 @@ import io
 import logging
 import lzma
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select, update
@@ -133,7 +133,13 @@ async def resume_chain_plan_by_user(db: Any, request: Any, user: Any, chain_plan
     jobs = list((await db.execute(select(BuildJob).where(BuildJob.rpmbuild_plan_id == plan.id, BuildJob.rpmbuild_layer_index == cur))).scalars().all())
     reopen = [j for j in jobs if j.status in (BuildStatus.FAILED, BuildStatus.CANCELLED, BuildStatus.BLOCKED)]
     if not reopen:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No failed or cancelled jobs in the current chain group")
+        if plan.status != RpmbuildPlanStatus.FAILED:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No failed or cancelled jobs in the current chain group")
+        plan.status = RpmbuildPlanStatus.RUNNING
+        plan.error_message = None
+        plan.settle_deadline_at = None
+        await log_audit(db, "build.chain_resume", account_id=user.id, resource_type="rpmbuild_plan", resource_id=str(plan.id), details=f"unstuck group {cur + 1} with no failed jobs", ip_address=get_client_ip(request), user_agent=get_user_agent(request))
+        return plan
     from oreon_build.services.build_target_util import latest_package_version_id
     from oreon_build.models import PackageVersion, Source
 
@@ -272,43 +278,18 @@ def decide_open_layer(
     dirty: bool,
     blocked: bool,
     discovery: bool,
-    deadline_passed: bool,
 ) -> str:
     if builds_active:
         return "builds"
     if dirty:
         return "fail"
     if publish_waiting:
-        if deadline_passed:
-            return "expire"
         return "settle"
     if blocked and not discovery:
         return "fail"
     if blocked:
         return "blocked"
     return "advance"
-
-
-def _aware(dt: datetime | None) -> datetime | None:
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
-def _deadline_passed(plan: RpmbuildPlan, now: datetime) -> bool:
-    dl = _aware(plan.settle_deadline_at)
-    return dl is not None and now >= dl
-
-
-def _arm_settle_deadline(plan: RpmbuildPlan, now: datetime) -> None:
-    if _aware(plan.settle_deadline_at) is not None:
-        return
-    from oreon_build.config import get_settings
-
-    secs = int(get_settings().rpmbuild_settle_timeout_seconds)
-    plan.settle_deadline_at = now + timedelta(seconds=secs)
 
 
 async def _layer_status(db: Any, plan: RpmbuildPlan, layer: int) -> dict[str, Any]:
@@ -414,7 +395,7 @@ async def _stop_unclean_group(db: Any, plan: RpmbuildPlan, jobs: list[BuildJob],
     plan.error_message = f"Stopped, group {layer_index + 1} was not clean. Failed builds: {shown}"
 
 
-async def _hold_layer(db: Any, plan: RpmbuildPlan, layer: int, *, discovery: bool, now: datetime) -> str:
+async def _hold_layer(db: Any, plan: RpmbuildPlan, layer: int, *, discovery: bool) -> str:
     info = await _layer_status(db, plan, layer)
     return decide_open_layer(
         builds_active=bool(info["builds_active"]),
@@ -422,7 +403,6 @@ async def _hold_layer(db: Any, plan: RpmbuildPlan, layer: int, *, discovery: boo
         dirty=bool(info["dirty"]),
         blocked=bool(info["blocked"]),
         discovery=discovery,
-        deadline_passed=_deadline_passed(plan, now),
     )
 
 
@@ -493,7 +473,6 @@ async def advance_rpmbuild_plans_once(db: Any) -> None:
         providers = _stored_dep_providers(plan) or {}
         opened = False
         discovery = plan.seed_mode == "discovery"
-        now = datetime.now(timezone.utc)
 
         async def _take(hold: str) -> bool:
             if hold in ("builds", "blocked"):
@@ -501,7 +480,7 @@ async def advance_rpmbuild_plans_once(db: Any) -> None:
                 plan.settle_deadline_at = None
                 return True
             if hold == "settle":
-                _arm_settle_deadline(plan, now)
+                plan.settle_deadline_at = None
                 plan.status = RpmbuildPlanStatus.WAITING_SETTLE
                 return True
             if hold in ("fail", "expire"):
@@ -510,7 +489,7 @@ async def advance_rpmbuild_plans_once(db: Any) -> None:
             return False
 
         while cur < len(layers):
-            hold = await _hold_layer(db, plan, cur, discovery=discovery, now=now)
+            hold = await _hold_layer(db, plan, cur, discovery=discovery)
             if await _take(hold):
                 opened = True
                 break
@@ -532,7 +511,7 @@ async def advance_rpmbuild_plans_once(db: Any) -> None:
                     preferred_mock_environment_id=plan_mock_id,
                     skip_package_names=skip,
                 )
-                hold = await _hold_layer(db, plan, cur, discovery=discovery, now=now)
+                hold = await _hold_layer(db, plan, cur, discovery=discovery)
                 if await _take(hold):
                     opened = True
                     break

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 from oreon_build.api.routers.auth import _login_hits, login_rate_limited
+from oreon_build.core.scratch import disk_tmpdir
 from oreon_build.services.rpm_scan import parse_clam_line, parse_yr_json, skip_scan_path, _scan_failure
 from pathlib import Path
 
@@ -12,6 +13,16 @@ def test_skip_noise_paths():
     assert skip_scan_path("opt/pkg/testdata/sample")
     assert skip_scan_path("usr/share/rules/a.yar")
     assert not skip_scan_path("usr/bin/curl")
+
+
+def test_disk_tmpdir_refuses_tmpfs(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("OREON_DISK_TMPDIR", "/tmp/oreon-nope")
+    monkeypatch.setenv("OREON_SCAN_TMPDIR", "/tmp/oreon-nope")
+    monkeypatch.setenv("OREON_REPO_TMPDIR", "/tmp/oreon-nope")
+    got = disk_tmpdir("scan")
+    text = str(got.resolve())
+    assert not text.startswith("/tmp/")
+    assert got.is_dir()
 
 
 def test_clam_ignores_pua_and_doc(tmp_path: Path):
