@@ -343,26 +343,6 @@ class BuildTriggerAccepted(BaseModel):
     package_count: Optional[int] = None
 
 
-class DistgitBatchPackageItem(BaseModel):
-    name: str = Field(..., max_length=256)
-    spec_path: Optional[str] = Field(None, max_length=512, description="Defaults to releasename/name/name.spec")
-
-
-class DistgitBatchTrigger(BaseModel):
-    release_id: int = Field(..., ge=1)
-    side_tag_id: int = Field(..., description="Side tag to publish into (required)")
-    packages: List[DistgitBatchPackageItem] = Field(..., min_length=1)
-    architectures: List[str] = Field(default_factory=lambda: ["x86_64", "aarch64"])
-    preferred_mock_environment_id: Optional[int] = None
-    distgit_url: Optional[str] = Field(None, max_length=1024)
-    distgit_branch: Optional[str] = Field(None, max_length=128)
-    priority: int = 0
-    skip_complete_arches: bool = Field(
-        default=False,
-        description="If true, skip arches that already have a successful build for this package and release.",
-    )
-
-
 class SideTagCreate(BaseModel):
     release_id: int = Field(..., ge=1)
     name: str = Field(..., min_length=1, max_length=128)

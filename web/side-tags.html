@@ -66,7 +66,9 @@
       function fillReleases(sel, withAll) {
         return api.get('/releases?limit=500&active_only=true').then(function(r) {
           var items = (r && r.items) ? r.items : [];
-          var html = withAll ? '<option value="">All releases</option>'  : '-';
+          var html = withAll
+            ? '<option value="">All releases</option>'
+            : '<option value="" selected>Select release</option>';
           html += items.map(function(x) {
             return '<option value="' + x.id + '">' + escapeHtml(x.releasename || ('#' + x.id)) + '</option>';
           }).join('');

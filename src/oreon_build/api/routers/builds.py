@@ -24,7 +24,6 @@ from oreon_build.api.schemas import (
     DiscoveryBuildTrigger,
     LayerJobRow,
     CurrentFailureItem,
-    DistgitBatchTrigger,
     PaginatedResponse,
     RpmbuildPlanCreate,
     RpmbuildPlanResponse,
@@ -346,41 +345,6 @@ async def trigger_build(
     jobs_created = await execute_build_trigger(db, user, data, request=request)
     att_map = await _latest_attempt_by_job_ids(db, [j.id for j in jobs_created])
     return [await _job_to_response(db, j, att_map.get(j.id)) for j in jobs_created]
-
-
-@router.post("/trigger-batch", status_code=status.HTTP_202_ACCEPTED, response_model=BuildTriggerAccepted)
-async def trigger_distgit_batch(
-    data: DistgitBatchTrigger,
-    request: Request,
-    db: DbSession,
-    user: CurrentUser,
-):
-    from oreon_build.services.build_trigger_bg import run_distgit_batch, spawn
-
-    names = sorted({(p.name or "").strip() for p in data.packages if (p.name or "").strip()})
-    if not names:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No package names provided")
-    rr = await db.execute(select(Release).where(Release.id == data.release_id))
-    release = rr.scalar_one_or_none()
-    if not release:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Release not found")
-    if not release.is_active:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Release is inactive")
-    payload = data.model_dump(mode="json")
-    await db.commit()
-    spawn(
-        run_distgit_batch(
-            payload,
-            user.id,
-            get_client_ip(request),
-            get_user_agent(request),
-        )
-    )
-    return BuildTriggerAccepted(
-        status="accepted",
-        message="DistGit batch accepted. Packages are being queued in the background.",
-        package_count=len(data.packages),
-    )
 
 
 @router.post("/mass-rebuild/run", response_model=dict)

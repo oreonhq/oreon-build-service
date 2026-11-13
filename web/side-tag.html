@@ -96,7 +96,6 @@
               <button type="button" class="source-type-tab active" data-type="url">From URLs</button>
               <button type="button" class="source-type-tab" data-type="upload">Upload</button>
               <button type="button" class="source-type-tab" data-type="scm">SCM</button>
-              <button type="button" class="source-type-tab" data-type="distgit">DistGit</button>
               <button type="button" class="source-type-tab" data-type="chainbuild">Chain build</button>
             </div>
             <div id="source-url-panel" class="source-panel">
@@ -112,10 +111,6 @@
               <input type="text" id="source-scm-url" class="form-control" placeholder="https://github.com/org/repo.git#branch:path">
               <label style="margin-top:0.5rem;">Branch (optional)</label>
               <input type="text" id="source-scm-branch" class="form-control" placeholder="main">
-            </div>
-            <div id="source-distgit-panel" class="source-panel" style="display:none;">
-              <label>Package names</label>
-                <textarea id="distgit-packages" class="form-control" rows="3" placeholder="one package per line"></textarea>
             </div>
             <div id="source-chainbuild-panel" class="source-panel" style="display:none;">
               <label>Chain</label>
@@ -992,37 +987,6 @@
               })
               .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
           });
-        } else if (currentSourceType === 'distgit') {
-          var pkgsRaw = (document.getElementById('distgit-packages') && document.getElementById('distgit-packages').value) || '';
-          var pkgNames = pkgsRaw
-            .split(/[\s,]+/)
-            .map(function(s) { return s.trim(); })
-            .filter(function(s) { return !!s; });
-          if (!pkgNames.length) { alert('Enter at least one package name.'); return; }
-          var rel = releaseById(selectedReleaseIdNew);
-          var releasename = rel && rel.releasename ? rel.releasename.trim()  : '-';
-          if (!releasename) { alert('Selected release is missing a releasename.'); return; }
-        var batchBody = {
-          release_id: selectedReleaseIdNew,
-          side_tag_id: sideTagId,
-          architectures: arches,
-          skip_complete_arches: false,
-          packages: pkgNames.map(function(pkgName) {
-            return { name: pkgName, spec_path: releasename + '/' + pkgName + '/' + pkgName + '.spec' };
-          })
-        };
-        if (mockIdVal) batchBody.preferred_mock_environment_id = parseInt(mockIdVal, 10);
-        batchBody.distgit_branch = getDistgitBranch();
-        oreonWithLoading(_btn, function() {
-          return api.post('/builds/trigger-batch', batchBody)
-            .then(function(data) {
-              render();
-              var n = (data && data.package_count) ? data.package_count : pkgNames.length;
-              alert(buildAcceptedMessage(data, 'Queued ' + n + ' DistGit package(s) in the background.'));
-            })
-            .catch(function(e) { alert('Failed: ' + (e.message || 'Unknown error')); });
-        });
-          return;
         } else if (currentSourceType === 'chainbuild') {
           var chainSpec = (document.getElementById('chainbuild-spec') && document.getElementById('chainbuild-spec').value || '').trim();
           if (!chainSpec) { alert('Enter a package chain.'); return; }
