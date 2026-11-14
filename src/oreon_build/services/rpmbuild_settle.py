@@ -277,18 +277,13 @@ def decide_open_layer(
     publish_waiting: bool,
     dirty: bool,
     blocked: bool,
-    discovery: bool,
 ) -> str:
     if builds_active:
         return "builds"
-    if dirty:
+    if dirty or blocked:
         return "fail"
     if publish_waiting:
         return "settle"
-    if blocked and not discovery:
-        return "fail"
-    if blocked:
-        return "blocked"
     return "advance"
 
 
@@ -367,7 +362,7 @@ def _stored_dep_providers(plan: RpmbuildPlan) -> dict[str, list[str]] | None:
     return out
 
 
-async def _stop_unclean_group(db: Any, plan: RpmbuildPlan, jobs: list[BuildJob], layer_index: int) -> None:
+async def _stop_group(db: Any, plan: RpmbuildPlan, jobs: list[BuildJob], layer_index: int) -> None:
     bad_ids = [
         j.id
         for j in jobs
@@ -392,17 +387,16 @@ async def _stop_unclean_group(db: Any, plan: RpmbuildPlan, jobs: list[BuildJob],
         names = sorted({str(n) for (n,) in rows})
     shown = ", ".join(names[:20]) if names else "unknown"
     plan.status = RpmbuildPlanStatus.FAILED
-    plan.error_message = f"Stopped, group {layer_index + 1} was not clean. Failed builds: {shown}"
+    plan.error_message = f"Stopped, group {layer_index + 1}. Failed builds: {shown}"
 
 
-async def _hold_layer(db: Any, plan: RpmbuildPlan, layer: int, *, discovery: bool) -> str:
+async def _hold_layer(db: Any, plan: RpmbuildPlan, layer: int) -> str:
     info = await _layer_status(db, plan, layer)
     return decide_open_layer(
         builds_active=bool(info["builds_active"]),
         publish_waiting=bool(info["publish_waiting"]),
         dirty=bool(info["dirty"]),
         blocked=bool(info["blocked"]),
-        discovery=discovery,
     )
 
 
@@ -422,13 +416,13 @@ async def _jobs_for_layer(db: Any, plan_id: int, layer: int) -> list[BuildJob]:
 async def _stop_for_hold(db: Any, plan: RpmbuildPlan, layer: int, hold: str) -> None:
     jobs = await _jobs_for_layer(db, plan.id, layer)
     if hold == "expire":
-        await _stop_unclean_group(db, plan, jobs, layer)
+        await _stop_group(db, plan, jobs, layer)
         plan.error_message = (
             f"Stopped, group {layer + 1} had no active builds and publishing did not finish "
             f"before the settle timeout. {plan.error_message or ''}"
         ).strip()
     else:
-        await _stop_unclean_group(db, plan, jobs, layer)
+        await _stop_group(db, plan, jobs, layer)
     plan.settle_deadline_at = None
 
 
@@ -472,7 +466,6 @@ async def advance_rpmbuild_plans_once(db: Any) -> None:
         arches = plan_arches or rel.arch_list() or ["x86_64", "aarch64"]
         providers = _stored_dep_providers(plan) or {}
         opened = False
-        discovery = plan.seed_mode == "discovery"
 
         async def _take(hold: str) -> bool:
             if hold in ("builds", "blocked"):
@@ -489,7 +482,7 @@ async def advance_rpmbuild_plans_once(db: Any) -> None:
             return False
 
         while cur < len(layers):
-            hold = await _hold_layer(db, plan, cur, discovery=discovery)
+            hold = await _hold_layer(db, plan, cur)
             if await _take(hold):
                 opened = True
                 break
@@ -511,7 +504,7 @@ async def advance_rpmbuild_plans_once(db: Any) -> None:
                     preferred_mock_environment_id=plan_mock_id,
                     skip_package_names=skip,
                 )
-                hold = await _hold_layer(db, plan, cur, discovery=discovery)
+                hold = await _hold_layer(db, plan, cur)
                 if await _take(hold):
                     opened = True
                     break

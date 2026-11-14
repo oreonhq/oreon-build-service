@@ -16,7 +16,6 @@ def test_failed_group_fails_even_when_publishes_are_still_open() -> None:
         publish_waiting=True,
         dirty=True,
         blocked=False,
-        discovery=False,
     ) == "fail"
 
 
@@ -26,7 +25,6 @@ def test_idle_group_does_not_expire_while_publish_is_in_flight() -> None:
         publish_waiting=True,
         dirty=False,
         blocked=False,
-        discovery=False,
     )
     assert decide_open_layer(**waiting) == "settle"
 
@@ -37,38 +35,25 @@ def test_active_builds_hold_the_group() -> None:
         publish_waiting=False,
         dirty=True,
         blocked=False,
-        discovery=False,
     ) == "builds"
 
 
-def test_clean_published_group_advances() -> None:
+def test_published_group_advances() -> None:
     assert decide_open_layer(
         builds_active=False,
         publish_waiting=False,
         dirty=False,
         blocked=False,
-        discovery=False,
     ) == "advance"
 
 
-def test_blocked_manual_group_fails_when_nothing_is_building() -> None:
+def test_blocked_group_fails_the_chain() -> None:
     assert decide_open_layer(
         builds_active=False,
-        publish_waiting=False,
+        publish_waiting=True,
         dirty=False,
         blocked=True,
-        discovery=False,
     ) == "fail"
-
-
-def test_blocked_discovery_stays_open_for_attention() -> None:
-    assert decide_open_layer(
-        builds_active=False,
-        publish_waiting=False,
-        dirty=False,
-        blocked=True,
-        discovery=True,
-    ) == "blocked"
 
 
 def test_names_blocked_by_failures_is_transitive() -> None:
