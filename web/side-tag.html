@@ -214,13 +214,11 @@
           updateDistgitBranchFromRelease();
         }).catch(function() { releases = []; updateDistgitBranchFromRelease(); });
       }
-      function renderSideTagChrome() {
+      function paintSideTagMeta() {
         var meta = document.getElementById('side-tag-meta');
-        var actions = document.getElementById('side-tag-actions');
         if (!sideTag) {
           if (meta) meta.textContent = sideTagId ? ('Loading #' + sideTagId) : 'Missing side tag id';
-          if (actions) { actions.style.display = 'none'; actions.innerHTML = ''; }
-          return;
+          return '';
         }
         var st = sideTag.status || 'idle';
         var icon = window.oreonStatusIcon ? window.oreonStatusIcon(st) : escapeHtml(st);
@@ -230,19 +228,31 @@
         function fact(k, v) {
           return '<span><span class="k">' + k + '</span><span class="v">' + escapeHtml(v) + '</span></span>';
         }
-        if (meta) {
-          meta.innerHTML =
-            '<div class="tag-head">' +
-            '<div class="tag-title">' + icon + '<h2>' + escapeHtml(sideTag.name) + '</h2></div>' +
-            '<div class="tag-facts">' +
-              fact('Release', sideTag.releasename || ('#' + sideTag.release_id)) +
-              fact('Owner', sideTag.owner_username || '-') +
-              fact('Members', memberText) +
-              fact('From', sideTag.created_from || '-') +
-              (activity ? fact('Last activity', activity) : '') +
-            '</div></div>';
+        var html =
+          '<div class="tag-head">' +
+          '<div class="tag-title">' + icon + '<h2>' + escapeHtml(sideTag.name) + '</h2></div>' +
+          '<div class="tag-facts">' +
+            fact('Release', sideTag.releasename || ('#' + sideTag.release_id)) +
+            fact('Owner', sideTag.owner_username || '-') +
+            fact('Members', memberText) +
+            fact('From', sideTag.created_from || '-') +
+            (activity ? fact('Last activity', activity) : '') +
+          '</div></div>';
+        var metaKey = [st, activity, memberText, sideTag.name || '', sideTag.owner_username || '', sideTag.releasename || ''].join('\n');
+        if (meta && meta.getAttribute('data-key') !== metaKey) {
+          meta.setAttribute('data-key', metaKey);
+          meta.innerHTML = html;
         }
         document.title = sideTag.name + ' - Side Tag';
+        return html;
+      }
+      function renderSideTagChrome() {
+        var actions = document.getElementById('side-tag-actions');
+        paintSideTagMeta();
+        if (!sideTag) {
+          if (actions) { actions.style.display = 'none'; actions.innerHTML = ''; }
+          return;
+        }
         if (!actions) return;
         if (!api.token) { actions.style.display = 'none'; actions.innerHTML = ''; return; }
         actions.style.display = 'flex';
@@ -479,12 +489,10 @@
             + chainThreatsHtml(data)
             + '<p style="margin:0.35rem 0 0;color:var(--text-muted);font-size:0.85rem;">' + escapeHtml(progress) + '</p>',
             { showResume: true, chainId: data.chain_plan_id });
-          stopLayerPoll();
           return;
         }
         if (st === 'success') {
           showLayerAlert('success', head, chainCountsHtml(data.counts) + chainThreatsHtml(data), { chainId: data.chain_plan_id });
-          stopLayerPoll();
           return;
         }
         showLayerAlert('info', head,
@@ -498,7 +506,6 @@
           api.get('/builds/chain/' + chainId + '/status?t=' + Date.now()).then(function(data) {
             if (watchedChainId !== chainId) return;
             renderChainAlertFromStatus(data);
-            if (data.status === 'failed' || data.status === 'cancelled' || data.status === 'success') render();
           }).catch(function() {});
         }
         tick();
@@ -750,17 +757,25 @@
           btns.appendChild(cancelBulk);
         }
       });
-      function render() {
+      var buildsReq = 0;
+      var lastBuildsHtml = '';
+      function render(opts) {
+        opts = opts || {};
+        var quiet = !!opts.quiet;
+        var req = ++buildsReq;
         var offset = buildsPage * buildsPageSize;
         var bf = document.getElementById('builds-filter');
         var bq = (bf && bf.value) ? String(bf.value).trim()  : '-';
-        var buildsUrl = '/builds?limit=' + buildsPageSize + '&offset=' + offset + (sideTagId ? ('&side_tag_id=' + sideTagId) : '');
+        var buildsUrl = '/builds?limit=' + buildsPageSize + '&offset=' + offset + (sideTagId ? ('&side_tag_id=' + sideTagId) : '') + (quiet ? ('&t=' + Date.now()) : '');
         if (bq) buildsUrl += '&search=' + encodeURIComponent(bq);
+        var pkgReq = (quiet && packages.length) ? Promise.resolve({ items: packages }) : api.get('/packages?limit=500').catch(function() { return { items: [] }; });
+        var relReq = (quiet && releases.length) ? Promise.resolve({ items: releases }) : api.get('/releases?limit=500&active_only=true').catch(function() { return { items: [] }; });
         Promise.all([
           api.get(buildsUrl),
-          api.get('/packages?limit=500').catch(function() { return { items: [] }; }),
-          api.get('/releases?limit=500&active_only=true').catch(function() { return { items: [] }; })
+          pkgReq,
+          relReq
         ]).then(function(results) {
+          if (req !== buildsReq) return;
           var data = results[0];
           var packagesList = (results[1] && results[1].items) ? results[1].items : [];
           var releasesList = (results[2] && results[2].items) ? results[2].items : [];
@@ -768,6 +783,12 @@
           if (!tbody) return;
           var jobs = (data && data.items) ? data.items : [];
           buildsTotal = (data && typeof data.total === 'number') ? data.total : 0;
+          var kept = {};
+          if (quiet) {
+            tbody.querySelectorAll('.build-row-cb:checked').forEach(function(cb) {
+              kept[cb.getAttribute('data-id')] = true;
+            });
+          }
           function packageLabel(j) {
             var fromJob = (j.package_name || '').trim();
             if (fromJob) return escapeHtml(fromJob);
@@ -775,7 +796,7 @@
             var name = pkg ? (pkg.name || '').trim() : '';
             return name ? escapeHtml(name) : ('#' + j.package_id);
           }
-          tbody.innerHTML = jobs.map(function(j) {
+          var html = jobs.map(function(j) {
             const canAct = api.token;
             var cancelBtn = (canAct && (j.status === 'pending' || j.status === 'queued' || j.status === 'running')) ? ' <button type="button" class="btn cancel-build" data-id="' + j.id + '">Cancel</button>'  : '';
             var retryEligible = canAct && j.side_tag_id != null && j.side_tag_id !== undefined && j.status !== 'pending' && j.status !== 'queued' && j.status !== 'running';
@@ -800,6 +821,20 @@
             }
             return '<tr data-id="' + j.id + '" data-status="' + escapeAttr(j.status || '') + '" data-side-tag="' + (j.side_tag_id != null ? '1' : '0') + '"><td class="col-checkbox"><input type="checkbox" class="build-row-cb" data-id="' + j.id + '"></td><td>' + j.id + '</td><td>' + packageLabel(j) + '</td><td>' + arch + '</td><td>' + statusCell + '</td><td>' + signCell + '</td><td>' + layerPart + '</td><td>' + (j.created_at || '').slice(0,19) + '</td><td><a href="/build.html?job_id=' + j.id + '">View</a>' + retryBtn + cancelBtn + '</td></tr>';
           }).join('') || '<tr><td colspan="9">No builds</td></tr>';
+          if (quiet && html === lastBuildsHtml) {
+            var numPagesSame = buildsTotal ? Math.ceil(buildsTotal / buildsPageSize) : 1;
+            document.getElementById('builds-page-info').textContent = 'Page ' + (buildsPage + 1) + ' of ' + numPagesSame;
+            document.getElementById('builds-prev').disabled = buildsPage <= 0;
+            document.getElementById('builds-next').disabled = buildsPage >= numPagesSame - 1;
+            return;
+          }
+          lastBuildsHtml = html;
+          tbody.innerHTML = html;
+          if (quiet) {
+            tbody.querySelectorAll('.build-row-cb').forEach(function(cb) {
+              if (kept[cb.getAttribute('data-id')]) cb.checked = true;
+            });
+          }
           tbody.querySelectorAll('.retry:not([disabled])').forEach(function(btn) {
             btn.addEventListener('click', function() {
               var jid = String(btn.dataset.id);
@@ -1009,7 +1044,29 @@
           return;
         }
       });
+      function refreshTagQuiet() {
+        if (!sideTagId) return;
+        api.get('/side-tags/' + sideTagId + '?t=' + Date.now()).then(function(t) {
+          sideTag = t;
+          canAccessTag = !!t.can_access;
+          paintSideTagMeta();
+        }).catch(function() {});
+      }
+      var pageLiveTimer = null;
+      function tickPageLive() {
+        if (document.hidden) return;
+        render({ quiet: true });
+        refreshTagQuiet();
+      }
+      function startPageLive() {
+        if (pageLiveTimer) clearInterval(pageLiveTimer);
+        pageLiveTimer = setInterval(tickPageLive, 3000);
+      }
+      document.addEventListener('visibilitychange', function() {
+        if (!document.hidden) tickPageLive();
+      });
       render();
+      startPageLive();
       startWatchLayerFromUrl();
     })();
   </script>

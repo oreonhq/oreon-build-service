@@ -86,14 +86,15 @@
           if (hint) hint.textContent = 'Open side tags for builds. Login to create or manage tags.';
         }
       }
+      var lastTagsHtml = '';
       function load() {
         var rid = (document.getElementById('release-filter').value || '').trim();
         var url = '/side-tags?limit=200';
         if (rid) url += '&release_id=' + encodeURIComponent(rid);
-        api.get(url).then(function(data) {
+        api.get(url + (url.indexOf('?') >= 0 ? '&' : '?') + 't=' + Date.now()).then(function(data) {
           var items = (data && data.items) ? data.items : [];
           var tbody = document.getElementById('tags-tbody');
-          tbody.innerHTML = items.map(function(t) {
+          var html = items.map(function(t) {
             var st = (t.status || 'idle');
             var chip = window.oreonStatusIcon ? window.oreonStatusIcon(st) : escapeHtml(st);
             var acts = '<a class="btn" href="/side-tag.html?id=' + t.id + '">Open</a>';
@@ -109,6 +110,9 @@
               '<td>' + acts + '</td>' +
               '</tr>';
           }).join('') || '<tr><td colspan="6">No side tags</td></tr>';
+          if (html === lastTagsHtml) return;
+          lastTagsHtml = html;
+          tbody.innerHTML = html;
           tbody.querySelectorAll('.scrap-tag').forEach(function(btn) {
             btn.onclick = function() {
               var name = btn.getAttribute('data-name') || '';
@@ -145,6 +149,13 @@
         fillReleases(document.getElementById('create-release'), false),
         fillReleases(document.getElementById('release-filter'), true),
       ]).then(load);
+      setInterval(function() {
+        if (document.hidden) return;
+        load();
+      }, 4000);
+      document.addEventListener('visibilitychange', function() {
+        if (!document.hidden) load();
+      });
     })();
   </script>
 </body>
