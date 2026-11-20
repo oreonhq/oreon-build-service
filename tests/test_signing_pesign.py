@@ -9,6 +9,8 @@ import pytest
 from oreon_build.config import Settings
 from oreon_build.services.signing import (
     _PESIGN_TREE_SCRIPT,
+    _gpg_sign_extra_args,
+    _rpm_buildtime,
     package_name_matches_pesign_pattern,
     PesignRepackError,
     pesign_rpm_if_configured,
@@ -161,3 +163,22 @@ def test_kernel_without_efi_payload_skips_repack(monkeypatch, tmp_path, name, ar
 def test_kernel_efi_payload_still_requires_signing(name):
     settings = Settings(pesign_rules_json=OREON_LIKE_RULES, pesign_nss_dir="/etc/pki/pesign")
     assert resolve_pesign_nickname(name, "aarch64", settings) == "oreonsecureboot501"
+
+
+def test_gpg_sign_extra_freezes_clock_at_buildtime():
+    extra = _gpg_sign_extra_args("/run/pass", 1795132800)
+    assert "--faked-system-time 1795132800!" in extra
+    assert "--ignore-time-conflict" in extra
+    assert "--passphrase-file /run/pass" in extra
+
+
+def test_gpg_sign_extra_without_buildtime_does_not_fake_clock():
+    extra = _gpg_sign_extra_args(None, None)
+    assert "faked-system-time" not in extra
+    assert extra == "--batch --no-tty"
+
+
+def test_rpm_buildtime_reads_header(tmp_path):
+    rpm = tmp_path / "empty.rpm"
+    rpm.write_bytes(b"not an rpm")
+    assert _rpm_buildtime(rpm) is None

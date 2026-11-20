@@ -462,6 +462,35 @@ def pesign_rpm_if_configured(rpm_path: Path, settings: Optional[PesignConfig] = 
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 
+def _rpm_buildtime(rpm_path: Path) -> Optional[int]:
+    try:
+        result = subprocess.run(
+            ["rpm", "-qp", "--nosignature", "--qf", "%{BUILDTIME}", str(rpm_path)],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    raw = (result.stdout or "").strip()
+    if not raw.isdigit():
+        return None
+    built = int(raw)
+    if built <= 0:
+        return None
+    return built
+
+
+def _gpg_sign_extra_args(pass_path: Optional[str], buildtime: Optional[int]) -> str:
+    extra = "--batch --no-tty"
+    if buildtime:
+        extra += f" --ignore-time-conflict --faked-system-time {buildtime}!"
+    if pass_path:
+        extra += f" --pinentry-mode loopback --passphrase-file {shlex.quote(pass_path)}"
+    return extra
+
+
 def sign_rpm(rpm_path: Path, key_id: Optional[str] = None) -> bool:
     settings = get_settings()
     kid = key_id or settings.signing_key_id
@@ -475,13 +504,12 @@ def sign_rpm(rpm_path: Path, key_id: Optional[str] = None) -> bool:
     phrase = _signing_passphrase_plain(settings)
     pass_path: Optional[str] = None
     try:
-        extra = "--batch --no-tty"
         if phrase:
             fd, pass_path = tempfile.mkstemp(prefix="oreon-gpg-pass-", text=True)
             with os.fdopen(fd, "w") as pf:
                 pf.write(phrase)
             os.chmod(pass_path, 0o600)
-            extra += f" --pinentry-mode loopback --passphrase-file {shlex.quote(pass_path)}"
+        extra = _gpg_sign_extra_args(pass_path, _rpm_buildtime(rpm_path))
         result = subprocess.run(
             [
                 "rpm",
