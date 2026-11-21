@@ -12,8 +12,10 @@
     .build-meta dt { color: var(--text-muted); }
     .attempt-card { margin-bottom: 1rem; border: none; border-radius: 10px; padding: 0.75rem; }
     .attempt-card h4 { margin: 0 0 0.5rem 0; }
-    .log-viewer { background: #1e1e1e; color: #d4d4d4; padding: 1rem; border-radius: 10px; overflow: auto; max-height: 70vh; font-family: ui-monospace, monospace; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
     .log-placeholder { color: var(--text-muted); font-style: italic; }
+    .log-group { margin-top: 0.55rem; }
+    .log-group-name { color: var(--text-muted); font-size: 0.82rem; margin-bottom: 0.15rem; }
+    .log-link { display: inline-block; margin: 0.15rem 0.85rem 0.15rem 0; }
   </style>
 </head>
 <body>
@@ -64,38 +66,56 @@
           window.__oreonLogPollTimer = null;
         }
       }
-      function startLogPoll(attemptId, pre, card) {
-        stopLogPoll();
-        if (!pre || !card) return;
-        var st = (card.getAttribute('data-attempt-status') || '').toLowerCase();
-        if (st !== 'running' && st !== 'queued') return;
-        window.__oreonLogPollTimer = setInterval(function() {
-          var live = (card.getAttribute('data-attempt-status') || '').toLowerCase();
-          if (live !== 'running' && live !== 'queued') {
-            stopLogPoll();
-            return;
-          }
-          if (pre.style.display === 'none') return;
-          fetchAttemptLogTail(attemptId, pre, true);
-        }, LOG_POLL_MS);
+      function logFileHref(attemptId, name) {
+        var parts = String(name).split('/').map(function(p) { return encodeURIComponent(p); }).join('/');
+        return '/api/logs/attempts/' + encodeURIComponent(attemptId) + '/files/' + parts;
       }
-      function fetchAttemptLogTail(attemptId, pre, silent) {
-        if (!silent) {
-          pre.style.display = 'block';
-          pre.textContent = 'Loading';
-        }
-        return api.get('/logs/attempts/' + attemptId + '/tail?lines=2000').then(function(r) {
-          var lines = (r && r.lines) ? r.lines : [];
-          var atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 80;
-          pre.textContent = lines.join('\n') || '(empty log)';
-          pre.dataset.loaded = '1';
-          if (silent && atBottom) pre.scrollTop = pre.scrollHeight;
-        }).catch(function(e) {
-          if (!silent) {
-            pre.textContent = 'Log not available: ' + (e.message || 'Log not yet uploaded or build did not produce a log.');
-            pre.dataset.loaded = '1';
+      function renderLogLinks(attemptId, files) {
+        var html = '<a class="log-link" target="_blank" rel="noopener" href="/api/logs/attempts/' + encodeURIComponent(attemptId) + '">log</a>';
+        var groups = {};
+        var order = [];
+        (files || []).forEach(function(f) {
+          var name = String((f && f.name) || '');
+          if (!name) return;
+          var slash = name.indexOf('/');
+          var group = slash >= 0 ? name.slice(0, slash) : 'logs';
+          var label = slash >= 0 ? name.slice(slash + 1) : name;
+          if (!groups[group]) {
+            groups[group] = [];
+            order.push(group);
           }
+          groups[group].push({ label: label, name: name });
         });
+        order.forEach(function(group) {
+          html += '<div class="log-group"><div class="log-group-name">' + escapeHtml(group) + '</div>';
+          groups[group].forEach(function(item) {
+            html += '<a class="log-link" target="_blank" rel="noopener" href="' + logFileHref(attemptId, item.name) + '">' + escapeHtml(item.label) + '</a>';
+          });
+          html += '</div>';
+        });
+        return html;
+      }
+      function paintLogs(attemptId, host) {
+        if (!host) return Promise.resolve();
+        return api.get('/logs/attempts/' + attemptId + '/files').then(function(r) {
+          host.innerHTML = renderLogLinks(attemptId, (r && r.files) || []);
+        }).catch(function() {
+          host.innerHTML = renderLogLinks(attemptId, []);
+        });
+      }
+      function startLogPoll(container) {
+        stopLogPoll();
+        if (!container) return;
+        window.__oreonLogPollTimer = setInterval(function() {
+          var live = false;
+          container.querySelectorAll('.attempt-card').forEach(function(card) {
+            var st = (card.getAttribute('data-attempt-status') || '').toLowerCase();
+            if (st !== 'running' && st !== 'queued') return;
+            live = true;
+            paintLogs(card.getAttribute('data-attempt-id'), card.querySelector('.attempt-logs'));
+          });
+          if (!live) stopLogPoll();
+        }, LOG_POLL_MS);
       }
       function refreshAttemptElapsed(container) {
         if (!container) return;
@@ -185,7 +205,6 @@
             return;
           }
           container.innerHTML = list.map(function(a, idx) {
-            var logId = 'log-' + a.id;
             var st = (a.status || '').toLowerCase();
             var adisp = window.oreonJobDisplayStatus
               ? window.oreonJobDisplayStatus({ display_status: a.display_status, status: a.status })
@@ -206,48 +225,16 @@
               '<div class="attempt-elapsed-live" style="color:var(--text-muted);"></div>' +
               '<div><small>Started: ' + (a.started_at ? a.started_at.slice(0, 19) : '---') + ' &nbsp; Finished: ' + (a.finished_at ? a.finished_at.slice(0, 19) : '---') + '</small></div>' +
               '<div class="artifacts" id="artifacts-' + a.id + '" style="margin-top:0.5rem; font-size:0.9rem; color:var(--text-muted);">Artifacts: loading</div>' +
-              '<div style="margin-top:0.5rem;display:flex;gap:0.35rem;flex-wrap:wrap;align-items:center;">' +
-              '<button type="button" class="btn load-log" data-attempt-id="' + a.id + '">View log</button>' +
-              '<button type="button" class="btn refresh-log" data-attempt-id="' + a.id + '">Refresh log</button></div>' +
-              '<pre id="' + logId + '" class="log-viewer" style="display:none; margin-top:0.5rem;"></pre>' +
+              '<div class="attempt-logs" id="logs-' + a.id + '" style="margin-top:0.5rem;">' + renderLogLinks(a.id, []) + '</div>' +
               '</div>';
           }).join('');
           refreshAttemptElapsed(container);
           if (window.__oreonBuildElapsedTimer) clearInterval(window.__oreonBuildElapsedTimer);
           window.__oreonBuildElapsedTimer = setInterval(function() { refreshAttemptElapsed(container); }, 30000);
-          container.querySelectorAll('.load-log').forEach(function(btn) {
-            btn.addEventListener('click', function() {
-              var attemptId = btn.dataset.attemptId;
-              var pre = document.getElementById('log-' + attemptId);
-              var card = btn.closest('.attempt-card');
-              if (!pre) return;
-              if (pre.dataset.loaded === '1') {
-                var showing = pre.style.display === 'none';
-                pre.style.display = showing ? 'block' : 'none';
-                if (showing) startLogPoll(attemptId, pre, card);
-                else stopLogPoll();
-                return;
-              }
-              oreonWithLoading(btn, function() {
-                return fetchAttemptLogTail(attemptId, pre, false).then(function() {
-                  startLogPoll(attemptId, pre, card);
-                });
-              });
-            });
+          list.forEach(function(a) {
+            paintLogs(a.id, document.getElementById('logs-' + a.id));
           });
-          container.querySelectorAll('.refresh-log').forEach(function(btn) {
-            btn.addEventListener('click', function() {
-              var attemptId = btn.dataset.attemptId;
-              var pre = document.getElementById('log-' + attemptId);
-              var card = btn.closest('.attempt-card');
-              if (!pre) return;
-              oreonWithLoading(btn, function() {
-                return fetchAttemptLogTail(attemptId, pre, false).then(function() {
-                  startLogPoll(attemptId, pre, card);
-                });
-              });
-            });
-          });
+          startLogPoll(container);
           // Load artifacts (including signing status) for each attempt
           list.forEach(function(a) {
             var placeholder = document.getElementById('artifacts-' + a.id);

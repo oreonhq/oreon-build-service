@@ -58,7 +58,15 @@ from oreon_build.models import (
     Worker,
     WorkerState,
 )
-from oreon_build.services.r2 import get_r2_client, log_r2_key, repo_r2_prefix, repo_rpms_key, src_r2_key
+from oreon_build.services.build_logs import safe_log_name
+from oreon_build.services.r2 import (
+    get_r2_client,
+    log_file_r2_key,
+    log_r2_key,
+    repo_r2_prefix,
+    repo_rpms_key,
+    src_r2_key,
+)
 from oreon_build.services.signing import (
     PesignRepackError,
     pesign_rpm_if_configured,
@@ -81,7 +89,6 @@ def _cancel_cache_ttl_seconds() -> float:
         v = 2.0
     return max(0.2, min(v, 10.0))
 
-_MAX_BUILD_LOG_BYTES = 64 * 1024 * 1024
 
 def _pesign_expected_for_filename(fname: str) -> bool:
     name = Path((fname or "").strip()).name
@@ -1419,11 +1426,7 @@ def _prune_superseded_repo_objects(
 
 _BUILD_LOG_PUT_CONTENT_TYPE = "text/plain; charset=utf-8"
 
-async def _resolve_worker_build_log_r2_key(
-    db: DbSession,
-    worker: Worker,
-    attempt_id: int,
-) -> str:
+async def _worker_attempt_releasename(db: DbSession, worker: Worker, attempt_id: int) -> str:
     ar = await db.execute(
         select(BuildAttempt).where(
             BuildAttempt.id == attempt_id,
@@ -1445,7 +1448,22 @@ async def _resolve_worker_build_log_r2_key(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Release missing",
         )
-    return log_r2_key(release.releasename, attempt_id)
+    return release.releasename
+
+
+async def _resolve_worker_build_log_r2_key(
+    db: DbSession,
+    worker: Worker,
+    attempt_id: int,
+) -> str:
+    return log_r2_key(await _worker_attempt_releasename(db, worker, attempt_id), attempt_id)
+
+
+def _named_log_key(releasename: str, attempt_id: int, name: str) -> str:
+    safe = safe_log_name(name)
+    if safe is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid log name")
+    return log_file_r2_key(releasename, attempt_id, safe)
 
 async def _assign_attempt_build_log_key(db: DbSession, worker: Worker, attempt_id: int, key: str) -> None:
     r = await db.execute(
@@ -1499,11 +1517,6 @@ async def worker_build_log_complete(
     worker: Annotated[Worker, Depends(_require_worker)],
     body: WorkerBuildLogCompleteBody,
 ):
-    if body.size_bytes > _MAX_BUILD_LOG_BYTES:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"Log exceeds max {_MAX_BUILD_LOG_BYTES // (1024 * 1024)} MiB",
-        )
     key = await _resolve_worker_build_log_r2_key(db, worker, attempt_id)
     want_sha = (body.checksum_sha256 or "").strip().lower()
     if len(want_sha) != 64 or any(c not in "0123456789abcdef" for c in want_sha):
@@ -1599,11 +1612,6 @@ async def worker_upload_build_log(
     worker: Annotated[Worker, Depends(_require_worker)],
     content: bytes = Body(...),
 ):
-    if len(content) > _MAX_BUILD_LOG_BYTES:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"Log exceeds max {_MAX_BUILD_LOG_BYTES // (1024 * 1024)} MiB",
-        )
     key = await _resolve_worker_build_log_r2_key(db, worker, attempt_id)
 
     def _put() -> None:
@@ -1612,6 +1620,135 @@ async def worker_upload_build_log(
     await asyncio.to_thread(_put)
     await _assign_attempt_build_log_key(db, worker, attempt_id, key)
     return {"log_r2_key": key}
+
+
+class WorkerNamedLogBody(BaseModel):
+    name: str
+    checksum_sha256: str
+    size_bytes: int
+
+
+def _check_named_log_body(body: WorkerNamedLogBody) -> tuple[str, str, int]:
+    safe = safe_log_name(body.name)
+    if safe is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid log name")
+    if body.size_bytes < 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid size_bytes")
+    want_sha = (body.checksum_sha256 or "").strip().lower()
+    if len(want_sha) != 64 or any(c not in "0123456789abcdef" for c in want_sha):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid checksum_sha256")
+    return safe, want_sha, int(body.size_bytes)
+
+
+def _verify_r2_log(key: str, want_sha: str, size_bytes: int) -> None:
+    import time as _time
+
+    verify_retries = max(
+        1, int((os.environ.get("OREON_WORKER_BUILD_LOG_COMPLETE_RETRIES") or "6").strip() or "6")
+    )
+    last_err: Exception | None = None
+    for round_i in range(verify_retries):
+        try:
+            r2 = get_r2_client()
+            cl = r2.head_object_content_length(key)
+            if cl is None:
+                raise FileNotFoundError("Build log not in R2 yet (complete presigned PUT first)")
+            if cl != size_bytes:
+                raise ValueError(f"Size mismatch: R2 has {cl} bytes, worker claimed {size_bytes}")
+            stream = r2.get_object_stream(key)
+            if stream is None:
+                raise FileNotFoundError("Build log not in R2")
+            h = hashlib.sha256()
+            try:
+                while True:
+                    chunk = stream.read(8 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            finally:
+                stream.close()
+            if h.hexdigest() != want_sha:
+                raise ValueError("SHA256 of uploaded log does not match checksum_sha256")
+            return
+        except (FileNotFoundError, ValueError) as e:
+            last_err = e
+            if round_i + 1 >= verify_retries:
+                break
+            delay = min(1.5 * (1.4**round_i), 12.0)
+            logger.warning(
+                "named build-log verify retry key=%s round=%s/%s sleep=%.1fs: %s",
+                key,
+                round_i + 1,
+                verify_retries,
+                delay,
+                e,
+            )
+            _time.sleep(delay)
+    assert last_err is not None
+    raise last_err
+
+
+@router.post("/build-log/file/presign/{attempt_id}")
+async def worker_named_log_presign(
+    attempt_id: int,
+    db: DbSession,
+    worker: Annotated[Worker, Depends(_require_worker)],
+    body: WorkerNamedLogBody,
+):
+    safe, _want_sha, _size = _check_named_log_body(body)
+    releasename = await _worker_attempt_releasename(db, worker, attempt_id)
+    key = log_file_r2_key(releasename, attempt_id, safe)
+    settings = get_settings()
+    expires = settings.worker_rpm_presign_put_expires_seconds
+    url = get_r2_client().generate_presigned_put_url(
+        key,
+        content_type=_BUILD_LOG_PUT_CONTENT_TYPE,
+        expires_in=expires,
+    )
+    return {
+        "put_url": url,
+        "headers": {"Content-Type": _BUILD_LOG_PUT_CONTENT_TYPE},
+        "expires_in": expires,
+        "name": safe,
+    }
+
+
+@router.post("/build-log/file/complete/{attempt_id}")
+async def worker_named_log_complete(
+    attempt_id: int,
+    db: DbSession,
+    worker: Annotated[Worker, Depends(_require_worker)],
+    body: WorkerNamedLogBody,
+):
+    safe, want_sha, size_bytes = _check_named_log_body(body)
+    releasename = await _worker_attempt_releasename(db, worker, attempt_id)
+    key = log_file_r2_key(releasename, attempt_id, safe)
+    try:
+        await asyncio.to_thread(_verify_r2_log, key, want_sha, size_bytes)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    return {"name": safe, "log_r2_key": key}
+
+
+@router.put("/build-log/file/{attempt_id}")
+async def worker_upload_named_log(
+    attempt_id: int,
+    db: DbSession,
+    worker: Annotated[Worker, Depends(_require_worker)],
+    name: str = Query(..., min_length=1, max_length=512),
+    content: bytes = Body(...),
+):
+    releasename = await _worker_attempt_releasename(db, worker, attempt_id)
+    key = _named_log_key(releasename, attempt_id, name)
+
+    def _put() -> None:
+        get_r2_client().put_object(key, content, content_type=_BUILD_LOG_PUT_CONTENT_TYPE)
+
+    await asyncio.to_thread(_put)
+    return {"name": safe_log_name(name), "log_r2_key": key}
+
 
 @router.get("/source-blob/{attempt_id}")
 async def worker_download_source_blob(

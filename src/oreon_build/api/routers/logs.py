@@ -9,8 +9,9 @@ from sqlalchemy import select
 from starlette.concurrency import iterate_in_threadpool
 
 from oreon_build.db.session import async_session_maker
-from oreon_build.models import BuildAttempt
-from oreon_build.services.r2 import get_r2_client
+from oreon_build.models import BuildAttempt, BuildJob, Release
+from oreon_build.services.build_logs import safe_log_name, sort_log_names
+from oreon_build.services.r2 import get_r2_client, log_file_r2_key, log_files_prefix
 
 router = APIRouter(prefix="/logs", tags=["logs"])
 
@@ -104,4 +105,65 @@ async def get_build_log_tail(attempt_id: int, lines: int = 100):
     return JSONResponse(
         content={"lines": tail_lines},
         headers={"Cache-Control": "no-store"},
+    )
+
+
+async def _attempt_releasename(attempt_id: int) -> str:
+    async with async_session_maker() as db:
+        row = await db.execute(
+            select(Release.releasename)
+            .join(BuildJob, BuildJob.release_id == Release.id)
+            .join(BuildAttempt, BuildAttempt.build_job_id == BuildJob.id)
+            .where(BuildAttempt.id == attempt_id)
+        )
+        name = row.scalar_one_or_none()
+    if name is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Build attempt not found")
+    return name
+
+
+@router.get("/attempts/{attempt_id}/files")
+async def list_attempt_logs(attempt_id: int):
+    releasename = await _attempt_releasename(attempt_id)
+    prefix = log_files_prefix(releasename, attempt_id)
+
+    def _list() -> list[dict]:
+        objs = get_r2_client().list_objects(prefix)
+        files = []
+        for obj in objs:
+            key = str(obj.get("key") or "")
+            if not key.startswith(prefix):
+                continue
+            rel = key[len(prefix):]
+            safe = safe_log_name(rel)
+            if safe is None:
+                continue
+            files.append({"name": safe, "size": int(obj.get("size") or 0)})
+        order = {name: i for i, name in enumerate(sort_log_names([f["name"] for f in files]))}
+        files.sort(key=lambda item: order.get(item["name"], 0))
+        return files
+
+    files = await asyncio.to_thread(_list)
+    return JSONResponse(content={"files": files}, headers={"Cache-Control": "no-store"})
+
+
+@router.get("/attempts/{attempt_id}/files/{name:path}")
+async def get_attempt_log_file(attempt_id: int, name: str):
+    safe = safe_log_name(name)
+    if safe is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Log not found")
+    releasename = await _attempt_releasename(attempt_id)
+    key = log_file_r2_key(releasename, attempt_id, safe)
+    iterator = await asyncio.to_thread(_iter_log_chunks, key)
+    if iterator is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Log file not found in storage")
+    base = safe.rsplit("/", 1)[-1]
+    return StreamingResponse(
+        iterate_in_threadpool(iterator),
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Content-Disposition": f'inline; filename="{base}"',
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
     )

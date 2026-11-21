@@ -10,10 +10,12 @@ from oreon_build.worker.main import (
 )
 
 
-def test_mock_live_output_tail_trims():
-    buf = MockLiveOutput(max_bytes=100)
+def test_mock_live_output_keeps_the_whole_stream(tmp_path):
+    buf = MockLiveOutput(tmp_path)
     buf.append("a" * 80)
     buf.append("b" * 80)
+    buf.close()
+    assert buf.path.read_text(encoding="utf-8") == ("a" * 80) + ("b" * 80)
     tail = buf.tail(max_bytes=50)
     assert len(tail) == 50
     assert tail.endswith("b" * 50)

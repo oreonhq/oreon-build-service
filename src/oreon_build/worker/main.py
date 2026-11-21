@@ -28,6 +28,7 @@ from typing import Callable, Iterator, TypeVar
 
 import httpx
 
+from oreon_build.services.build_logs import iter_log_files, safe_log_name
 from oreon_build.services.signing import (
     PesignRepackError,
     PesignRuntimeConfig,
@@ -58,26 +59,42 @@ _inflight_attempt_lock = threading.Lock()
 
 class MockLiveOutput:
 
-    def __init__(self, max_bytes: int = 4 * 1024 * 1024) -> None:
+    def __init__(self, directory: Path) -> None:
         self._lock = threading.Lock()
-        self._buf = ""
-        self._max_bytes = max(1, int(max_bytes))
+        directory.mkdir(parents=True, exist_ok=True)
+        self._path = directory / "mock_output.log"
+        self._fh = self._path.open("w", encoding="utf-8", errors="replace")
+
+    @property
+    def path(self) -> Path:
+        return self._path
 
     def append(self, text: str) -> None:
         if not text:
             return
         with self._lock:
-            self._buf += text
-            if len(self._buf) > self._max_bytes:
-                self._buf = self._buf[-self._max_bytes :]
+            self._fh.write(text)
+            self._fh.flush()
 
     def tail(self, max_bytes: int = 800_000) -> str:
-        cap = max(1, int(max_bytes))
         with self._lock:
-            s = self._buf
-        if len(s) <= cap:
-            return s
-        return s[-cap:]
+            if not self._fh.closed:
+                self._fh.flush()
+        try:
+            data = self._path.read_bytes()
+        except OSError:
+            return ""
+        if max_bytes > 0 and len(data) > max_bytes:
+            data = data[-max_bytes:]
+        return data.decode("utf-8", errors="replace")
+
+    def close(self) -> None:
+        with self._lock:
+            try:
+                self._fh.flush()
+                self._fh.close()
+            except OSError:
+                pass
 
 def _worker_cpu_count() -> int:
     return max(1, os.cpu_count() or 1)
@@ -262,8 +279,6 @@ def _upload_build_log_via_controller(
 
     return _with_http_retries(f"build-log upload attempt_id={attempt_id}", _do)
 
-_OREON_MAX_BUILD_LOG_BYTES = 64 * 1024 * 1024
-
 def _upload_build_log_direct_put(
     session: httpx.Client,
     controller_url: str,
@@ -277,6 +292,167 @@ def _upload_build_log_direct_put(
         timeout=_build_log_put_timeout(),
     )
     r.raise_for_status()
+
+
+def _hash_file(path: Path) -> tuple[str, int]:
+    h = hashlib.sha256()
+    size = 0
+    with path.open("rb") as fh:
+        while True:
+            chunk = fh.read(8 * 1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            h.update(chunk)
+    return h.hexdigest(), size
+
+
+def _upload_named_log_file(
+    session: httpx.Client,
+    controller_url: str,
+    attempt_id: int,
+    name: str,
+    path: Path,
+) -> None:
+    safe = safe_log_name(name)
+    if safe is None or not path.is_file():
+        return
+    digest, size = _hash_file(path)
+    put_to = _build_log_put_timeout()
+    if _build_log_presigned_r2_enabled():
+
+        def _presign() -> dict:
+            r = session.post(
+                f"{controller_url}/api/worker/build-log/file/presign/{attempt_id}",
+                json={"name": safe, "checksum_sha256": digest, "size_bytes": size},
+                timeout=httpx.Timeout(120.0, connect=60.0),
+            )
+            r.raise_for_status()
+            return r.json()
+
+        pres = _with_http_retries(f"named-log presign {safe} attempt_id={attempt_id}", _presign)
+        put_url = str(pres["put_url"])
+        hdrs = dict(pres.get("headers") or {})
+
+        def _put() -> None:
+            with path.open("rb") as fh:
+                pr = session.put(put_url, headers=hdrs, content=fh, timeout=put_to)
+                pr.raise_for_status()
+
+        _with_http_retries(f"named-log R2 PUT {safe} attempt_id={attempt_id}", _put)
+
+        def _complete() -> None:
+            r = session.post(
+                f"{controller_url}/api/worker/build-log/file/complete/{attempt_id}",
+                json={"name": safe, "checksum_sha256": digest, "size_bytes": size},
+                timeout=put_to,
+            )
+            r.raise_for_status()
+
+        _with_http_retries(f"named-log complete {safe} attempt_id={attempt_id}", _complete)
+        return
+
+    def _do() -> None:
+        with path.open("rb") as fh:
+            r = session.put(
+                f"{controller_url}/api/worker/build-log/file/{attempt_id}",
+                params={"name": safe},
+                content=fh,
+                headers={"Content-Type": "text/plain; charset=utf-8"},
+                timeout=put_to,
+            )
+            r.raise_for_status()
+
+    _with_http_retries(f"named-log upload {safe} attempt_id={attempt_id}", _do)
+
+
+def _mock_chroot_var_log(mock_config: str | None, mock_unique_ext: str | None) -> Path | None:
+    name = (mock_config or "").strip()
+    if name.endswith(".cfg"):
+        name = name[:-4]
+    if not name:
+        return None
+    if mock_unique_ext:
+        name = f"{name}-{mock_unique_ext}"
+    p = Path("/var/lib/mock") / name / "root" / "var" / "log"
+    return p if p.is_dir() else None
+
+
+def _stage_log_files(
+    stage: str,
+    result_dir: Path,
+    *,
+    mock_config: str | None = None,
+    mock_unique_ext: str | None = None,
+    mock_output_path: Path | None = None,
+) -> list[tuple[str, Path]]:
+    roots = _mock_result_search_dirs(
+        result_dir,
+        mock_config=mock_config,
+        mock_unique_ext=mock_unique_ext,
+    )
+    var_log = _mock_chroot_var_log(mock_config, mock_unique_ext)
+    if var_log is not None:
+        roots.append(var_log)
+    found: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    chmodded: set[str] = getattr(_stage_log_files, "_chmodded", set())
+    _stage_log_files._chmodded = chmodded
+    for root in roots:
+        key = str(root)
+        if key not in chmodded:
+            try:
+                _make_mock_resultdir_world_readable(root)
+            except Exception:
+                logger.debug("chmod on log dir failed %s", root, exc_info=True)
+            chmodded.add(key)
+        for rel, path in iter_log_files(root):
+            name = safe_log_name(f"{stage}/{rel}")
+            if name is None or name in seen:
+                continue
+            seen.add(name)
+            found.append((name, path))
+    if mock_output_path is not None and mock_output_path.is_file():
+        name = safe_log_name(f"{stage}/mock_output.log")
+        if name is not None:
+            found = [item for item in found if item[0] != name]
+            found.append((name, mock_output_path))
+    return found
+
+
+def _upload_stage_logs(
+    session: httpx.Client,
+    controller_url: str,
+    attempt_id: int,
+    stage: str,
+    result_dir: Path,
+    *,
+    mock_config: str | None = None,
+    mock_unique_ext: str | None = None,
+    mock_output_path: Path | None = None,
+    changed_only: dict[str, tuple[int, int]] | None = None,
+) -> None:
+    for name, path in _stage_log_files(
+        stage,
+        result_dir,
+        mock_config=mock_config,
+        mock_unique_ext=mock_unique_ext,
+        mock_output_path=mock_output_path,
+    ):
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        marker = (int(st.st_size), int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))))
+        if changed_only is not None and changed_only.get(name) == marker:
+            continue
+        try:
+            _upload_named_log_file(session, controller_url, attempt_id, name, path)
+        except Exception:
+            logger.exception("log upload failed attempt_id=%s name=%s", attempt_id, name)
+            continue
+        if changed_only is not None:
+            changed_only[name] = marker
 
 def _live_log_interval_sec() -> int:
     raw = (os.environ.get("OREON_WORKER_LIVE_LOG_INTERVAL_SEC") or "15").strip()
@@ -434,6 +610,8 @@ def _start_live_build_log_snapshot_thread(
     mock_output_getter: Callable[[], str] | None = None,
     mock_config: str | None = None,
     mock_unique_ext: str | None = None,
+    stage: str | None = None,
+    mock_output_path: Path | None = None,
 ) -> threading.Thread | None:
     interval = _live_log_interval_sec()
     if interval <= 0:
@@ -441,11 +619,27 @@ def _start_live_build_log_snapshot_thread(
 
     def runner() -> None:
         first = True
+        changed: dict[str, tuple[int, int]] = {}
         while True:
             wait_s = 0.0 if first else float(interval)
             first = False
             if stop_flag.wait(timeout=wait_s):
                 break
+            if stage:
+                try:
+                    _upload_stage_logs(
+                        session,
+                        controller_url,
+                        attempt_id,
+                        stage,
+                        result_dir,
+                        mock_config=mock_config,
+                        mock_unique_ext=mock_unique_ext,
+                        mock_output_path=mock_output_path,
+                        changed_only=changed,
+                    )
+                except Exception:
+                    logger.debug("Live log file upload failed (attempt %s)", attempt_id, exc_info=True)
             try:
                 snippet = _read_inprogress_mock_build_log_snippet(
                     result_dir,
@@ -472,8 +666,6 @@ def _start_live_build_log_snapshot_thread(
                 if snippet.strip():
                     body += snippet
                 body_bytes = body.encode("utf-8")
-                if len(body_bytes) > _OREON_MAX_BUILD_LOG_BYTES:
-                    continue
 
                 def _snap() -> None:
                     _upload_build_log_direct_put(session, controller_url, attempt_id, body_bytes)
@@ -2881,7 +3073,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                 srpm_result_dir = tmp / "srpm_result"
                 srpm_result_dir.mkdir()
                 live_srpm_stop = threading.Event()
-                srpm_live = MockLiveOutput()
+                srpm_live = MockLiveOutput(tmp / "srpm-live")
 
                 def _srpm_mock_tail() -> str:
                     return srpm_live.tail()
@@ -2896,6 +3088,8 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                     mock_output_getter=_srpm_mock_tail,
                     mock_config=mock_config,
                     mock_unique_ext=mock_unique_ext,
+                    stage="srpm",
+                    mock_output_path=srpm_live.path,
                 )
                 try:
                     ok, srpm_path, srpm_out, srpm_cancelled = _mock_build_srpm_from_spec(
@@ -2914,7 +3108,21 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                     )
                 finally:
                     _stop_live_build_log_snapshot_thread(live_srpm_stop, live_srpm_thread)
+                    srpm_live.close()
                 _make_mock_resultdir_world_readable(srpm_result_dir)
+                try:
+                    _upload_stage_logs(
+                        session,
+                        controller_url,
+                        attempt_id,
+                        "srpm",
+                        srpm_result_dir,
+                        mock_config=mock_config,
+                        mock_unique_ext=mock_unique_ext,
+                        mock_output_path=srpm_live.path,
+                    )
+                except Exception:
+                    logger.exception("srpm log upload failed attempt_id=%s", attempt_id)
                 build_log_parts.extend(
                     _mock_stage_log_sections(
                         srpm_result_dir,
@@ -2969,7 +3177,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
             resolve_dir = tmp / "resolve"
             resolve_dir.mkdir()
             live_resolve_stop = threading.Event()
-            resolve_live = MockLiveOutput()
+            resolve_live = MockLiveOutput(tmp / "resolve-live")
 
             def _resolve_mock_tail() -> str:
                 return resolve_live.tail()
@@ -2984,6 +3192,8 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                 mock_output_getter=_resolve_mock_tail,
                 mock_config=mock_config,
                 mock_unique_ext=mock_unique_ext,
+                stage="resolve",
+                mock_output_path=resolve_live.path,
             )
             try:
                 resolve_ok, resolve_out, resolve_cancelled = _mock_installdeps_srpm(
@@ -3002,7 +3212,21 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                 )
             finally:
                 _stop_live_build_log_snapshot_thread(live_resolve_stop, live_resolve_thread)
+                resolve_live.close()
             _make_mock_resultdir_world_readable(resolve_dir)
+            try:
+                _upload_stage_logs(
+                    session,
+                    controller_url,
+                    attempt_id,
+                    "resolve",
+                    resolve_dir,
+                    mock_config=mock_config,
+                    mock_unique_ext=mock_unique_ext,
+                    mock_output_path=resolve_live.path,
+                )
+            except Exception:
+                logger.exception("resolve log upload failed attempt_id=%s", attempt_id)
             build_log_parts.extend(
                 _mock_stage_log_sections(
                     resolve_dir,
@@ -3061,7 +3285,7 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
             result_dir.mkdir()
             kernel_build = _is_kernel_srpm(srpm_path)
             live_rebuild_stop = threading.Event()
-            rebuild_live = MockLiveOutput()
+            rebuild_live = MockLiveOutput(tmp / "rebuild-live")
 
             def _rebuild_mock_tail() -> str:
                 return rebuild_live.tail()
@@ -3076,6 +3300,8 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                 mock_output_getter=_rebuild_mock_tail,
                 mock_config=mock_config,
                 mock_unique_ext=mock_unique_ext,
+                stage="rebuild",
+                mock_output_path=rebuild_live.path,
             )
             try:
                 ok, rebuild_out, rebuild_cancelled = _mock_rebuild_srpm(
@@ -3094,7 +3320,21 @@ def _process_job(controller_url: str, worker_headers: dict[str, str], job: dict)
                 )
             finally:
                 _stop_live_build_log_snapshot_thread(live_rebuild_stop, live_rebuild_thread)
+                rebuild_live.close()
             _make_mock_resultdir_world_readable(result_dir)
+            try:
+                _upload_stage_logs(
+                    session,
+                    controller_url,
+                    attempt_id,
+                    "rebuild",
+                    result_dir,
+                    mock_config=mock_config,
+                    mock_unique_ext=mock_unique_ext,
+                    mock_output_path=rebuild_live.path,
+                )
+            except Exception:
+                logger.exception("rebuild log upload failed attempt_id=%s", attempt_id)
             build_log_parts.extend(
                 _mock_stage_log_sections(
                     result_dir,

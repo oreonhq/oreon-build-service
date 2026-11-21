@@ -144,7 +144,7 @@ class Settings(BaseSettings):
 
     secret_key: str = Field(default="change-me-to-a-secure-random-string-min-32-chars")
     jwt_algorithm: str = Field(default="HS256")
-    jwt_expire_minutes: int = Field(default=60, ge=5, le=10080)
+    jwt_expire_minutes: int = Field(default=1440, ge=5, le=10080)
 
     admin_username: str = Field(default="admin")
     admin_password: str = Field(default="change-me-secure-password")

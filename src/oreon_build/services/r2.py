@@ -261,6 +261,14 @@ def log_r2_key(releasename: str, build_attempt_id: int) -> str:
     return f"{releasename}/logs/{build_attempt_id}.log"
 
 
+def log_files_prefix(releasename: str, build_attempt_id: int) -> str:
+    return f"{releasename}/logs/{build_attempt_id}/"
+
+
+def log_file_r2_key(releasename: str, build_attempt_id: int, name: str) -> str:
+    return log_files_prefix(releasename, build_attempt_id) + name
+
+
 def upload_r2_key(releasename: str, package_name: str, unique_id: str, filename: str) -> str:
     import re
     safe = re.sub(r"[^\w.\-]", "_", filename)
