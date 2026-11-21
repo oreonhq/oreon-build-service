@@ -31,6 +31,7 @@ cp "${ROOT}/src/oreon_build/core/dnf_missing.py" "${PKG_SRC}/core/dnf_missing.py
 : > "${PKG_SRC}/core/__init__.py"
 cp "${ROOT}/src/oreon_build/services/__init__.py" "${PKG_SRC}/services/__init__.py"
 cp "${ROOT}/src/oreon_build/services/signing.py" "${PKG_SRC}/services/signing.py"
+cp "${ROOT}/src/oreon_build/services/build_logs.py" "${PKG_SRC}/services/build_logs.py"
 
 cat > "${PKG_ROOT}/pyproject.toml" << EOF
 [build-system]
