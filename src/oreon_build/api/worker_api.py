@@ -59,6 +59,11 @@ from oreon_build.models import (
     WorkerState,
 )
 from oreon_build.services.build_logs import safe_log_name
+from oreon_build.services.promotion_r2_cleanup import (
+    dropped_sibling_filenames,
+    load_binary_source_names,
+    source_names_from_filenames,
+)
 from oreon_build.services.r2 import (
     get_r2_client,
     log_file_r2_key,
@@ -1309,9 +1314,12 @@ def _prune_superseded_repo_objects(
     arch: str,
     keep_artifact_filenames: set[str],
     payload_artifacts: list[ArtifactPayload],
+    source_package_names: set[str] | None = None,
+    known_binary_filenames: set[str] | None = None,
 ) -> list[str]:
     r2 = get_r2_client()
     pruned: list[str] = []
+    present_binaries: set[str] = set()
 
     binary_names: set[str] = set()
     src_names: set[str] = set()
@@ -1348,6 +1356,7 @@ def _prune_superseded_repo_objects(
         base = key.rsplit("/", 1)[-1]
         if not base.endswith(".rpm") or base.endswith(".src.rpm"):
             continue
+        present_binaries.add(base)
         if base in keep_artifact_filenames:
             continue
         old_name = _rpm_name_from_filename(base)
@@ -1381,6 +1390,34 @@ def _prune_superseded_repo_objects(
             r2.delete_object(key)
             pruned.append(base)
             logger.info("Pruned superseded SRPM %s", key)
+
+    source_names = set(source_package_names or ())
+    source_names.update(src_names)
+    source_names.update(source_names_from_filenames(keep_artifact_filenames))
+    sibling_map: dict[str, str] = {}
+    if source_names:
+        try:
+            sibling_map = load_binary_source_names(r2, releasename, branch, arch)
+        except Exception:
+            logger.exception(
+                "dropped subpackage lookup failed %s %s %s",
+                releasename,
+                branch,
+                arch,
+            )
+    drop = set(dropped_sibling_filenames(sibling_map, source_names, keep_artifact_filenames))
+    for base in known_binary_filenames or ():
+        if not base or base in keep_artifact_filenames or base.endswith(".src.rpm"):
+            continue
+        if base.endswith(".rpm"):
+            drop.add(base)
+    for base in drop:
+        if base not in present_binaries:
+            continue
+        key = repo_rpms_key(releasename, branch, arch, base)
+        r2.delete_object(key)
+        pruned.append(base)
+        logger.info("Pruned dropped subpackage %s", key)
 
     def _enforce_single_version(prefix: str, *, src: bool) -> None:
         by_name: dict[str, list[tuple[str, str, object]]] = {}

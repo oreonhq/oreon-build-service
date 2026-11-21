@@ -13,7 +13,7 @@ from sqlalchemy import select, update
 
 from oreon_build.core.repo_branch import job_publish_branch
 from oreon_build.db.session import async_session_maker
-from oreon_build.models import Artifact, BuildAttempt, BuildJob, BuildTarget, PublishTask, Release
+from oreon_build.models import Artifact, BuildAttempt, BuildJob, BuildTarget, Package, PublishTask, Release
 from oreon_build.services.publisher import prefix_publish_lock, rpm_publish_locks, update_repodata_at_prefix
 from oreon_build.services.r2 import get_r2_client, repo_r2_prefix, repo_rpms_key, src_r2_key
 
@@ -54,6 +54,8 @@ def process_repo_publish_sync(
     attempt_ids: list[int],
     payload_artifacts: list,
     build_attempt_r2_keys: list[str],
+    source_package_names: list[str] | None = None,
+    known_binary_filenames: list[str] | None = None,
 ) -> None:
     from oreon_build.api.worker_api import _prune_superseded_repo_objects
 
@@ -128,6 +130,8 @@ def process_repo_publish_sync(
             arch=arch,
             keep_artifact_filenames=keep,
             payload_artifacts=payload_artifacts,
+            source_package_names=set(source_package_names or ()),
+            known_binary_filenames=set(known_binary_filenames or ()),
         )
         for fn in pruned:
             if not fn or fn.endswith(".src.rpm"):
@@ -164,6 +168,8 @@ class _PrefixPublishBatch:
     attempt_ids: list[int] = field(default_factory=list)
     payload_artifacts: list = field(default_factory=list)
     build_attempt_r2_keys: list[str] = field(default_factory=list)
+    source_package_names: list[str] = field(default_factory=list)
+    known_binary_filenames: list[str] = field(default_factory=list)
 
 def _group_publish_tasks_by_prefix(batches: list[_PrefixPublishBatch]) -> dict[str, _PrefixPublishBatch]:
     out: dict[str, _PrefixPublishBatch] = {}
@@ -176,6 +182,8 @@ def _group_publish_tasks_by_prefix(batches: list[_PrefixPublishBatch]) -> dict[s
         cur.attempt_ids.extend(b.attempt_ids)
         cur.payload_artifacts.extend(b.payload_artifacts)
         cur.build_attempt_r2_keys.extend(b.build_attempt_r2_keys)
+        cur.source_package_names.extend(b.source_package_names)
+        cur.known_binary_filenames.extend(b.known_binary_filenames)
     return out
 
 async def _load_publish_batch(task: PublishTask) -> _PrefixPublishBatch | None:
@@ -214,6 +222,28 @@ async def _load_publish_batch(task: PublishTask) -> _PrefixPublishBatch | None:
         arch = target.architecture
         prefix = repo_r2_prefix(release.releasename, branch, arch)
 
+        pkg_name = ""
+        if job.package_id:
+            pkg = await db.get(Package, job.package_id)
+            pkg_name = (pkg.name or "").strip() if pkg else ""
+        prev_names: list[str] = []
+        if job.package_id and job.target_id:
+            prev_r = await db.execute(
+                select(Artifact.filename)
+                .join(BuildAttempt, Artifact.build_attempt_id == BuildAttempt.id)
+                .join(BuildJob, BuildAttempt.build_job_id == BuildJob.id)
+                .where(
+                    BuildJob.package_id == job.package_id,
+                    BuildJob.release_id == job.release_id,
+                    BuildJob.target_id == job.target_id,
+                    Artifact.filename.like("%.rpm"),
+                )
+            )
+            prev_names = [
+                fn
+                for fn in prev_r.scalars().all()
+                if fn and fn.endswith(".rpm") and not fn.endswith(".src.rpm")
+            ]
         art_r = await db.execute(select(Artifact).where(Artifact.build_attempt_id == task.attempt_id))
         artifacts = list(art_r.scalars().all())
         payload_artifacts = [
@@ -238,6 +268,8 @@ async def _load_publish_batch(task: PublishTask) -> _PrefixPublishBatch | None:
         attempt_ids=[task.attempt_id],
         payload_artifacts=payload_artifacts,
         build_attempt_r2_keys=r2_keys,
+        source_package_names=[pkg_name] if pkg_name else [],
+        known_binary_filenames=prev_names,
     )
 
 async def _mark_publish_tasks_running(task_ids: list[int]) -> None:
@@ -307,6 +339,8 @@ async def _run_prefix_publish_batch(batch: _PrefixPublishBatch) -> None:
                 attempt_ids=batch.attempt_ids,
                 payload_artifacts=batch.payload_artifacts,
                 build_attempt_r2_keys=batch.build_attempt_r2_keys,
+                source_package_names=batch.source_package_names,
+                known_binary_filenames=batch.known_binary_filenames,
             ),
             timeout=_repo_publish_timeout_sec(),
         )

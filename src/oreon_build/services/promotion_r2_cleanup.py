@@ -3,10 +3,15 @@
 
 from __future__ import annotations
 
+import bz2
+import gzip
+import io
 import logging
+import lzma
 import os
 import subprocess
 import tempfile
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Optional
@@ -37,6 +42,163 @@ def rpm_name_from_filename(filename: str) -> Optional[str]:
         return None
     name = parts[0].strip()
     return name or None
+
+
+def source_names_from_filenames(filenames: set[str] | list[str]) -> set[str]:
+    out: set[str] = set()
+    for fn in filenames:
+        if not str(fn).endswith(".src.rpm"):
+            continue
+        name = rpm_name_from_filename(str(fn))
+        if name:
+            out.add(name)
+    return out
+
+
+def parse_primary_sourcerpms(primary_xml: bytes) -> dict[str, str]:
+    out: dict[str, str] = {}
+    try:
+        root = ET.fromstring(primary_xml)
+    except ET.ParseError:
+        return out
+    for pkg in root.findall(".//{*}package"):
+        arch = (pkg.findtext("{*}arch") or "").strip()
+        if arch == "src":
+            continue
+        sourcerpm = (pkg.findtext(".//{*}sourcerpm") or "").strip()
+        if not sourcerpm.endswith(".src.rpm"):
+            continue
+        loc = pkg.find("{*}location")
+        href = ((loc.attrib.get("href") if loc is not None else "") or "").strip()
+        base = href.rsplit("/", 1)[-1] if href else ""
+        if not base.endswith(".rpm"):
+            ver = pkg.find("{*}version")
+            name = (pkg.findtext("{*}name") or "").strip()
+            rel = (ver.attrib.get("rel") if ver is not None else "") or ""
+            ver_s = (ver.attrib.get("ver") if ver is not None else "") or ""
+            if name and ver_s and rel and arch:
+                base = f"{name}-{ver_s}-{rel}.{arch}.rpm"
+            else:
+                continue
+        out[base] = sourcerpm
+    return out
+
+
+def binary_source_names(binary_to_srpm: dict[str, str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for base, srpm in binary_to_srpm.items():
+        name = rpm_name_from_filename(srpm)
+        if name:
+            out[base] = name
+    return out
+
+
+def dropped_sibling_filenames(
+    binary_to_source: dict[str, str],
+    source_names: set[str],
+    keep: set[str],
+) -> list[str]:
+    if not source_names:
+        return []
+    out: list[str] = []
+    for base, src in binary_to_source.items():
+        if not base.endswith(".rpm") or base.endswith(".src.rpm"):
+            continue
+        if base in keep or src not in source_names:
+            continue
+        out.append(base)
+    return out
+
+
+def promote_filenames_without_stale_siblings(
+    filenames: list[str],
+    binary_to_srpm: dict[str, str],
+) -> list[str]:
+    src_files = {fn for fn in filenames if fn.endswith(".src.rpm")}
+    source_names = source_names_from_filenames(src_files)
+    if not source_names:
+        return list(filenames)
+    kept: list[str] = []
+    for fn in filenames:
+        if not fn.endswith(".rpm") or fn.endswith(".src.rpm"):
+            kept.append(fn)
+            continue
+        srpm = binary_to_srpm.get(fn)
+        if not srpm:
+            kept.append(fn)
+            continue
+        src_name = rpm_name_from_filename(srpm)
+        if src_name in source_names and srpm not in src_files:
+            continue
+        kept.append(fn)
+    return kept
+
+
+def _decompress_repodata(raw: bytes, key: str) -> bytes:
+    lk = key.lower()
+    if lk.endswith(".gz"):
+        return gzip.decompress(raw)
+    if lk.endswith(".bz2"):
+        return bz2.decompress(raw)
+    if lk.endswith(".xz"):
+        return lzma.decompress(raw)
+    if lk.endswith(".zst"):
+        import zstandard as zstd
+
+        with zstd.ZstdDecompressor().stream_reader(io.BytesIO(raw)) as reader:
+            return reader.read()
+    return raw
+
+
+def _primary_key_from_repomd(repo_prefix: str, repomd_raw: bytes) -> str | None:
+    try:
+        root = ET.fromstring(repomd_raw)
+    except ET.ParseError:
+        return None
+    for data in root.findall(".//{*}data"):
+        if (data.attrib.get("type") or "") != "primary":
+            continue
+        loc = data.find("{*}location")
+        href = ((loc.attrib.get("href") if loc is not None else "") or "").strip()
+        if not href:
+            continue
+        if href.startswith(f"{repo_prefix}/"):
+            return href
+        return f"{repo_prefix}/{href.lstrip('/')}"
+    return None
+
+
+def load_binary_sourcerpms(
+    r2: R2Client,
+    releasename: str,
+    branch: str,
+    arch: str,
+) -> dict[str, str]:
+    repo_prefix = repo_r2_prefix(releasename, branch, arch)
+    repomd = r2.get_object(f"{repo_prefix}/repodata/repomd.xml")
+    if not repomd:
+        return {}
+    primary_key = _primary_key_from_repomd(repo_prefix, repomd)
+    if not primary_key:
+        return {}
+    raw = r2.get_object(primary_key)
+    if not raw:
+        return {}
+    try:
+        xml = _decompress_repodata(raw, primary_key)
+    except Exception:
+        logger.warning("could not read primary for %s", repo_prefix, exc_info=True)
+        return {}
+    return parse_primary_sourcerpms(xml)
+
+
+def load_binary_source_names(
+    r2: R2Client,
+    releasename: str,
+    branch: str,
+    arch: str,
+) -> dict[str, str]:
+    return binary_source_names(load_binary_sourcerpms(r2, releasename, branch, arch))
 
 
 def _rpm_name_from_bytes(data: bytes) -> Optional[str]:
@@ -222,6 +384,18 @@ def whole_tree_promote_branch(
         filenames = sorted(src_bin | src_src)
         if not filenames:
             continue
+        try:
+            filenames = promote_filenames_without_stale_siblings(
+                filenames,
+                load_binary_sourcerpms(client, rel, src_b, arch),
+            )
+        except Exception:
+            logger.exception(
+                "stale subpackage filter failed %s %s %s",
+                rel,
+                src_b,
+                arch,
+            )
         src_prefix = repo_r2_prefix(rel, src_b, arch)
         dest_prefix = repo_r2_prefix(rel, dest_b, arch)
         lock_prefixes = sorted((src_prefix, dest_prefix))
@@ -428,6 +602,52 @@ def _prune_src_rpms_matching_names(
         logger.info("Pruned %s superseded SRPMs", len(to_delete))
 
 
+def _prune_dropped_subpackages(
+    r2: R2Client,
+    *,
+    releasename: str,
+    from_branch: str,
+    dest_channel: str,
+    arch: str,
+    keep_basenames: set[str],
+    source_names: set[str],
+) -> None:
+    if not source_names:
+        return
+    try:
+        mapping = load_binary_source_names(r2, releasename, dest_channel, arch)
+        mapping.update(load_binary_source_names(r2, releasename, from_branch, arch))
+    except Exception:
+        logger.exception(
+            "dropped subpackage lookup failed %s %s -> %s %s",
+            releasename,
+            from_branch,
+            dest_channel,
+            arch,
+        )
+        return
+    drop = dropped_sibling_filenames(mapping, source_names, keep_basenames)
+    if not drop:
+        return
+    keys = [repo_rpms_key(releasename, dest_channel, arch, base) for base in drop]
+    try:
+        r2.delete_objects(keys)
+    except Exception:
+        logger.warning("batch delete of dropped subpackages failed", exc_info=True)
+        for key in keys:
+            try:
+                r2.delete_object(key)
+            except Exception:
+                logger.warning("could not delete dropped subpackage %s", key, exc_info=True)
+    logger.info(
+        "Pruned %s dropped subpackage RPM(s) from %s/%s/%s",
+        len(drop),
+        releasename,
+        dest_channel,
+        arch,
+    )
+
+
 def _remove_promoted_objects_from_branch(
     r2: R2Client,
     releasename: str,
@@ -501,6 +721,15 @@ def run_batched_promotion_r2_maintenance(
         keep_basenames,
         src_names,
         listed_by_channel=src_listings,
+    )
+    _prune_dropped_subpackages(
+        r2,
+        releasename=releasename,
+        from_branch=from_branch,
+        dest_channel=dest_channel,
+        arch=arch,
+        keep_basenames=keep_basenames,
+        source_names=source_names_from_filenames(artifact_filenames) | src_names,
     )
 
     dest_prefix = repo_r2_prefix(releasename, dest_channel, arch)
