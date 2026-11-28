@@ -1,10 +1,17 @@
 # Copyright (C) 2026 Oreon HQ
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+import asyncio
+from pathlib import Path
+from types import SimpleNamespace
+
+from sqlalchemy.exc import InterfaceError
+
 from oreon_build.api.routers.auth import _login_hits, login_rate_limited
 from oreon_build.core.scratch import disk_tmpdir
+from oreon_build.models import BuildStatus
+from oreon_build.services import rpm_scan
 from oreon_build.services.rpm_scan import parse_clam_line, parse_yr_json, skip_scan_path, _scan_failure
-from pathlib import Path
 
 
 def test_skip_noise_paths():
@@ -59,6 +66,132 @@ def test_dead_clamd_is_not_a_walk_error():
         "LibClamAV Error: File tree walk aborted.",
     ])
     assert _scan_failure(text) == "clamd is not running"
+
+
+def test_scan_does_not_hold_db_while_reading_rpms(monkeypatch, tmp_path: Path):
+    asyncio.run(_scan_does_not_hold_db_while_reading_rpms(monkeypatch, tmp_path))
+
+
+async def _scan_does_not_hold_db_while_reading_rpms(monkeypatch, tmp_path: Path):
+    open_count = {"n": 0}
+    seen = {"during": []}
+    job = SimpleNamespace(id=7, status=BuildStatus.SUCCESS, scan_state="pending")
+    art = SimpleNamespace(filename="kernel-debuginfo.rpm", r2_key="builds/kernel-debuginfo.rpm")
+
+    class Result:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [art]
+
+    class DB:
+        async def get(self, model, pk):
+            return job
+
+        async def execute(self, stmt):
+            return Result()
+
+        def add(self, obj):
+            return None
+
+        async def commit(self):
+            return None
+
+    db = DB()
+
+    class Session:
+        async def __aenter__(self):
+            open_count["n"] += 1
+            return db
+
+        async def __aexit__(self, *args):
+            open_count["n"] -= 1
+
+    def download(key, dest):
+        seen["during"].append(open_count["n"])
+        dest.write_bytes(b"rpm")
+        return None
+
+    def scan_path(path):
+        seen["during"].append(open_count["n"])
+        return [{"engine": "clamav", "rule": "Win.Test", "file_path": "usr/bin/x", "evidence": "x"}], None
+
+    monkeypatch.setattr(rpm_scan, "async_session_maker", Session)
+    monkeypatch.setattr(rpm_scan, "_download", download)
+    monkeypatch.setattr(rpm_scan, "scan_rpm_path", scan_path)
+    monkeypatch.setattr(rpm_scan, "_scan_tmp_parent", lambda: tmp_path)
+    monkeypatch.setattr(rpm_scan, "log_audit", _noop_audit)
+
+    await rpm_scan._scan_job(7, 11)
+    assert seen["during"] == [0, 0]
+    assert job.scan_state == "quarantined"
+    assert open_count["n"] == 0
+
+
+def test_scan_retries_dead_db_write(monkeypatch, tmp_path: Path):
+    asyncio.run(_scan_retries_dead_db_write(monkeypatch, tmp_path))
+
+
+async def _scan_retries_dead_db_write(monkeypatch, tmp_path: Path):
+    job = SimpleNamespace(id=8, status=BuildStatus.SUCCESS, scan_state="pending")
+    art = SimpleNamespace(filename="kernel.rpm", r2_key="builds/kernel.rpm")
+    commits = {"n": 0}
+
+    class Result:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [art]
+
+    class DB:
+        def __init__(self, dead: bool):
+            self.dead = dead
+
+        async def get(self, model, pk):
+            if self.dead:
+                raise InterfaceError("connection is closed", None, None)
+            return job
+
+        async def execute(self, stmt):
+            if self.dead:
+                raise InterfaceError("connection is closed", None, None)
+            return Result()
+
+        def add(self, obj):
+            return None
+
+        async def commit(self):
+            commits["n"] += 1
+
+    made = {"n": 0}
+
+    class Session:
+        async def __aenter__(self):
+            made["n"] += 1
+            return DB(dead=made["n"] == 2)
+
+        async def __aexit__(self, *args):
+            return None
+
+    monkeypatch.setattr(rpm_scan, "async_session_maker", Session)
+    def download(key, dest):
+        dest.write_bytes(b"rpm")
+        return None
+
+    monkeypatch.setattr(rpm_scan, "_download", download)
+    monkeypatch.setattr(rpm_scan, "scan_rpm_path", lambda path: ([], None))
+    monkeypatch.setattr(rpm_scan, "_scan_tmp_parent", lambda: tmp_path)
+
+    await rpm_scan._scan_job(8, 12)
+    assert job.scan_state == "clean"
+    assert commits["n"] == 1
+    assert made["n"] == 3
+
+
+async def _noop_audit(*args, **kwargs):
+    return None
 
 
 def test_login_rate_limit_trips():

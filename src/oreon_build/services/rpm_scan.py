@@ -17,6 +17,7 @@ from pathlib import Path
 
 from sqlalchemy import case, delete, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import InterfaceError, InternalError, OperationalError, PendingRollbackError
 
 from oreon_build.core.audit import log_audit
 from oreon_build.db.session import async_session_maker
@@ -412,6 +413,10 @@ def schedule_rpm_scan(job_id: int, attempt_id: int) -> None:
     loop.create_task(run_job_scan(job_id, attempt_id))
 
 
+def _db_write_dead(exc: BaseException) -> bool:
+    return isinstance(exc, (InterfaceError, OperationalError, InternalError, PendingRollbackError))
+
+
 async def run_job_scan(job_id: int, attempt_id: int) -> None:
     async with _gate:
         if job_id in _inflight:
@@ -419,89 +424,132 @@ async def run_job_scan(job_id: int, attempt_id: int) -> None:
         _inflight.add(job_id)
     try:
         await _scan_job(job_id, attempt_id)
+    except Exception:
+        logger.exception("rpm scan failed job %s attempt %s", job_id, attempt_id)
     finally:
         async with _gate:
             _inflight.discard(job_id)
 
 
-async def _scan_job(job_id: int, attempt_id: int) -> None:
+async def _load_pending_rpms(job_id: int, attempt_id: int) -> list[tuple[str, str]] | None:
     async with async_session_maker() as db:
         job = await db.get(BuildJob, job_id)
         if job is None or job.status != BuildStatus.SUCCESS:
-            return
+            return None
         if (job.scan_state or "") != "pending":
-            return
+            return None
         arts = (
             await db.execute(
                 select(Artifact).where(Artifact.build_attempt_id == attempt_id)
             )
         ).scalars().all()
-        rpms = [a for a in arts if (a.filename or "").endswith(".rpm") and a.r2_key]
-        if not rpms:
-            job.scan_state = "clean"
-            await _enqueue(db, job_id, attempt_id)
-            await db.commit()
-            return
-        findings: list[dict] = []
-        with tempfile.TemporaryDirectory(prefix="oreon-rpm-", dir=_scan_tmp_parent()) as tmp:
-            root = Path(tmp)
-            for art in rpms:
-                dest = root / Path(art.filename).name
-                err = await asyncio.to_thread(_download, art.r2_key, dest)
-                if err:
-                    if "missing" in err:
-                        job.scan_state = "skipped"
-                        await _enqueue(db, job_id, attempt_id)
-                        await db.execute(
-                            update(PublishTask)
-                            .where(
-                                PublishTask.attempt_id == attempt_id,
-                                PublishTask.status.in_(("pending", "queued")),
-                            )
-                            .values(
-                                status="failed",
-                                error_message=err[:500],
-                                finished_at=datetime.now(timezone.utc),
-                            )
+        return [
+            (a.filename, a.r2_key)
+            for a in arts
+            if (a.filename or "").endswith(".rpm") and a.r2_key
+        ]
+
+
+async def _finish_scan(
+    job_id: int,
+    attempt_id: int,
+    findings: list[dict],
+    missing: str | None,
+) -> None:
+    last: BaseException | None = None
+    for attempt in range(4):
+        try:
+            async with async_session_maker() as db:
+                job = await db.get(BuildJob, job_id)
+                if job is None or job.status != BuildStatus.SUCCESS:
+                    return
+                if (job.scan_state or "") != "pending":
+                    return
+                if missing:
+                    job.scan_state = "skipped"
+                    await _enqueue(db, job_id, attempt_id)
+                    await db.execute(
+                        update(PublishTask)
+                        .where(
+                            PublishTask.attempt_id == attempt_id,
+                            PublishTask.status.in_(("pending", "queued")),
                         )
-                        await db.commit()
-                        logger.warning("rpm scan dropped job %s: %s", job_id, err)
-                        return
-                    logger.warning("rpm scan held job %s: %s", job_id, err)
+                        .values(
+                            status="failed",
+                            error_message=missing[:500],
+                            finished_at=datetime.now(timezone.utc),
+                        )
+                    )
+                    await db.commit()
+                    logger.warning("rpm scan dropped job %s: %s", job_id, missing)
                     return
-                try:
-                    hits, scan_err = await asyncio.to_thread(scan_rpm_path, dest)
-                finally:
-                    dest.unlink(missing_ok=True)
-                if scan_err:
-                    logger.warning("rpm scan held job %s: %s", job_id, scan_err)
+                await db.execute(delete(RpmScanFinding).where(RpmScanFinding.build_job_id == job_id))
+                if findings:
+                    for hit in findings:
+                        db.add(RpmScanFinding(
+                            build_job_id=job_id,
+                            attempt_id=attempt_id,
+                            engine=hit["engine"],
+                            rule=hit["rule"],
+                            file_path=hit["file_path"],
+                            evidence=hit.get("evidence") or "",
+                        ))
+                    job.scan_state = "quarantined"
+                    await log_audit(
+                        db,
+                        action="scan.quarantine",
+                        resource_type="build_job",
+                        resource_id=str(job_id),
+                        details=f"{len(findings)} hit(s) attempt_id={attempt_id}",
+                        user_agent="scanner",
+                    )
+                    await db.commit()
+                    logger.info("rpm scan quarantined job %s attempt %s hits %s", job_id, attempt_id, len(findings))
                     return
-                findings.extend(hits)
-        await db.execute(delete(RpmScanFinding).where(RpmScanFinding.build_job_id == job_id))
-        if findings:
-            for hit in findings:
-                db.add(RpmScanFinding(
-                    build_job_id=job_id,
-                    attempt_id=attempt_id,
-                    engine=hit["engine"],
-                    rule=hit["rule"],
-                    file_path=hit["file_path"],
-                    evidence=hit.get("evidence") or "",
-                ))
-            job.scan_state = "quarantined"
-            await log_audit(
-                db,
-                action="scan.quarantine",
-                resource_type="build_job",
-                resource_id=str(job_id),
-                details=f"{len(findings)} hit(s) attempt_id={attempt_id}",
-                user_agent="scanner",
-            )
-            await db.commit()
-            return
-        job.scan_state = "clean"
-        await _enqueue(db, job_id, attempt_id)
-        await db.commit()
+                job.scan_state = "clean"
+                await _enqueue(db, job_id, attempt_id)
+                await db.commit()
+                logger.info("rpm scan done job %s attempt %s", job_id, attempt_id)
+                return
+        except Exception as exc:
+            last = exc
+            if not _db_write_dead(exc) or attempt == 3:
+                raise
+            logger.warning("rpm scan db write retry job %s: %s", job_id, exc)
+            await asyncio.sleep(1 + attempt)
+    if last:
+        raise last
+
+
+async def _scan_job(job_id: int, attempt_id: int) -> None:
+    rpms = await _load_pending_rpms(job_id, attempt_id)
+    if rpms is None:
+        return
+    if not rpms:
+        await _finish_scan(job_id, attempt_id, [], None)
+        return
+    logger.info("rpm scan start job %s attempt %s rpms %s", job_id, attempt_id, len(rpms))
+    findings: list[dict] = []
+    with tempfile.TemporaryDirectory(prefix="oreon-rpm-", dir=_scan_tmp_parent()) as tmp:
+        root = Path(tmp)
+        for filename, key in rpms:
+            dest = root / Path(filename).name
+            err = await asyncio.to_thread(_download, key, dest)
+            if err:
+                if "missing" in err:
+                    await _finish_scan(job_id, attempt_id, [], err)
+                    return
+                logger.warning("rpm scan held job %s: %s", job_id, err)
+                return
+            try:
+                hits, scan_err = await asyncio.to_thread(scan_rpm_path, dest)
+            finally:
+                dest.unlink(missing_ok=True)
+            if scan_err:
+                logger.warning("rpm scan held job %s: %s", job_id, scan_err)
+                return
+            findings.extend(hits)
+    await _finish_scan(job_id, attempt_id, findings, None)
 
 
 async def retry_pending_scans(db) -> None:
