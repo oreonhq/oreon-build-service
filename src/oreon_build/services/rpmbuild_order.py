@@ -39,6 +39,7 @@ from oreon_build.services.build_target_util import (
 logger = logging.getLogger(__name__)
 
 _CHAIN_PACKAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+_.-]*$")
+_BOOT_SUFFIX = "#boot"
 
 
 def distgit_new_package_dict(
@@ -67,28 +68,64 @@ def distgit_new_package_dict(
     }
 
 
-def parse_manual_chain(chain: str) -> list[list[str]]:
-    """Parse Koji-style ``a b : c : d e`` groups without graph expansion.
+def _chain_token(token: str) -> tuple[str, bool]:
+    boot = token.endswith(_BOOT_SUFFIX)
+    name = token[: -len(_BOOT_SUFFIX)] if boot else token
+    if not name or not _CHAIN_PACKAGE_RE.fullmatch(name):
+        raise ValueError(f"Invalid package name in chain: {token}")
+    return name, boot
 
-    The same package may show up in a later group. That earlier copy is a
-    bootstrap build. Twice in one group is still invalid.
-    """
+
+def _parse_manual_chain(chain: str) -> tuple[list[list[str]], dict[int, set[str]]]:
     raw_groups = chain.split(":")
     if any(not group.strip() for group in raw_groups):
         raise ValueError("Chain contains an empty group")
     layers: list[list[str]] = []
+    boots: dict[int, set[str]] = {}
+    counts: dict[str, int] = {}
+    boot_used: set[str] = set()
     for raw_group in raw_groups:
         group: list[str] = []
         seen: set[str] = set()
-        for name in raw_group.replace(",", " ").split():
-            if not _CHAIN_PACKAGE_RE.fullmatch(name):
-                raise ValueError(f"Invalid package name in chain: {name}")
+        group_boots: set[str] = set()
+        follow: list[str] = []
+        for token in raw_group.replace(",", " ").split():
+            name, boot = _chain_token(token)
             if name in seen:
                 raise ValueError(f"Package appears more than once in the same group: {name}")
             seen.add(name)
             group.append(name)
+            counts[name] = counts.get(name, 0) + 1
+            if boot:
+                group_boots.add(name)
+                boot_used.add(name)
+                follow.append(name)
+                counts[name] += 1
+        if group_boots:
+            boots[len(layers)] = group_boots
         layers.append(group)
+        if follow:
+            layers.append(follow)
+        for name, count in counts.items():
+            if name in boot_used and count > 2:
+                raise ValueError(f"{name}#boot already includes the full build")
+    return layers, boots
+
+
+def parse_manual_chain(chain: str) -> list[list[str]]:
+    """Parse Koji-style ``a b : c : d e`` groups without graph expansion.
+
+    ``name#boot`` is the bootstrap build followed by the full build.
+    A repeated name still marks every earlier copy as bootstrap.
+    Twice in one group is still invalid.
+    """
+    layers, _boots = _parse_manual_chain(chain)
     return layers
+
+
+def explicit_bootstrap_by_layer(chain: str) -> dict[str, list[str]]:
+    _layers, boots = _parse_manual_chain(chain)
+    return {str(idx): sorted(names) for idx, names in boots.items()}
 
 
 def dep_providers_from_edges(edges: list[dict], names: set[str]) -> dict[str, list[str]]:
@@ -135,6 +172,21 @@ def bootstrap_names_by_layer(layers: list[list[str]]) -> dict[int, set[str]]:
         if boots:
             out[idx] = boots
     return out
+
+
+def layer_bootstrap_names(
+    layers: list[list[str]],
+    layer_index: int,
+    explicit: dict | None = None,
+) -> set[str]:
+    names = set(bootstrap_names_by_layer(layers).get(layer_index, set()))
+    if isinstance(explicit, dict):
+        raw = explicit.get(str(layer_index))
+        if raw is None:
+            raw = explicit.get(layer_index)
+        if isinstance(raw, list):
+            names.update(str(item) for item in raw if str(item).strip())
+    return names
 
 
 def _plan_skip_jobs_not_before(plan: RpmbuildPlan) -> datetime | None:
@@ -270,7 +322,12 @@ async def enqueue_plan_layer_jobs(
     jobs: list[BuildJob] = []
     layer_pkgs = [str(x) for x in layers[layer_index] if str(x).strip()]
     skip_names = skip_package_names or set()
-    boot_names = bootstrap_names_by_layer([[str(x) for x in g] for g in layers]).get(layer_index, set())
+    plan_opts = plan.options_json if isinstance(plan.options_json, dict) else {}
+    boot_names = layer_bootstrap_names(
+        [[str(x) for x in g] for g in layers],
+        layer_index,
+        plan_opts.get("bootstrap_by_layer"),
+    )
     plan_not_before = _plan_skip_jobs_not_before(plan)
     for pkg_name in layer_pkgs:
         pkg, _pref = await _get_or_create_distgit_package(
@@ -367,7 +424,7 @@ async def create_manual_chain_plan(
     from oreon_build.models import SideTag
 
     try:
-        layers = parse_manual_chain(chain)
+        layers, boot_marks = _parse_manual_chain(chain)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     release = await db.get(Release, release_id)
@@ -406,6 +463,7 @@ async def create_manual_chain_plan(
             "architectures": selected_arches,
             "priority": int(priority),
             "preferred_mock_environment_id": preferred_mock_environment_id,
+            "bootstrap_by_layer": {str(idx): sorted(names) for idx, names in boot_marks.items()},
         },
         status=RpmbuildPlanStatus.RUNNING,
         current_open_layer=0,
